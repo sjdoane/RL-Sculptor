@@ -49,7 +49,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import sys
+
 import numpy as np
+
+from sculptor.refs import timing as _timing
 
 #: Feasibility thresholds (§mission spec — "calibrate later against the
 #: known-good jump reference"). Both must hold for a tracking run to
@@ -104,12 +108,18 @@ ROOT_ERR_WEIGHT = 40.0
 #: reward prefers the `step_dt` the mjlab runner publishes per step, so this
 #: only matters for an adapter that does not report it.
 #:
-#: Measured, not assumed: with `episode_length_s` capped to a 3.70 s reference
-#: the G1 velocity task reported a mean `episode_length` of 92.9 steps, i.e.
-#: 3.70 / 92.9 = 0.0398 s per control step. The 0.02 `step_dt` that appears in
-#: `_mjlab_runner`'s `video_params` is the PHYSICS timestep; the control loop
-#: decimates it by 2. Assuming 50 Hz here made the clock run at half speed.
-DEFAULT_CONTROL_HZ = 25.0
+#: Read from the task config, not inferred from a training statistic:
+#: `mjlab/tasks/velocity/velocity_env_cfg.py` sets `MujocoCfg.timestep=0.005`
+#: (200 Hz physics) with `decimation=4`, so the CONTROL step is 0.005 x 4 =
+#: 0.02 s -> 50 Hz. See `sculptor.refs.timing` for the literature basis and
+#: for why physics and control rates are separate numbers.
+#:
+#: Do NOT re-derive this from `__episode_length` in a reward trajectory: that
+#: channel is `env.episode_length_buf` averaged over envs (_mjlab_runner:654
+#: and :132), i.e. the MEAN PROGRESS of envs at uniformly distributed phases,
+#: which sits near half the maximum. Reading it as an episode duration is what
+#: produced a spurious "25 Hz" here.
+DEFAULT_CONTROL_HZ = _timing.MJLAB_G1_VELOCITY.control_hz
 
 DEFAULT_ITERATIONS = 3
 DEFAULT_STEPS_PER_ITERATION = 2000
@@ -314,6 +324,11 @@ REWARD_SPEC: dict = {{
     # MjlabAdapter refuses a reward without this flag AND a
     # `compute_reward_batched` entry point (see the batched section below).
     "supports_batched": True,
+    # Tells `_mjlab_runner` a reference motion is attached, so it narrows the
+    # task-reward realism floor to hardware-safety terms. Without this the
+    # task's `pose`/`upright`/gait terms compete with the very motion being
+    # certified (measured: 28% of the reference's joint amplitude reproduced).
+    "reference_tracking": True,
     "hyperparameters": {{
         "joint_err_weight": {joint_err_weight!r},
         "root_err_weight": {root_err_weight!r},
@@ -555,6 +570,11 @@ REWARD_SPEC: dict = {{
     "author": "sculptor",
     "parent_hash": None,
     "supports_batched": True,
+    # Tells `_mjlab_runner` a reference motion is attached, so it narrows the
+    # task-reward realism floor to hardware-safety terms. Without this the
+    # task's `pose`/`upright`/gait terms compete with the very motion being
+    # certified (measured: 28% of the reference's joint amplitude reproduced).
+    "reference_tracking": True,
     "composition": {{
         "type": "reference_tracking_residual",
         "reference_clip_id": {clip_id!r},
@@ -1137,6 +1157,19 @@ def build_track_project(
         np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase_targets)
     target_root_z = downsample_phase_targets(
         np.asarray(clip["root_pos_z"], dtype=np.float64), n=n_phase_targets)
+
+    # Say out loud whether this reference is even representable at the task's
+    # control rate. Both Tier-D timing failures were silent; a phase clock that
+    # cannot visit all its targets, or a reference with content above Nyquist,
+    # should be visible before the GPU time is spent rather than inferred from
+    # a flat learning curve afterwards.
+    timing_findings = _timing.validate_timing(
+        _timing.MJLAB_G1_VELOCITY,
+        reference_fps=fps,
+        reference_duration_s=duration_s,
+        n_phase_targets=n_phase_targets)
+    for finding in timing_findings:
+        print(f"[track] timing: {finding}", file=sys.stderr, flush=True)
 
     reward_source = generate_tracking_reward_source(
         clip_id=clip_id,

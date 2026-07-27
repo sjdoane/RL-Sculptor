@@ -1481,3 +1481,89 @@ def test_first_episode_freeze_fails_soft_on_incompatible_mask() -> None:
     result = _freeze_invalid_first_episode_steps(
         values, np.ones((2, 2), dtype=bool))
     np.testing.assert_array_equal(result, values)
+
+
+# ── reference-tracking narrows the realism floor (HANDOFF §10, option 2) ──
+#
+# A reference dictates posture, gait and body motion frame by frame, so the
+# task's own posture/gait priors stop complementing the sculpted reward and
+# start competing with it. Measured on the first Tier-D attempt: 14 task terms
+# at 0.3x against one tracking term at 1.0x produced a policy that reproduced
+# 28% of the reference's joint amplitude and could not beat a static pose.
+def test_hardware_safety_terms_survive_reference_tracking() -> None:
+    """Limits and smoothness constrain the hardware without prescribing a
+    pose, so they are compatible with any reference and stay on."""
+    from sculptor.adapters._mjlab_runner import _is_hardware_safety_term
+
+    for name in ("dof_pos_limits", "robot_dof_pos_limits", "dof_vel_limits",
+                 "self_collisions", "action_rate_l2", "joint_limits",
+                 "dof_torque_limits"):
+        assert _is_hardware_safety_term(name), name
+
+
+def test_posture_and_gait_terms_are_not_treated_as_safety() -> None:
+    """These are exactly the terms that fight the reference."""
+    from sculptor.adapters._mjlab_runner import _is_hardware_safety_term
+
+    for name in ("pose", "upright", "track_linear_velocity",
+                 "track_angular_velocity", "foot_clearance", "air_time",
+                 "foot_slip", "foot_swing_height", "angular_momentum",
+                 "body_ang_vel", "soft_landing"):
+        assert not _is_hardware_safety_term(name), name
+
+
+def test_the_g1_task_term_split_is_what_we_intend(tmp_path) -> None:
+    """Pin the actual split over the real G1 velocity task's 14 terms, so a
+    future task-term rename cannot silently re-enable a posture prior."""
+    from sculptor.adapters._mjlab_runner import _is_hardware_safety_term
+
+    shipped = [
+        "action_rate_l2", "air_time", "angular_momentum", "body_ang_vel",
+        "dof_pos_limits", "foot_clearance", "foot_slip", "foot_swing_height",
+        "pose", "self_collisions", "soft_landing", "track_angular_velocity",
+        "track_linear_velocity", "upright",
+    ]
+    kept = sorted(n for n in shipped if _is_hardware_safety_term(n))
+    assert kept == ["action_rate_l2", "dof_pos_limits", "self_collisions"]
+
+
+def test_reward_module_flag_is_read_and_fails_soft(tmp_path) -> None:
+    """The runner keys off REWARD_SPEC['reference_tracking']; an unreadable
+    module must NOT be guessed as tracking, since that would silently change
+    which task rewards are active."""
+    from sculptor.adapters._mjlab_runner import _reward_module_declares
+
+    tracking = tmp_path / "tracking.py"
+    tracking.write_text(
+        'REWARD_SPEC = {"reference_tracking": True}\n'
+        "def compute_reward(s, a, ns, i):\n    return 0.0, {}\n",
+        encoding="utf-8")
+    assert _reward_module_declares(tracking, "reference_tracking") is True
+
+    plain = tmp_path / "plain.py"
+    plain.write_text(
+        'REWARD_SPEC = {"version": "v1"}\n'
+        "def compute_reward(s, a, ns, i):\n    return 0.0, {}\n",
+        encoding="utf-8")
+    assert _reward_module_declares(plain, "reference_tracking") is False
+
+    broken = tmp_path / "broken.py"
+    broken.write_text("this is not python(", encoding="utf-8")
+    assert _reward_module_declares(broken, "reference_tracking") is False
+    assert _reward_module_declares(None, "reference_tracking") is False
+
+
+def test_generated_tracking_rewards_declare_the_flag() -> None:
+    """Both tracking-reward generators must set it, or the runner silently
+    keeps the competing posture priors."""
+    import numpy as np
+
+    from sculptor.refs.track import generate_tracking_reward_source
+
+    src = generate_tracking_reward_source(
+        clip_id="c", joint_names=["j0"],
+        target_joint_pos=np.zeros((4, 1)), target_root_z=np.zeros(4),
+        episode_len_steps=100, duration_s=2.0)
+    ns: dict = {}
+    exec(compile(src, "r", "exec"), ns)  # noqa: S102
+    assert ns["REWARD_SPEC"]["reference_tracking"] is True

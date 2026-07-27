@@ -900,6 +900,53 @@ def _authored_terminal_hold_s(world_bundle: Any | None) -> float:
     return hold_s if hold_s > 0.0 else 0.0
 
 
+#: Task-shipped reward terms that stay on when a reference is attached.
+#: The test is "does this constrain what the hardware may do, or does it
+#: prescribe what pose the robot holds?" -- limits, self-collision and
+#: actuator smoothness are the former and are compatible with ANY reference;
+#: `pose`, `upright`, the command-tracking terms and the gait shapers
+#: (`foot_clearance`, `air_time`, `foot_slip`, `foot_swing_height`,
+#: `angular_momentum`, `body_ang_vel`, `soft_landing`) are the latter and
+#: fight the motion being tracked. Matched as substrings so a task that names
+#: a term `robot_dof_pos_limits` is still recognised.
+_HARDWARE_SAFETY_TERM_MARKERS: tuple[str, ...] = (
+    "dof_pos_limits",
+    "dof_vel_limits",
+    "dof_torque_limits",
+    "joint_limits",
+    "torque_limits",
+    "self_collision",
+    "action_rate",
+    "action_smoothness",
+)
+
+
+def _is_hardware_safety_term(name: str) -> bool:
+    """Whether a task-shipped reward term constrains the hardware rather than
+    prescribing a posture (see `_HARDWARE_SAFETY_TERM_MARKERS`)."""
+    lowered = name.lower()
+    return any(marker in lowered for marker in _HARDWARE_SAFETY_TERM_MARKERS)
+
+
+def _reward_module_declares(reward_module_path: Any, key: str) -> bool:
+    """Read one boolean flag out of a reward module's `REWARD_SPEC`.
+
+    Fail-soft by design: a reward that cannot be imported here will fail
+    loudly a few lines later when `SculptorRewardTerm` loads it for real, and
+    guessing "tracking" for an unreadable module would silently change which
+    task rewards are active."""
+    if not reward_module_path:
+        return False
+    try:
+        from sculptor.adapters.base import _import_reward_module
+
+        mod = _import_reward_module(Path(reward_module_path))
+        spec = getattr(mod, "REWARD_SPEC", None)
+        return bool(isinstance(spec, dict) and spec.get(key))
+    except Exception:  # noqa: BLE001 — see docstring
+        return False
+
+
 def _authored_terminal_stillness_weight(
     rewards: Mapping[str, Any],
     authored_command_terms: frozenset[str],
@@ -2280,12 +2327,46 @@ def _cmd_train(args: argparse.Namespace) -> None:
         existing = getattr(env_cfg, "rewards", None)
         REALISM_FLOOR_SCALE = 0.3
         full_weight_terms = _full_weight_authored_command_rewards(world_bundle)
+        # When a REFERENCE is attached the realism prior stops being a
+        # complement and becomes a competitor: the reference already dictates
+        # posture, gait and body motion frame by frame, so `pose` (a nominal-
+        # pose regularizer), `upright`, the command-tracking terms and the
+        # gait-shaping terms are all pulling the policy AWAY from the motion
+        # it is being certified against. Measured on the first Tier-D attempt:
+        # 14 task terms at 0.3x against one tracking term at 1.0x produced a
+        # policy that reproduced 28% of the reference's joint amplitude and
+        # could not beat a static pose.
+        #
+        # So in tracking mode the floor is narrowed to HARDWARE-SAFETY terms
+        # only — limits, self-collision, actuator smoothness — which constrain
+        # what the robot may do without prescribing what pose it holds. The
+        # anti-falling role the broad floor used to play is covered by
+        # `_install_sculptor_termination_economics` below (survival guard +
+        # explicit non-timeout termination penalty), which is why dropping
+        # `upright` here does not reopen the fall-immediately failure mode.
+        tracking = _reward_module_declares(args.reward_module_path,
+                                           "reference_tracking")
         if isinstance(existing, dict):
+            kept, dropped = [], []
             for k in list(existing.keys()):
                 term = existing[k]
-                if term is not None and hasattr(term, "weight"):
-                    scale = 1.0 if str(k) in full_weight_terms else REALISM_FLOOR_SCALE
-                    term.weight = float(term.weight) * scale
+                if term is None or not hasattr(term, "weight"):
+                    continue
+                name = str(k)
+                if name in full_weight_terms:
+                    scale = 1.0            # authored command == task supervision
+                elif tracking and not _is_hardware_safety_term(name):
+                    scale = 0.0
+                else:
+                    scale = REALISM_FLOOR_SCALE
+                term.weight = float(term.weight) * scale
+                (dropped if scale == 0.0 else kept).append(name)
+            if tracking:
+                print(
+                    f"[runner] reference-tracking reward: narrowed the realism "
+                    f"floor to hardware-safety terms. kept={sorted(kept)} "
+                    f"dropped={sorted(dropped)}",
+                    file=sys.stderr, flush=True)
         else:
             env_cfg.rewards = {}
 

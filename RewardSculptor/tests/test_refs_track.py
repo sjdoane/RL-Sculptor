@@ -717,8 +717,9 @@ def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
     match = re.search(r"^EPISODE_LEN_STEPS = (\d+)", src, re.M)
     assert match, "reward must declare EPISODE_LEN_STEPS"
     got = int(match.group(1))
-    # 3.70 s at the measured 25 Hz = 92 steps -- NOT the 2000 training budget.
-    assert got == round((n / fps) * DEFAULT_CONTROL_HZ) == 92
+    # 3.70 s at the task's 50 Hz control rate (200 Hz physics / decimation 4)
+    # = 185 steps -- NOT the 2000 training budget.
+    assert got == round((n / fps) * DEFAULT_CONTROL_HZ) == 185
     assert got != 2000
     # ...and the reward carries the real duration so it can clock off step_dt
     # rather than trusting the build-time rate at all.
