@@ -38,6 +38,7 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from backend.models.kg import JobSummary
 from backend.models.project import ProblemDetail
 from backend.services import mission_store
 from backend.services.job_manager import JobManager
@@ -645,6 +646,21 @@ def _reward_dest(project_dir: Path, filename: str) -> Optional[Path]:
     return project_dir / "rewards" / name
 
 
+def _chain_name(stem: str, mode_name: str) -> str:
+    """`mode_reward_v0` -> `mode_reward_v1`, anything else -> `<stem>_<mode>.py`.
+
+    Authoring is one mode per call so the versions chain. Naming after the mode
+    when there is no version to bump keeps a hand-placed scaffold from silently
+    overwriting itself on the second call.
+    """
+    from sculptor.mode_rewards import mode_ident
+
+    m = re.fullmatch(r"(.*?)(\d+)", stem)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)) + 1}.py"
+    return f"{stem}_{mode_ident(mode_name)}.py"
+
+
 @router.post(
     "/projects/{slug}/references/{clip_id}/mode-reward",
     responses={404: {"model": ProblemDetail}, 409: {"model": ProblemDetail},
@@ -733,3 +749,138 @@ def scaffold_mode_reward(
         ],
         "unauthored": [n for n, done in authored.items() if not done],
     }
+
+
+class ModeAuthorRequest(BaseModel):
+    """POST /projects/{slug}/references/{clip_id}/mode-reward/author — Claude
+    writes ONE mode's reward bodies into an existing scaffold."""
+
+    model_config = ConfigDict(extra="forbid")
+    clip_id: str
+    robot: str = "g1"
+    #: Which mode to author. One per request: the scaffold's gating is already
+    #: correct, so the only thing a model can get wrong is one window's terms.
+    mode: str
+    #: The scaffold to author into — a bare filename under the project's
+    #: `rewards/`, as returned by the scaffold endpoint.
+    filename: str = "mode_reward_v0.py"
+    #: Where to write the result. Defaults to overwriting nothing: the caller
+    #: chains modes by passing the previous response's `filename` back in.
+    out_filename: Optional[str] = None
+    goal: str = ""
+    mode_goal: str = ""
+
+
+@router.post(
+    "/projects/{slug}/references/{clip_id}/mode-reward/author",
+    response_model=JobSummary,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={404: {"model": ProblemDetail}, 409: {"model": ProblemDetail},
+               422: {"model": ProblemDetail}, 503: {"model": ProblemDetail}},
+)
+def author_mode_reward(
+    slug: str, clip_id: str, body: ModeAuthorRequest, request: Request,
+) -> Any:
+    """Author one mode's reward terms. Fires a background job; poll
+    `GET /jobs/{job_id}`.
+
+    The scaffold's per-mode gating is generated, not authored, so what Claude
+    is asked for here is one function body (plus its batched twin) rather than
+    a whole reward — which is what keeps a bad edit scoped to one window.
+    """
+    import os
+
+    store: ProjectStore = request.app.state.project_store
+    jobs: JobManager = request.app.state.job_manager
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found")
+
+    if clip_id != body.clip_id:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "clip_id mismatch",
+            detail=f"path says {clip_id!r}, body says {body.clip_id!r}",
+            type_="/problems/validation-error")
+
+    if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+        return _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ANTHROPIC_API_KEY required for mode authoring",
+            detail="Set ANTHROPIC_API_KEY in the shell launching the backend "
+                   "OR in ../RewardSculptor/.env, then restart.",
+            type_="/problems/anthropic-key-missing")
+
+    loaded, err = _load_mode_graph(clip_id, body.robot)
+    if err is not None:
+        return err
+    _clip, graph = loaded
+    try:
+        graph.mode(body.mode)
+    except KeyError:
+        names = ", ".join(m.name for m in graph.modes)
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "unknown mode",
+            detail=f"{clip_id} has no mode {body.mode!r}; have: {names}",
+            type_="/problems/validation-error")
+
+    src = _reward_dest(project_dir, body.filename)
+    if src is None:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid filename",
+            detail=f"{body.filename!r} must be a bare .py filename",
+            type_="/problems/validation-error")
+    if not src.is_file():
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "scaffold not found",
+            detail=f"{src.name} does not exist — scaffold the mode reward "
+                   "first (POST .../mode-reward).",
+            type_="/problems/not-found")
+
+    out_name = body.out_filename or _chain_name(src.stem, body.mode)
+    dest = _reward_dest(project_dir, out_name)
+    if dest is None:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid out_filename",
+            detail=f"{out_name!r} must be a bare .py filename",
+            type_="/problems/validation-error")
+    if dest == src:
+        # Authoring in place would leave no way back to the scaffold if the
+        # edit is bad, and the caller chains by filename anyway.
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "out_filename same as source",
+            detail="authoring writes a new file; pass a different "
+                   "out_filename or let it be derived.",
+            type_="/problems/validation-error")
+
+    if jobs.has_active_sculpt_run(slug):
+        return _problem(
+            status.HTTP_409_CONFLICT, "sculpt run in progress",
+            detail="Reward edits are locked while a sculpt run is active.",
+            type_="/problems/state-conflict")
+    for existing in jobs.list(project_slug=slug):
+        if existing.kind == "mode_author" and existing.status in (
+                "queued", "running"):
+            # Two concurrent authoring jobs would race on the chained file.
+            return _problem(
+                status.HTTP_409_CONFLICT, "mode authoring already active",
+                detail="Another mode is being authored. Wait for it to "
+                       "finish — modes are authored one at a time.",
+                type_="/problems/job-busy",
+                active_job_id=existing.job_id)
+
+    from backend.services.mode_jobs import run_mode_author_job
+
+    job = jobs.submit(
+        kind="mode_author",  # type: ignore[arg-type]
+        project_slug=slug,
+        fn=run_mode_author_job(
+            project_dir=project_dir, reward_path=src, out_path=dest,
+            clip_id=clip_id, robot=body.robot, mode=body.mode,
+            behavior_goal=body.goal, mode_goal=body.mode_goal),
+        params={"clip_id": clip_id, "mode": body.mode,
+                "filename": src.name, "out_filename": dest.name},
+    )
+    return job.to_summary()

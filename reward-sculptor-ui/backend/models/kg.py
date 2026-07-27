@@ -123,6 +123,11 @@ JobKind = Literal[
     # regenerate. In-process thread job (mirrors mission_decompose's
     # strategy — a handful of LLM calls, no subprocess needed).
     "mission_stage_metric_regen",
+    # Per-mode reward authoring over a composed reference's automaton: Claude
+    # writes ONE mode's two function bodies, the rest of the module is
+    # generated. One job per mode on purpose — see
+    # `sculptor.mode_rewards.author_mode`.
+    "mode_author",
 ]
 JobStatus = Literal["queued", "running", "completed", "errored", "stopped"]
 

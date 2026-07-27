@@ -1186,17 +1186,243 @@ def mode_authoring_prompt(
 
 
 __all__ = [
+    "AUTHOR_MAX_TOKENS",
     "BATCHED_FN_SUFFIX",
     "MAX_PROMPT_CHARS",
     "MODE_COMPONENT_PREFIX",
     "MODE_FN_PREFIX",
+    "ModeAuthorError",
     "authored_modes",
+    "author_mode",
     "authoring_twin_source",
     "generate_mode_reward_scaffold",
     "graft_mode_bodies",
     "mode_authoring_prompt",
     "mode_ident",
     "mode_windows_s",
+    "probe_info_keys",
+    "probe_reward_module",
     "summarize_authored_modes",
     "validate_mode_reward_source",
 ]
+
+
+# ── the authoring call itself ─────────────────────────────────────────────
+#
+# Lives here rather than in `cli.py` because there are two callers — the CLI
+# and the UI's mode-author job — and the sequence below is not a formality.
+# Every step of it was added because a real run failed without it: the twin
+# because a model mangled a 32x29 float table, the summary because carrying
+# finished neighbours blew the output budget, the helper carry because a model
+# asked for one function wrote two, the info-key gate because a reward reading
+# a key the env never sends pays a constant and passes everything else.
+class ModeAuthorError(ModeError):
+    """An authoring attempt that produced nothing usable."""
+
+
+class _RecordingInfo(dict):
+    """A dict that remembers which keys were actually read."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.seen: set = set()
+
+    def __getitem__(self, key):
+        self.seen.add(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.seen.add(key)
+        return super().get(key, default)
+
+
+def probe_reward_module(path, contract) -> Optional[str]:
+    """Run `sculptor.edit`'s own reward probes on a file, or say why not.
+
+    Needed because authoring runs against a twin: `apply_prompt_edit` validated
+    THAT, and the grafted module is what trains. Re-probing is what makes the
+    graft safe rather than merely convenient.
+    """
+    import importlib.util
+    from pathlib import Path as _Path
+
+    from sculptor.edit import (EditValidationError, _call_compute_reward,
+                               _call_compute_reward_batched)
+
+    path = _Path(path)
+    try:
+        spec = importlib.util.spec_from_file_location(f"_probe_{path.stem}", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001 — surfaced as a message, not a crash
+        return f"module does not import: {type(e).__name__}: {e}"
+    for probe in (_call_compute_reward, _call_compute_reward_batched):
+        try:
+            probe(mod, contract)
+        except EditValidationError as e:
+            return str(e)
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}"
+    return None
+
+
+def probe_info_keys(path, contract, mode_name: str) -> Optional[str]:
+    """Reject a mode that reads an `info` key the env never publishes.
+
+    This is the failure the other probes cannot see. The first real authoring
+    run reached for ten info keys through a helper doing `info.get(key, 0.0)` —
+    every one happened to be real, but had one not been, that term would have
+    paid a constant 0.0 for the whole of training while the module imported,
+    ran and validated perfectly. A reward whose terms silently evaluate to a
+    constant is the exact shape of a gameable reward.
+
+    Recorded at runtime rather than read off the source, so a key reached
+    through a helper, a loop or an f-string is caught the same as a literal.
+    """
+    import importlib.util
+    from pathlib import Path as _Path
+
+    from sculptor.edit import _build_dummy_inputs
+
+    path = _Path(path)
+    spec = importlib.util.spec_from_file_location(f"_keyprobe_{path.stem}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    declared = set(contract.expected_info_keys or [])
+    seen: set = set()
+    ident = mode_ident(mode_name)
+
+    s, a, ns, info = _build_dummy_inputs(contract)
+    rec = _RecordingInfo(info)
+    fn = getattr(mod, MODE_FN_PREFIX + ident, None)
+    if fn is not None:
+        try:
+            fn(s, a, ns, rec)
+        except Exception:  # noqa: BLE001 — crashes are the other probes' job
+            pass
+        seen |= rec.seen
+
+    if bool(getattr(contract, "supports_batched", False)):
+        # The batched dispatch runs EVERY mode and masks afterwards, so one
+        # call covers this mode whatever the dummy elapsed time says.
+        import torch
+
+        schema = dict(contract.state_schema or {})
+        n = 2
+        state = {k: torch.zeros((n, *sh), dtype=torch.float32)
+                 for k, sh in schema.items()}
+        action = torch.zeros((n, int(schema.get("actuator_force", (1,))[0])),
+                             dtype=torch.float32)
+        ischema = getattr(contract, "info_schema", None) or {}
+        brec = _RecordingInfo({
+            k: torch.zeros((n, *tuple(ischema.get(k, ()))), dtype=torch.float32)
+            for k in declared})
+        bfn = getattr(mod, MODE_FN_PREFIX + ident + BATCHED_FN_SUFFIX, None)
+        if bfn is not None:
+            try:
+                bfn(state, action, state, brec, torch.zeros(n))
+            except Exception:  # noqa: BLE001
+                pass
+            seen |= brec.seen
+
+    unknown = sorted(k for k in seen if k not in declared)
+    if not unknown:
+        return None
+    return (f"reads info keys this env does not publish: {', '.join(unknown)}. "
+            f"Every such read returns the fallback forever, so the term is a "
+            f"constant. Available keys: {', '.join(sorted(declared))}")
+
+
+#: Token ceiling for a mode-authoring call. The `edit.MAX_TOKENS` default of
+#: 16000 truncated attempt 1 of EVERY real authoring run — adaptive thinking on
+#: "write a single-leg-takeoff reward" is expensive and what is left has to
+#: carry the whole module back. Raised here rather than there, because
+#: `edit.MAX_TOKENS` has a 240s HTTP timeout calibrated against it for the
+#: training-mission path, which is not what needed more room.
+AUTHOR_MAX_TOKENS = 32000
+
+
+def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
+                clip: Optional[Mapping[str, Any]] = None,
+                clip_id: str = "", behavior_goal: str = "",
+                mode_goal: str = "", kg_store=None,
+                max_tokens: int = AUTHOR_MAX_TOKENS,
+                on_event=None) -> dict:
+    """Author one mode's bodies into `source`, leaving every other mode alone.
+
+    One mode per call on purpose: the scaffold's gating is already correct, so
+    the only thing a model can get wrong is the terms of a single mode. That
+    keeps the blast radius of a bad edit to one window rather than the whole
+    behavior, and lets each mode clear the metric gauntlet separately.
+
+    Returns `{"source", "prompt", "authored", "pending"}`. Raises
+    `ModeAuthorError` with a caller-presentable message on any rejection;
+    `sculptor.edit.EditValidationError` propagates unchanged.
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    from sculptor.edit import apply_prompt_edit
+
+    try:
+        graph.mode(mode)
+    except KeyError:
+        names = ", ".join(m.name for m in graph.modes)
+        raise ModeAuthorError(
+            f"no mode {mode!r} in this automaton; have: {names}") from None
+
+    stale = validate_mode_reward_source(source, graph)
+    if stale:
+        # Authoring into a scaffold that no longer matches the automaton would
+        # write terms for a window that has since moved. Regenerate instead.
+        raise ModeAuthorError(
+            "scaffold no longer matches the automaton: " + "; ".join(stale))
+
+    prompt = mode_authoring_prompt(
+        graph, mode, behavior_goal=behavior_goal, mode_goal=mode_goal)
+
+    twin_source = authoring_twin_source(
+        graph, clip=clip, behavior_goal=behavior_goal, clip_id=clip_id)
+    already = [n for n, ok in authored_modes(source).items() if ok]
+    if already:
+        twin_source = summarize_authored_modes(twin_source, source, already)
+
+    with tempfile.TemporaryDirectory(prefix="rs_mode_author_") as tmp:
+        twin = _Path(tmp) / "v0.py"
+        twin.write_text(twin_source, encoding="utf-8")
+        edited = apply_prompt_edit(
+            current_reward_path=twin, user_prompt=prompt, new_iter_id="v1",
+            reward_contract=contract, kg_store=kg_store,
+            max_tokens=max_tokens, on_event=on_event)
+        edited_source = _Path(edited).read_text(encoding="utf-8")
+
+    grafted = graft_mode_bodies(source, edited_source, [mode])
+
+    stale = validate_mode_reward_source(grafted, graph)
+    if stale:
+        raise ModeAuthorError("grafted module invalid: " + "; ".join(stale))
+
+    with tempfile.TemporaryDirectory(prefix="rs_mode_probe_") as tmp:
+        probe_path = _Path(tmp) / "probe.py"
+        probe_path.write_text(grafted, encoding="utf-8")
+        err = probe_reward_module(probe_path, contract)
+        if err:
+            # The twin cleared the probes; the grafted module is what trains.
+            raise ModeAuthorError(
+                f"grafted module failed the reward contract probe: {err}")
+        err = probe_info_keys(probe_path, contract, mode)
+        if err:
+            raise ModeAuthorError(err)
+
+    authored = authored_modes(grafted)
+    if not authored.get(mode):
+        # Accepted by the reward gates but the bodies were not actually
+        # filled — a silent no-op, worse than a rejection because the next
+        # call would move on to the following mode.
+        raise ModeAuthorError(
+            f"{mode} still reads as an unauthored stub — the edit was accepted "
+            f"but did not fill its bodies. Re-run, or check the prompt reached "
+            f"the right function.")
+    return {"source": grafted, "prompt": prompt, "authored": authored,
+            "pending": [n for n, ok in authored.items() if not ok]}

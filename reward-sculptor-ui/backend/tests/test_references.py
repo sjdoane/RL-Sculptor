@@ -926,3 +926,155 @@ def test_scaffolding_for_an_unknown_project_is_404(
         "/projects/no-such-project/references/novel-jump-kick--g1/mode-reward",
         json={"clip_id": "novel-jump-kick--g1"})
     assert r.status_code == 404, r.text
+
+
+# ── authoring one mode ────────────────────────────────────────────────────
+AUTHOR_URL = "/projects/{slug}/references/novel-jump-kick--g1/mode-reward/author"
+
+
+def _scaffold(client: TestClient, slug: str) -> dict:
+    r = client.post(
+        f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
+        json={"clip_id": "novel-jump-kick--g1"})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _author_body(**kw) -> dict:
+    return {"clip_id": "novel-jump-kick--g1", "mode": "launch", **kw}
+
+
+def test_authoring_a_mode_fires_a_job_and_chains_the_filename(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    """The whole route minus Claude. What is asserted is what the route
+    decides: which file is read, which is written, and that it is one job."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    scaffold = _scaffold(client, slug)
+
+    captured: dict = {}
+
+    def _fake_job(**kwargs):
+        captured.update(kwargs)
+
+        async def _runner(job, cancel):
+            return {"mode": kwargs["mode"], "authored_count": 1,
+                    "mode_count": 3, "pending": ["approach", "strike"]}
+        return _runner
+
+    monkeypatch.setattr("backend.services.mode_jobs.run_mode_author_job",
+                        _fake_job)
+    r = client.post(AUTHOR_URL.format(slug=slug), json=_author_body())
+    assert r.status_code == 202, r.text
+    assert r.json()["kind"] == "mode_author"
+
+    assert captured["mode"] == "launch"
+    assert Path(captured["reward_path"]).name == "mode_reward_v0.py"
+    # Chained, not overwritten: the scaffold survives a bad edit.
+    assert Path(captured["out_path"]).name == "mode_reward_v1.py"
+    assert Path(scaffold["path"]).is_file()
+
+
+def test_authoring_an_unknown_mode_is_422_before_any_model_call(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    r = client.post(AUTHOR_URL.format(slug=slug),
+                    json=_author_body(mode="nosuchmode"))
+    assert r.status_code == 422, r.text
+    assert "approach, launch, strike" in r.json()["detail"]
+
+
+def test_authoring_without_a_scaffold_is_404(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    """There is nothing to author INTO — the per-mode gating comes from the
+    scaffold, not from the model."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    r = client.post(AUTHOR_URL.format(slug=slug), json=_author_body())
+    assert r.status_code == 404, r.text
+    assert "scaffold" in r.json()["detail"]
+
+
+def test_authoring_in_place_is_refused(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    r = client.post(AUTHOR_URL.format(slug=slug),
+                    json=_author_body(out_filename="mode_reward_v0.py"))
+    assert r.status_code == 422, r.text
+    assert "out_filename" in r.json()["title"]
+
+
+def test_authoring_rejects_a_filename_that_escapes_the_project(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    for name in ("../../etc/passwd.py", "sub/dir.py", ".hidden.py", "no_ext"):
+        r = client.post(AUTHOR_URL.format(slug=slug),
+                        json=_author_body(out_filename=name))
+        assert r.status_code == 422, f"{name} -> {r.status_code}"
+
+
+def test_authoring_without_an_api_key_is_503_not_a_wedged_job(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    r = client.post(AUTHOR_URL.format(slug=slug), json=_author_body())
+    assert r.status_code == 503, r.text
+
+
+def test_a_second_authoring_job_is_refused_while_one_is_running(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    """Modes are authored one at a time; two jobs would race on the chained
+    file and the second would author into a scaffold that is about to move."""
+    import asyncio
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+
+    def _slow_job(**_kw):
+        async def _runner(job, cancel):
+            await asyncio.sleep(30)
+            return {}
+        return _runner
+
+    monkeypatch.setattr("backend.services.mode_jobs.run_mode_author_job",
+                        _slow_job)
+    first = client.post(AUTHOR_URL.format(slug=slug), json=_author_body())
+    assert first.status_code == 202, first.text
+    second = client.post(AUTHOR_URL.format(slug=slug),
+                         json=_author_body(mode="approach"))
+    assert second.status_code == 409, second.text
+    assert second.json()["active_job_id"] == first.json()["job_id"]
+
+
+def test_authoring_for_a_non_composite_reference_is_422(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _seed_library(refs_root)
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/references/walk1_subject2/mode-reward/author",
+        json={"clip_id": "walk1_subject2", "mode": "whole"})
+    assert r.status_code == 422, r.text

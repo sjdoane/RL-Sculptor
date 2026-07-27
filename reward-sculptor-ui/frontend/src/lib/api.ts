@@ -1387,3 +1387,90 @@ export async function previewWorldDraft(
     }),
   );
 }
+
+// ── per-mode reward authoring (OGMP modes of a composed reference) ──────
+export type ReferenceMode = {
+  name: string;
+  frame_range: [number, number];
+  start_s: number;
+  end_s: number;
+  source_clip_id: string | null;
+};
+
+export type ReferenceModeGraph = {
+  clip_id: string;
+  fps: number;
+  modes: ReferenceMode[];
+  transitions: {
+    from_mode: string;
+    to_mode: string;
+    guard_kind: string;
+    at_phase: number | null;
+    expression: string | null;
+  }[];
+};
+
+export type ModeRewardResult = {
+  path: string;
+  filename: string;
+  clip_id: string;
+  tracking: boolean;
+  modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
+  unauthored: string[];
+};
+
+/** GET /references/{clip_id}/modes — the hybrid automaton a composed clip's
+ *  own provenance implies. 422 when the clip is not a composite: there is
+ *  then one mode and no transition to derive, which is a real answer rather
+ *  than an error to paper over. */
+export async function getReferenceModes(
+  clipId: string,
+  robot = "g1",
+): Promise<ReferenceModeGraph> {
+  const u = new URL(
+    `/api/references/${encodeURIComponent(clipId)}/modes`,
+    window.location.origin,
+  );
+  u.searchParams.set("robot", robot);
+  return handle<ReferenceModeGraph>(await fetch(u.pathname + u.search));
+}
+
+/** POST .../mode-reward — write a per-mode reward scaffold into the project.
+ *  Every mode starts as a stub paying nothing; the point of the scaffold is
+ *  the gating, which is generated from the automaton rather than authored. */
+export async function scaffoldModeReward(
+  slug: string,
+  clipId: string,
+  body: { robot?: string; goal?: string; tracking?: boolean; filename?: string; overwrite?: boolean },
+): Promise<ModeRewardResult> {
+  return handle<ModeRewardResult>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/references/${encodeURIComponent(clipId)}/mode-reward`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clip_id: clipId, ...body }),
+      },
+    ),
+  );
+}
+
+/** POST .../mode-reward/author — Claude writes ONE mode's reward bodies.
+ *  Returns a job; poll `getJob`. One mode per call so a bad edit is scoped
+ *  to one window rather than the whole behavior. */
+export async function authorModeReward(
+  slug: string,
+  clipId: string,
+  body: { mode: string; robot?: string; filename?: string; out_filename?: string; goal?: string; mode_goal?: string },
+): Promise<JobSummary> {
+  return handle<JobSummary>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/references/${encodeURIComponent(clipId)}/mode-reward/author`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clip_id: clipId, ...body }),
+      },
+    ),
+  );
+}

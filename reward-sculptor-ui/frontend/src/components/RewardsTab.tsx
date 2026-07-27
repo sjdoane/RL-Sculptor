@@ -3,6 +3,7 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
+import { ModeRewardPanel } from "@/components/ModeRewardPanel";
 import { AuthorBadge, Btn, Delta, Modal } from "@/components/rs/primitives";
 import { MonacoDiffLazy, MonacoLazy } from "@/components/MonacoLazy";
 import { useJob, useJobEvents } from "@/hooks/useJob";
@@ -645,6 +646,19 @@ function ReadOnlyPane({
       )}
 
       <SpecPanel detail={detail} />
+
+      {/* Per-mode authoring for the attached reference. Shown next to the
+          spec because that is where the attached clip is already named, and
+          the two answer the same question from opposite ends: the spec says
+          what this reward IS, this says what each phase of it still owes. */}
+      {detail.spec.composition?.type === "reference_tracking_residual"
+        && detail.spec.composition.reference_clip_id && (
+        <ModeRewardPanel
+          slug={slug}
+          clipId={detail.spec.composition.reference_clip_id}
+          goal={detail.spec.description ?? ""}
+        />
+      )}
     </>
   );
 }
