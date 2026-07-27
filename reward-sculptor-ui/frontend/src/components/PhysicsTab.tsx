@@ -255,7 +255,7 @@ function SummaryPanel({ summary }: { summary: MjcfSummary }) {
             <div className="v">
               {fmt(summary.timestep)}
               {summary.timing?.mjcf_overridden && (
-                <span style={{ color: "var(--rs-warn, #d08a3e)", marginLeft: 6, fontSize: 11 }}>
+                <span style={{ color: "var(--rs-muted)", marginLeft: 6, fontSize: 11 }}>
                   (overridden — see Timing)
                 </span>
               )}
@@ -357,22 +357,20 @@ function TimingCard({ timing }: { timing: MjcfTiming | null }) {
               <div className="v" style={{ textTransform: "none" }}>{timing.task_id}</div>
             </div>
             {timing.mjcf_overridden && (
-              <p className="rs-sub" style={{ marginTop: 10, fontSize: 12 }}>
-                The MJCF compiles to <strong>{fmt(timing.mjcf_timestep)} s</strong>, but
-                the task sets <strong>{timing.physics_dt} s</strong> — training uses the
-                task's value. Editing <code>&lt;option timestep&gt;</code> in the XML
-                below will <em>not</em> change the rate training runs at.
-              </p>
+              <div className="rs-banner warn" style={{ marginTop: 12 }}>
+                <span className="rs-grow">
+                  The MJCF compiles to <b>{fmt(timing.mjcf_timestep)} s</b>, but the
+                  task sets <b>{timing.physics_dt} s</b> — training uses the task's
+                  value. Editing <code>&lt;option timestep&gt;</code> in the XML will{" "}
+                  <em>not</em> change the rate training runs at.
+                </span>
+              </div>
             )}
-            {timing.findings.length > 0 && (
-              <ul style={{ marginTop: 10, paddingLeft: 18 }}>
-                {timing.findings.map((f) => (
-                  <li key={f} className="rs-sub" style={{ fontSize: 12, color: "var(--rs-warn, #d08a3e)" }}>
-                    {f}
-                  </li>
-                ))}
-              </ul>
-            )}
+            {timing.findings.map((f) => (
+              <div key={f} className="rs-banner warn" style={{ marginTop: 8 }}>
+                <span className="rs-grow">{f}</span>
+              </div>
+            ))}
           </>
         )}
       </div>

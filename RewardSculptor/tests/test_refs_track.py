@@ -1338,3 +1338,186 @@ def test_verify_tierd_certificate_never_raises_on_corrupt_provenance(tmp_path: P
     cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
     assert cert is None
     assert reason is not None
+
+
+# ── orientation tracking (OGMP Eq. 8) ───────────────────────────────────
+def _load_src(src, tmp_path, name="orient_mod"):
+    import importlib.util
+    p = tmp_path / f"{name}.py"
+    p.write_text(src, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _orient_src(target_gravity, n=8, j=4):
+    from sculptor.refs.track import generate_tracking_reward_source
+    return generate_tracking_reward_source(
+        clip_id="t", joint_names=[f"j{i}" for i in range(j)],
+        target_joint_pos=np.zeros((n, j)), target_root_z=np.zeros(n),
+        episode_len_steps=100, duration_s=2.0, target_gravity=target_gravity)
+
+
+def test_projected_gravity_matches_the_rotation_matrix_definition():
+    """R^T @ [0,0,-1], checked against an independent construction rather than
+    trusting the sign conventions in the closed form."""
+    from sculptor.refs.track import projected_gravity_from_quat
+
+    def rot(q):
+        w, x, y, z = q
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+    rng = np.random.default_rng(0)
+    qs = rng.normal(size=(64, 4))
+    qs /= np.linalg.norm(qs, axis=1, keepdims=True)
+    want = np.stack([rot(q).T @ np.array([0.0, 0.0, -1.0]) for q in qs])
+    assert np.allclose(projected_gravity_from_quat(qs), want, atol=1e-12)
+
+
+def test_an_upright_quaternion_points_gravity_straight_down():
+    from sculptor.refs.track import projected_gravity_from_quat
+
+    got = projected_gravity_from_quat(np.array([[1.0, 0.0, 0.0, 0.0]]))
+    assert np.allclose(got, [[0.0, 0.0, -1.0]])
+
+
+def test_unnormalized_quaternions_are_normalized_not_rejected():
+    from sculptor.refs.track import projected_gravity_from_quat
+
+    got = projected_gravity_from_quat(np.array([[2.0, 0.0, 0.0, 0.0]]))
+    assert np.allclose(got, [[0.0, 0.0, -1.0]])
+
+
+def test_orientation_term_rewards_matching_attitude(tmp_path):
+    mod = _load_src(_orient_src(np.tile([0.0, 0.0, -1.0], (8, 1))), tmp_path)
+    info = {"episode_length": 0, "step_dt": 0.02}
+    upright = {"qpos": np.zeros(11), "projected_gravity_b": np.array([0.0, 0.0, -1.0])}
+    tipped = {"qpos": np.zeros(11), "projected_gravity_b": np.array([1.0, 0.0, 0.0])}
+    _, c_up = mod.compute_reward(None, None, upright, info)
+    _, c_tip = mod.compute_reward(None, None, tipped, info)
+    assert c_up["orientation_tracking"] == pytest.approx(1.0)
+    assert c_tip["orientation_tracking"] < 0.2
+
+
+def test_scalar_and_batched_orientation_agree(tmp_path):
+    torch = pytest.importorskip("torch")
+    mod = _load_src(_orient_src(np.tile([0.0, 0.0, -1.0], (8, 1))), tmp_path)
+    grav = np.array([0.30, -0.20, -0.93])
+    grav = grav / np.linalg.norm(grav)
+    _, c = mod.compute_reward(
+        None, None, {"qpos": np.zeros(11), "projected_gravity_b": grav},
+        {"episode_length": 0, "step_dt": 0.02})
+    _, cb = mod.compute_reward_batched(
+        None, None,
+        {"qpos": torch.zeros(3, 4),
+         "projected_gravity_b": torch.tensor([grav] * 3, dtype=torch.float32)},
+        {"episode_length": torch.zeros(3), "step_dt": torch.full((3,), 0.02)})
+    assert float(cb["orientation_tracking"].mean()) == pytest.approx(
+        c["orientation_tracking"], abs=1e-5)
+
+
+def test_a_clip_without_orientation_is_unchanged(tmp_path):
+    """Backward compatibility: no quaternion means no orientation term at all,
+    not a fabricated upright target that would penalize a legitimate lean."""
+    mod = _load_src(_orient_src(None), tmp_path, name="no_orient")
+    assert mod.TARGET_GRAVITY is None
+    assert mod.ORIENTATION_ERR_WEIGHT == 0.0
+    _, c = mod.compute_reward(
+        None, None,
+        {"qpos": np.zeros(11), "projected_gravity_b": np.array([1.0, 0.0, 0.0])},
+        {"episode_length": 0, "step_dt": 0.02})
+    assert "orientation_tracking" not in c
+
+
+def test_a_misshaped_gravity_target_is_rejected_at_build_time():
+    with pytest.raises(ValueError, match="n_phase"):
+        _orient_src(np.zeros((3, 3)))          # 3 rows vs 8 phase targets
+    with pytest.raises(ValueError, match="n_phase"):
+        _orient_src(np.zeros((8, 4)))          # not a 3-vector
+
+
+def test_gravity_targets_stay_unit_through_downsampling(tmp_path):
+    """mjlab's observed `projected_gravity_b` is a unit vector, so the target
+    has to be one too — a shrunken target charges a standing error against a
+    perfectly upright robot. `downsample_phase_targets` selects nearest frames
+    rather than interpolating, so this holds; pin it, because an interpolating
+    resampler would silently break it."""
+    from sculptor.refs.track import (
+        downsample_phase_targets, projected_gravity_from_quat)
+
+    rng = np.random.default_rng(3)
+    q = rng.normal(size=(200, 4))
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    g = downsample_phase_targets(projected_gravity_from_quat(q), n=16)
+    assert g.shape == (16, 3)
+    assert np.allclose(np.linalg.norm(g, axis=1), 1.0)
+
+
+def test_orientation_error_is_measured_when_both_channels_exist():
+    from sculptor.refs.track import compute_tracking_errors
+
+    n = 40
+    quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1))   # upright clip
+    clip = {"joint_pos": np.zeros((n, 2)), "joint_names": ["a", "b"],
+            "root_pos_z": np.zeros(n), "root_quat_wxyz": quat, "fps": 30.0}
+    upright = np.tile(np.array([0.0, 0.0, -1.0]), (n, 1))
+    tipped = np.tile(np.array([1.0, 0.0, 0.0]), (n, 1))
+
+    matched = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((n, 2)),
+        rollout_root_z=np.zeros(n), rollout_joint_names=["a", "b"],
+        rollout_gravity=upright)
+    wrong = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((n, 2)),
+        rollout_root_z=np.zeros(n), rollout_joint_names=["a", "b"],
+        rollout_gravity=tipped)
+    assert matched.orientation_err == pytest.approx(0.0, abs=1e-9)
+    assert wrong.orientation_err == pytest.approx(np.sqrt(2.0), abs=1e-6)
+
+
+def test_orientation_does_not_gate_certification():
+    """Deliberate: nothing has ever passed Tier-D, so there is no evidence for
+    an achievable orientation threshold. A completely inverted rollout must
+    still be `feasible` if joints and root height pass — the number is
+    reported so a threshold can be set from data later."""
+    from sculptor.refs.track import TrackingErrors
+
+    e = TrackingErrors(
+        mean_joint_err_rad=0.01, max_joint_err_rad=0.02, root_z_rmse_m=0.01,
+        duration_coverage=1.0, static_baseline_err_rad=0.5,
+        orientation_err=2.0)               # fully inverted
+    assert e.feasible is True
+    assert e.to_dict()["orientation_err"] == 2.0
+
+
+def test_orientation_is_skipped_without_a_rollout_gravity_channel():
+    """Older trajectories predate the channel; absence must not fail a run."""
+    from sculptor.refs.track import compute_tracking_errors
+
+    n = 20
+    clip = {"joint_pos": np.zeros((n, 2)), "joint_names": ["a", "b"],
+            "root_pos_z": np.zeros(n),
+            "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
+            "fps": 30.0}
+    e = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((n, 2)),
+        rollout_root_z=np.zeros(n), rollout_joint_names=["a", "b"],
+        rollout_gravity=None)
+    assert e.orientation_err == 0.0
+
+
+def test_orientation_is_skipped_when_the_clip_has_no_quaternion():
+    from sculptor.refs.track import compute_tracking_errors
+
+    n = 20
+    clip = {"joint_pos": np.zeros((n, 2)), "joint_names": ["a", "b"],
+            "root_pos_z": np.zeros(n), "fps": 30.0}
+    e = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((n, 2)),
+        rollout_root_z=np.zeros(n), rollout_joint_names=["a", "b"],
+        rollout_gravity=np.tile(np.array([1.0, 0.0, 0.0]), (n, 1)))
+    assert e.orientation_err == 0.0

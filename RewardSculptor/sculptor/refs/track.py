@@ -97,6 +97,13 @@ MIN_REFERENCE_MOTION_RAD = 0.02
 JOINT_ERR_WEIGHT = 8.0
 ROOT_ERR_WEIGHT = 40.0
 
+#: Orientation kernel width, on projected-gravity error (a unit vector, so the
+#: error is bounded by 2). Matches the residual generator's existing 4.0 rather
+#: than being tuned here — one imitation kernel shape across both paths.
+#: OGMP (2403.04205 Eq. 8) weights orientation equally with base position; this
+#: reward also tracks joints, so orientation is one of three terms, not half.
+ORIENTATION_ERR_WEIGHT = 4.0
+
 #: Default training budget — small iteration count x modest steps/iter,
 #: comfortably under an hour on an RTX 5070 (§mission: "1500-3000 steps
 #: x 2-3 iters"). `--iterations` overrides the iteration count only;
@@ -247,6 +254,32 @@ def _format_array_literal(arr: np.ndarray, *, ndigits: int = 5) -> str:
     ) + "\n]"
 
 
+def projected_gravity_from_quat(quat_wxyz: np.ndarray) -> np.ndarray:
+    """Unit gravity direction expressed in the body frame, `(N, 3)`.
+
+    OGMP's tracking reward (arXiv 2403.04205 Eq. 8) weights orientation error
+    equally with position — `0.475·e^(-5‖er_p‖) + 0.475·e^(-5‖er_o‖)` — but the
+    Tier-D reward tracked joints and root height only. Retargeted clips carry
+    `root_quat_wxyz`, and mjlab publishes `projected_gravity_b` every step, so
+    this is the bridge between them.
+
+    Projected gravity rather than the raw quaternion because it is what mjlab
+    already observes, it is yaw-invariant (a heading offset is not an
+    orientation error for a clip whose root translation was zeroed), and it is
+    the standard humanoid attitude signal. Upright is `[0, 0, -1]`.
+    """
+    q = np.asarray(quat_wxyz, dtype=np.float64).reshape(-1, 4)
+    norm = np.linalg.norm(q, axis=1, keepdims=True)
+    q = q / np.where(norm > 0.0, norm, 1.0)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    # R^T @ [0, 0, -1] — the negated third ROW of the rotation matrix.
+    return np.stack([
+        2.0 * (w * y - x * z),
+        -2.0 * (y * z + w * x),
+        2.0 * (x * x + y * y) - 1.0,
+    ], axis=1)
+
+
 def generate_tracking_reward_source(
     *,
     clip_id: str,
@@ -255,8 +288,10 @@ def generate_tracking_reward_source(
     target_root_z: np.ndarray,
     episode_len_steps: int,
     duration_s: float = 0.0,
+    target_gravity: Optional[np.ndarray] = None,
     joint_err_weight: float = JOINT_ERR_WEIGHT,
     root_err_weight: float = ROOT_ERR_WEIGHT,
+    orientation_err_weight: float = ORIENTATION_ERR_WEIGHT,
 ) -> str:
     """Build the PROGRAMMATIC (non-LLM) tracking reward module source.
 
@@ -298,9 +333,22 @@ def generate_tracking_reward_source(
     n_phase = target_joint_pos.shape[0]
     n_joints = target_joint_pos.shape[1]
 
+    if target_gravity is not None:
+        target_gravity = np.asarray(target_gravity, dtype=np.float64)
+        if target_gravity.shape != (n_phase, 3):
+            raise ValueError(
+                "target_gravity must be (n_phase, 3) to align with the joint "
+                f"targets: {target_gravity.shape} vs {(n_phase, 3)}")
+
     joint_pos_literal = _format_array_literal(target_joint_pos)
     root_z_literal = _format_array_literal(target_root_z)
     names_literal = "[" + ", ".join(repr(str(n)) for n in joint_names) + "]"
+    gravity_literal = (
+        "np.asarray(" + _format_array_literal(target_gravity)
+        + ", dtype=np.float64)" if target_gravity is not None else "None")
+    # Zero weight collapses the term to a no-op for clips with no orientation
+    # data, so the reward shape is identical to before for those.
+    orientation_weight = orientation_err_weight if target_gravity is not None else 0.0
 
     return f'''"""Auto-generated Tier-D tracking reward for clip {clip_id!r}.
 
@@ -332,6 +380,7 @@ REWARD_SPEC: dict = {{
     "hyperparameters": {{
         "joint_err_weight": {joint_err_weight!r},
         "root_err_weight": {root_err_weight!r},
+        "orientation_err_weight": {orientation_weight!r},
         "n_phase_targets": {n_phase},
         "episode_len_steps": {episode_len_steps!r},
     }},
@@ -346,16 +395,23 @@ EPISODE_LEN_STEPS = {episode_len_steps!r}
 # The reference's true duration. The phase clock prefers wall time --
 # `episode_length * step_dt`, with `step_dt` published per-step by the mjlab
 # runner -- because EPISODE_LEN_STEPS has to assume a control rate at BUILD
-# time and that assumption has been wrong twice: first as the training budget
-# (2000 PPO updates), then as 50 Hz when the G1 task actually steps at 25 Hz
-# (physics 0.02 with decimation 2). Reading step_dt removes the guess.
+# time and that assumption was once just the training budget (2000 PPO updates
+# read as env steps). The G1 task steps at 50 Hz (physics 0.005 x decimation 4,
+# see `sculptor.refs.timing`); reading step_dt removes the assumption entirely.
 REFERENCE_DURATION_S = {duration_s!r}
 JOINT_ERR_WEIGHT = {joint_err_weight!r}
 ROOT_ERR_WEIGHT = {root_err_weight!r}
+# 0.0 when the clip carries no root orientation, which makes the orientation
+# term an exact no-op rather than a silently-wrong constant.
+ORIENTATION_ERR_WEIGHT = {orientation_weight!r}
 
 # Phase-indexed targets, shape (N_PHASE, N_JOINTS) / (N_PHASE,).
 TARGET_JOINT_POS = np.asarray({joint_pos_literal}, dtype=np.float64).reshape(N_PHASE, N_JOINTS)
 TARGET_ROOT_Z = np.asarray({root_z_literal}, dtype=np.float64)
+# Unit gravity in the body frame, derived from the clip's root_quat_wxyz. Yaw-
+# invariant on purpose: retargeting zeroes root translation, so a heading
+# offset is not an orientation error. `None` when the clip has no quaternion.
+TARGET_GRAVITY = {gravity_literal}
 
 
 def _phase_index(info) -> int:
@@ -397,6 +453,13 @@ def compute_reward(state, action, next_state, info):
         "root_tracking": root_term,
     }}
     reward = joint_term + root_term
+    if TARGET_GRAVITY is not None:
+        gravity = np.asarray(
+            next_state["projected_gravity_b"], dtype=np.float64).reshape(-1)[-3:]
+        orient_err_sq = float(np.mean((gravity - TARGET_GRAVITY[i]) ** 2))
+        orient_term = float(np.exp(-ORIENTATION_ERR_WEIGHT * orient_err_sq))
+        components["orientation_tracking"] = orient_term
+        reward += orient_term
     return float(reward), components
 
 
@@ -451,10 +514,20 @@ def compute_reward_batched(state, action, next_state, info):
     root_err = actual_delta - (target_root - root0)
     root_term = torch.exp(-ROOT_ERR_WEIGHT * root_err ** 2)
 
-    return joint_term + root_term, {{
+    total = joint_term + root_term
+    components = {{
         "joint_tracking": joint_term,
         "root_tracking": root_term,
     }}
+    if TARGET_GRAVITY is not None:
+        target_gravity = torch.as_tensor(
+            TARGET_GRAVITY, device=qpos.device, dtype=qpos.dtype)[i]
+        gravity = next_state["projected_gravity_b"][:, -3:]
+        orient_term = torch.exp(-ORIENTATION_ERR_WEIGHT * torch.mean(
+            (gravity - target_gravity) ** 2, dim=-1))
+        components["orientation_tracking"] = orient_term
+        total = total + orient_term
+    return total, components
 '''
 
 
@@ -803,6 +876,15 @@ class TrackingErrors:
     #: How much of the reference's joint motion the rollout actually
     #: reproduced (std over time, rollout / clip). Informational.
     motion_ratio: float = 0.0
+    #: RMS error between the rollout's body-frame gravity and the clip's, in
+    #: units of a unit vector (so 0 = attitude matched, 2 = inverted). OGMP
+    #: (2403.04205 Eq. 8) weights orientation equally with base position, and
+    #: this reward now tracks it — but it is deliberately MEASURED, NOT GATED:
+    #: nothing has ever passed Tier-D, so there is no evidence for an
+    #: achievable threshold and inventing one would be a made-up number.
+    #: Gate it once a certified run establishes the range. 0.0 when the clip
+    #: has no quaternion or the rollout recorded no gravity channel.
+    orientation_err: float = 0.0
 
     @property
     def beats_static_baseline(self) -> bool:
@@ -829,6 +911,7 @@ class TrackingErrors:
             "max_joint_err_rad": round(self.max_joint_err_rad, 6),
             "root_z_rmse_m": round(self.root_z_rmse_m, 6),
             "duration_coverage": round(self.duration_coverage, 6),
+            "orientation_err": round(self.orientation_err, 6),
             "common_joint_names": list(self.common_joint_names),
             "n_common_joints": self.n_common_joints,
             "root_frame": self.root_frame,
@@ -938,6 +1021,7 @@ def compute_tracking_errors(
     rollout_joint_pos: np.ndarray,
     rollout_root_z: np.ndarray,
     rollout_joint_names: list[str],
+    rollout_gravity: Optional[np.ndarray] = None,
 ) -> TrackingErrors:
     """Score a rollout (`trajectory.npz`-shaped arrays) against the clip
     it was tracking. `rollout_joint_pos` is `(T, J_rollout)`,
@@ -1017,6 +1101,21 @@ def compute_tracking_errors(
     else:
         root_rmse = float("inf")
 
+    # Orientation, per OGMP Eq. 8. Measured only — see `TrackingErrors.
+    # orientation_err` for why this does not gate.
+    orientation_err = 0.0
+    clip_quat = clip.get("root_quat_wxyz")
+    if clip_quat is not None and rollout_gravity is not None:
+        roll_g = np.asarray(rollout_gravity, dtype=np.float64).reshape(
+            -1, 3) if np.asarray(rollout_gravity).size else np.zeros((0, 3))
+        clip_g = projected_gravity_from_quat(
+            np.asarray(clip_quat, dtype=np.float64))
+        m = min(roll_g.shape[0], clip_g.shape[0])
+        if m > 0:
+            diff = (downsample_phase_targets(clip_g, n=m)
+                    - downsample_phase_targets(roll_g, n=m))
+            orientation_err = float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
+
     return TrackingErrors(
         mean_joint_err_rad=mean_err,
         max_joint_err_rad=max_err,
@@ -1028,6 +1127,7 @@ def compute_tracking_errors(
         root_z_offset_m=root_offset,
         static_baseline_err_rad=static_err,
         motion_ratio=motion_ratio,
+        orientation_err=orientation_err,
     )
 
 
@@ -1157,6 +1257,25 @@ def build_track_project(
         np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase_targets)
     target_root_z = downsample_phase_targets(
         np.asarray(clip["root_pos_z"], dtype=np.float64), n=n_phase_targets)
+    # Orientation, per OGMP Eq. 8. Downsample the derived gravity rather than
+    # the quaternion: averaging quaternion components across a phase window is
+    # not a rotation, while averaging unit gravity vectors is a well-defined
+    # (if approximate) direction. Clips without a quaternion get None, which
+    # zeroes the term rather than fabricating an upright target.
+    quat = clip.get("root_quat_wxyz")
+    target_gravity = None
+    if quat is not None:
+        target_gravity = downsample_phase_targets(
+            projected_gravity_from_quat(np.asarray(quat, dtype=np.float64)),
+            n=n_phase_targets)
+        # Already unit — `projected_gravity_from_quat` normalizes and
+        # `downsample_phase_targets` selects nearest frames rather than
+        # interpolating. Re-normalizing is a cheap guard that keeps the
+        # invariant true if either of those ever changes: mjlab's observed
+        # `projected_gravity_b` is unit, and a shrunken target would charge a
+        # standing error against a perfectly upright robot.
+        norm = np.linalg.norm(target_gravity, axis=1, keepdims=True)
+        target_gravity = target_gravity / np.where(norm > 0.0, norm, 1.0)
 
     # Say out loud whether this reference is even representable at the task's
     # control rate. Both Tier-D timing failures were silent; a phase clock that
@@ -1178,6 +1297,7 @@ def build_track_project(
         target_root_z=target_root_z,
         episode_len_steps=episode_len_steps,
         duration_s=duration_s,
+        target_gravity=target_gravity,
     )
     rewards_dir = project_dir / "rewards"
     rewards_dir.mkdir(parents=True, exist_ok=True)
@@ -1380,13 +1500,19 @@ def track_clip(
         # small by design for a Tier-D smoke run).
         rollout_joint_pos = npz["joint_pos"][:, 0, :]
         rollout_root_z = npz["root_link_pos_w"][:, 0, 2]
+        # Optional: older trajectories predate the channel, and orientation is
+        # measured rather than gated, so its absence must not fail a run.
+        rollout_gravity = (
+            npz["projected_gravity_b"][:, 0, :]
+            if "projected_gravity_b" in npz.files else None)
 
     from sculptor.eval.robot_manifest import robot_joint_names
 
     rollout_joint_names = robot_joint_names(robot) or plan.joint_names
     errors = compute_tracking_errors(
         clip=clip, rollout_joint_pos=rollout_joint_pos,
-        rollout_root_z=rollout_root_z, rollout_joint_names=rollout_joint_names)
+        rollout_root_z=rollout_root_z, rollout_joint_names=rollout_joint_names,
+        rollout_gravity=rollout_gravity)
     _log(f"[track] errors: {errors.to_dict()}")
 
     rollout_dest = None

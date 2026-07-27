@@ -374,6 +374,43 @@ only reason this failure was visible at all.
 policy was recoverable and only needed rollout + scoring — do not restart a
 certification from zero without checking `tierD_work/train/logs/` first.
 
+### Timesteps: what the literature says, and what the UI was showing
+
+New module `RewardSculptor/sculptor/refs/timing.py` — the literature snapshot,
+with sources in its docstring. Short version:
+
+* **Control at ~50 Hz is the sim2real convention** for legged/humanoid RL
+  (MuJoCo Playground, Booster Gym). That is what our mjlab G1 task uses.
+* **Physics 200–500 Hz via decimation**, not a slower integrator. mjlab: 0.005 s
+  × decimation 4.
+* **On hardware the PD loop underneath runs ~1 kHz**; the policy emits joint
+  targets, not torques, so it does not need that rate.
+* **Series elasticity moves the floor by an order of magnitude.** The spring
+  adds a fast mode needing `dt ≪ 1/ω_n` — SEA force-control studies use ~1e-5 s.
+  This is also why Brax needs finer steps than MuJoCo: MuJoCo's constraint
+  solver is implicit in the velocity update and tolerates steps that blow up an
+  explicit spring model. **A rigid-actuator G1 at 200 Hz is not evidence that
+  200 Hz suffices for an SEA model of the same robot.** `validate_timing(...,
+  series_elastic=True)` flags that rather than letting it pass.
+
+Conclusion: 200/50 Hz is correct and intentional for the rigid-actuator G1 we
+simulate. It should be revisited *per-task* only if an actuator model with
+series elasticity is added — not calibrated per-clip.
+
+`validate_timing` immediately found a real issue on the composite: control at
+50 Hz cannot represent a 120 fps reference above 25 Hz (Nyquist), so fast
+transients alias — and that composite's third phase is a kick.
+
+**The UI was showing the wrong number.** The Physics tab reported the MJCF's
+compiled timestep. The Unitree G1 XML declares no `<option timestep>`, so it
+compiled at MuJoCo's 0.002 s default and the tab said **500 Hz**, while mjlab's
+task config sets 0.005 s and training ran at **200 Hz**. The control rate — the
+one that must match the hardware loop — was not displayed anywhere. There is
+now a Timing card (physics / control / decimation + `validate_timing`
+findings), and the MJCF row is marked "overridden" so editing the XML timestep
+no longer looks like it changes what trains. Unresolvable tasks render
+"unknown" rather than a default.
+
 ### Paper corpus: full text is stored, but only partly *read*
 
 Audited all Paper nodes after OGMP (2403.04205) turned out to be missing from
@@ -420,7 +457,26 @@ Two things fall out of actually reading it that the abstract does not tell you:
    not a reproduction of it — describe it that way.
 2. **Its tracking reward weights orientation.** Eq. 8 is
    `0.475·e^(−5‖er_p‖) + 0.475·e^(−5‖er_o‖)` — position and orientation at
-   equal weight, plus `0.05·e^(−0.01‖u_t‖) − 0.3·𝟙(non-toe contact)`. Our
-   Tier-D reward tracks joints + `root_z` only and **has no orientation term at
-   all**. That is a real gap against the reference method, and a candidate
-   explanation for residual tracking error independent of the floor fix above.
+   equal weight, plus `0.05·e^(−0.01‖u_t‖) − 0.3·𝟙(non-toe contact)`.
+
+   **Closed, 2026-07-26.** The gap was narrower than first written: `refs/
+   track.py` has *two* reward generators, and only one had orientation.
+   `generate_tracking_residual_reward_source` (reference-run path) already
+   tracked projected gravity; `generate_tracking_reward_source` — the one
+   `build_track_project` actually uses for Tier-D — did not, so every
+   certification attempt trained without it. Verified against the live
+   `tierD_work/rewards/current.py`: no `REFERENCE_GRAVITY`, no
+   `tracking_orientation`.
+
+   Now wired: `projected_gravity_from_quat()` derives the target from the
+   clip's `root_quat_wxyz` (mjlab publishes `projected_gravity_b` every step,
+   so that is the common frame), and it feeds both the scalar and batched
+   paths. Projected gravity rather than raw quaternion because it is
+   yaw-invariant — retargeting zeroes root translation, so a heading offset is
+   not an orientation error.
+
+   `TrackingErrors.orientation_err` reports it, and **deliberately does not
+   gate**. Nothing has ever passed Tier-D, so there is no evidence for an
+   achievable threshold; inventing one would be a made-up number. Set it from
+   data once a run certifies. `test_orientation_does_not_gate_certification`
+   pins that on purpose — a fully inverted rollout is still `feasible` today.
