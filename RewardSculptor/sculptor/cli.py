@@ -2677,5 +2677,354 @@ def refs_track(
     typer.echo(_json.dumps(result.errors.to_dict(), indent=2))
 
 
+modes_app = typer.Typer(
+    name="modes",
+    help="Hybrid-automaton modes over a composed reference (OGMP, arXiv "
+         "2403.04205; docs/RESEARCH_DIRECTION.md §4). `show` reads the "
+         "automaton out of a composite's own provenance; `scaffold` turns it "
+         "into a reward module whose per-mode gating is derived rather than "
+         "authored.",
+    no_args_is_help=True,
+)
+app.add_typer(modes_app, name="modes")
+
+
+def _graph_for_clip(clip_id: str, robot: str):
+    """Load a composed clip and derive its automaton, or exit with the reason.
+
+    Kept here rather than in `sculptor.modes` so the library stays free of
+    Typer: the same two calls are what the UI route makes.
+    """
+    from sculptor.modes import ModeError, modes_from_composition
+    from sculptor.reference import load_clip
+    from sculptor.refs.library import CLIP_FILENAME, clip_dir
+
+    path = clip_dir(robot, clip_id) / CLIP_FILENAME
+    if not path.exists():
+        typer.echo(f"[modes] no clip at {path}", err=True)
+        raise typer.Exit(code=1)
+    try:
+        clip = load_clip(path)
+        return clip, modes_from_composition(clip, clip_id=clip_id)
+    except (ModeError, ValueError) as e:
+        typer.echo(f"[modes] {clip_id}: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+
+@modes_app.command("show")
+def modes_show(
+    clip_id: str = typer.Option(
+        ..., "--clip-id", help="Composed clip_id to read the automaton from."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the graph as JSON instead of a summary."),
+) -> None:
+    """Print the hybrid automaton derived from a composite's provenance.
+
+    Nothing is invented here: one composed segment is one mode and each seam is
+    the transition between the pair it separates, so this is a *read* of what
+    `sculptor.refs.compose` already recorded."""
+    import json as _json
+
+    from sculptor.mode_rewards import mode_windows_s
+
+    _, graph = _graph_for_clip(clip_id, robot)
+    if as_json:
+        typer.echo(_json.dumps(graph.to_dict(), indent=2))
+        return
+
+    windows = mode_windows_s(graph)
+    typer.echo(f"[modes] {clip_id}: {len(graph.modes)} modes @ {graph.fps:g} fps")
+    for m in graph.modes:
+        lo, hi = windows[m.name]
+        src = f" from {m.source_clip_id}" if m.source_clip_id else ""
+        typer.echo(
+            f"  {m.name}: frames [{m.frame_range[0]}, {m.frame_range[1]}) "
+            f"= {lo:.3f}s–{hi:.3f}s{src}")
+    for t in graph.transitions:
+        g = t.guard
+        cond = (f"phase>={g.at_phase:g}" if g.kind == "phase"
+                else f"predicate {g.expression!r}")
+        typer.echo(f"  {t.from_mode} -> {t.to_mode} on {cond}")
+
+
+@modes_app.command("scaffold")
+def modes_scaffold(
+    clip_id: str = typer.Option(
+        ..., "--clip-id", help="Composed clip_id to scaffold a reward for."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+    out: Optional[str] = typer.Option(
+        None, "--out", help="Write the module here. Default: print to stdout."),
+    goal: str = typer.Option(
+        "", "--goal", help="Overall behavior goal, recorded in the module "
+        "header and used by `modes author`."),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite --out if it already exists."),
+    tracking: bool = typer.Option(
+        True, "--tracking/--no-tracking",
+        help="Include the reference-tracking backbone. On by default: without "
+             "it every mode is a stub paying zero, so the module is not "
+             "trainable until every mode has been authored."),
+) -> None:
+    """Emit a per-mode reward module for a composed clip.
+
+    With the tracking backbone (the default) the module is trainable
+    immediately — it IS the Tier-D tracking reward — and authoring adds
+    mode-specific task terms on top of it. That layering is OGMP's own shape:
+    one oracle tracked throughout, a per-mode objective above it.
+
+    Every mode still starts as an UNAUTHORED STUB paying nothing; the point of
+    the scaffold is the gating, which is derived from the graph and correct by
+    construction, not the terms. Author them with `modes author`."""
+    from sculptor.mode_rewards import (authored_modes,
+                                       generate_mode_reward_scaffold,
+                                       validate_mode_reward_source)
+    from sculptor.modes import ModeError
+
+    clip, graph = _graph_for_clip(clip_id, robot)
+    try:
+        source = generate_mode_reward_scaffold(
+            graph, behavior_goal=goal, clip_id=clip_id,
+            clip=clip if tracking else None)
+    except ModeError as e:
+        typer.echo(f"[modes scaffold] FAILED: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    errors = validate_mode_reward_source(source, graph)
+    if errors:   # a scaffold that fails its own validator is a bug here, not upstream
+        for err in errors:
+            typer.echo(f"[modes scaffold] {err}", err=True)
+        raise typer.Exit(code=1)
+
+    if not out:
+        typer.echo(source)
+        return
+
+    dest = Path(out).expanduser()
+    if dest.exists() and not force:
+        typer.echo(
+            f"[modes scaffold] {dest} exists — pass --force to overwrite. "
+            "Regenerating would discard any authored mode bodies.", err=True)
+        raise typer.Exit(code=1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(source, encoding="utf-8")
+    pending = [n for n, done in authored_modes(source).items() if not done]
+    typer.echo(
+        f"[modes scaffold] wrote {dest} ({len(graph.modes)} modes, "
+        f"{len(pending)} unauthored)")
+    for name in pending:
+        typer.echo(f"  - {name}: sculpt modes author --clip-id {clip_id} "
+                   f"--mode {name} --file {dest}")
+
+
+def _probe_reward_module(path: Path, contract) -> Optional[str]:
+    """Run `sculptor.edit`'s own reward probes, or return why they failed.
+
+    Needed because `modes author` authors against a stubs-only twin and grafts
+    the result into the real module: `apply_prompt_edit` validated the TWIN,
+    but the grafted module is what trains. Re-probing here is what makes the
+    graft safe rather than merely convenient.
+    """
+    import importlib.util
+
+    from sculptor.edit import (EditValidationError, _call_compute_reward,
+                               _call_compute_reward_batched)
+
+    try:
+        spec = importlib.util.spec_from_file_location(f"_probe_{path.stem}", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001 — surfaced as a message, not a crash
+        return f"module does not import: {type(e).__name__}: {e}"
+    for probe in (_call_compute_reward, _call_compute_reward_batched):
+        try:
+            probe(mod, contract)
+        except EditValidationError as e:
+            return str(e)
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}"
+    return None
+
+
+def _next_iter_id(stem: str, mode_name: str) -> str:
+    """`v3` -> `v4`, anything else -> `<stem>_<mode>`.
+
+    Authoring is one mode per call, so the versions chain; naming the file after
+    the mode when there is no version to bump keeps a hand-placed scaffold from
+    silently overwriting itself on the second call.
+    """
+    from sculptor.mode_rewards import mode_ident
+
+    m = re.fullmatch(r"v(\d+)", stem)
+    return f"v{int(m.group(1)) + 1}" if m else f"{stem}_{mode_ident(mode_name)}"
+
+
+@modes_app.command("author")
+def modes_author(
+    clip_id: str = typer.Option(
+        ..., "--clip-id", help="Composed clip_id the scaffold came from."),
+    file: str = typer.Option(
+        ..., "--file", help="Scaffold written by `modes scaffold`. The authored "
+        "module is written alongside it; chain the next call at that path."),
+    mode: str = typer.Option(
+        ..., "--mode", help="Which mode's bodies to author."),
+    project_dir: Optional[Path] = typer.Option(
+        None, "--project", help="Sculpt project whose adapter supplies the "
+        "reward contract. Required unless --print-prompt."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+    goal: str = typer.Option("", "--goal", help="Overall behavior goal."),
+    mode_goal: str = typer.Option(
+        "", "--mode-goal", help="What this mode in particular has to do. "
+        "Defaults to the mode's own name."),
+    print_prompt: bool = typer.Option(
+        False, "--print-prompt", help="Print the authoring instruction and "
+        "exit without calling a model."),
+) -> None:
+    """Author one mode's reward, leaving the other modes alone.
+
+    One mode per call on purpose. The scaffold's gating is already correct, so
+    the only thing an LLM can get wrong here is the terms of a single mode —
+    which keeps the blast radius of a bad edit to one window rather than the
+    whole behavior, and lets each mode clear the metric gauntlet separately.
+
+    The edit goes through `sculptor.edit.apply_prompt_edit`, so it inherits the
+    KG grounding, the repair retries and the pre-flight probes unchanged; the
+    only new thing is what the prompt asks for."""
+    from sculptor.mode_rewards import (authored_modes, mode_authoring_prompt,
+                                       validate_mode_reward_source)
+
+    _, graph = _graph_for_clip(clip_id, robot)
+    try:
+        graph.mode(mode)
+    except KeyError:
+        names = ", ".join(m.name for m in graph.modes)
+        typer.echo(f"[modes author] {clip_id} has no mode {mode!r}; have: {names}",
+                   err=True)
+        raise typer.Exit(code=1) from None
+
+    path = Path(file).expanduser()
+    if not path.is_file():
+        typer.echo(f"[modes author] no scaffold at {path} — run "
+                   f"`sculpt modes scaffold --clip-id {clip_id}` first", err=True)
+        raise typer.Exit(code=1)
+
+    stale = validate_mode_reward_source(path.read_text(encoding="utf-8"), graph)
+    if stale:
+        # Authoring into a scaffold that no longer matches the automaton would
+        # write terms for a window that has since moved. Regenerate instead.
+        for err in stale:
+            typer.echo(f"[modes author] {err}", err=True)
+        raise typer.Exit(code=1)
+
+    prompt = mode_authoring_prompt(
+        graph, mode, behavior_goal=goal, mode_goal=mode_goal)
+    if print_prompt:
+        typer.echo(prompt)
+        return
+
+    if project_dir is None:
+        typer.echo(
+            "[modes author] --project is required: the reward contract comes "
+            "from the project's adapter, and it is what the post-flight probe "
+            "checks the authored batched path against. Use --print-prompt to "
+            "see the instruction without one.", err=True)
+        raise typer.Exit(code=2)
+
+    config_path = Path(project_dir) / "config.toml"
+    if not config_path.is_file():
+        typer.echo(f"[modes author] {config_path} not found — is this a sculpt "
+                   "project?", err=True)
+        raise typer.Exit(code=2)
+
+    import tempfile
+
+    from sculptor.adapters.base import load_adapter
+    from sculptor.edit import EditValidationError, apply_prompt_edit
+    from sculptor.kg.store import SculptorKG
+    from sculptor.mode_rewards import (generate_mode_reward_scaffold,
+                                       graft_mode_bodies)
+
+    adapter = load_adapter(config_path)
+    contract = adapter.reward_contract()
+    new_iter_id = _next_iter_id(path.stem, mode)
+    out_path = path.parent / f"{new_iter_id}.py"
+    source = path.read_text(encoding="utf-8")
+
+    # Author against a STUBS-ONLY twin, then transplant the result.
+    #
+    # `apply_prompt_edit` rewrites the whole module, and a scaffold carrying
+    # the tracking backbone is ~27 KB of which most is a table of float
+    # literals. The first real authoring run against one came back
+    # `SyntaxError: '[' was never closed` — the model had mangled the table
+    # while reproducing it. The twin has no literals, and grafting means an
+    # edit to the dispatch, the windows or another mode is simply dropped
+    # rather than having to be caught after the fact.
+    twin_source = generate_mode_reward_scaffold(
+        graph, behavior_goal=goal, clip_id=clip_id, clip=None)
+    already = [n for n, ok in authored_modes(source).items() if ok]
+    if already:
+        # Carry the modes already written into the twin, so the model sees the
+        # real neighbours rather than stubs it might feel obliged to fill.
+        twin_source = graft_mode_bodies(twin_source, source, already)
+
+    with tempfile.TemporaryDirectory(prefix="rs_mode_author_") as tmp:
+        twin = Path(tmp) / "v0.py"
+        twin.write_text(twin_source, encoding="utf-8")
+        try:
+            edited = apply_prompt_edit(
+                current_reward_path=twin,
+                user_prompt=prompt,
+                new_iter_id="v1",
+                reward_contract=contract,
+                kg_store=SculptorKG(),
+            )
+        except EditValidationError as e:
+            typer.echo(f"[modes author] {mode}: rejected: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        edited_source = edited.read_text(encoding="utf-8")
+
+    from sculptor.modes import ModeError as _ModeError
+
+    try:
+        grafted = graft_mode_bodies(source, edited_source, [mode])
+    except _ModeError as e:
+        typer.echo(f"[modes author] {mode}: could not graft: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    stale = validate_mode_reward_source(grafted, graph)
+    if stale:
+        for err in stale:
+            typer.echo(f"[modes author] grafted module invalid: {err}", err=True)
+        raise typer.Exit(code=1)
+
+    out_path.write_text(grafted, encoding="utf-8")
+    err = _probe_reward_module(out_path, contract)
+    if err:
+        # The twin cleared the probes; the grafted module is what will train.
+        typer.echo(f"[modes author] {mode}: grafted module failed the reward "
+                   f"contract probe: {err}", err=True)
+        raise typer.Exit(code=1)
+
+    authored = authored_modes(grafted)
+    pending = [n for n, ok in authored.items() if not ok]
+    if not authored.get(mode):
+        # The edit was accepted by the reward gates but did not actually fill
+        # this mode's bodies — a silent no-op, which is worse than a rejection
+        # because the next call would move on to the following mode.
+        typer.echo(
+            f"[modes author] {mode}: WROTE {out_path} but the mode still reads "
+            "as an unauthored stub — re-run, or check the prompt reached the "
+            "right function.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"[modes author] {mode}: authored -> {out_path}")
+    typer.echo(
+        f"[modes author] {len(authored) - len(pending)}/{len(authored)} modes "
+        "authored" + (f"; pending: {', '.join(pending)}" if pending else ""))
+    for name in pending:
+        typer.echo(f"  - sculpt modes author --clip-id {clip_id} --mode {name} "
+                   f"--file {out_path} --project {project_dir}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

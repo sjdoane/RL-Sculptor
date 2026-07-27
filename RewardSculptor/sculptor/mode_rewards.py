@@ -46,7 +46,7 @@ inferred.
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from sculptor.modes import Mode, ModeGraph, ModeError, validate_mode_graph
 
@@ -60,6 +60,11 @@ MODE_FN_PREFIX = "_mode_"
 #: Component key a mode's contribution is reported under. Per-mode metrics key
 #: off this, so it is part of the contract rather than a formatting detail.
 MODE_COMPONENT_PREFIX = "mode_"
+
+#: Hard ceiling on an authoring prompt, mirroring `sculptor.edit`'s own limit
+#: (`edit.py:2042`). Stated here so `mode_authoring_prompt` can budget for it
+#: instead of discovering it after the KG query has already run.
+MAX_PROMPT_CHARS = 2000
 
 #: Suffix of a mode's batched twin. mjlab dispatches to `compute_reward_batched`
 #: and treats its absence as a contract violation (`adapters/mjlab.py:670`), so
@@ -146,12 +151,204 @@ def _stub_body_batched(mode: Mode) -> str:
     )
 
 
+def _tracking_block(clip: Mapping[str, Any], n_phase: int) -> tuple[str, str, str]:
+    """`(constants, scalar_fns, batched_fns)` for the reference-tracking
+    backbone, or three empty strings when `clip` is None.
+
+    This is the same two-Gaussian-plus-orientation formula
+    `sculptor.refs.track` emits, deliberately reproduced rather than improved
+    on: it is the version that took a Tier-D rollout from 28% of the
+    reference's joint amplitude to 85%, and a per-mode reward is a worse place
+    to try a new tracking formulation than a flat one.
+
+    The tracking clock stays GLOBAL — phase over the whole composite — while
+    the authored terms are mode-gated. Re-anchoring the phase at each mode
+    boundary would be a different (and arguably better) design, but it would
+    also mean the backbone is no longer the thing that has been measured, so
+    it is left for after a per-mode clip certifies.
+    """
+    import numpy as np
+
+    from sculptor.refs.track import (JOINT_ERR_WEIGHT, ORIENTATION_ERR_WEIGHT,
+                                     ROOT_ERR_WEIGHT, _format_array_literal,
+                                     downsample_phase_targets,
+                                     projected_gravity_from_quat)
+
+    joint_names = list(clip.get("joint_names") or [])
+    if not joint_names or clip.get("joint_pos") is None:
+        raise ModeError(
+            "clip has no joint_pos/joint_names — a tracking backbone needs a "
+            "per-joint target. Scaffold without `clip` for stubs only.")
+
+    fps = float(clip.get("fps") or 0.0) or 30.0
+    n_frames = int(np.asarray(clip["root_pos_z"]).shape[0])
+    duration_s = n_frames / fps if fps > 0 else 0.0
+    joint_pos = downsample_phase_targets(
+        np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase)
+    root_z = downsample_phase_targets(
+        np.asarray(clip["root_pos_z"], dtype=np.float64), n=n_phase)
+
+    quat = clip.get("root_quat_wxyz")
+    gravity_literal = "None"
+    orientation_weight = 0.0
+    if quat is not None:
+        gravity = downsample_phase_targets(
+            projected_gravity_from_quat(np.asarray(quat, dtype=np.float64)),
+            n=n_phase)
+        norm = np.linalg.norm(gravity, axis=1, keepdims=True)
+        gravity = gravity / np.where(norm > 0.0, norm, 1.0)
+        gravity_literal = (
+            f"np.asarray({_format_array_literal(gravity)}, dtype=np.float64)"
+            f".reshape(N_PHASE, 3)")
+        orientation_weight = ORIENTATION_ERR_WEIGHT
+
+    constants = f'''import numpy as np
+
+# ── reference-tracking backbone ────────────────────────────────────────
+# Paid in EVERY mode. The automaton decides which TASK terms apply; it does
+# not change what the robot is supposed to be tracking, so the backbone is
+# mode-independent by construction. Same formula as `sculptor.refs.track`.
+JOINT_NAMES = {joint_names!r}
+N_JOINTS = {len(joint_names)}
+N_PHASE = {n_phase}
+REFERENCE_DURATION_S = {duration_s!r}
+JOINT_ERR_WEIGHT = {JOINT_ERR_WEIGHT!r}
+ROOT_ERR_WEIGHT = {ROOT_ERR_WEIGHT!r}
+# 0.0 when the clip carries no root orientation, making the term an exact
+# no-op rather than a silently-wrong upright target.
+ORIENTATION_ERR_WEIGHT = {orientation_weight!r}
+
+TARGET_JOINT_POS = np.asarray({_format_array_literal(joint_pos)}, dtype=np.float64).reshape(N_PHASE, N_JOINTS)
+TARGET_ROOT_Z = np.asarray({_format_array_literal(root_z)}, dtype=np.float64)
+TARGET_GRAVITY = {gravity_literal}
+'''
+
+    scalar = '''
+def _phase_index(info) -> int:
+    """Where in the WHOLE composite we are — not where in the mode.
+
+    The tracking target is the reference's own frame at this instant, and the
+    reference does not restart per mode.
+    """
+    t = _elapsed_s(info)
+    phase = (t / REFERENCE_DURATION_S) if REFERENCE_DURATION_S > 0.0 else 0.0
+    return int(min(max(phase, 0.0), 0.999999) * N_PHASE)
+
+
+def _tracking(next_state, info):
+    """(value, components) for the reference-tracking backbone, scalar path.
+
+    Handles BOTH qpos layouts, because both really occur:
+
+      * a full MuJoCo vector (7 free-joint DOFs + N actuated), from replay
+        against a raw MuJoCo state;
+      * an mjlab per-env row of just the N actuated joints — which is what the
+        G1 task's reward contract declares (`qpos: (29,)`), and what
+        `sculptor.edit`'s pre-flight probe builds. Slicing `qpos[7:7+N]` here
+        raised on that contract.
+
+    Taking the TRAILING N_JOINTS is correct for both (they coincide when the
+    vector is exactly 7+N long) and matches the batched path, so the two cannot
+    drift apart on the joint term.
+    """
+    qpos = np.asarray(next_state["qpos"], dtype=np.float64).reshape(-1)
+    if qpos.shape[0] < N_JOINTS:
+        raise ValueError(
+            f"qpos has {qpos.shape[0]} entries, fewer than the {N_JOINTS} "
+            f"tracked joints")
+    i = _phase_index(info)
+    joint_err = qpos[-N_JOINTS:] - TARGET_JOINT_POS[i]
+    joint_term = float(np.exp(-JOINT_ERR_WEIGHT * np.mean(joint_err ** 2)))
+    # Root height: prefer what the runner publishes, since mjlab's
+    # `base_height_delta` is measured from the ROBOT's own episode start and is
+    # the only anchor that means anything for origin-relative retargeted clips.
+    # Fall back to absolute `qpos[2]` only when qpos really is a full MuJoCo
+    # vector; a joints-only row has no root at index 2 to read.
+    root0 = float(TARGET_ROOT_Z[0])
+    if "base_height_delta" in info or "base_height" in info:
+        actual_delta = float(info.get(
+            "base_height_delta", float(info.get("base_height", root0)) - root0))
+        root_err = actual_delta - (float(TARGET_ROOT_Z[i]) - root0)
+    elif qpos.shape[0] >= 7 + N_JOINTS:
+        root_err = float(qpos[2]) - float(TARGET_ROOT_Z[i])
+    else:
+        root_err = 0.0
+    root_term = float(np.exp(-ROOT_ERR_WEIGHT * root_err ** 2))
+    components = {"joint_tracking": joint_term, "root_tracking": root_term}
+    total = joint_term + root_term
+    if TARGET_GRAVITY is not None:
+        gravity = np.asarray(
+            next_state["projected_gravity_b"], dtype=np.float64).reshape(-1)[-3:]
+        orient = float(np.exp(-ORIENTATION_ERR_WEIGHT * np.mean(
+            (gravity - TARGET_GRAVITY[i]) ** 2)))
+        components["orientation_tracking"] = orient
+        total += orient
+    return total, components
+
+'''
+
+    batched = '''
+def _tracking_batched(next_state, info, like):
+    """The training path's backbone.
+
+    Joints are the TRAILING N_JOINTS of a per-env `qpos` row — the G1 task's
+    contract declares `qpos: (29,)`, actuated joints only. Root height arrives
+    as `info["base_height"]` and is compared as a DELTA from the reference's
+    own first frame: retargeting zeroes root translation, so the clip's root_z
+    sits near 0 while a standing G1 base is ~0.74 m, and an absolute comparison
+    would saturate the kernel at zero for every frame no matter how well the
+    motion tracked. `_tracking` follows both conventions, so the two paths
+    agree wherever they can.
+    """
+    import torch
+
+    qpos = next_state["qpos"]
+    if qpos.shape[-1] < N_JOINTS:
+        raise ValueError(
+            f"batched qpos has {qpos.shape[-1]} columns, fewer than the "
+            f"{N_JOINTS} tracked joints")
+    t = _elapsed_s_batched(like, info)
+    phase = torch.clamp(t / REFERENCE_DURATION_S, 0.0, 0.999999) \\
+        if REFERENCE_DURATION_S > 0.0 else torch.zeros_like(like)
+    i = torch.clamp((phase * N_PHASE).long(), 0, N_PHASE - 1)
+
+    target_joint = torch.as_tensor(
+        TARGET_JOINT_POS, device=qpos.device, dtype=qpos.dtype)[i]
+    joint_err = qpos[:, -N_JOINTS:] - target_joint
+    joint_term = torch.exp(
+        -JOINT_ERR_WEIGHT * torch.mean(joint_err ** 2, dim=-1))
+
+    target_root = torch.as_tensor(
+        TARGET_ROOT_Z, device=qpos.device, dtype=qpos.dtype)[i]
+    root0 = float(TARGET_ROOT_Z[0])
+    base_height = info.get("base_height", torch.zeros_like(like))
+    actual_delta = info.get("base_height_delta", base_height - root0)
+    root_term = torch.exp(-ROOT_ERR_WEIGHT * (actual_delta - (target_root - root0)) ** 2)
+
+    components = {"joint_tracking": joint_term, "root_tracking": root_term}
+    total = joint_term + root_term
+    if TARGET_GRAVITY is not None:
+        target_gravity = torch.as_tensor(
+            TARGET_GRAVITY, device=qpos.device, dtype=qpos.dtype)[i]
+        gravity = next_state["projected_gravity_b"][:, -3:]
+        orient = torch.exp(-ORIENTATION_ERR_WEIGHT * torch.mean(
+            (gravity - target_gravity) ** 2, dim=-1))
+        components["orientation_tracking"] = orient
+        total = total + orient
+    return total, components
+
+'''
+    return constants, scalar, batched
+
+
 def generate_mode_reward_scaffold(
     graph: ModeGraph,
     *,
     behavior_goal: str = "",
     goal_by_mode: Optional[Mapping[str, str]] = None,
     clip_id: str = "",
+    clip: Optional[Mapping[str, Any]] = None,
+    n_phase: int = 32,
 ) -> str:
     """Emit a reward module whose mode gating is correct by construction.
 
@@ -164,8 +361,18 @@ def generate_mode_reward_scaffold(
     `active_mode_index`, so a per-mode metric can slice a rollout by mode
     without re-deriving the automaton.
 
-    Raises `ModeError` when the graph is structurally invalid or when two mode
-    names collide once sanitized to identifiers.
+    Pass `clip` (a loaded reference, `sculptor.reference.load_clip`) to include
+    the reference-tracking backbone. Without it every mode is a stub paying
+    zero, so the module only becomes trainable once every mode is authored —
+    and even then it has nothing telling the policy to follow the reference.
+    With it the scaffold is trainable IMMEDIATELY (it is the tracking reward
+    that already works), and authoring adds mode-specific task terms on top.
+    That layering is OGMP's own shape: one oracle to track throughout, a
+    per-mode objective on top of it.
+
+    Raises `ModeError` when the graph is structurally invalid, when two mode
+    names collide once sanitized to identifiers, or when `clip` carries no
+    per-joint target to track.
     """
     errors = validate_mode_graph(graph)
     if errors:
@@ -198,6 +405,21 @@ def generate_mode_reward_scaffold(
     dispatch_b = ",\n".join(
         f"    {name!r}: {MODE_FN_PREFIX}{idents[name]}{BATCHED_FN_SUFFIX}"
         for name in order)
+
+    has_track = clip is not None
+    track_const, track_scalar, track_batched = (
+        _tracking_block(clip, int(n_phase)) if has_track else ("", "", ""))
+    # The calls are spliced rather than always emitted-and-zeroed: a stubs-only
+    # scaffold must not require `qpos` in the contract, since it does not read
+    # the state at all.
+    track_call = ("    track_value, track_components = _tracking(next_state, info)\n"
+                  "    value = value + track_value\n"
+                  "    out.update(track_components)\n") if has_track else ""
+    track_call_b = (
+        "    track_total, track_components = _tracking_batched(\n"
+        "        next_state, info, like)\n"
+        "    total = total + track_total\n"
+        "    components.update(track_components)\n") if has_track else ""
 
     return f'''"""Auto-generated per-mode reward scaffold{f" for clip {clip_id!r}" if clip_id else ""}.
 
@@ -241,6 +463,7 @@ REFERENCE_FPS = {graph.fps!r}
 #: the real control rate rather than a round number.
 DEFAULT_STEP_DT = 0.02
 
+{track_const}
 
 def _elapsed_s(info) -> float:
     """Wall time into the episode. `step_dt` is published per-step by the mjlab
@@ -337,6 +560,7 @@ def _mode_masks(like, info):
     masks[0] = masks[0] | (leftover & (~past_end))
     return masks
 
+{track_scalar}{track_batched}
 
 {fns}
 
@@ -351,12 +575,14 @@ _MODE_FNS_BATCHED = {{
 
 
 def compute_reward(state, action, next_state, info):
-    """Pay only the active mode.
+    """Tracking backbone (if any) plus ONLY the active mode's terms.
 
     Terms authored for one mode are not paid during another — that scoping is
     the entire point of the automaton. An episode-level sum would let a term
     written for landing punish the policy throughout a flight phase where the
-    reference is deliberately pitched over.
+    reference is deliberately pitched over. The backbone is exempt because it
+    is not a task term: what the robot should be tracking does not change with
+    the mode.
     """
     name = active_mode(info)
     value, components = _MODE_FNS[name](state, action, next_state, info)
@@ -365,7 +591,7 @@ def compute_reward(state, action, next_state, info):
            "active_mode_index": float(MODE_ORDER.index(name))}}
     for k, v in (components or {{}}).items():
         out[f"{{name}}.{{k}}"] = float(v)
-    return value, out
+{track_call}    return value, out
 
 
 def compute_reward_batched(state, action, next_state, info):
@@ -402,8 +628,17 @@ def compute_reward_batched(state, action, next_state, info):
             v = torch.as_tensor(v, device=like.device, dtype=like.dtype) + like
             components[f"{{name}}.{{k}}"] = torch.where(mask, v, zero)
     components["active_mode_index"] = index
-    return total, components
+{track_call_b}    return total, components
 '''
+
+
+def _fn_span(source: str, fn_name: str) -> Optional[tuple[int, int]]:
+    """`(start, end)` of `fn_name`'s whole `def` block, or None if absent."""
+    m = re.search(
+        rf"^def {re.escape(fn_name)}\(.*?\):\n.*?"
+        rf"(?=\n\ndef |\n\n_MODE_FNS|\Z)",
+        source, re.M | re.S)
+    return (m.start(), m.end()) if m else None
 
 
 def _body_after(source: str, fn_name: str) -> Optional[str]:
@@ -413,6 +648,45 @@ def _body_after(source: str, fn_name: str) -> Optional[str]:
         rf"(?=\n\ndef |\n\n_MODE_FNS|\Z)",
         source, re.M | re.S)
     return m.group(1) if m else None
+
+
+def graft_mode_bodies(base: str, authored: str,
+                      mode_names: Sequence[str]) -> str:
+    """Copy the named modes' functions out of `authored` into `base`.
+
+    Why this exists: `apply_prompt_edit` rewrites the WHOLE module, and a
+    scaffold carrying the tracking backbone is ~27 KB of which most is a
+    32x29 table of float literals. Asking a model to reproduce those verbatim
+    on every edit is a corruption waiting to happen — and it happened on the
+    first real authoring run, which came back
+    `SyntaxError: '[' was never closed`.
+
+    So authoring runs against a stubs-only twin (small, no literals) and the
+    result is transplanted here. That is the same division of labour the rest
+    of this module already draws: the deterministic parts are generated, the
+    model writes function bodies and nothing else. It also means a model that
+    edits the dispatch, the windows or another mode's body simply has that
+    edit dropped, rather than it having to be caught downstream.
+
+    Raises `ModeError` when a named mode is missing from either side.
+    """
+    out = base
+    for name in mode_names:
+        ident = mode_ident(name)
+        for fn in (MODE_FN_PREFIX + ident,
+                   MODE_FN_PREFIX + ident + BATCHED_FN_SUFFIX):
+            src_span = _fn_span(authored, fn)
+            dst_span = _fn_span(out, fn)
+            if src_span is None:
+                raise ModeError(
+                    f"authored module has no {fn} — nothing to graft for mode "
+                    f"{name!r}")
+            if dst_span is None:
+                raise ModeError(f"target module has no {fn} to replace")
+            out = (out[:dst_span[0]]
+                   + authored[src_span[0]:src_span[1]]
+                   + out[dst_span[1]:])
+    return out
 
 
 def authored_modes(source: str, *, require_batched: bool = True) -> dict[str, bool]:
@@ -505,6 +779,87 @@ def validate_mode_reward_source(source: str, graph: ModeGraph) -> list[str]:
     return errors
 
 
+def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
+                             goal_text: str, mode_text: str) -> str:
+    """The prompt body. Split out so `mode_authoring_prompt` can measure the
+    fixed part before deciding how much free text fits."""
+    mode = graph.mode(mode_name)
+    windows = mode_windows_s(graph)
+    lo, hi = windows[mode_name]
+    order = [m.name for m in graph.modes]
+    i = order.index(mode_name)
+
+    neighbours = []
+    if i > 0:
+        neighbours.append(
+            f"after {order[i - 1]!r} (ends {windows[order[i - 1]][1]:g}s)")
+    if i + 1 < len(order):
+        neighbours.append(
+            f"before {order[i + 1]!r} (starts {windows[order[i + 1]][0]:g}s)")
+    neighbour_line = "; ".join(neighbours) if neighbours else "the only mode"
+
+    ident = mode_ident(mode_name)
+    return (
+        f"Author `{MODE_FN_PREFIX}{ident}` and its batched twin "
+        f"`{MODE_FN_PREFIX}{ident}{BATCHED_FN_SUFFIX}` — the reward for mode "
+        f"{mode_name!r} ONLY. Both must compute the SAME quantity: the scalar "
+        f"one is scored in replay, the batched one is what trains, and "
+        f"authoring one without the other silently pays nothing where it "
+        f"matters.\n\n"
+        f"Overall behavior: {goal_text or '(unspecified)'}\n"
+        f"This mode's job: {mode_text}\n"
+        f"Window: {lo:g}s-{hi:g}s (reference frames "
+        f"[{mode.frame_range[0]}, {mode.frame_range[1]}) at {graph.fps:g} fps); "
+        f"{neighbour_line}.\n\n"
+        "Scope:\n"
+        "- Called ONLY inside that window. Do not re-detect the phase — the "
+        "dispatch already did.\n"
+        "- Do not reward or penalize what the neighbouring modes own. A term "
+        "that is right here but reads as a global constraint is the main "
+        "failure.\n"
+        "- Return `(value, components)`; snake_case component names, the SAME "
+        "ones in both halves. They are reported as `<mode>.<name>` and scored "
+        "against this window's slice of the rollout.\n"
+        "- Leave `compute_reward`, `compute_reward_batched`, `MODE_WINDOWS_S`, "
+        "`MODE_ORDER`, `_mode_masks` and the other modes untouched.\n"
+        "\nBatched half — signature `(state, action, next_state, info, like)`:\n"
+        "- `like` is zeros of shape (num_envs,); build terms from it "
+        "(`torch.zeros_like(like)`, `torch.full_like(like, c)`) so device and "
+        "dtype follow the env.\n"
+        "- It runs for EVERY env and is masked afterwards, so it must be "
+        "finite outside this window too: no unguarded div, log or index that "
+        "assumes time is inside it.\n"
+        "- Return tensors of shape (num_envs,), not floats.\n"
+        "- Arithmetic on a bool tensor raises; use `mask.float()`."
+    )
+
+
+def _fit_free_text(behavior_goal: str, mode_goal: str, *,
+                   fixed: int) -> tuple[str, str]:
+    """Squeeze the two caller-supplied strings into what's left of the budget.
+
+    `apply_prompt_edit` hard-rejects a prompt over `MAX_PROMPT_CHARS`
+    (`edit.py:2042`), and a behavior goal is free text a user typed — so
+    without this, a long goal fails at the *end* of the authoring call, after
+    the KG query, with an error about a character count rather than about the
+    goal. Truncating here is deterministic and visible in `--print-prompt`.
+    """
+    goal = " ".join(str(behavior_goal or "").split())
+    mode = " ".join(str(mode_goal or "").split())
+    room = MAX_PROMPT_CHARS - fixed
+    if len(goal) + len(mode) <= room:
+        return goal, mode
+    # The mode's own job is the more specific of the two, so it keeps its half
+    # of the budget outright and the overall goal absorbs the truncation.
+    half = max(0, room // 2)
+    if len(mode) > half:
+        mode = mode[:max(0, half - 1)].rstrip() + "…"
+    goal_room = max(0, room - len(mode))
+    if len(goal) > goal_room:
+        goal = goal[:max(0, goal_room - 1)].rstrip() + "…"
+    return goal, mode
+
+
 def mode_authoring_prompt(
     graph: ModeGraph,
     mode_name: str,
@@ -520,68 +875,25 @@ def mode_authoring_prompt(
     the ground" authored for an approach mode, which then reads as a global
     constraint to anyone editing later). Naming the neighbours makes the scope
     explicit in the prompt rather than implicit in the gating.
+
+    The result is guaranteed to fit `MAX_PROMPT_CHARS`; see `_fit_free_text`
+    for why that is enforced here rather than left to the caller.
     """
     mode = graph.mode(mode_name)          # KeyError here is a caller bug
-    windows = mode_windows_s(graph)
-    lo, hi = windows[mode_name]
-    order = [m.name for m in graph.modes]
-    i = order.index(mode_name)
-    prev_m = order[i - 1] if i > 0 else None
-    next_m = order[i + 1] if i + 1 < len(order) else None
-
-    neighbours = []
-    if prev_m:
-        neighbours.append(f"preceded by {prev_m!r} (ends at {windows[prev_m][1]}s)")
-    if next_m:
-        neighbours.append(f"followed by {next_m!r} (starts at {windows[next_m][0]}s)")
-    neighbour_line = ("; ".join(neighbours)) if neighbours else "the only mode"
-
-    ident = mode_ident(mode_name)
-    return (
-        f"Author the bodies of `{MODE_FN_PREFIX}{ident}` and its batched twin "
-        f"`{MODE_FN_PREFIX}{ident}{BATCHED_FN_SUFFIX}` — the reward for mode "
-        f"{mode_name!r} ONLY. Both, computing the SAME quantity: the scalar "
-        f"one is used for replay and scoring, the batched one is the actual "
-        f"training path, and a mode authored in only one of them silently pays "
-        f"nothing where it matters.\n\n"
-        f"Overall behavior: {behavior_goal.strip() or '(unspecified)'}\n"
-        f"This mode's job: {mode_goal.strip() or mode.name}\n"
-        f"Window: {lo}s to {hi}s "
-        f"(reference frames [{mode.frame_range[0]}, {mode.frame_range[1]}) at "
-        f"{graph.fps} fps); {neighbour_line}.\n\n"
-        "Scope rules:\n"
-        "- This function is called ONLY inside that window. Do not add terms "
-        "that belong to another mode, and do not try to detect the phase "
-        "yourself — the dispatch already did.\n"
-        "- Do not reward or penalize anything the neighbouring modes own. A "
-        "term that is right for this mode but reads as a global constraint is "
-        "the main failure here.\n"
-        "- Return `(value, components)` where components names are snake_case; "
-        "they are reported as `<mode>.<name>` and a per-mode metric scores "
-        "them against this window's slice of the rollout. Use the SAME "
-        "component names in both halves.\n"
-        "- Leave `compute_reward`, `compute_reward_batched`, `MODE_WINDOWS_S`, "
-        "`MODE_ORDER`, `_mode_masks` and the other modes' functions untouched.\n"
-        "\nBatched half:\n"
-        "- Signature is `(state, action, next_state, info, like)`. `like` is a "
-        "zeros tensor of shape (num_envs,); build terms from it "
-        "(`torch.zeros_like(like)`, `torch.full_like(like, c)`) so device and "
-        "dtype follow the env instead of being hardcoded.\n"
-        "- It is evaluated for EVERY env and masked afterwards, so it must be "
-        "finite for envs outside this window too — no unguarded div, log, or "
-        "index derived from the assumption that time is inside the window.\n"
-        "- Return tensors of shape (num_envs,), not Python floats.\n"
-        "- Arithmetic on a bool tensor raises; use `mask.float()` or "
-        "`(~mask).float()`."
-    )
+    goal_text, mode_text = _fit_free_text(
+        behavior_goal, mode_goal or mode.name,
+        fixed=len(_render_authoring_prompt(graph, mode_name, "", "")))
+    return _render_authoring_prompt(graph, mode_name, goal_text, mode_text)
 
 
 __all__ = [
     "BATCHED_FN_SUFFIX",
+    "MAX_PROMPT_CHARS",
     "MODE_COMPONENT_PREFIX",
     "MODE_FN_PREFIX",
     "authored_modes",
     "generate_mode_reward_scaffold",
+    "graft_mode_bodies",
     "mode_authoring_prompt",
     "mode_ident",
     "mode_windows_s",

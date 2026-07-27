@@ -19,10 +19,12 @@ import pytest
 
 from sculptor.mode_rewards import (
     BATCHED_FN_SUFFIX,
+    MAX_PROMPT_CHARS,
     MODE_COMPONENT_PREFIX,
     MODE_FN_PREFIX,
     authored_modes,
     generate_mode_reward_scaffold,
+    graft_mode_bodies,
     mode_authoring_prompt,
     mode_ident,
     mode_windows_s,
@@ -264,7 +266,7 @@ def test_the_prompt_states_the_window_and_the_neighbours():
                               behavior_goal="running jump kick",
                               mode_goal="drive off the back foot")
     assert f"{MODE_FN_PREFIX}launch" in p
-    assert "1.0s to 2.0s" in p
+    assert "1s-2s" in p
     assert "approach" in p and "land" in p
     assert "running jump kick" in p and "drive off the back foot" in p
 
@@ -273,14 +275,14 @@ def test_the_prompt_tells_the_author_not_to_re_detect_phase():
     """Phase detection inside an authored body would duplicate — and could
     contradict — the derived dispatch."""
     p = mode_authoring_prompt(_graph(), "approach")
-    assert "do not try to detect the phase" in p.lower()
+    assert "do not re-detect the phase" in p.lower()
 
 
 def test_the_first_and_last_modes_have_only_one_neighbour():
     first = mode_authoring_prompt(_graph(), "approach")
     last = mode_authoring_prompt(_graph(), "land")
-    assert "preceded by" not in first and "followed by" in first
-    assert "preceded by" in last and "followed by" not in last
+    assert "after 'approach'" not in first and "before 'launch'" in first
+    assert "after 'launch'" in last and "before " not in last
 
 
 def test_a_single_mode_graph_reads_as_the_only_mode():
@@ -516,12 +518,276 @@ def test_the_batch_size_is_derived_rather_than_assumed(tmp_path):
         mod._batch_like(None, {}, {})
 
 
+def test_a_long_behavior_goal_cannot_blow_the_prompt_budget():
+    """`apply_prompt_edit` hard-rejects a prompt over 2000 chars (edit.py:2042),
+    and a behavior goal is free text a user typed. Budgeting here means a long
+    goal is truncated visibly in `--print-prompt`; without it the authoring call
+    fails at the very end, after the KG query, with an error about a character
+    count rather than about the goal."""
+    p = mode_authoring_prompt(_graph(), "launch",
+                              behavior_goal="sprint and " * 400,
+                              mode_goal="take off from one leg " * 400)
+    assert len(p) <= MAX_PROMPT_CHARS
+    assert "…" in p, "truncation must be visible, not silent"
+    # The window and the scope rules survive — they are what the prompt is for.
+    assert "Window:" in p and "_mode_masks" in p
+
+
+def test_a_realistic_goal_leaves_the_prompt_well_inside_the_budget():
+    p = mode_authoring_prompt(
+        _graph(), "launch",
+        behavior_goal="run in, launch off one leg, strike at the apex",
+        mode_goal="convert horizontal speed into a single-leg takeoff")
+    assert len(p) <= MAX_PROMPT_CHARS
+    assert "…" not in p, "a normal goal must not be truncated"
+
+
 def test_the_prompt_asks_for_both_halves():
     """A prompt that asks for one body would produce exactly the half-authored
     mode `authored_modes` refuses to call done."""
     p = mode_authoring_prompt(_graph(), "launch")
     assert f"{MODE_FN_PREFIX}launch{BATCHED_FN_SUFFIX}" in p
     assert "num_envs" in p and "torch.zeros_like(like)" in p
+
+
+# ── the reference-tracking backbone ─────────────────────────────────────
+def _tracking_clip(n=240, fps=120.0, j=6):
+    t = np.arange(n, dtype=np.float64) / fps
+    return {
+        "fps": fps,
+        "joint_names": [f"joint_{i}" for i in range(j)],
+        "joint_pos": (0.10 * np.sin(2 * np.pi * 0.5 * t)[:, None]
+                      + 0.01 * np.arange(j)[None, :]),
+        "root_pos_z": 0.70 + 0.02 * np.sin(2 * np.pi * 0.5 * t),
+        "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
+    }
+
+
+def test_without_a_clip_the_scaffold_pays_exactly_zero(tmp_path):
+    """Which is the problem the backbone exists to solve: a stubs-only module
+    is not trainable until every mode has been authored, and even then nothing
+    tells the policy to follow the reference."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="t0")
+    assert not hasattr(mod, "TARGET_JOINT_POS")
+    v, _ = mod.compute_reward({}, None, {}, _info(1.5))
+    assert v == 0.0
+
+
+def test_the_backbone_makes_a_fresh_scaffold_trainable(tmp_path):
+    """The whole point: scaffold, then train, then author on top — rather than
+    author three modes before finding out whether any of it works."""
+    clip = _tracking_clip()
+    mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
+                                              clip=clip),
+                tmp_path, name="t1")
+    assert mod.N_JOINTS == 6 and mod.N_PHASE == 32
+    assert mod.REFERENCE_DURATION_S == pytest.approx(2.0)
+
+    qpos = np.zeros(7 + mod.N_JOINTS)
+    qpos[2] = 0.70
+    v, comps = mod.compute_reward(
+        {}, None, {"qpos": qpos, "projected_gravity_b": np.array([0., 0., -1.])},
+        _info(1.0))
+    assert v > 0.0, "an unauthored scaffold with a backbone still pays"
+    assert {"joint_tracking", "root_tracking", "orientation_tracking"} <= set(comps)
+    # The mode's own contribution is still zero — the backbone is not a mode.
+    assert comps[f"{MODE_COMPONENT_PREFIX}launch"] == 0.0
+
+
+def test_the_scalar_path_handles_a_joints_only_qpos(tmp_path):
+    """Caught by a real authoring run, not by reasoning about it.
+
+    The G1 task's reward contract declares `qpos: (29,)` — the ACTUATED joints
+    only, no free-joint DOFs — and `sculptor.edit` probes the scalar path with
+    exactly that. Slicing `qpos[7:7+N]` raised `qpos too short for 29 tracked
+    joints: (29,)` and the whole authoring call was rejected after the model had
+    already been called. Both layouts are real, so both are handled."""
+    clip = _tracking_clip()
+    mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
+                                              clip=clip),
+                tmp_path, name="t2a")
+    joints = np.linspace(-0.2, 0.2, mod.N_JOINTS)
+    info = {"episode_length": 50, "step_dt": 0.02, "base_height": 0.70}
+
+    joints_only, _ = mod.compute_reward(
+        {}, None, {"qpos": joints,
+                   "projected_gravity_b": np.array([0., 0., -1.])}, info)
+    full = np.zeros(7 + mod.N_JOINTS)
+    full[2] = 0.70
+    full[7:] = joints
+    full_mujoco, _ = mod.compute_reward(
+        {}, None, {"qpos": full,
+                   "projected_gravity_b": np.array([0., 0., -1.])}, info)
+    assert joints_only == pytest.approx(full_mujoco), (
+        "the trailing N_JOINTS are the same joints in both layouts")
+
+
+def test_the_two_paths_agree_on_the_terms_they_can_agree_on(tmp_path):
+    """`root_tracking` differs by construction — the scalar path compares
+    absolute root z while the batched path compares a delta from the
+    reference's first frame, because retargeting zeroes root translation and an
+    absolute comparison would saturate the kernel at zero for every frame. The
+    joint and orientation terms have no such excuse and must match."""
+    clip = _tracking_clip()
+    mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
+                                              clip=clip),
+                tmp_path, name="t2")
+    rng = np.random.default_rng(0)
+    for step in range(0, 120, 11):
+        j = rng.normal(0.0, 0.3, mod.N_JOINTS)
+        grav = np.array([0.05, -0.02, -0.998])
+        grav = grav / np.linalg.norm(grav)
+
+        qpos = np.zeros(7 + mod.N_JOINTS)
+        qpos[2] = 0.70
+        qpos[7:] = j
+        _, s = mod.compute_reward(
+            {}, None, {"qpos": qpos, "projected_gravity_b": grav},
+            {"episode_length": step, "step_dt": 0.02})
+
+        qb = torch.zeros(1, 7 + mod.N_JOINTS)
+        qb[0, -mod.N_JOINTS:] = torch.tensor(j, dtype=torch.float32)
+        _, b = mod.compute_reward_batched(
+            {}, torch.zeros(1, mod.N_JOINTS),
+            {"qpos": qb,
+             "projected_gravity_b": torch.tensor(grav, dtype=torch.float32).reshape(1, 3)},
+            {"episode_length": torch.tensor([float(step)]),
+             "step_dt": torch.tensor([0.02]),
+             "base_height": torch.tensor([0.70])})
+        assert s["joint_tracking"] == pytest.approx(
+            float(b["joint_tracking"]), abs=1e-6)
+        assert s["orientation_tracking"] == pytest.approx(
+            float(b["orientation_tracking"]), abs=1e-6)
+
+
+def test_the_tracking_clock_spans_the_composite_not_the_mode(tmp_path):
+    """The automaton decides which TASK terms apply; it does not change what
+    the robot is supposed to be tracking. Re-anchoring phase per mode is a
+    defensible design but a different one, and it would mean the backbone is no
+    longer the version that has actually been measured."""
+    mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
+                                              clip=_tracking_clip()),
+                tmp_path, name="t3")
+    # Three modes over 2.0 s. Phase must advance monotonically ACROSS mode
+    # boundaries rather than resetting at each one.
+    idx = [mod._phase_index(_info(t)) for t in (0.0, 0.6, 0.7, 1.3, 1.4, 1.99)]
+    assert idx == sorted(idx)
+    assert idx[0] == 0 and idx[-1] == mod.N_PHASE - 1
+
+
+def test_a_clip_without_orientation_zeroes_the_term_rather_than_guessing(tmp_path):
+    """An upright target would be a fabricated one, and it would charge an
+    error against a robot that is correctly pitched over."""
+    clip = _tracking_clip()
+    clip.pop("root_quat_wxyz")
+    mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
+                                              clip=clip),
+                tmp_path, name="t4")
+    assert mod.TARGET_GRAVITY is None
+    assert mod.ORIENTATION_ERR_WEIGHT == 0.0
+    qpos = np.zeros(7 + mod.N_JOINTS)
+    _, comps = mod.compute_reward({}, None, {"qpos": qpos}, _info(1.0))
+    assert "orientation_tracking" not in comps
+
+
+def test_a_clip_with_no_joint_target_is_refused_rather_than_scaffolded():
+    clip = _tracking_clip()
+    clip.pop("joint_pos")
+    with pytest.raises(ModeError, match="joint_pos"):
+        generate_mode_reward_scaffold(_graph(fps=120.0, span=80), clip=clip)
+
+
+def test_the_backbone_survives_the_pre_flight_probe(tmp_path):
+    import types
+
+    from sculptor.edit import _call_compute_reward_batched
+
+    mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
+                                              clip=_tracking_clip()),
+                tmp_path, name="t5")
+    contract = types.SimpleNamespace(
+        supports_batched=True,
+        state_schema={"qpos": (13,), "projected_gravity_b": (3,),
+                      "actuator_force": (6,)},
+        info_schema={"episode_length": (), "step_dt": (), "base_height": ()},
+        expected_info_keys=["episode_length", "step_dt", "base_height"])
+    _call_compute_reward_batched(mod, contract)
+
+
+# ── grafting an authored mode into a backbone-carrying module ───────────
+def test_grafting_moves_a_mode_without_touching_the_tables(tmp_path):
+    """The reason grafting exists. `apply_prompt_edit` rewrites the WHOLE
+    module, and a scaffold with the tracking backbone is ~27 KB of which most
+    is a table of float literals. The first real authoring run against one came
+    back `SyntaxError: '[' was never closed` — the model had mangled the table
+    while reproducing it. So authoring runs against a stubs-only twin and the
+    result is transplanted."""
+    clip = _tracking_clip()
+    g = _graph(fps=120.0, span=80)
+    full = generate_mode_reward_scaffold(g, clip=clip)
+    twin = _author(generate_mode_reward_scaffold(g), "launch")
+
+    grafted = graft_mode_bodies(full, twin, ["launch"])
+    assert validate_mode_reward_source(grafted, g) == []
+    assert authored_modes(grafted) == {
+        "approach": False, "launch": True, "land": False}
+    # The tables came from the deterministic side and are untouched.
+    for marker in ("TARGET_JOINT_POS", "TARGET_ROOT_Z", "TARGET_GRAVITY"):
+        i, j = full.index(marker), grafted.index(marker)
+        assert full[i:i + 400] == grafted[j:j + 400]
+
+    mod = _load(grafted, tmp_path, name="gr1")
+    qpos = np.zeros(mod.N_JOINTS)
+    v, comps = mod.compute_reward(
+        {}, None, {"qpos": qpos, "projected_gravity_b": np.array([0., 0., -1.])},
+        {"episode_length": 50, "step_dt": 0.02, "base_height": 0.70})
+    assert comps[f"{MODE_COMPONENT_PREFIX}launch"] == 1.0, "authored term is live"
+    assert v > 1.0, "and the backbone is still paid alongside it"
+
+
+def test_grafting_drops_edits_the_model_had_no_business_making(tmp_path):
+    """A model that rewrites the dispatch, the windows or another mode's body
+    gets that edit dropped rather than having to be caught downstream — the
+    graft only ever moves the functions it was asked for."""
+    g = _graph(fps=120.0, span=80)
+    full = generate_mode_reward_scaffold(g, clip=_tracking_clip())
+    twin = _author(_author(generate_mode_reward_scaffold(g), "launch"), "land")
+    twin = twin.replace("MODE_ORDER: list = ['approach', 'launch', 'land']",
+                        "MODE_ORDER: list = ['launch']")
+
+    grafted = graft_mode_bodies(full, twin, ["launch"])
+    assert "MODE_ORDER: list = ['approach', 'launch', 'land']" in grafted
+    # 'land' was authored in the twin but not requested, so it stays a stub.
+    assert authored_modes(grafted)["land"] is False
+
+
+def test_grafting_a_mode_that_is_not_in_the_authored_module_is_refused():
+    g = _graph(fps=120.0, span=80)
+    full = generate_mode_reward_scaffold(g, clip=_tracking_clip())
+    with pytest.raises(ModeError, match="nothing to graft"):
+        graft_mode_bodies(full, "def unrelated():\n    pass\n", ["launch"])
+
+
+def test_a_grafted_module_still_clears_the_pre_flight_probes(tmp_path):
+    """`apply_prompt_edit` validated the TWIN; the grafted module is what
+    trains. Re-probing is what makes the graft safe rather than convenient."""
+    import types
+
+    from sculptor.edit import _call_compute_reward, _call_compute_reward_batched
+
+    g = _graph(fps=120.0, span=80)
+    full = generate_mode_reward_scaffold(g, clip=_tracking_clip())
+    grafted = graft_mode_bodies(full, _author(
+        generate_mode_reward_scaffold(g), "launch"), ["launch"])
+    mod = _load(grafted, tmp_path, name="gr2")
+    contract = types.SimpleNamespace(
+        supports_batched=True,
+        state_schema={"qpos": (6,), "projected_gravity_b": (3,),
+                      "actuator_force": (6,)},
+        info_schema={"episode_length": (), "step_dt": (), "base_height": ()},
+        expected_info_keys=["episode_length", "step_dt", "base_height"])
+    _call_compute_reward(mod, contract)
+    _call_compute_reward_batched(mod, contract)
 
 
 def test_a_fresh_scaffold_passes_edits_real_pre_flight_probe(tmp_path):
