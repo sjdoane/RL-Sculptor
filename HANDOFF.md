@@ -329,6 +329,44 @@ Now derived from wall time: `round(duration_s * DEFAULT_CONTROL_HZ)`, i.e.
 **185** steps for the 3.70 s composite at mjlab's 50 Hz, not 2000. A
 re-certification with the corrected clock is running.
 
+### Diagnosed root cause of the tracking failure — OPEN DECISION
+
+After fixing the clock (wall-time), the episode cap, and the control rate, the
+learning curve barely moved: v2 (phase reaching 0.5) and v3 (phase reaching
+1.0) converged to the SAME `joint_tracking` 0.5447. A policy that is actually
+tracking cannot be insensitive to how much of the reference it sees. So the
+phase bugs were real but were not what is holding tracking back.
+
+The mechanism is in `_mjlab_runner.py` §11 and its injection site (~2330):
+reward injection adds `sculptor_primary` at **weight 1.0** and attenuates the
+task-shipped terms to a **0.3x realism floor** — it does not remove them. The
+G1 velocity task ships **14** such terms (visible as `reward_term__*` in any
+rollout npz): `pose`, `upright`, `track_linear_velocity`,
+`track_angular_velocity`, `foot_clearance`, `foot_swing_height`, `air_time`,
+`foot_slip`, `soft_landing`, `action_rate_l2`, `angular_momentum`,
+`body_ang_vel`, `dof_pos_limits`, `self_collisions`.
+
+Several of those — `pose` above all, plus `upright` — are explicit
+regularizers toward the robot's NOMINAL pose. Fourteen of them at 0.3x
+against one tracking term at 1.0x is a direct explanation for a policy that
+settles into a near-default posture: measured `motion_ratio` 0.278, i.e. the
+rollout reproduced 28% of the reference's joint amplitude.
+
+The floor exists for a good reason (§11: without it an early policy learns to
+fall immediately to dodge realism penalties). But for a Tier-D *tracking*
+certification it is competing with the thing being certified. This is a design
+decision, not a bug to quietly patch — the options are roughly:
+
+  a. raise `sculptor_primary`'s weight for tracking runs specifically;
+  b. drop the floor to safety/termination terms only when a reference is
+     attached, keeping `self_collisions`/`dof_pos_limits` but dropping `pose`
+     and the command-tracking terms;
+  c. leave it and accept that Tier-D certifies "tracks while remaining a
+     plausible robot", with the static-pose control as the honest bar.
+
+**Do not skip the static-pose control to make (c) pass.** That control is the
+only reason this failure was visible at all.
+
 ### Landmine that cost 13 GPU-hours
 
 `refs track` writes its throwaway project to `<clip_dir>/tierD_work/`, and
