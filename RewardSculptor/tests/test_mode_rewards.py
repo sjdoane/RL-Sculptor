@@ -18,6 +18,8 @@ import numpy as np
 import pytest
 
 from sculptor.mode_rewards import (
+    BATCHED_FN_SUFFIX,
+    MODE_COMPONENT_PREFIX,
     MODE_FN_PREFIX,
     authored_modes,
     generate_mode_reward_scaffold,
@@ -156,20 +158,56 @@ def test_an_unauthored_mode_pays_nothing_and_says_so(tmp_path):
         "approach": False, "launch": False, "land": False}
 
 
+def _author(src, mode, *, scalar=True, batched=True):
+    """Replace `mode`'s stub bodies the way a real authoring pass would — the
+    whole function, docstring included, so the stub marker goes with it."""
+    out = src
+    if scalar:
+        start = out.index(f"def {MODE_FN_PREFIX}{mode}(")
+        end = out.index(f"def {MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}(")
+        out = out[:start] + (
+            f"def {MODE_FN_PREFIX}{mode}(state, action, next_state, info):\n"
+            f'    """{mode}: authored."""\n'
+            "    del state, action, next_state, info\n"
+            "    return 1.0, {}\n\n\n") + out[end:]
+    if batched:
+        start = out.index(f"def {MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}(")
+        tail = out.index("\n\ndef ", start)
+        out = out[:start] + (
+            f"def {MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}"
+            "(state, action, next_state, info, like):\n"
+            f'    """{mode}: authored."""\n'
+            "    del state, action, next_state, info\n"
+            "    return like + 1.0, {}\n") + out[tail:]
+    return out
+
+
 def test_authoring_one_mode_is_detected(tmp_path):
     """A real authoring pass replaces the whole body, docstring included — so
     the stub marker goes with it. Keeping the marker while changing the return
     still reads as a stub, which is the safe direction to be wrong in."""
-    src = generate_mode_reward_scaffold(_graph())
-    stub_start = src.index(f"def {MODE_FN_PREFIX}approach(")
-    stub_end = src.index(f"def {MODE_FN_PREFIX}launch(")
-    authored = (f"def {MODE_FN_PREFIX}approach(state, action, next_state, info):\n"
-                '    """approach: close the distance."""\n'
-                "    del state, action, next_state, info\n"
-                "    return 1.0, {}\n\n\n")
-    src = src[:stub_start] + authored + src[stub_end:]
+    src = _author(generate_mode_reward_scaffold(_graph()), "approach")
     assert authored_modes(src) == {
         "approach": True, "launch": False, "land": False}
+
+
+def test_a_mode_authored_only_in_the_scalar_half_reads_as_unauthored():
+    """The silent one: mjlab dispatches to `compute_reward_batched` and never
+    calls the scalar path, so a mode written only in the scalar half evaluates
+    correctly in replay and pays exactly zero in training. That looks like a bad
+    reward, not a missing one — which is much harder to notice."""
+    src = _author(generate_mode_reward_scaffold(_graph()), "approach",
+                  batched=False)
+    assert authored_modes(src)["approach"] is False
+    assert authored_modes(src, require_batched=False)["approach"] is True
+
+
+def test_a_mode_authored_only_in_the_batched_half_reads_as_unauthored():
+    """The mirror case: training would be right and every replay-based score
+    would read the mode as contributing nothing."""
+    src = _author(generate_mode_reward_scaffold(_graph()), "approach",
+                  scalar=False)
+    assert authored_modes(src)["approach"] is False
 
 
 def test_keeping_the_stub_marker_still_reads_as_unauthored(tmp_path):
@@ -327,3 +365,200 @@ def test_a_hand_built_one_mode_graph_still_scaffolds(tmp_path):
                 tmp_path, name="solo_mode")
     assert mod.active_mode(_info(0.0)) == "solo"
     assert mod.active_mode(_info(99.0)) == "solo"
+
+
+# ── the batched path (the one mjlab actually trains on) ─────────────────
+torch = pytest.importorskip("torch")
+
+
+def _steps(n=260, step_dt=0.02):
+    s = torch.arange(0, n, dtype=torch.float32)
+    return s, {"episode_length": s, "step_dt": torch.full_like(s, step_dt)}
+
+
+def test_the_scaffold_declares_and_defines_the_batched_path(tmp_path):
+    """mjlab dispatches to `compute_reward_batched` and treats its absence as a
+    reward-contract violation (`adapters/mjlab.py:670`), falling back to a
+    per-env Python loop. Without this the whole module could not train."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b0")
+    assert mod.REWARD_SPEC["supports_batched"] is True
+    assert callable(mod.compute_reward_batched)
+
+
+def test_batched_masks_agree_with_the_scalar_dispatch_step_for_step(tmp_path):
+    """The load-bearing invariant. A rollout is SCORED through the scalar path
+    and TRAINED through the batched one; if they disagreed about which mode owns
+    an instant, the metric would be grading terms the policy was never paid for.
+    Swept past the terminal window so the overrun fallback is covered too."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b1")
+    steps, info = _steps()
+    like = mod._batch_like(torch.zeros(len(steps), 3), {}, info)
+    masks = torch.stack(mod._mode_masks(like, info))
+
+    assert masks.sum(0).eq(1).all(), "modes must partition every instant"
+    batched = [mod.MODE_ORDER[int(i)] for i in masks.float().argmax(0)]
+    scalar = [mod.active_mode({"episode_length": float(s), "step_dt": 0.02})
+              for s in steps]
+    assert batched == scalar
+
+
+def test_envs_at_different_episode_times_get_different_modes(tmp_path):
+    """Why this is a tensor and not a scalar: mjlab's envs reset independently,
+    so at any given step they sit at different points in the automaton. A scalar
+    clock would put the whole batch in one mode and pay most of it the wrong
+    terms."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b2")
+    # 0.5 s, 1.5 s, 2.5 s into their episodes — one env per mode.
+    steps = torch.tensor([25.0, 75.0, 125.0])
+    info = {"episode_length": steps, "step_dt": torch.full_like(steps, 0.02)}
+    _, comps = mod.compute_reward_batched({}, torch.zeros(3, 3), {}, info)
+    assert comps["active_mode_index"].tolist() == [0.0, 1.0, 2.0]
+
+
+def test_an_unauthored_batched_scaffold_pays_nothing_finitely(tmp_path):
+    """The pre-flight probe in `sculptor.edit` runs this on zero tensors and
+    rejects non-finite rewards, so a fresh scaffold has to survive it."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b3")
+    steps, info = _steps()
+    r, comps = mod.compute_reward_batched({}, torch.zeros(len(steps), 3), {}, info)
+    assert tuple(r.shape) == (len(steps),)
+    assert torch.isfinite(r).all() and r.abs().sum() == 0
+    assert comps, "components must be non-empty — edit.py rejects an empty dict"
+    for name in mod.MODE_ORDER:
+        assert f"{MODE_COMPONENT_PREFIX}{name}" in comps
+
+
+def test_a_mode_is_paid_only_inside_its_own_window_batched(tmp_path):
+    mod = _load(_author(generate_mode_reward_scaffold(_graph()), "launch"),
+                tmp_path, name="b4")
+    steps, info = _steps()
+    t = steps * 0.02
+    r, comps = mod.compute_reward_batched({}, torch.zeros(len(steps), 3), {}, info)
+    inside = (t >= 1.0) & (t < 2.0)          # launch's window at 30 fps / 30 frames
+    assert (r[inside] == 1.0).all()
+    assert (r[~inside] == 0.0).all()
+    assert (comps[f"{MODE_COMPONENT_PREFIX}approach"] == 0.0).all()
+
+
+def test_out_of_window_nan_cannot_poison_the_batch(tmp_path):
+    """Why the dispatch masks with `torch.where` and not `mask * value`.
+
+    A mode's terms are only defined inside its own window, but every mode's
+    function is evaluated for every env before masking — that is what makes it
+    vectorizable. `0.0 * nan` is `nan`, so a multiply would let one out-of-window
+    env take down the entire batch's reward. `where` discards the unselected
+    branch, while a nan produced INSIDE the window still surfaces, which is the
+    direction a numerical bug should fail in."""
+    src = generate_mode_reward_scaffold(_graph())
+    start = src.index(f"def {MODE_FN_PREFIX}launch{BATCHED_FN_SUFFIX}(")
+    tail = src.index("\n\ndef ", start)
+    src = src[:start] + (
+        f"def {MODE_FN_PREFIX}launch{BATCHED_FN_SUFFIX}"
+        "(state, action, next_state, info, like):\n"
+        '    """launch: nan before this window opens."""\n'
+        "    del state, action, next_state\n"
+        "    import torch\n"
+        "    return torch.sqrt(_elapsed_s_batched(like, info) - 1.0), {}\n"
+    ) + src[tail:]
+
+    mod = _load(src, tmp_path, name="b5")
+    steps, info = _steps()
+    t = steps * 0.02
+    raw = torch.sqrt(t - 1.0)
+    assert raw.isnan().any(), "the fixture must actually produce nan"
+    assert (raw * (t < 1.0).float()).isnan().any(), "a multiply would spread it"
+
+    r, comps = mod.compute_reward_batched({}, torch.zeros(len(steps), 3), {}, info)
+    assert torch.isfinite(r).all()
+    inside = (t >= 1.0) & (t < 2.0)
+    assert torch.allclose(r[inside], raw[inside]), "in-window value is untouched"
+
+
+def test_the_batched_clock_reads_step_dt_rather_than_assuming_a_rate(tmp_path):
+    """Same assumption that broke Tier-D twice, now on the training path."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b6")
+    steps = torch.tensor([50.0])
+    slow = {"episode_length": steps, "step_dt": torch.tensor([0.02])}   # 1.0 s
+    fast = {"episode_length": steps, "step_dt": torch.tensor([0.005])}  # 0.25 s
+    like = mod._batch_like(torch.zeros(1, 3), {}, slow)
+    assert float(mod._elapsed_s_batched(like, slow)) == pytest.approx(1.0)
+    assert float(mod._elapsed_s_batched(like, fast)) == pytest.approx(0.25)
+    _, a = mod.compute_reward_batched({}, torch.zeros(1, 3), {}, slow)
+    _, b = mod.compute_reward_batched({}, torch.zeros(1, 3), {}, fast)
+    assert a["active_mode_index"].tolist() == [1.0]   # 'launch'
+    assert b["active_mode_index"].tolist() == [0.0]   # still 'approach'
+
+
+def test_a_missing_step_dt_falls_back_to_the_real_g1_rate_batched(tmp_path):
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b7")
+    steps = torch.tensor([75.0])
+    like = mod._batch_like(torch.zeros(1, 3), {}, {})
+    bare = float(mod._elapsed_s_batched(like, {"episode_length": steps}))
+    assert bare == pytest.approx(75.0 * 0.02)
+    # A published-but-zero step_dt must take the fallback too, matching the
+    # scalar path's `or DEFAULT_STEP_DT` rather than collapsing every env to t=0.
+    zeroed = float(mod._elapsed_s_batched(
+        like, {"episode_length": steps, "step_dt": torch.zeros(1)}))
+    assert zeroed == bare
+
+
+def test_the_batch_size_is_derived_rather_than_assumed(tmp_path):
+    """`edit.py`'s probe builds state/next_state from the contract's schema, so
+    no single key is guaranteed present."""
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b8")
+    n = 7
+    from_info = mod._batch_like(None, None, {"episode_length": torch.zeros(n)})
+    from_action = mod._batch_like(torch.zeros(n, 3), {}, {})
+    from_state = mod._batch_like(None, {"qpos": torch.zeros(n, 35)}, {})
+    for like in (from_info, from_action, from_state):
+        assert tuple(like.shape) == (n,) and float(like.sum()) == 0.0
+    with pytest.raises(ValueError, match="batch size"):
+        mod._batch_like(None, {}, {})
+
+
+def test_the_prompt_asks_for_both_halves():
+    """A prompt that asks for one body would produce exactly the half-authored
+    mode `authored_modes` refuses to call done."""
+    p = mode_authoring_prompt(_graph(), "launch")
+    assert f"{MODE_FN_PREFIX}launch{BATCHED_FN_SUFFIX}" in p
+    assert "num_envs" in p and "torch.zeros_like(like)" in p
+
+
+def test_a_fresh_scaffold_passes_edits_real_pre_flight_probe(tmp_path):
+    """The actual admission gate, not a stand-in for it.
+
+    `_call_compute_reward_batched` is what `apply_prompt_edit` runs before a
+    reward is allowed near a GPU — it executes the batched path on N=2 zero
+    tensors and rejects wrong shapes, empty component dicts and non-finite
+    rewards. Its docstring records why it exists: a bool-tensor arithmetic bug
+    that got caught live AFTER training started and burned the stage. A scaffold
+    that cannot clear this probe cannot be authored against at all.
+    """
+    import types
+
+    from sculptor.edit import _call_compute_reward_batched
+
+    mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path, name="b9")
+    mjlab = types.SimpleNamespace(
+        supports_batched=True,
+        state_schema={"qpos": (36,), "qvel": (35,), "actuator_force": (29,),
+                      "projected_gravity_b": (3,)},
+        info_schema={"episode_length": (), "step_dt": (), "base_height": ()},
+        expected_info_keys=["episode_length", "step_dt", "base_height"])
+    _call_compute_reward_batched(mod, mjlab)          # raises on failure
+
+    # A contract that declares no info keys at all: the clock finds nothing to
+    # read and must still produce a correctly shaped, finite reward.
+    bare = types.SimpleNamespace(
+        supports_batched=True, state_schema={"actuator_force": (29,)},
+        info_schema={}, expected_info_keys=[])
+    _call_compute_reward_batched(mod, bare)
+
+
+def test_validation_catches_a_scaffold_with_the_batched_half_stripped():
+    g = _graph()
+    src = generate_mode_reward_scaffold(g)
+    start = src.index(f"def {MODE_FN_PREFIX}launch{BATCHED_FN_SUFFIX}(")
+    stripped = src[:start] + src[src.index("\n\ndef ", start) + 2:]
+    errors = validate_mode_reward_source(stripped, g)
+    assert any("launch" in e and BATCHED_FN_SUFFIX in e for e in errors)
