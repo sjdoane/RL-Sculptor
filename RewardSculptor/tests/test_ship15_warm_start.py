@@ -674,3 +674,171 @@ def test_ship15_warm_start_event_shape():
         assert f'"{key}"' in src, (
             f"warm_start_loaded event must include {key!r} field"
         )
+
+
+def test_named_warm_start_outranks_a_partial_from_an_interrupted_attempt(
+    tmp_path: Path, monkeypatch,
+):
+    """Stopping a run to pick a different policy must actually pick it.
+
+    Recovery treats a `model_*.pt` in the iter's own logs as strictly closer
+    to the interrupted phase, which is right for a crash. It is wrong when
+    the operator stopped the run BECAUSE that policy was going wrong and
+    named a different one to restart from — reinstating it silently makes
+    the UI's "Warm-start checkpoint" field look broken.
+    """
+    import torch
+    from sculptor import sculpt as sculpt_mod
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_4"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "the policy we stopped"}, logs / "model_450.pt")
+    chosen = tmp_path / "iter_1.pt"
+    chosen.write_bytes(b"stub")
+    events: list[dict] = []
+    monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=4, iter_dir=iter_dir,
+        reward_module_path=tmp_path / "v4.py", steps=1500, seed=46,
+        init_policy_path=chosen, warm_start_explicit=True,
+    )
+
+    assert captured["init_policy_path"] == chosen
+    assert [e for e in events if e.get("type") == "partial_train_ignored"] == [{
+        "type": "partial_train_ignored",
+        "iter": 4,
+        "checkpoint": str(logs / "model_450.pt"),
+        "reason": "explicit_warm_start_wins",
+        "warm_start": str(chosen),
+    }]
+    assert not [e for e in events
+                if e.get("type") == "partial_train_recovered"]
+
+
+def test_an_inferred_warm_start_still_yields_to_a_partial(
+    tmp_path: Path, monkeypatch,
+):
+    """Crash recovery is unchanged when nobody named a starting policy.
+
+    `sculpt_run` fills `init_ckpt` itself when resuming across reward-version
+    gaps. That guess carries no intent, so the partial — trained under the
+    exact current reward/seed/world tuple — must still win.
+    """
+    import torch
+    from sculptor import sculpt as sculpt_mod
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_4"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "partial"}, logs / "model_450.pt")
+    inferred = tmp_path / "iter_3.pt"
+    inferred.write_bytes(b"stub")
+    monkeypatch.setattr(sculpt_mod, "_emit_event", lambda _e: None)
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=4, iter_dir=iter_dir,
+        reward_module_path=tmp_path / "v4.py", steps=1500, seed=46,
+        init_policy_path=inferred, warm_start_explicit=False,
+    )
+
+    assert captured["init_policy_path"] == logs / "model_450.pt"
+
+
+def test_configured_init_std_reads_the_tasks_fresh_policy_noise():
+    """The ceiling comes from the task cfg, not a constant."""
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    def cfg(distribution_cfg):
+        actor = type("Actor", (), {"distribution_cfg": distribution_cfg})()
+        return type("RlCfg", (), {"actor": actor})()
+
+    assert runner_mod._configured_init_std(
+        cfg({"class_name": "GaussianDistribution", "init_std": 1.0,
+             "std_type": "scalar"})) == 1.0
+    assert runner_mod._configured_init_std(cfg({"init_std": 0.4})) == 0.4
+    # A deterministic / non-Gaussian actor has no exploration std to bound.
+    assert runner_mod._configured_init_std(cfg(None)) is None
+    assert runner_mod._configured_init_std(cfg({})) is None
+    assert runner_mod._configured_init_std(cfg({"init_std": "wat"})) is None
+    assert runner_mod._configured_init_std(cfg({"init_std": 0.0})) is None
+    assert runner_mod._configured_init_std(type("RlCfg", (), {})()) is None
+
+
+@pytest.mark.parametrize("std_type", ["scalar", "log"])
+def test_warm_start_noise_is_clamped_to_the_fresh_init_value(std_type):
+    """Inherited exploration noise above fresh-init is drift, not knowledge.
+
+    Measured on platform-ascent-showcase, the action-noise std ratcheted
+    1.05 -> 1.39 -> 1.71 across three chained warm starts against an
+    `init_std` of 1.0. mjlab's `action_rate_l2` penalty grows as 2*sigma^2,
+    so by the third the inherited noise alone cost more per step than the
+    whole task reward paid.
+    """
+    import torch
+    from rsl_rl.modules.distribution import GaussianDistribution
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    dist = GaussianDistribution(29, init_std=1.708, std_type=std_type)
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": dist})()})()})()
+
+    got = runner_mod._clamp_warm_started_noise(runner, 1.0)
+
+    assert got is not None
+    assert got["std_before"] == pytest.approx(1.708, abs=1e-4)
+    assert got["std_after"] == pytest.approx(1.0, abs=1e-4)
+    assert got["ceiling"] == 1.0
+    param = (dist.std_param if std_type == "scalar"
+             else dist.log_std_param.exp())
+    assert torch.allclose(param.detach(), torch.ones(29), atol=1e-4)
+
+
+@pytest.mark.parametrize("std_type", ["scalar", "log"])
+def test_a_policy_quieter_than_fresh_init_keeps_its_precision(std_type):
+    """The bound is one-directional — converged precision is real learning."""
+    from rsl_rl.modules.distribution import GaussianDistribution
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    dist = GaussianDistribution(29, init_std=0.25, std_type=std_type)
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": dist})()})()})()
+
+    assert runner_mod._clamp_warm_started_noise(runner, 1.0) is None
+    param = (dist.std_param if std_type == "scalar"
+             else dist.log_std_param.exp())
+    assert float(param.detach().mean()) == pytest.approx(0.25, abs=1e-4)
+
+
+def test_clamping_noise_leaves_a_non_gaussian_policy_alone():
+    """No std parameter to bound is not an error."""
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": object()})()})()})()
+    assert runner_mod._clamp_warm_started_noise(runner, 1.0) is None
+    assert runner_mod._clamp_warm_started_noise(object(), 1.0) is None
+
+
+def test_clamped_noise_stays_trainable():
+    """The clamp must not detach the parameter from the optimizer."""
+    import torch
+    from rsl_rl.modules.distribution import GaussianDistribution
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    dist = GaussianDistribution(4, init_std=1.7, std_type="scalar")
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": dist})()})()})()
+    runner_mod._clamp_warm_started_noise(runner, 1.0)
+
+    assert dist.std_param.requires_grad
+    assert isinstance(dist.std_param, torch.nn.Parameter)
+    dist.update(torch.zeros(2, 4))
+    dist.log_prob(torch.zeros(2, 4)).sum().backward()
+    assert dist.std_param.grad is not None
+    assert torch.isfinite(dist.std_param.grad).all()

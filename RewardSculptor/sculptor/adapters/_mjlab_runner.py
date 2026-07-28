@@ -26,7 +26,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 # ── Component capture sink (§7.1 / §7.2 — Eureka-style reward reflection) ──
@@ -2226,6 +2226,68 @@ def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
     _apply_rl_spec(rl_cfg, jump_preset_spec())
 
 
+def _configured_init_std(rl_cfg: Any) -> Optional[float]:
+    """The exploration std a *fresh* policy would start from, or None.
+
+    Reads `actor.distribution_cfg["init_std"]` — the value rsl_rl's
+    `GaussianDistribution` uses to initialize `std_param`. None when the
+    task uses a deterministic or non-Gaussian actor, which is the signal
+    to leave a warm-started policy's noise alone.
+    """
+    dist = getattr(getattr(rl_cfg, "actor", None), "distribution_cfg", None)
+    if not isinstance(dist, dict):
+        return None
+    try:
+        init_std = float(dist.get("init_std"))
+    except (TypeError, ValueError):
+        return None
+    return init_std if init_std > 0.0 else None
+
+
+def _clamp_warm_started_noise(runner: Any, ceiling: float) -> Optional[dict]:
+    """Cap a warm-started policy's exploration noise at `ceiling`.
+
+    A warm start loads actor weights from a checkpoint, and for a Gaussian
+    policy that includes the learned action-noise std. Across chained sculpt
+    iterations that std ratchets *up*: measured on platform-ascent-showcase
+    it went 1.05 → 1.39 → 1.71 over three iterations against an `init_std`
+    of 1.0, and since mjlab's `action_rate_l2` penalty grows as 2σ² the
+    inherited noise alone came to cost more per step than the entire task
+    reward paid — every episode ended in `fell_over` and the run read as
+    "the reward does nothing".
+
+    Exploration scale is a property of the training run about to start, not
+    knowledge carried by the checkpoint — the same reasoning that already
+    makes the warm-start path skip the source optimizer's Adam momentum.
+    So the bound is one-directional: a policy that converged to *less* noise
+    than a fresh one keeps that precision, while anything above the fresh-init
+    value is drift and gets clamped back. Returns the before/after summary
+    when it changed anything, else None.
+    """
+    import torch
+
+    distribution = getattr(getattr(runner, "alg", None), "actor", None)
+    distribution = getattr(distribution, "distribution", None)
+    scalar = getattr(distribution, "std_param", None)
+    logged = getattr(distribution, "log_std_param", None)
+    param = scalar if scalar is not None else logged
+    if param is None:
+        return None
+
+    with torch.no_grad():
+        std = param.detach() if scalar is not None else param.detach().exp()
+        before = float(std.mean())
+        if before <= ceiling:
+            return None
+        if scalar is not None:
+            param.detach().clamp_(max=ceiling)
+        else:
+            param.detach().clamp_(max=float(torch.log(torch.tensor(ceiling))))
+        after = scalar if scalar is not None else logged.detach().exp()
+        return {"std_before": before, "std_after": float(after.detach().mean()),
+                "ceiling": ceiling}
+
+
 def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
     """Keep directly-parameterized Gaussian policy noise positive.
 
@@ -2552,6 +2614,27 @@ def _cmd_train(args: argparse.Namespace) -> None:
             }),
             flush=True,
         )
+        # The actor weights just loaded include the learned exploration std,
+        # which ratchets up across chained warm starts until the action-rate
+        # penalty outweighs the task reward. Bound it by what a fresh policy
+        # would start from; see `_clamp_warm_started_noise`.
+        init_std = _configured_init_std(rl_cfg)
+        clamped = (None if init_std is None
+                   else _clamp_warm_started_noise(runner, init_std))
+        if clamped is not None:
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "warm_start_noise_clamped", **clamped}),
+                flush=True,
+            )
+            print(
+                f"[runner] warm start carried action-noise std "
+                f"{clamped['std_before']:.3f}, above this task's fresh-init "
+                f"{clamped['ceiling']:.3f} — clamped to "
+                f"{clamped['std_after']:.3f} so the inherited noise does not "
+                f"pay the action-rate penalty for the whole run",
+                file=sys.stderr, flush=True,
+            )
 
     # Progress poller — watches the logs dir for new model_<N>.pt
     # checkpoints rsl_rl writes every `save_interval` iters and emits

@@ -1288,6 +1288,7 @@ def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
     init_policy_path: Optional[Path] = None,
+    warm_start_explicit: bool = False,
 ):
     """Skip `adapter.train` when `iter_dir/checkpoint.pt` is already on
     disk and loads successfully — the expensive phase (≥ 22 min for
@@ -1347,8 +1348,25 @@ def _train_or_resume(
     # candidates corrupt. Prefer this iter's newest valid intermediate policy
     # over a previous-iter warm start: it was trained under the exact current
     # reward/seed/world tuple and is strictly closer to the interrupted phase.
+    #
+    # Exception: a warm start the caller NAMED outranks the partial. Recovery
+    # assumes the partial and the request are the same intent — true when a
+    # crashed iteration is resumed, false when someone stopped a run precisely
+    # because its policy was going wrong and picked a different one to restart
+    # from. Silently reinstating the rejected policy there makes the UI's
+    # "Warm-start checkpoint" field look broken, which is what happened on
+    # platform-ascent-showcase. `warm_start_explicit` is only ever set for the
+    # first iteration of a run, so mid-run crash recovery is unaffected.
     partial_policy = _latest_valid_partial_policy(iter_dir)
-    if partial_policy is not None:
+    if partial_policy is not None and warm_start_explicit:
+        _emit_event({
+            "type": "partial_train_ignored",
+            "iter": iter_index,
+            "checkpoint": str(partial_policy),
+            "reason": "explicit_warm_start_wins",
+            "warm_start": str(init_policy_path),
+        })
+    elif partial_policy is not None:
         superseded = init_policy_path
         init_policy_path = partial_policy
         _emit_event({
@@ -1626,6 +1644,7 @@ def _run_one_iter(
     kg_store,
     seed: int,
     init_policy_path: Optional[Path] = None,
+    warm_start_explicit: bool = False,
     fitness_fn: Optional[Callable[[Path], float]] = None,
     prior_fitness: Optional[dict] = None,
     fitness_observe_only: bool = False,
@@ -1857,6 +1876,7 @@ def _run_one_iter(
         steps=steps,
         seed=seed,
         init_policy_path=init_policy_path,
+        warm_start_explicit=warm_start_explicit,
     )
     train_s = time.time() - t0
 
@@ -2824,6 +2844,11 @@ def sculpt_run(
                     f"init_policy_path not found: {init_ckpt}. "
                     "Pass a valid rsl_rl checkpoint or None."
                 )
+    # Whether the starting policy was NAMED by the caller (the UI's
+    # "Warm-start checkpoint" field) rather than inferred below. Only a
+    # named one outranks a partial left by an interrupted attempt — see
+    # `_train_or_resume`.
+    warm_start_explicit = init_ckpt is not None
 
     cfg = _parse_toml(config_path)
     # `--steps-per-iter` CLI override wins over the config.toml value.
@@ -3106,6 +3131,7 @@ def sculpt_run(
                 no_kg=no_kg, dry_run=dry_run, kg_store=kg_store,
                 seed=base_seed + i,
                 init_policy_path=(init_ckpt if i == start_iter else None),
+                warm_start_explicit=(warm_start_explicit and i == start_iter),
                 fitness_fn=fitness_fn,
                 prior_fitness=(
                     {"best_so_far": result.best_fitness,
