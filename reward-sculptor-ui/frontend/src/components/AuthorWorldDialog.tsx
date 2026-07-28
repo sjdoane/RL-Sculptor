@@ -72,6 +72,7 @@ export default function AuthorWorldDialog({
   const [open, setOpen] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [robot, setRobot] = useState("");
+  const [kgGrounding, setKgGrounding] = useState(true);
   const [draft, setDraft] = useState<WorldAuthorResponse | null>(null);
   const [page, setPage] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -129,7 +130,7 @@ export default function AuthorWorldDialog({
 
   const runAuthor = () => {
     author.mutate(
-      { prompt, robot_capability_id: robot.trim() || null },
+      { prompt, robot_capability_id: robot.trim() || null, kg_grounding: kgGrounding },
       {
         onSuccess: (d) => {
           setDraft(d);
@@ -250,6 +251,29 @@ export default function AuthorWorldDialog({
                   placeholder="project robot"
                 />
               </Field>
+              {/* The CLI has had `--kg-grounding/--no-kg-grounding` all
+                  along; the dialog sent neither, so authoring here was
+                  always grounded. Retrieval is best-effort and never blocks,
+                  so the reason to turn it off is a noisy or off-topic graph,
+                  not speed. */}
+              <label
+                className="rs-flex rs-gap-8"
+                style={{ alignItems: "flex-start", fontSize: 12 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={kgGrounding}
+                  onChange={(e) => setKgGrounding(e.target.checked)}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  Ground in the knowledge graph
+                  <span className="rs-sub" style={{ display: "block", fontSize: 11 }}>
+                    Cites this project's ingested papers when choosing terrain
+                    and task structure. Best-effort — it never blocks authoring.
+                  </span>
+                </span>
+              </label>
             </>
           ) : (
             <div style={{ display: "grid", minHeight: 0, height: "100%",
