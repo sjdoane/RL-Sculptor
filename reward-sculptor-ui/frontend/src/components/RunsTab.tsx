@@ -1642,23 +1642,26 @@ function LiveRunDetailPane({
   }, [events.events]);
 
   // The most recent `learning_vitals`, plus where the run's exploration
-  // noise started. The pay/cost pair alone does not separate a healthy run
-  // from a failing one — the previous run had the penalty exceeding the
-  // reward at its BEST iteration. What separated them was the action-noise
-  // std drifting up from where it began, which grows the action-rate
-  // penalty quadratically. Measured against this run's own first reading,
-  // so it needs no guessed threshold.
+  // noise started and whether it is ratcheting. Neither simpler signal
+  // works on its own: the failed run's penalty exceeded its reward at its
+  // BEST iteration, and the healthy run's noise still rose 0.91 -> 1.24
+  // while its return climbed to its best. Only noise rising WHILE return
+  // falls tells the two apart.
   const vitals = useMemo(() => {
-    let first: LearningVitals | null = null;
-    let last: LearningVitals | null = null;
+    const all: LearningVitals[] = [];
     for (const ev of events.events) {
-      if ((ev as { type?: string }).type !== "learning_vitals") continue;
-      const v = ev as unknown as LearningVitals;
-      if (first === null && typeof v.action_std === "number") first = v;
-      last = v;
+      if ((ev as { type?: string }).type === "learning_vitals") {
+        all.push(ev as unknown as LearningVitals);
+      }
     }
-    if (last === null) return null;
-    return { v: last, stdAtStart: first?.action_std ?? null };
+    const last = all[all.length - 1];
+    if (last === undefined) return null;
+    const first = all.find((v) => typeof v.action_std === "number") ?? null;
+    return {
+      v: last,
+      stdAtStart: first?.action_std ?? null,
+      ratcheting: isRatcheting(all),
+    };
   }, [events.events]);
 
   // §Ship 43: launch-time objective-metric generation as run-phase 0. Fold the
@@ -2006,25 +2009,46 @@ interface LearningVitals {
   top_penalty?: { term: string; value: number };
 }
 
-/** Exploration drift this far above where the run started is the pattern
- *  that preceded both collapses here (0.91 → 1.19 by the time returns had
- *  fallen 3×), and it stayed flat through the healthy stretch. */
-const STD_DRIFT_WARN = 1.15;
+/** Is exploration noise running away with the run?
+ *
+ * Rising noise is NOT by itself a problem: a healthy 1500-iteration run here
+ * went 0.91 → 1.25 and finished at its best return. What went wrong looked
+ * different — noise still climbing while returns fell, 0.91 → 1.37 as the
+ * return dropped from 358 to 38. So the signal is the conjunction, compared
+ * across two halves of a recent window rather than against any fixed level.
+ *
+ * Deliberately conservative: silence on a struggling-but-recovering run costs
+ * nothing, while crying wolf on a healthy one would make the whole strip
+ * ignorable.
+ */
+function isRatcheting(all: LearningVitals[]): boolean {
+  const WINDOW = 120;              // ~8% of a default 1500-iteration run
+  const pts = all.filter((v) => typeof v.action_std === "number"
+                             && typeof v.mean_reward === "number");
+  if (pts.length < WINDOW) return false;
+  const tail = pts.slice(-WINDOW);
+  const half = Math.floor(WINDOW / 2);
+  const mean = (xs: LearningVitals[], k: "action_std" | "mean_reward") =>
+    xs.reduce((s, x) => s + (x[k] as number), 0) / xs.length;
+  const older = tail.slice(0, half);
+  const newer = tail.slice(half);
+  const stdUp = mean(newer, "action_std") > mean(older, "action_std") * 1.05;
+  const returnDown = mean(newer, "mean_reward") < mean(older, "mean_reward") * 0.8;
+  return stdUp && returnDown;
+}
 
 // Is training going anywhere? The progress bar answers "how far", never
 // "how well". Shows what the policy is paid most for and what it is charged
 // most for — the pair that decides whether attempting the task beats standing
 // still — plus the exploration noise, whose upward drift is what turns the
 // second into the first.
-function LearningVitalsStrip({ v, stdAtStart }: {
-  v: LearningVitals; stdAtStart: number | null;
+function LearningVitalsStrip({ v, stdAtStart, ratcheting }: {
+  v: LearningVitals; stdAtStart: number | null; ratcheting: boolean;
 }) {
   const num = (x: number | null | undefined, digits = 1) =>
     typeof x === "number" ? x.toFixed(digits) : "—";
   const pays = v.top_reward;
   const costs = v.top_penalty;
-  const drifting = typeof v.action_std === "number" && stdAtStart != null
-    && stdAtStart > 0 && v.action_std / stdAtStart >= STD_DRIFT_WARN;
   const stat = (label: string, value: string) => (
     <span className="rs-flex rs-gap-6" style={{ alignItems: "baseline" }}>
       <span className="rs-eyebrow">{label}</span>
@@ -2046,12 +2070,13 @@ function LearningVitalsStrip({ v, stdAtStart }: {
           {" · "}Costs most: <code className="mono">{costs.term}</code> {num(costs.value, 2)}
         </div>
       )}
-      {drifting && (
+      {ratcheting && (
         <div className="rs-sub" style={{ fontSize: 11, marginTop: 6, color: "var(--st-amber)" }}>
-          Exploration noise has drifted well above where this run started. The
-          action-rate penalty grows with its square, so it will keep eating into
-          the return. Lower <code className="mono">entropy_coef_scale</code> in
-          project settings and restart from a checkpoint taken before the drift.
+          Exploration noise is still climbing while the return falls. The
+          action-rate penalty grows with the square of that noise, so it will
+          keep eating into the return. Lower{" "}
+          <code className="mono">entropy_coef_scale</code> in project settings
+          and restart from a checkpoint taken before the climb.
         </div>
       )}
     </div>

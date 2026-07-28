@@ -304,8 +304,14 @@ def _dummy_from_space(space) -> Any:
 
 def _build_dummy_inputs(
     contract, *, info_leading_batch: bool = True,
+    clock: "tuple[float, float] | None" = None,
 ) -> tuple[Any, Any, Any, dict]:
     """Synthesize dummy inputs matching the reward's expected shape.
+
+    `clock` is `(episode_length, step_dt)`, filled into the info dict when
+    the contract advertises those keys. Everything else is zeros, and a
+    zero clock puts a mode automaton at t=0 — i.e. always in its entry
+    mode. Callers that need to see another mode say so here.
 
     Two contract flavors:
       * gym-style — `observation_space_spec` is a `gym.spaces.Box` (or
@@ -360,20 +366,29 @@ def _build_dummy_inputs(
                 # but still expected scalar fields as one-element tensors.
                 shape = feature_shape or (1,)
             info[key] = torch.zeros(shape, dtype=torch.float32)
+        if clock is not None:
+            for key, value in zip(("episode_length", "step_dt"), clock):
+                if key in info:
+                    info[key] = torch.full_like(info[key], float(value))
         return state, action, next_state, info
     # Gym-style path unchanged (gym_sb3 uses numpy throughout).
     state = _dummy_from_space(contract.observation_space_spec)
     next_state = _dummy_from_space(contract.observation_space_spec)
     action = _dummy_from_space(contract.action_space_spec)
     info: dict[str, float] = {k: 0.0 for k in (contract.expected_info_keys or [])}
+    if clock is not None:
+        for key, value in zip(("episode_length", "step_dt"), clock):
+            if key in info:
+                info[key] = float(value)
     return state, action, next_state, info
 
 
 def _call_compute_reward(
     mod, contract, *, info_leading_batch: bool = True,
+    clock: "tuple[float, float] | None" = None,
 ) -> tuple[float, dict]:
     s, a, ns, info = _build_dummy_inputs(
-        contract, info_leading_batch=info_leading_batch)
+        contract, info_leading_batch=info_leading_batch, clock=clock)
     try:
         out = mod.compute_reward(s, a, ns, info)
     except Exception as e:  # noqa: BLE001 — module bug → retryable
@@ -822,6 +837,60 @@ def _call_compute_reward_batched(mod, contract) -> None:
             "inputs — bound the offending term (unguarded div/log/exp).")
 
 
+def _mode_probe_step_dt(current_module) -> float:
+    """The control period the probe should tell a mode reward it is running at.
+
+    Handed to the module rather than inferred from it, so both halves of the
+    usual `float(info["step_dt"]) or DEFAULT_STEP_DT` idiom agree on the clock.
+    Prefers the module's own declared default so the two never diverge.
+    """
+    dt = getattr(current_module, "DEFAULT_STEP_DT", None)
+    try:
+        dt = float(dt)
+    except (TypeError, ValueError):
+        dt = 0.0
+    return dt if dt > 0.0 else 0.02
+
+
+def _reward_mode_windows(current_module) -> dict[str, tuple[float, float]]:
+    """`{mode: (start_s, end_s)}` for a mode-automaton reward, else `{}`.
+
+    `REWARD_SPEC['mode_windows_s']` is the declared contract and wins; the
+    module-level `MODE_WINDOWS_S` is the fallback for a reward that only
+    carries the automaton in code.
+    """
+    spec = getattr(current_module, "REWARD_SPEC", {}) or {}
+    windows = spec.get("mode_windows_s") if isinstance(spec, dict) else None
+    if not windows:
+        windows = getattr(current_module, "MODE_WINDOWS_S", None)
+    if not isinstance(windows, dict):
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for name, span in windows.items():
+        try:
+            lo, hi = float(span[0]), float(span[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if hi > lo:
+            out[str(name)] = (lo, hi)
+    return out
+
+
+def _mode_probe_clocks(current_module) -> list[tuple[float, float]]:
+    """One `(episode_length, step_dt)` per mode window — each window's midpoint.
+
+    A mode automaton routes on elapsed episode time, so the zero-filled probe
+    in `_build_dummy_inputs` always lands in the entry mode. Without these,
+    every other mode's components stay invisible to the grounding check and
+    the diagnoser's edits to them are rejected as unknown terms.
+    """
+    windows = _reward_mode_windows(current_module)
+    if not windows:
+        return []
+    dt = _mode_probe_step_dt(current_module)
+    return [(((lo + hi) / 2.0) / dt, dt) for lo, hi in windows.values()]
+
+
 def _current_reward_component_keys(current_module, contract) -> set[str]:
     try:
         _, components = _call_compute_reward(current_module, contract)
@@ -840,7 +909,23 @@ def _current_reward_component_keys(current_module, contract) -> set[str]:
                 current_module, contract, info_leading_batch=False)
         except EditValidationError:
             raise exact_shape_error
-    return set(components.keys())
+    keys = set(components.keys())
+    # Walk the rest of the automaton. Best-effort: the probe above is the
+    # one that decides whether this module conforms to the contract, so a
+    # mode that trips on synthetic inputs costs its own term names and
+    # nothing else.
+    for clock in _mode_probe_clocks(current_module):
+        try:
+            _, extra = _call_compute_reward(current_module, contract,
+                                            clock=clock)
+        except EditValidationError:
+            continue
+        keys |= set(extra.keys())
+    # A `<mode>.<term>` component also grounds the bare `<term>`: that is
+    # how the diagnoser names a change meant for every mode at once ("applies
+    # to all four mode variants of goal_progress").
+    keys |= {k.split(".", 1)[1] for k in keys if "." in k}
+    return keys
 
 
 def _current_reward_hparam_keys(current_module) -> set[str]:

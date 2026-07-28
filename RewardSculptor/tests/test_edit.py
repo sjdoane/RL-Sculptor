@@ -1886,3 +1886,191 @@ def test_the_rewrite_ceiling_is_hard_capped():
     assert _rewrite_token_ceiling("z" * 10_000_000) == MAX_REWRITE_TOKENS
     # Probed against claude-opus-5, which accepted 96000.
     assert MAX_REWRITE_TOKENS <= 96000
+
+
+# ── Mode-automaton component discovery ─────────────────────────────────────
+def _mode_contract():
+    """An mjlab-shaped contract carrying the clock a mode automaton reads."""
+    from sculptor.adapters.base import RewardContract
+
+    return RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["episode_length", "step_dt", "base_height"],
+        supports_batched=True,
+        state_schema={"actuator_force": (2,)},
+        info_schema={},
+    )
+
+
+class _ModeReward:
+    """Three time-windowed modes, each paying a differently-named term.
+
+    Deliberately mirrors the generated per-mode rewards: the dispatcher
+    reads `episode_length * step_dt` and only the owning mode's components
+    come back from any single call.
+    """
+
+    DEFAULT_STEP_DT = 0.02
+    REWARD_SPEC = {
+        "version": "v4",
+        "hyperparameters": {},
+        "mode_windows_s": {
+            "approach": [0.0, 2.0],
+            "bound": [2.0, 6.0],
+            "settle": [6.0, 10.0],
+        },
+    }
+
+    @staticmethod
+    def compute_reward(state, action, next_state, info):
+        step = float(info.get("episode_length", 0.0) or 0.0)
+        dt = float(info.get("step_dt", 0.0) or 0.0) or _ModeReward.DEFAULT_STEP_DT
+        t = step * dt
+        if t < 2.0:
+            name = "approach"
+        elif t < 6.0:
+            name = "bound"
+        else:
+            name = "settle"
+        term = {"approach": "goal_progress", "bound": "push_off",
+                "settle": "stance_support"}[name]
+        return 1.0, {f"{name}.{term}": 1.0, "tracking": 0.5}
+
+
+def test_component_discovery_reaches_every_mode_not_just_the_first():
+    """The entry mode used to be the only one the grounding check ever saw.
+
+    Its consequence was not cosmetic: the diagnoser's edits to `bound.*` and
+    `settle.*` were rejected as unknown terms, so a four-mode reward could
+    only ever be edited in its first mode.
+    """
+    keys = _current_reward_component_keys(_ModeReward(), _mode_contract())
+
+    assert {"approach.goal_progress", "bound.push_off",
+            "settle.stance_support"} <= keys
+
+
+def test_a_mode_qualified_component_also_grounds_its_bare_name():
+    """`gate goal_progress` means every mode's goal_progress at once."""
+    keys = _current_reward_component_keys(_ModeReward(), _mode_contract())
+
+    assert {"goal_progress", "push_off", "stance_support"} <= keys
+
+
+def test_a_reward_without_an_automaton_is_probed_exactly_once():
+    """No `mode_windows_s` → no extra probes, so nothing new can leak in."""
+    from sculptor.edit import _mode_probe_clocks
+
+    class _Plain:
+        REWARD_SPEC = {"version": "v0", "hyperparameters": {}}
+
+        @staticmethod
+        def compute_reward(state, action, next_state, info):
+            return 1.0, {"forward_velocity": 1.0}
+
+    assert _mode_probe_clocks(_Plain()) == []
+    assert _current_reward_component_keys(_Plain(), _mode_contract()) == {
+        "forward_velocity"}
+
+
+def test_a_mode_that_crashes_costs_only_its_own_term_names():
+    """Best-effort: the t=0 probe is what judges contract conformance."""
+
+    class _HalfBroken(_ModeReward):
+        @staticmethod
+        def compute_reward(state, action, next_state, info):
+            step = float(info.get("episode_length", 0.0) or 0.0)
+            dt = float(info.get("step_dt", 0.0) or 0.0) or 0.02
+            if step * dt >= 6.0:
+                raise ZeroDivisionError("settle divides by a zero it assumed")
+            return _ModeReward.compute_reward(state, action, next_state, info)
+
+    keys = _current_reward_component_keys(_HalfBroken(), _mode_contract())
+
+    assert "bound.push_off" in keys
+    assert "settle.stance_support" not in keys
+
+
+def test_mode_probes_use_the_modules_own_step_dt():
+    """A clock the module and the probe disagree on lands in the wrong mode."""
+    from sculptor.edit import _mode_probe_clocks
+
+    clocks = _mode_probe_clocks(_ModeReward())
+
+    assert [dt for _, dt in clocks] == [0.02, 0.02, 0.02]
+    # Midpoints of (0,2), (2,6), (6,10) seconds, in steps.
+    assert [round(step * dt, 3) for step, dt in clocks] == [1.0, 4.0, 8.0]
+
+
+def test_probe_clocks_fall_back_to_the_module_level_window_table():
+    """A reward carrying the automaton only in code is still walkable."""
+    from sculptor.edit import _reward_mode_windows
+
+    class _CodeOnly:
+        REWARD_SPEC = {"version": "v1", "hyperparameters": {}}
+        MODE_WINDOWS_S = {"a": (0.0, 1.0), "b": (1.0, 3.0)}
+
+    assert _reward_mode_windows(_CodeOnly()) == {
+        "a": (0.0, 1.0), "b": (1.0, 3.0)}
+
+
+def test_a_malformed_window_is_skipped_not_fatal():
+    """Half-written automata shouldn't take the whole grounding check down."""
+    from sculptor.edit import _reward_mode_windows
+
+    class _Malformed:
+        REWARD_SPEC = {
+            "version": "v1",
+            "mode_windows_s": {
+                "ok": [0.0, 1.0],
+                "backwards": [3.0, 1.0],   # hi <= lo
+                "short": [1.0],
+                "junk": "not a span",
+            },
+        }
+
+    assert _reward_mode_windows(_Malformed()) == {"ok": (0.0, 1.0)}
+
+
+def test_the_dummy_clock_only_fills_keys_the_contract_advertises():
+    """`step_dt` is an mjlab key; a gym contract must not grow one."""
+    from sculptor.edit import _build_dummy_inputs
+
+    contract = _hopper_contract()
+    _, _, _, info = _build_dummy_inputs(contract, clock=(200.0, 0.02))
+
+    assert "episode_length" not in info and "step_dt" not in info
+
+
+def test_dead_mode_terms_become_editable(tmp_path: Path):
+    """The end-to-end effect: `replace bound.push_off` used to be rejected.
+
+    That edit is the one that turns a climb bonus gated on having already
+    climbed into a dense ascent term, so losing it cost the whole mission.
+    """
+    kg_store = SculptorKG(tmp_path / "kg.db")
+    kg_store.add_node(Paper(
+        id=make_paper_id("2509.06342"), arxiv_id="2509.06342",
+        title="Towards bridging the gap", authors=["Bjelonic"], year=2025))
+    diagnosis = Diagnosis(
+        behavior_goal="ascend the platforms",
+        failure_modes=["sparse_reward"],
+        evidence="bound.push_off is pinned at 0.00 for all 10 windows",
+        proposed_edits=[
+            ProposedEdit(
+                operation="replace",
+                target_term="bound.push_off",
+                rationale="re-shape the dead bonus into a dense ascent term",
+                suggested_value="0.4 * base_height",
+                paper_refs=["2509.06342"],
+            ),
+        ],
+    )
+
+    plan = _pre_validate(
+        diagnosis=diagnosis, contract=_mode_contract(),
+        current_module=_ModeReward(), kg_store=kg_store)
+
+    assert [e.target_term for e in plan.applicable_edits] == ["bound.push_off"]
+    assert plan.rejected_edits == []
