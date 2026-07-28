@@ -42,6 +42,30 @@ export function useRuns(
   });
 }
 
+/** §Ship 37: does this project have a run in flight right now?
+ *
+ *  `project.status` cannot answer this. The backend derives it in
+ *  `_compute_status` (backend/services/project_store.py), which never returns
+ *  `"running"` — its own docstring says the state is "owned by the job manager
+ *  (not implemented in this prompt)". Every `project.status === "running"`
+ *  check was therefore dead, which left the Rewards editor unlocked through an
+ *  entire sculpt run.
+ *
+ *  `/runs` is the honest source: `RunSummary.status` is copied straight off
+ *  `job.status`, and `useLaunchRun` invalidates this key, so a run started
+ *  elsewhere in the app engages the lock without a reload. */
+export function hasActiveRun(runs: RunSummary[] | undefined): boolean {
+  return (runs ?? []).some(
+    (r) => r.status === "running" || r.status === "queued",
+  );
+}
+
+/** `hasActiveRun` for callers that don't already hold a `useRuns` result.
+ *  Shares the query key, so this adds an observer, not a second poll. */
+export function useHasActiveRun(slug: string | undefined): boolean {
+  return hasActiveRun(useRuns(slug).data);
+}
+
 export function useRun(
   slug: string | undefined,
   runId: string | undefined,

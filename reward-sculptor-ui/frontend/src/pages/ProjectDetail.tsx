@@ -17,8 +17,14 @@ import { useWorldSelection } from "@/hooks/useWorlds";
 import { usePhysics } from "@/hooks/usePhysics";
 import { useProject } from "@/hooks/useProjects";
 import { useRobot } from "@/hooks/useRobot";
+import { useHasActiveRun } from "@/hooks/useRuns";
 import { formatRelative } from "@/lib/utils";
-import type { ProjectDetail as ProjectDetailShape, RobotStateResponse, SelectedStage } from "@/lib/types";
+import type {
+  ProjectDetail as ProjectDetailShape,
+  ProjectStatus,
+  RobotStateResponse,
+  SelectedStage,
+} from "@/lib/types";
 
 const RunsTabLazy = lazy(() => import("@/components/RunsTab"));
 const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
@@ -169,6 +175,12 @@ export default function ProjectDetail() {
   }, [setSearchParams]);
   const p = project.data;
   const canRun = !!p && !p.adapter_unavailable && p.ready_to_train !== false;
+  // §Ship 37: the backend's derived `project.status` never reports "running"
+  // (see `hasActiveRun`), so this page showed "Draft" through an entire run.
+  // Overlay the live signal onto the badge; the other derived states —
+  // configured / ready / completed / errored — still come from the project.
+  const liveRun = useHasActiveRun(slug);
+  const shownStatus = (s: ProjectStatus): ProjectStatus => (liveRun ? "running" : s);
 
   return (
     <>
@@ -181,7 +193,7 @@ export default function ProjectDetail() {
           <span className="rs-phead-name" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {p?.display_name ?? slug}
           </span>
-          {p && <Badge status={p.status} big />}
+          {p && <Badge status={shownStatus(p.status)} big />}
         </div>
         <div className="rs-phead-spacer" />
         {p && <ProjectSettingsDialog project={p} />}
@@ -312,6 +324,8 @@ function OverviewTab({
   setSelectedStage: (value: SelectedStage | null) => void;
 }) {
   const configured = isRobotConfigured(robot, project);
+  // §Ship 37: same overlay as the page header — see `hasActiveRun`.
+  const liveRun = useHasActiveRun(slug);
   const cfg = project.adapter_config || {};
   const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
   const numEnvs = typeof cfg.num_envs === "number" ? cfg.num_envs : null;
@@ -344,7 +358,7 @@ function OverviewTab({
           <div className="rs-card">
             <div className="rs-card-head"><div className="rs-card-title"><Icon name="info" size={16} />Project facts</div></div>
             <div className="rs-kv">
-              <div className="k">status</div><div className="v"><Badge status={project.status} /></div>
+              <div className="k">status</div><div className="v"><Badge status={liveRun ? "running" : project.status} /></div>
               <div className="k">adapter</div><div className="v">{adapterShort(project.adapter_class)}</div>
               {humanizeSlug(project.library_slug) && (<><div className="k">robot</div><div className="v">{humanizeSlug(project.library_slug)}</div></>)}
               {(taskId || project.env_id) && (<><div className="k">task_id</div><div className="v">{taskId ?? project.env_id}</div></>)}

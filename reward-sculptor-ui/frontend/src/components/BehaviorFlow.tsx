@@ -24,6 +24,7 @@ import { Btn } from "@/components/rs/primitives";
 import { useBehaviorDraft, useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useRewards } from "@/hooks/useRewards";
+import { useHasActiveRun } from "@/hooks/useRuns";
 import { useWorldSelection } from "@/hooks/useWorlds";
 import { listModeRewards } from "@/lib/api";
 import { referenceRobotForProject } from "@/lib/referenceRobot";
@@ -83,6 +84,10 @@ export function BehaviorFlow({
   const draft = useBehaviorDraft(slug);
   const saveDraft = useSaveBehaviorDraft(slug);
   const [pickingMotion, setPickingMotion] = useState(false);
+  // §Ship 37: the live-run signal. `project.status` is never "running" —
+  // see `hasActiveRun` — so the Train row below used to offer "New run" to
+  // someone whose run was already hours in.
+  const training = useHasActiveRun(slug);
   const referenceRobot = referenceRobotForProject(project);
   const modeRewards = useQuery({
     queryKey: ["modeRewards", slug],
@@ -93,7 +98,6 @@ export function BehaviorFlow({
 
   const steps: Step[] = useMemo(() => {
     const hasIters = project.n_iterations_completed > 0;
-    const training = project.status === "running";
     const clipId = draft.data?.reference_clip_id ?? "";
     // Match the chosen clip, or — with no clip chosen — whatever is actually
     // promoted. The old `!clipId || ...` fell through to the FIRST file in an
@@ -248,7 +252,7 @@ export function BehaviorFlow({
       },
     ];
   }, [project, robotConfigured, world.data, rewards.data, policies.data,
-      draft.data, modeRewards.data, onGoTo]);
+      draft.data, modeRewards.data, onGoTo, training]);
 
   // Don't flash a wrong list while the queries settle.
   if (world.isLoading || rewards.isLoading || policies.isLoading) return null;

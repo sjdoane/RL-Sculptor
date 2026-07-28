@@ -10,7 +10,7 @@ import { AuthorBadge, Btn, Delta, Modal } from "@/components/rs/primitives";
 import { MonacoDiffLazy, MonacoLazy } from "@/components/MonacoLazy";
 import { useJob, useJobEvents } from "@/hooks/useJob";
 import { useMissions } from "@/hooks/useMissions";
-import { useRuns } from "@/hooks/useRuns";
+import { hasActiveRun, useRuns } from "@/hooks/useRuns";
 import {
   useRegenerateRewardTemplate,
   useReward,
@@ -212,7 +212,11 @@ export function RewardsTab({
     setDraftParentVersion(null);
   }, [selectedVersion]);
 
-  const isRunning = project.status === "running";
+  // §Ship 37: NOT `project.status === "running"` — the backend's
+  // `_compute_status` never returns that value, so this lock was dead and
+  // manual edits stayed enabled for the whole of a sculpt run. See
+  // `hasActiveRun`.
+  const isRunning = hasActiveRun(runs.data);
   const isDrafting = draftSource !== null;
   const editsLockedByStageScope = isStageScope;
   const latestVersion = list.data && list.data.length > 0
