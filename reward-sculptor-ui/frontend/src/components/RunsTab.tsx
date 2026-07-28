@@ -1641,6 +1641,26 @@ function LiveRunDetailPane({
     return { source, chosen, ignoredPartial, noise };
   }, [events.events]);
 
+  // The most recent `learning_vitals`, plus where the run's exploration
+  // noise started. The pay/cost pair alone does not separate a healthy run
+  // from a failing one — the previous run had the penalty exceeding the
+  // reward at its BEST iteration. What separated them was the action-noise
+  // std drifting up from where it began, which grows the action-rate
+  // penalty quadratically. Measured against this run's own first reading,
+  // so it needs no guessed threshold.
+  const vitals = useMemo(() => {
+    let first: LearningVitals | null = null;
+    let last: LearningVitals | null = null;
+    for (const ev of events.events) {
+      if ((ev as { type?: string }).type !== "learning_vitals") continue;
+      const v = ev as unknown as LearningVitals;
+      if (first === null && typeof v.action_std === "number") first = v;
+      last = v;
+    }
+    if (last === null) return null;
+    return { v: last, stdAtStart: first?.action_std ?? null };
+  }, [events.events]);
+
   // §Ship 43: launch-time objective-metric generation as run-phase 0. Fold the
   // metric_generation_* events into a single phase view (progress while running;
   // accepted / rejected-with-reasons outcome — never silent).
@@ -1773,6 +1793,7 @@ function LiveRunDetailPane({
           }}
         />
         {startingPolicy && <StartingPolicyCard {...startingPolicy} />}
+        {vitals && <LearningVitalsStrip {...vitals} />}
         {isActive && awaiting && run.data && (
           <FeedbackPanel
             iterIndex={awaitingIter}
@@ -1970,6 +1991,69 @@ function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePendi
         </Btn>
       )}
       {isActive && <Btn kind="danger" size="sm" icon="square" onClick={onKill}>Stop</Btn>}
+    </div>
+  );
+}
+
+/** One `learning_vitals` event — rsl_rl's own per-iteration numbers. */
+interface LearningVitals {
+  rl_iter: number;
+  rl_total: number;
+  mean_reward: number | null;
+  mean_ep_len: number | null;
+  action_std: number | null;
+  top_reward?: { term: string; value: number };
+  top_penalty?: { term: string; value: number };
+}
+
+/** Exploration drift this far above where the run started is the pattern
+ *  that preceded both collapses here (0.91 → 1.19 by the time returns had
+ *  fallen 3×), and it stayed flat through the healthy stretch. */
+const STD_DRIFT_WARN = 1.15;
+
+// Is training going anywhere? The progress bar answers "how far", never
+// "how well". Shows what the policy is paid most for and what it is charged
+// most for — the pair that decides whether attempting the task beats standing
+// still — plus the exploration noise, whose upward drift is what turns the
+// second into the first.
+function LearningVitalsStrip({ v, stdAtStart }: {
+  v: LearningVitals; stdAtStart: number | null;
+}) {
+  const num = (x: number | null | undefined, digits = 1) =>
+    typeof x === "number" ? x.toFixed(digits) : "—";
+  const pays = v.top_reward;
+  const costs = v.top_penalty;
+  const drifting = typeof v.action_std === "number" && stdAtStart != null
+    && stdAtStart > 0 && v.action_std / stdAtStart >= STD_DRIFT_WARN;
+  const stat = (label: string, value: string) => (
+    <span className="rs-flex rs-gap-6" style={{ alignItems: "baseline" }}>
+      <span className="rs-eyebrow">{label}</span>
+      <span className="mono" style={{ fontSize: 12 }}>{value}</span>
+    </span>
+  );
+  return (
+    <div className="rs-card" style={{ margin: "0 16px 12px" }}>
+      <div className="rs-flex rs-gap-12" style={{ flexWrap: "wrap", alignItems: "baseline" }}>
+        {stat("iter", `${v.rl_iter}/${v.rl_total}`)}
+        {stat("return", num(v.mean_reward))}
+        {stat("episode", `${num(v.mean_ep_len)} steps`)}
+        {stat("action noise", num(v.action_std, 2)
+          + (stdAtStart != null ? ` (from ${num(stdAtStart, 2)})` : ""))}
+      </div>
+      {pays && costs && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>
+          Pays most: <code className="mono">{pays.term}</code> {num(pays.value, 2)}
+          {" · "}Costs most: <code className="mono">{costs.term}</code> {num(costs.value, 2)}
+        </div>
+      )}
+      {drifting && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6, color: "var(--st-amber)" }}>
+          Exploration noise has drifted well above where this run started. The
+          action-rate penalty grows with its square, so it will keep eating into
+          the return. Lower <code className="mono">entropy_coef_scale</code> in
+          project settings and restart from a checkpoint taken before the drift.
+        </div>
+      )}
     </div>
   );
 }
