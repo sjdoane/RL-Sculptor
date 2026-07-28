@@ -1123,8 +1123,18 @@ export function NewRunDialog({
               {isMjlab && (
                 <div className="rs-row2">
                   <Field label="num_envs (override)" htmlFor="run-numenvs">
-                    {numField(numEnvs, setNumEnvs, { id: "run-numenvs", min: 1, max: 8192 })}
-                    <p className="rs-hintline">Drop if OOM. Halve + snap to power-of-two is safe.</p>
+                    {numField(numEnvs, setNumEnvs, {
+                      id: "run-numenvs", min: 1, max: 8192,
+                      placeholder: String(defaults.num_envs),
+                    })}
+                    {/* Blank used to mean an invisible project default, and on
+                        an authored world that default can be one the physics
+                        cannot build — the run then dies seconds in, before the
+                        first training step. Name the number that will be used. */}
+                    <p className="rs-hintline">
+                      Blank uses the project's <b>{defaults.num_envs}</b>. Drop it if the run
+                      dies allocating — halve and snap to a power of two.
+                    </p>
                   </Field>
                   <Field label="device" htmlFor="run-device">
                     <input
