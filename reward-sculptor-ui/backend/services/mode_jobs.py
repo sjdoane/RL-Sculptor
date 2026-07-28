@@ -55,6 +55,7 @@ def run_mode_author_job(
     mode: str,
     behavior_goal: str = "",
     mode_goal: str = "",
+    mission: str = "",
     timeout_s: float | None = None,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Return a job callable that authors one mode into `reward_path` and
@@ -62,6 +63,10 @@ def run_mode_author_job(
 
     `out_path` is resolved by the route (not here) so the conflict check and
     the job agree on which file is about to be written.
+
+    `mission` is the project's rendered world/goal brief, or "" when there is
+    no authored world. Without it the model authoring a mode sees only the
+    reference clip and can write nothing that mentions the course.
     """
     budget_s = timeout_s if timeout_s is not None else DEFAULT_MODE_AUTHOR_TIMEOUT_S
 
@@ -110,7 +115,7 @@ def run_mode_author_job(
                     source=reward_path.read_text(encoding="utf-8"),
                     graph=graph, mode=mode, contract=contract, clip=clip,
                     clip_id=clip_id, behavior_goal=behavior_goal,
-                    mode_goal=mode_goal, kg_store=store,
+                    mode_goal=mode_goal, kg_store=store, mission=mission,
                     on_event=_emit_from_worker)
 
             out_path.parent.mkdir(parents=True, exist_ok=True)

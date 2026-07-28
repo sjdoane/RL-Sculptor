@@ -88,6 +88,20 @@ MAX_TOKENS = 16000
 #: which is the safe direction.
 _BYTES_PER_TOKEN = 2.2
 
+#: What a HUMAN may type into the Rewards-tab prompt box. Small on purpose:
+#: the bound is there to catch someone pasting a whole file into a steering
+#: prompt, not to constrain what the system composes for itself.
+USER_PROMPT_MAX_CHARS = 2000
+
+#: What a system-composed prompt may reach. `sculptor.mode_rewards` builds a
+#: per-mode authoring prompt out of the mode's window, its neighbours, the
+#: batched-half contract and — on a project with an authored world — the course
+#: geometry and the goal channels a term may read. That last part is what stops
+#: a mode being authored blind to the mission, and it does not fit in 2000
+#: chars. Still bounded: an unbounded prompt is a way to smuggle a whole module
+#: past the module-rewrite path.
+SYSTEM_PROMPT_MAX_CHARS = 8000
+
 #: Hard ceiling, so a pathological module cannot request an absurd budget.
 #: `claude-opus-5` accepts at least 96000 output tokens (probed); 64000 leaves
 #: margin without being a real constraint on any reward we generate.
@@ -2393,6 +2407,7 @@ def apply_prompt_edit(
     client=None,
     on_event=None,
     max_tokens: int | None = None,
+    max_prompt_chars: int = USER_PROMPT_MAX_CHARS,
 ) -> Path:
     """One-shot reward rewrite from a user's natural-language prompt.
 
@@ -2416,9 +2431,10 @@ def apply_prompt_edit(
         raise EditValidationError(
             "prompt must be at least 3 characters"
         )
-    if len(user_prompt) > 2000:
+    limit = min(int(max_prompt_chars), SYSTEM_PROMPT_MAX_CHARS)
+    if len(user_prompt) > limit:
         raise EditValidationError(
-            f"prompt must be ≤ 2000 chars (got {len(user_prompt)})"
+            f"prompt must be ≤ {limit} chars (got {len(user_prompt)})"
         )
 
     # Always consult the KG — users editing reward functions through

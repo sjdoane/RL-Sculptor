@@ -30,6 +30,7 @@ from sculptor.mode_rewards import (
     mode_authoring_prompt,
     mode_ident,
     mode_windows_s,
+    task_brief,
     validate_mode_reward_source,
 )
 from sculptor.modes import Guard, Mode, ModeError, ModeGraph, Transition
@@ -1128,3 +1129,180 @@ def test_degenerate_horizons_fall_back_to_clip_time():
     for bad in (0.0, -5.0):
         assert generate_mode_reward_scaffold(
             g, behavior_goal="x", horizon_s=bad) == base
+
+
+def test_a_horizon_fitted_scaffold_still_validates_against_its_graph():
+    """Fitting to an episode is not staleness. The windows no longer equal the
+    graph's clip seconds, and the check has to know the difference."""
+    g = _graph()
+    src = generate_mode_reward_scaffold(g, behavior_goal="x", horizon_s=12.0)
+    assert validate_mode_reward_source(src, g) == []
+
+
+def test_a_uniform_rescale_the_module_never_declared_is_still_stale():
+    """The loophole a proportional check opens: the same clip re-exported at
+    another fps scales every window uniformly, which looks exactly like a
+    horizon fit. Only the scale the module DECLARES is allowed."""
+    src = generate_mode_reward_scaffold(_graph(span=30))   # declares 1.0
+    errors = validate_mode_reward_source(src, _graph(span=45))
+    assert any("stale" in e for e in errors)
+
+
+# ── backbone weighting ──────────────────────────────────────────────────
+def _standing_probe(mod):
+    """What the backbone pays a robot that is upright, at height, in the
+    reference's own first pose — i.e. doing nothing."""
+    state = {"qpos": np.asarray(mod.TARGET_JOINT_POS[0])}
+    info = dict(_info(0.0), base_height_delta=0.0)
+    state["projected_gravity_b"] = np.asarray(mod.TARGET_GRAVITY[0])
+    return mod._tracking(state, info)
+
+
+def test_an_unweighted_backbone_pays_a_motionless_robot_three_per_step(tmp_path):
+    """The measured failure, pinned. Three exp kernels summed, all three
+    near-maximal for standing still, is ~3/step of income for doing nothing —
+    an order above anything a mode's terms were writing."""
+    mod = _load(generate_mode_reward_scaffold(
+        _graph(), behavior_goal="x", clip=_tracking_clip()),
+        tmp_path, name="unweighted")
+    total, parts = _standing_probe(mod)
+    assert mod.TRACKING_W == 1.0
+    assert total == pytest.approx(3.0, abs=1e-6)
+    assert set(parts) == {"joint_tracking", "root_tracking",
+                          "orientation_tracking"}
+
+
+def test_tracking_weight_caps_what_standing_still_earns(tmp_path):
+    """At 1/3 the whole backbone is worth one mode's terms, so the clip is a
+    style prior rather than the objective."""
+    mod = _load(generate_mode_reward_scaffold(
+        _graph(), behavior_goal="x", clip=_tracking_clip(),
+        tracking_weight=1.0 / 3.0), tmp_path, name="weighted")
+    total, _ = _standing_probe(mod)
+    assert total == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_weight_reaches_the_reported_components_not_just_the_total(tmp_path):
+    """Scaling only the total would leave the diagnosis loop comparing an
+    unpaid backbone against paid mode terms, and 'rebalance' the wrong way."""
+    mod = _load(generate_mode_reward_scaffold(
+        _graph(), behavior_goal="x", clip=_tracking_clip(),
+        tracking_weight=0.25), tmp_path, name="weighted_parts")
+    total, parts = _standing_probe(mod)
+    assert sum(parts.values()) == pytest.approx(total)
+    assert all(v == pytest.approx(0.25, abs=1e-6) for v in parts.values())
+
+
+def test_default_weight_leaves_pure_imitation_scaffolds_untouched():
+    """A project with no world must generate exactly what it always did."""
+    g, clip = _graph(), _tracking_clip()
+    assert generate_mode_reward_scaffold(
+        g, behavior_goal="x", clip=clip, tracking_weight=1.0
+    ) == generate_mode_reward_scaffold(g, behavior_goal="x", clip=clip)
+
+
+# ── mission brief ───────────────────────────────────────────────────────
+_TASK = {"shared": {"goal": {"id": "complete_course", "type": "waypoint_sequence",
+                             "success": {"predicate": "sequence_complete",
+                                         "hold_s": 0.15}}}}
+_WORLD = {"shared": {"obstacles": {
+    "layout": "linear", "start_offset_m": 0.81,
+    "course": [{"element": "platform", "id": "box_01",
+                "nominal": {"height_m": 0.231, "length_m": 1.0}}]}}}
+_CHANNELS = [
+    {"name": "goal__complete_course__waypoint_distance",
+     "access": "shared_shaping", "metric_role": "progress",
+     "source": {"goal": "complete_course"}},
+    {"name": "goal__complete_course__waypoint_index",
+     "access": "metric_only", "metric_role": "progress",
+     "source": {"goal": "complete_course"}},
+]
+
+
+def test_a_project_with_no_goal_gets_no_mission_brief():
+    """Pure imitation must not be told to chase a course that does not exist."""
+    assert task_brief({}, {}, None) == ""
+    assert task_brief({"shared": {"goal": {}}}, _WORLD, _CHANNELS) == ""
+
+
+def test_the_brief_names_the_course_the_robot_is_actually_in():
+    """The measured failure: four modes of terms, none mentioning the
+    platforms, because the prompt never said there were any."""
+    brief = task_brief(_TASK, _WORLD, _CHANNELS)
+    assert "platform box_01" in brief and "height 0.231 m" in brief
+    assert "starts 0.81 m before it" in brief
+
+
+def test_only_shaping_channels_are_offered_to_read():
+    """`waypoint_index` is metric_only and absent from the contract's info
+    keys, so a term reading it is rejected as ungrounded AFTER the model call.
+    Naming it as off-limits is cheaper than that round trip."""
+    brief = task_brief(_TASK, _WORLD, _CHANNELS)
+    may, must_not = brief.split("METRICS ONLY", 1)
+    assert "goal__complete_course__waypoint_distance" in may
+    assert "goal__complete_course__waypoint_index" not in may
+    assert "goal__complete_course__waypoint_index" in must_not
+
+
+def test_the_brief_requires_a_dense_progress_term():
+    """A stand-still policy already out-earns any gait term; the only way a
+    mode competes with it is by paying for closing distance."""
+    brief = task_brief(_TASK, _WORLD, _CHANNELS)
+    assert "REQUIRED" in brief and "dense progress term" in brief
+    assert "goal__complete_course__waypoint_distance" in brief
+
+
+def test_a_catalog_with_nothing_readable_still_describes_the_mission():
+    """No shaping channel is a reason to say less, not to say nothing — the
+    course and the goal are still what the reward is for."""
+    metric_only = [dict(_CHANNELS[1])]
+    brief = task_brief(_TASK, _WORLD, metric_only)
+    assert "platform box_01" in brief
+    assert "REQUIRED" not in brief
+
+
+def test_the_mission_reaches_the_authoring_prompt():
+    """The brief is only worth rendering if the model actually receives it."""
+    prompt = mode_authoring_prompt(
+        _graph(), "approach", behavior_goal="cross the course",
+        task_brief=task_brief(_TASK, _WORLD, _CHANNELS))
+    assert "goal__complete_course__waypoint_distance" in prompt
+    assert "platform box_01" in prompt
+    assert len(prompt) <= MAX_PROMPT_CHARS
+
+
+def test_a_mission_brief_never_pushes_the_prompt_over_budget():
+    """`_fit_free_text` measures the fixed part; the brief is part of it."""
+    prompt = mode_authoring_prompt(
+        _graph(), "approach", behavior_goal="g" * 40_000,
+        mode_goal="m" * 40_000,
+        task_brief=task_brief(_TASK, _WORLD, _CHANNELS))
+    assert len(prompt) <= MAX_PROMPT_CHARS
+    assert "goal__complete_course__waypoint_distance" in prompt
+
+
+def test_a_human_prompt_keeps_the_small_bound():
+    """Raising the ceiling for a system-composed brief must not raise it for
+    the Rewards-tab text box — that bound is there to catch a pasted file."""
+    from sculptor.edit import (EditValidationError, SYSTEM_PROMPT_MAX_CHARS,
+                               USER_PROMPT_MAX_CHARS, apply_prompt_edit)
+
+    assert USER_PROMPT_MAX_CHARS == 2000
+    assert MAX_PROMPT_CHARS == SYSTEM_PROMPT_MAX_CHARS > USER_PROMPT_MAX_CHARS
+    with pytest.raises(EditValidationError, match="2000"):
+        apply_prompt_edit(current_reward_path="unread.py",
+                          user_prompt="x" * 2001, new_iter_id="v1",
+                          reward_contract=None)
+
+
+def test_no_prompt_may_exceed_the_system_ceiling():
+    """`max_prompt_chars` is a caller's budget, not an escape hatch: an
+    unbounded prompt is a way to push a whole module through the edit path."""
+    from sculptor.edit import (EditValidationError, SYSTEM_PROMPT_MAX_CHARS,
+                               apply_prompt_edit)
+
+    with pytest.raises(EditValidationError, match=str(SYSTEM_PROMPT_MAX_CHARS)):
+        apply_prompt_edit(current_reward_path="unread.py",
+                          user_prompt="x" * (SYSTEM_PROMPT_MAX_CHARS + 1),
+                          new_iter_id="v1", reward_contract=None,
+                          max_prompt_chars=10 ** 9)

@@ -1302,3 +1302,107 @@ def test_mode_rewards_promoted_clears_when_a_flat_reward_supersedes_it(
 
     assert body["promoted"] is None
     assert [f["filename"] for f in body["mode_rewards"]], "the files remain"
+
+
+# ── the mission a per-mode reward is authored against ───────────────────
+def _write_selection(project_dir: Path, *, episode_s: float = 20.0,
+                     with_goal: bool = True) -> None:
+    """The three files `_selection_specs` reads, as a promoted selection."""
+    env = project_dir / "env"
+    env.mkdir(parents=True, exist_ok=True)
+    goal = {"id": "complete_course", "type": "waypoint_sequence",
+            "success": {"predicate": "sequence_complete", "hold_s": 0.15}}
+    (env / "task.json").write_text(json.dumps({"shared": {
+        "goal": goal if with_goal else {},
+        "termination": {"episode_length_s": episode_s}}}), encoding="utf-8")
+    (env / "world.json").write_text(json.dumps({"shared": {"obstacles": {
+        "layout": "linear", "start_offset_m": 0.81,
+        "course": [{"element": "platform", "id": "box_01",
+                    "nominal": {"height_m": 0.231}}]}}}), encoding="utf-8")
+    (env / "catalog.json").write_text(json.dumps({"channels": [
+        {"name": "goal__complete_course__waypoint_distance",
+         "access": "shared_shaping", "metric_role": "progress",
+         "source": {"goal": "complete_course"}},
+        {"name": "goal__complete_course__waypoint_index",
+         "access": "metric_only", "metric_role": "progress",
+         "source": {"goal": "complete_course"}}]}), encoding="utf-8")
+    (env / "selection_current.json").write_text(json.dumps({"refs": {
+        "task": {"path": "env/task.json"},
+        "world": {"path": "env/world.json"},
+        "channel_catalog": {"path": "env/catalog.json"}}}), encoding="utf-8")
+
+
+def test_a_project_with_no_selection_stays_on_clip_time_and_full_tracking(
+    tmp_projects_root: Path,
+) -> None:
+    """Pure imitation must generate exactly what it always did."""
+    from backend.routes.references import _episode_horizon_s, _tracking_weight
+
+    d = tmp_projects_root / "bare"
+    d.mkdir(parents=True, exist_ok=True)
+    assert _episode_horizon_s(d) is None
+    assert _tracking_weight(d) == 1.0
+
+
+def test_a_world_project_scales_the_windows_and_demotes_the_clip(
+    tmp_projects_root: Path,
+) -> None:
+    """The two measured defects, read off the same selection: a 6.92 s
+    automaton gating a 20 s episode, and a backbone worth 7x every authored
+    mode term put together."""
+    from backend.routes.references import (WORLD_TRACKING_WEIGHT,
+                                           _episode_horizon_s,
+                                           _tracking_weight)
+
+    d = tmp_projects_root / "world"
+    _write_selection(d)
+    assert _episode_horizon_s(d) == 20.0
+    assert _tracking_weight(d) == WORLD_TRACKING_WEIGHT
+
+
+def test_a_selection_without_a_goal_is_not_a_mission(
+    tmp_projects_root: Path,
+) -> None:
+    """A world with no goal has nothing to make progress towards, so the clip
+    stays the objective and the brief stays empty."""
+    from backend.routes.references import (_mission_brief, _selection_specs,
+                                           _tracking_weight)
+
+    d = tmp_projects_root / "goalless"
+    _write_selection(d, with_goal=False)
+    assert _mission_brief(*_selection_specs(d)) == ""
+    assert _tracking_weight(d) == 1.0
+
+
+def test_the_brief_offers_only_the_channel_a_reward_may_read(
+    tmp_projects_root: Path,
+) -> None:
+    """`waypoint_index` is metric_only and absent from the contract's info
+    keys; a term reading it is rejected as ungrounded after the model call."""
+    from backend.routes.references import _mission_brief, _selection_specs
+
+    d = tmp_projects_root / "channels"
+    _write_selection(d)
+    brief = _mission_brief(*_selection_specs(d))
+    may, metric_only = brief.split("METRICS ONLY", 1)
+    assert "goal__complete_course__waypoint_distance" in may
+    assert "goal__complete_course__waypoint_index" in metric_only
+    assert "platform box_01" in brief
+
+
+def test_a_scaffold_on_a_world_project_carries_both_fixes(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    """End to end through the route: the file the UI writes must be on the
+    episode's clock AND price the clip as a style prior."""
+    from backend.routes.references import WORLD_TRACKING_WEIGHT
+
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _write_selection(tmp_projects_root / slug)
+    body = _scaffold(client, slug)
+
+    src = (tmp_projects_root / slug / "rewards" / body["filename"]).read_text()
+    assert f"TRACKING_W = {WORLD_TRACKING_WEIGHT!r}" in src
+    assert '"episode_horizon_s": 20.0' in src
+    assert "REFERENCE_DURATION_S = 20.0" in src

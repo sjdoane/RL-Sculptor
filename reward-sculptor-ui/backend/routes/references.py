@@ -742,6 +742,56 @@ class ModeRewardRequest(BaseModel):
     overwrite: bool = False
 
 
+def _selection_specs(project_dir: Path) -> tuple[dict, dict, dict]:
+    """`(task, world, channel_catalog)` from the promoted selection.
+
+    `({}, {}, {})` when there is no selection or a file is unreadable. One
+    reader for all three, because everything the mode-reward generator needs to
+    know about the mission — the horizon, the course, which goal channels a
+    reward may legally read — is split across exactly these files, and reading
+    them separately meant three helpers that could each independently decide
+    the project had no world.
+    """
+    sel = project_dir / "env" / "selection_current.json"
+    try:
+        refs = (json.loads(sel.read_text(encoding="utf-8")) or {}).get("refs")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}, {}, {}
+    out = []
+    for kind in ("task", "world", "channel_catalog"):
+        rel = (((refs or {}).get(kind) or {}).get("path"))
+        try:
+            loaded = json.loads(
+                (project_dir / rel).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            loaded = None
+        out.append(loaded if isinstance(loaded, dict) else {})
+    return out[0], out[1], out[2]
+
+
+#: How much a task-grounded project's imitation backbone is worth. The backbone
+#: is three exp kernels summed, each near-maximal for a robot standing upright
+#: at nominal height, so unweighted it pays ~2.3/step for doing nothing —
+#: measured against 0.34/step for every authored mode term put together. At 1/3
+#: it caps at 1.0, which is the magnitude the authoring prompt asks a mode's
+#: terms to reach, so imitation and mission are comparable instead of the clip
+#: outvoting the course 7:1. Pure-imitation projects keep 1.0 and are unchanged.
+WORLD_TRACKING_WEIGHT = 1.0 / 3.0
+
+
+def _tracking_weight(project_dir: Path) -> float:
+    """`WORLD_TRACKING_WEIGHT` when a mission exists, else 1.0."""
+    return (WORLD_TRACKING_WEIGHT
+            if _mission_brief(*_selection_specs(project_dir)) else 1.0)
+
+
+def _mission_brief(task: dict, world: dict, catalog: dict) -> str:
+    """The authoring prompt's mission section, or "" for pure imitation."""
+    from sculptor.mode_rewards import task_brief
+
+    return task_brief(task, world, (catalog or {}).get("channels"))
+
+
 def _episode_horizon_s(project_dir: Path) -> Optional[float]:
     """The episode the mode automaton has to cover, or None if unknowable.
 
@@ -762,18 +812,11 @@ def _episode_horizon_s(project_dir: Path) -> Optional[float]:
     selection, malformed json — so projects without a world keep clip time and
     byte-identical output.
     """
-    sel = project_dir / "env" / "selection_current.json"
+    task, _world, _catalog = _selection_specs(project_dir)
     try:
-        refs = (json.loads(sel.read_text(encoding="utf-8")) or {}).get("refs")
-        task_rel = ((refs or {}).get("task") or {}).get("path")
-        if not task_rel:
-            return None
-        task = json.loads(
-            (project_dir / task_rel).read_text(encoding="utf-8")) or {}
-        value = (((task.get("shared") or {}).get("termination") or {})
-                 .get("episode_length_s"))
-        horizon = float(value)
-    except (OSError, ValueError, TypeError, AttributeError):
+        horizon = float((((task.get("shared") or {}).get("termination") or {})
+                         .get("episode_length_s")))
+    except (ValueError, TypeError, AttributeError):
         return None
     return horizon if horizon > 0.0 else None
 
@@ -1060,7 +1103,8 @@ def scaffold_mode_reward(
         source = generate_mode_reward_scaffold(
             graph, behavior_goal=body.goal, clip_id=clip_id,
             clip=clip if body.tracking else None,
-            horizon_s=_episode_horizon_s(project_dir))
+            horizon_s=_episode_horizon_s(project_dir),
+            tracking_weight=_tracking_weight(project_dir))
     except ModeError as e:
         return _problem(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1077,7 +1121,11 @@ def scaffold_mode_reward(
     dest.write_text(source, encoding="utf-8")
 
     authored = authored_modes(source)
-    windows = mode_windows_s(graph)
+    # The MODULE's windows, not the graph's. They differ once the scaffold has
+    # been fitted to an episode horizon, and these are the ones each mode's
+    # terms are actually paid over — reporting clip seconds here told the user
+    # the fit had not happened when it had.
+    windows = _mode_windows_from_source(source) or mode_windows_s(graph)
     return {
         "path": str(dest),
         "filename": dest.name,
@@ -1222,7 +1270,8 @@ def author_mode_reward(
         fn=run_mode_author_job(
             project_dir=project_dir, reward_path=src, out_path=dest,
             clip_id=clip_id, robot=body.robot, mode=body.mode,
-            behavior_goal=body.goal, mode_goal=body.mode_goal),
+            behavior_goal=body.goal, mode_goal=body.mode_goal,
+            mission=_mission_brief(*_selection_specs(project_dir))),
         params={"clip_id": clip_id, "mode": body.mode,
                 "filename": src.name, "out_filename": dest.name},
     )

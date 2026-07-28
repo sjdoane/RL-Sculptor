@@ -45,9 +45,11 @@ inferred.
 """
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any, Mapping, Optional, Sequence
 
+from sculptor.edit import SYSTEM_PROMPT_MAX_CHARS as _SYSTEM_PROMPT_MAX_CHARS
 from sculptor.modes import Mode, ModeGraph, ModeError, validate_mode_graph
 
 #: Identifier-safe form of a mode name, for the generated function names.
@@ -61,10 +63,16 @@ MODE_FN_PREFIX = "_mode_"
 #: off this, so it is part of the contract rather than a formatting detail.
 MODE_COMPONENT_PREFIX = "mode_"
 
-#: Hard ceiling on an authoring prompt, mirroring `sculptor.edit`'s own limit
-#: (`edit.py:2042`). Stated here so `mode_authoring_prompt` can budget for it
-#: instead of discovering it after the KG query has already run.
-MAX_PROMPT_CHARS = 2000
+#: Hard ceiling on an authoring prompt. This is a SYSTEM-composed prompt, not
+#: the Rewards-tab text box, so it budgets against `SYSTEM_PROMPT_MAX_CHARS`
+#: rather than the human bound — a mission brief naming the course and the
+#: readable goal channels does not fit in 2000 chars, and authoring a mode
+#: blind to the mission is what produced four modes of terms that a robot
+#: standing in front of the platforms maximized. Stated here so
+#: `mode_authoring_prompt` can budget for it instead of discovering it after
+#: the KG query has already run. Imported rather than restated: two copies of a
+#: limit is how the last one drifted.
+MAX_PROMPT_CHARS = _SYSTEM_PROMPT_MAX_CHARS
 
 #: Suffix of a mode's batched twin. mjlab dispatches to `compute_reward_batched`
 #: and treats its absence as a contract violation (`adapters/mjlab.py:670`), so
@@ -203,7 +211,8 @@ def _stub_body_batched(mode: Mode) -> str:
 
 def _tracking_block(clip: Mapping[str, Any], n_phase: int,
                     placeholder: bool = False,
-                    time_scale: float = 1.0) -> tuple[str, str, str]:
+                    time_scale: float = 1.0,
+                    tracking_weight: float = 1.0) -> tuple[str, str, str]:
     """`(constants, scalar_fns, batched_fns)` for the reference-tracking
     backbone, or three empty strings when `clip` is None.
 
@@ -222,6 +231,19 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int,
     `placeholder=True` emits the same code with the phase tables replaced by
     `np.zeros(...)` — see `authoring_twin_source` for why that exists and why
     the fake numbers are harmless.
+
+    `tracking_weight` scales the whole backbone. It exists because the backbone
+    is three exp kernels summed unweighted, so it pays up to 3.0/step, and all
+    three are near-maximal for a robot standing upright at nominal height in a
+    neutral pose. Measured on the platform-ascent-showcase run: the backbone
+    paid 2.28/step while every authored mode term together paid 0.34 — a 7:1
+    ratio in favour of the style prior. Standing still scored 2.62/step against
+    roughly 2.5 for actually running the course, so the optimal policy was to
+    stand in front of the first platform, which is exactly what it did for
+    three iterations. On a task-grounded project the imitation clip is a style
+    prior and the mission is the objective, so the caller passes a weight that
+    caps the backbone at one mode's worth of reward. 1.0 (the default) leaves
+    pure-imitation projects byte-for-byte as they were.
     """
     import numpy as np
 
@@ -295,6 +317,11 @@ ROOT_ERR_WEIGHT = {ROOT_ERR_WEIGHT!r}
 # 0.0 when the clip carries no root orientation, making the term an exact
 # no-op rather than a silently-wrong upright target.
 ORIENTATION_ERR_WEIGHT = {orientation_weight!r}
+# Scales the WHOLE backbone, components included, so what is reported is what
+# is paid. The three kernels are each <= 1 and each is near-maximal for a robot
+# standing upright at nominal height, so at 1.0 the backbone pays ~2.3/step for
+# doing nothing — more than any authored mode could earn for doing the task.
+TRACKING_W = {tracking_weight!r}
 
 TARGET_JOINT_POS = {joint_literal}
 TARGET_ROOT_Z = {root_literal}
@@ -353,15 +380,17 @@ def _tracking(next_state, info):
         root_err = 0.0
     root_term = float(np.exp(-ROOT_ERR_WEIGHT * root_err ** 2))
     components = {"joint_tracking": joint_term, "root_tracking": root_term}
-    total = joint_term + root_term
     if TARGET_GRAVITY is not None:
         gravity = np.asarray(
             next_state["projected_gravity_b"], dtype=np.float64).reshape(-1)[-3:]
-        orient = float(np.exp(-ORIENTATION_ERR_WEIGHT * np.mean(
-            (gravity - TARGET_GRAVITY[i]) ** 2)))
-        components["orientation_tracking"] = orient
-        total += orient
-    return total, components
+        components["orientation_tracking"] = float(
+            np.exp(-ORIENTATION_ERR_WEIGHT * np.mean(
+                (gravity - TARGET_GRAVITY[i]) ** 2)))
+    # Weighted before anything is returned, so the reported components are the
+    # amounts actually added to the reward. Scaling only the total would leave
+    # the diagnosis loop comparing an unpaid backbone against paid mode terms.
+    components = {k: v * TRACKING_W for k, v in components.items()}
+    return float(sum(components.values())), components
 
 '''
 
@@ -404,15 +433,19 @@ def _tracking_batched(next_state, info, like):
     root_term = torch.exp(-ROOT_ERR_WEIGHT * (actual_delta - (target_root - root0)) ** 2)
 
     components = {"joint_tracking": joint_term, "root_tracking": root_term}
-    total = joint_term + root_term
     if TARGET_GRAVITY is not None:
         target_gravity = torch.as_tensor(
             TARGET_GRAVITY, device=qpos.device, dtype=qpos.dtype)[i]
         gravity = next_state["projected_gravity_b"][:, -3:]
-        orient = torch.exp(-ORIENTATION_ERR_WEIGHT * torch.mean(
-            (gravity - target_gravity) ** 2, dim=-1))
-        components["orientation_tracking"] = orient
-        total = total + orient
+        components["orientation_tracking"] = torch.exp(
+            -ORIENTATION_ERR_WEIGHT * torch.mean(
+                (gravity - target_gravity) ** 2, dim=-1))
+    # Same weighting as the scalar path, applied the same way, so replay and
+    # training cannot disagree about how much the backbone is worth.
+    components = {k: v * TRACKING_W for k, v in components.items()}
+    total = torch.zeros_like(like)
+    for v in components.values():
+        total = total + v
     return total, components
 
 '''
@@ -429,6 +462,7 @@ def generate_mode_reward_scaffold(
     n_phase: int = 32,
     placeholder_targets: bool = False,
     horizon_s: Optional[float] = None,
+    tracking_weight: float = 1.0,
 ) -> str:
     """Emit a reward module whose mode gating is correct by construction.
 
@@ -498,7 +532,8 @@ def generate_mode_reward_scaffold(
     has_track = clip is not None
     track_const, track_scalar, track_batched = (
         _tracking_block(clip, int(n_phase), bool(placeholder_targets),
-                        time_scale=time_scale)
+                        time_scale=time_scale,
+                        tracking_weight=float(tracking_weight))
         if has_track else ("", "", ""))
     # The calls are spliced rather than always emitted-and-zeroed: a stubs-only
     # scaffold must not require `qpos` in the contract, since it does not read
@@ -547,6 +582,10 @@ REWARD_SPEC: dict = {{
     # promoted reward is on without re-deriving it from the windows.
     "episode_horizon_s": {horizon_s!r},
     "clip_time_scale": {round(time_scale, 6)!r},
+    # How much the imitation backbone is worth relative to the authored task
+    # terms. Below 1.0 the clip is a style prior and the mission is the
+    # objective; at 1.0 it is the other way round.
+    "tracking_weight": {float(tracking_weight)!r},
     "hyperparameters": {{}},
     "references": [],
 }}
@@ -938,6 +977,8 @@ def authoring_twin_source(
     behavior_goal: str = "",
     clip_id: str = "",
     n_phase: int = 4,
+    horizon_s: Optional[float] = None,
+    tracking_weight: float = 1.0,
 ) -> str:
     """A small, literal-free stand-in to run `apply_prompt_edit` against.
 
@@ -963,9 +1004,41 @@ def authoring_twin_source(
     real `clip` so the twin has the right `N_JOINTS` and duration — an authored
     body that indexes joints must see the real joint count.
     """
+    # `horizon_s` and `tracking_weight` must match the module the bodies are
+    # grafted back into, or the twin gates on different windows — and reports a
+    # different backbone magnitude — than the real thing.
     return _strip_prose(generate_mode_reward_scaffold(
         graph, behavior_goal=behavior_goal, clip_id=clip_id, clip=clip,
-        n_phase=n_phase, placeholder_targets=True))
+        n_phase=n_phase, placeholder_targets=True, horizon_s=horizon_s,
+        tracking_weight=tracking_weight))
+
+
+def _horizon_of(source: str) -> Optional[float]:
+    """The episode horizon a scaffold was fitted to, read back off its own
+    windows. Recovering it from the source keeps the twin in step with the
+    module even for scaffolds written before `episode_horizon_s` was recorded.
+    """
+    windows = windows_in_source(source)
+    if not windows:
+        return None
+    span = max((hi for _, hi in windows.values()), default=0.0)
+    return span if span > 0.0 else None
+
+
+def _tracking_weight_of(source: str) -> float:
+    """`TRACKING_W` as the module declares it; 1.0 for modules predating it.
+
+    Read off the module rather than re-derived, for the same reason as
+    `_horizon_of`: the twin has to describe the module that exists on disk, not
+    the one today's generator would produce.
+    """
+    match = re.search(r"^TRACKING_W\s*=\s*([0-9.eE+-]+)\s*$", source, re.M)
+    if not match:
+        return 1.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 1.0
 
 
 def graft_mode_bodies(base: str, authored: str,
@@ -1154,21 +1227,134 @@ def validate_mode_reward_source(source: str, graph: ModeGraph) -> list[str]:
                 "terms would be paid in replay and silently skipped in "
                 "training")
 
-    windows = mode_windows_s(graph)
-    for name, (lo, hi) in windows.items():
-        if f"{name!r}: ({lo!r}, {hi!r})" not in source:
+    errors.extend(_window_agreement_errors(source, graph))
+    return errors
+
+
+def windows_in_source(source: str) -> dict[str, tuple[float, float]]:
+    """`MODE_WINDOWS_S` as the module actually declares it, or {} if unreadable.
+
+    Parsed, not string-matched: the literal is no longer predictable from the
+    graph alone once the automaton has been fitted to an episode horizon.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    for node in tree.body:
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign)
+                   else [])
+        if not any(isinstance(t, ast.Name) and t.id == "MODE_WINDOWS_S"
+                   for t in targets):
+            continue
+        try:
+            raw = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): (float(v[0]), float(v[1])) for k, v in raw.items()}
+    return {}
+
+
+def _declared_time_scale(source: str) -> Optional[float]:
+    """`REWARD_SPEC['clip_time_scale']`, or None if the module predates it."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign)
+                   else [])
+        if not any(isinstance(t, ast.Name) and t.id == "REWARD_SPEC"
+                   for t in targets):
+            continue
+        try:
+            spec = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return None
+        value = spec.get("clip_time_scale") if isinstance(spec, dict) else None
+        return float(value) if isinstance(value, (int, float)) else None
+    return None
+
+
+def _window_agreement_errors(source: str, graph: ModeGraph) -> list[str]:
+    """Do the module's windows still describe THIS graph?
+
+    This used to demand the clip-time literal verbatim. That conflated two
+    different things: whether the scaffold belongs to this automaton, and which
+    clock it is on. A scaffold fitted to an episode horizon is not stale — its
+    windows are the graph's windows times one shared factor — so check the
+    property that actually matters: same modes, same order, same proportions,
+    no window moved by hand relative to its neighbours.
+    """
+    want = mode_windows_s(graph)
+    got = windows_in_source(source)
+    if not got:
+        return ["source has an unreadable MODE_WINDOWS_S — mode gating cannot "
+                "be verified against the automaton"]
+    missing = [n for n in want if n not in got]
+    if missing:
+        return [f"mode {n!r}: no window in MODE_WINDOWS_S — the scaffold is "
+                f"stale relative to the graph; regenerate it" for n in missing]
+
+    # The scale must be the one the module DECLARES, not merely some uniform
+    # one. Otherwise a scaffold built from a proportionally different graph —
+    # the same clip re-exported at another fps, say — is numerically
+    # indistinguishable from a horizon fit and would slip through. A module
+    # that declares nothing is a pre-horizon scaffold and must still be exact.
+    declared = _declared_time_scale(source)
+    span = max((hi for _, hi in want.values()), default=0.0)
+    got_span = max((hi for n, (_, hi) in got.items() if n in want), default=0.0)
+    observed = (got_span / span) if span > 0 and got_span > 0 else 1.0
+    scale = declared if declared is not None else 1.0
+    if abs(observed - scale) > 1e-3:
+        return [
+            f"MODE_WINDOWS_S spans {got_span:g}s where this automaton spans "
+            f"{span:g}s — a factor of {observed:.4f}, but the module declares "
+            f"{scale:.4f}. The scaffold is stale relative to the graph; "
+            f"regenerate it."]
+    errors: list[str] = []
+    for name, (lo, hi) in want.items():
+        glo, ghi = got[name]
+        # 1 ms, comfortably above the 4-dp rounding the scaler applies.
+        if abs(glo - lo * scale) > 1e-3 or abs(ghi - hi * scale) > 1e-3:
             errors.append(
-                f"mode {name!r}: window ({lo}, {hi}) not found in source — the "
-                "scaffold is stale relative to the graph; regenerate it")
+                f"mode {name!r}: window {(round(glo, 4), round(ghi, 4))} is not "
+                f"{(lo, hi)} scaled by {scale:.4f} — the scaffold is stale "
+                f"relative to the graph, or a window was moved by hand; "
+                f"regenerate it")
     return errors
 
 
 def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
-                             goal_text: str, mode_text: str) -> str:
+                             goal_text: str, mode_text: str,
+                             windows: Optional[
+                                 Mapping[str, tuple[float, float]]] = None,
+                             task_brief: str = "",
+                             ) -> str:
     """The prompt body. Split out so `mode_authoring_prompt` can measure the
-    fixed part before deciding how much free text fits."""
+    fixed part before deciding how much free text fits.
+
+    `windows` overrides the graph's clip-time windows. The prompt states the
+    mode's window on purpose, so once a scaffold has been fitted to an episode
+    horizon it must state the FITTED window — otherwise the model reasons about
+    a 0.82 s approach while the module pays one lasting 2.37 s.
+
+    `task_brief` is the world and goal the robot is being trained in, rendered
+    by the caller (`sculptor.mode_rewards.task_brief`). It is empty for a pure
+    imitation project. Without it the prompt describes a clip and nothing else,
+    so a model can only write terms over proprioception — gait quality,
+    uprightness, stillness — every one of which a robot standing in front of
+    the course maximizes. On the platform-ascent-showcase run that produced
+    four modes' worth of terms, none of which mentioned the platforms, and the
+    policy stood still for three iterations. The goal channels were published
+    by the runner the whole time; nothing told the author they existed.
+    """
     mode = graph.mode(mode_name)
-    windows = mode_windows_s(graph)
+    windows = dict(windows) if windows else mode_windows_s(graph)
     lo, hi = windows[mode_name]
     order = [m.name for m in graph.modes]
     i = order.index(mode_name)
@@ -1195,6 +1381,7 @@ def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
         f"Window: {lo:g}s-{hi:g}s (reference frames "
         f"[{mode.frame_range[0]}, {mode.frame_range[1]}) at {graph.fps:g} fps); "
         f"{neighbour_line}.\n\n"
+        f"{task_brief}"
         "Scope:\n"
         "- Called ONLY inside that window. Do not re-detect the phase — the "
         "dispatch already did.\n"
@@ -1219,6 +1406,124 @@ def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
         "- Return tensors of shape (num_envs,), not floats.\n"
         "- Arithmetic on a bool tensor raises; use `mask.float()`."
     )
+
+
+#: Cap on how many course elements the brief lists. A long course would eat the
+#: prompt budget `_fit_free_text` divides up, and the shape of the first dozen
+#: is what a mode's terms actually need.
+MAX_BRIEF_ELEMENTS = 12
+
+
+def _element_line(element: Mapping[str, Any]) -> str:
+    """One course element as `kind id: k=v, k=v`, in the units the spec uses."""
+    nominal = element.get("nominal") or {}
+    dims = ", ".join(
+        f"{k.removesuffix('_m')} {float(v):g} m"
+        for k, v in sorted(nominal.items())
+        if isinstance(v, (int, float)))
+    kind = str(element.get("element") or "element")
+    ident = str(element.get("id") or "")
+    return f"  {kind} {ident}: {dims}" if dims else f"  {kind} {ident}"
+
+
+#: Catalog `access` value that means "a reward term may read this". Everything
+#: else is published for metrics only and is NOT in the contract's
+#: `expected_info_keys`, so `sculptor.edit`'s grounding check rejects any term
+#: that reads it. Naming them in the brief anyway — as off-limits — is
+#: deliberate: a model told only about the distance channel invents a
+#: `waypoint_index` read on its own, and fails validation after the model call.
+SHAPING_ACCESS = "shared_shaping"
+
+
+def task_brief(task: Optional[Mapping[str, Any]],
+               world: Optional[Mapping[str, Any]],
+               channels: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
+    """The mission section of an authoring prompt, or "" when there is none.
+
+    Renders three things the author cannot otherwise know: the course geometry,
+    the goal channels the runner publishes into `info` (by their exact keys and
+    split by whether a reward may read them), and the magnitude discipline that
+    keeps a stand-still policy from out-earning a working one.
+
+    `channels` is the project's channel catalog (`channel_catalog["channels"]`).
+    Without it the brief still describes the course and the goal, but names no
+    channel — better than naming one the contract does not ground.
+
+    Empty for a project with no goal — a pure imitation reward should not be
+    told to chase a course that does not exist.
+    """
+    shared = dict((task or {}).get("shared") or task or {})
+    goal = dict(shared.get("goal") or {})
+    goal_id = str(goal.get("id") or "").strip()
+    goal_type = str(goal.get("type") or "").strip()
+    if not goal_id or not goal_type:
+        return ""
+
+    lines = ["MISSION — what this reward is FOR. The reference clip is a style",
+             "prior; the world below is the objective."]
+
+    obstacles = dict(
+        ((world or {}).get("shared") or world or {}).get("obstacles") or {})
+    course = list(obstacles.get("course") or [])
+    if course:
+        start = obstacles.get("start_offset_m")
+        head = f"Course ({obstacles.get('layout') or 'linear'})"
+        if isinstance(start, (int, float)):
+            head += f", robot starts {float(start):g} m before it"
+        lines.append(head + ", in order:")
+        lines.extend(_element_line(e) for e in course[:MAX_BRIEF_ELEMENTS])
+        if len(course) > MAX_BRIEF_ELEMENTS:
+            lines.append(f"  … and {len(course) - MAX_BRIEF_ELEMENTS} more")
+
+    success = dict(goal.get("success") or {})
+    goal_line = f"Goal: {goal_type} {goal_id!r}"
+    if success.get("predicate"):
+        goal_line += f" — {success['predicate']}"
+    if isinstance(success.get("hold_s"), (int, float)):
+        goal_line += f", held {float(success['hold_s']):g}s"
+    lines.append(goal_line + ".")
+
+    mine = [c for c in (channels or [])
+            if str((c.get("source") or {}).get("goal") or "") == goal_id]
+    readable = [c for c in mine if c.get("access") == SHAPING_ACCESS]
+    metric_only = [c for c in mine if c.get("access") != SHAPING_ACCESS]
+
+    if readable:
+        lines += [
+            "",
+            "Task channels your terms MAY read. They are in `info` every step;",
+            "use `info.get(<key>)` and give both halves the same fallback:",
+        ]
+        lines += [f"  {c.get('name')} — {c.get('metric_role') or 'task signal'}"
+                  for c in readable]
+    if metric_only:
+        lines += [
+            "",
+            "Published for METRICS ONLY — reading one is rejected as ungrounded,",
+            "because it is not in the reward contract's info keys:",
+        ]
+        lines += [f"  {c.get('name')}" for c in metric_only]
+
+    progress = next((c.get("name") for c in readable
+                     if c.get("metric_role") == "progress"), None)
+    if progress:
+        lines += [
+            "",
+            f"REQUIRED: include a dense progress term built on `{progress}`,",
+            "and make it the LARGEST term in this mode. Dense means it pays for",
+            "the first centimetre closed, not on arrival — an arrival-gated",
+            "bonus is unreachable from a policy that has never arrived.",
+        ]
+    lines += [
+        "",
+        "Anything a MOTIONLESS robot can max out (upright, stillness, pose,",
+        "gait shape) must be gated on progress or kept small: standing still",
+        "already collects ~2/step from the tracking backbone and the base",
+        "locomotion terms, so an ungated stationary term competes with the",
+        "mission instead of serving it.",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _fit_free_text(behavior_goal: str, mode_goal: str, *,
@@ -1253,6 +1558,8 @@ def mode_authoring_prompt(
     *,
     behavior_goal: str = "",
     mode_goal: str = "",
+    windows: Optional[Mapping[str, tuple[float, float]]] = None,
+    task_brief: str = "",
 ) -> str:
     """The per-mode authoring instruction for `apply_prompt_edit`.
 
@@ -1269,8 +1576,10 @@ def mode_authoring_prompt(
     mode = graph.mode(mode_name)          # KeyError here is a caller bug
     goal_text, mode_text = _fit_free_text(
         behavior_goal, mode_goal or mode.name,
-        fixed=len(_render_authoring_prompt(graph, mode_name, "", "")))
-    return _render_authoring_prompt(graph, mode_name, goal_text, mode_text)
+        fixed=len(_render_authoring_prompt(graph, mode_name, "", "", windows,
+                                           task_brief)))
+    return _render_authoring_prompt(graph, mode_name, goal_text, mode_text,
+                                    windows, task_brief)
 
 
 __all__ = [
@@ -1292,6 +1601,7 @@ __all__ = [
     "probe_reward_module",
     "promote_mode_reward",
     "summarize_authored_modes",
+    "task_brief",
     "validate_mode_reward_source",
 ]
 
@@ -1436,6 +1746,7 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
                 clip: Optional[Mapping[str, Any]] = None,
                 clip_id: str = "", behavior_goal: str = "",
                 mode_goal: str = "", kg_store=None,
+                mission: str = "",
                 max_tokens: int = AUTHOR_MAX_TOKENS,
                 on_event=None) -> dict:
     """Author one mode's bodies into `source`, leaving every other mode alone.
@@ -1444,6 +1755,10 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
     the only thing a model can get wrong is the terms of a single mode. That
     keeps the blast radius of a bad edit to one window rather than the whole
     behavior, and lets each mode clear the metric gauntlet separately.
+
+    `mission` is the rendered `task_brief` for the project's world and goal, or
+    "" for pure imitation. It is what makes an authored term able to mention
+    the course at all.
 
     Returns `{"source", "prompt", "authored", "pending"}`. Raises
     `ModeAuthorError` with a caller-presentable message on any rejection;
@@ -1468,11 +1783,17 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
         raise ModeAuthorError(
             "scaffold no longer matches the automaton: " + "; ".join(stale))
 
+    # State the module's OWN windows, not the graph's. They differ whenever the
+    # scaffold was fitted to an episode horizon, and the prompt's whole job is
+    # to tell the model which slice of the episode its terms are paid over.
     prompt = mode_authoring_prompt(
-        graph, mode, behavior_goal=behavior_goal, mode_goal=mode_goal)
+        graph, mode, behavior_goal=behavior_goal, mode_goal=mode_goal,
+        windows=windows_in_source(source) or None, task_brief=mission)
 
     twin_source = authoring_twin_source(
-        graph, clip=clip, behavior_goal=behavior_goal, clip_id=clip_id)
+        graph, clip=clip, behavior_goal=behavior_goal, clip_id=clip_id,
+        horizon_s=_horizon_of(source),
+        tracking_weight=_tracking_weight_of(source))
     already = [n for n, ok in authored_modes(source).items() if ok]
     if already:
         twin_source = summarize_authored_modes(twin_source, source, already)
@@ -1483,7 +1804,8 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
         edited = apply_prompt_edit(
             current_reward_path=twin, user_prompt=prompt, new_iter_id="v1",
             reward_contract=contract, kg_store=kg_store,
-            max_tokens=max_tokens, on_event=on_event)
+            max_tokens=max_tokens, max_prompt_chars=MAX_PROMPT_CHARS,
+            on_event=on_event)
         edited_source = _Path(edited).read_text(encoding="utf-8")
 
     grafted = graft_mode_bodies(source, edited_source, [mode])

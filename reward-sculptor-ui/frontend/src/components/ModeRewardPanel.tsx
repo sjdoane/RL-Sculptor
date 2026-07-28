@@ -75,6 +75,15 @@ export function ModeRewardPanel({
   const qc = useQueryClient();
   const saveDraft = useSaveBehaviorDraft(slug);
 
+  // `useState` reads its argument once, at mount — and at mount the behavior
+  // draft that names the clip is still in flight, so the panel opened on the
+  // "pick a composed reference" search even for a project whose scaffold was
+  // already on disk. Adopt the clip when it arrives, but only while nothing
+  // has been chosen here: a late-resolving query must not overwrite a pick.
+  useEffect(() => {
+    if (initialClipId && !clipId) setClipId(initialClipId);
+  }, [initialClipId, clipId]);
+
   useEffect(() => {
     if (!clipId) {
       setGraph(null);
@@ -569,7 +578,14 @@ export function ModeRewardPanel({
         </div>
       )}
 
-      {reward && promoted === null && (
+      {/* Promotion is not a one-way door. This was gated on `promoted === null`,
+          so the moment you promoted — which you must do to train — the only
+          control that can regenerate the automaton disappeared for good. That
+          left no way at all to pick up a corrected scaffold: when the mode
+          windows were found to be on the clip's clock instead of the episode's,
+          a project that had already trained could not be re-scaffolded from the
+          UI, at any point, by any sequence of clicks. */}
+      {reward && (
         <div className="rs-flex rs-gap-8" style={{ marginTop: 8 }}>
           <span className="rs-grow" />
           {confirmRescaffold ? (
@@ -577,6 +593,10 @@ export function ModeRewardPanel({
               <span className="rs-sub" style={{ fontSize: 10.5 }}>
                 Re-scaffolding discards all {doneCount} authored{" "}
                 {doneCount === 1 ? "body" : "bodies"}.
+                {promoted !== null && (
+                  <> <code>v{promoted.version}.py</code> stays the active
+                  reward until you promote again.</>
+                )}
               </span>
               <Btn kind="quiet" size="sm"
                    onClick={() => setConfirmRescaffold(false)}>
