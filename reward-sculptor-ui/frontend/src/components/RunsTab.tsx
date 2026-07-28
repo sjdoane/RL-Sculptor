@@ -1610,6 +1610,37 @@ function LiveRunDetailPane({
     return { awaiting: aw, awaitingIter: awIter, mode: m };
   }, [events.events, run.data?.mode]);
 
+  // Which policy this run actually started from. A run does not begin from
+  // scratch — it inherits weights from a previous iteration unless someone
+  // names a checkpoint — and nothing here used to say so. One run silently
+  // picked up a policy whose exploration noise alone cost more per step than
+  // the task reward paid, and 470 iterations of that read as "the authored
+  // reward does nothing". Show the source, whether it was chosen or inferred,
+  // and any repair applied on the way in.
+  const startingPolicy = useMemo(() => {
+    let source: string | null = null;
+    let chosen = false;
+    let ignoredPartial: string | null = null;
+    let noise: { before: number; after: number; ceiling: number } | null = null;
+    for (const ev of events.events) {
+      const e = ev as {
+        type?: string; source?: string; checkpoint?: string;
+        std_before?: number; std_after?: number; ceiling?: number;
+      };
+      if (e.type === "warm_start_checkpoint_resolved") { source = e.checkpoint ?? null; chosen = true; }
+      else if (e.type === "resume_warm_start_resolved") { source = asPath(e.source) ?? null; chosen = false; }
+      else if (e.type === "partial_train_recovered") { source = e.checkpoint ?? source; chosen = false; }
+      else if (e.type === "partial_train_ignored") { ignoredPartial = e.checkpoint ?? null; }
+      else if (e.type === "warm_start_loaded") { source = asPath(e.source) ?? source; }
+      else if (e.type === "warm_start_noise_clamped"
+               && typeof e.std_before === "number" && typeof e.std_after === "number") {
+        noise = { before: e.std_before, after: e.std_after, ceiling: e.ceiling ?? 1 };
+      }
+    }
+    if (source === null) return null;
+    return { source, chosen, ignoredPartial, noise };
+  }, [events.events]);
+
   // §Ship 43: launch-time objective-metric generation as run-phase 0. Fold the
   // metric_generation_* events into a single phase view (progress while running;
   // accepted / rejected-with-reasons outcome — never silent).
@@ -1741,6 +1772,7 @@ function LiveRunDetailPane({
             });
           }}
         />
+        {startingPolicy && <StartingPolicyCard {...startingPolicy} />}
         {isActive && awaiting && run.data && (
           <FeedbackPanel
             iterIndex={awaitingIter}
@@ -1938,6 +1970,62 @@ function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePendi
         </Btn>
       )}
       {isActive && <Btn kind="danger" size="sm" icon="square" onClick={onKill}>Stop</Btn>}
+    </div>
+  );
+}
+
+/** A checkpoint path, or null when the field carries something else.
+ *
+ * The event envelope overwrites a payload's own `source` with the string
+ * "stdout" to mark provenance (backend run_manager `_pump_stdout`), so a
+ * value from that key is only trustworthy when it still looks like a path.
+ */
+function asPath(v: string | undefined): string | null {
+  return typeof v === "string" && v.includes("/") ? v : null;
+}
+
+/** `.../runs/iter_4/logs/model_450.pt` → `iter_4/logs/model_450.pt`.
+ *  Keeps the `iter_N` segment — which iteration a checkpoint came from is
+ *  the whole point of showing it. */
+function shortCkpt(path: string): string {
+  const parts = path.split("/");
+  const at = parts.findIndex((s) => /^iter_\d+$/.test(s));
+  return (at >= 0 ? parts.slice(at) : parts.slice(-2)).join("/") || path;
+}
+
+// Where this run's weights came from. Training almost never starts from
+// scratch, and which policy seeded it decides what the run can reach — so it
+// belongs next to the run, not buried in the event log.
+function StartingPolicyCard({ source, chosen, ignoredPartial, noise }: {
+  source: string;
+  chosen: boolean;
+  ignoredPartial: string | null;
+  noise: { before: number; after: number; ceiling: number } | null;
+}) {
+  return (
+    <div className="rs-card" style={{ margin: "0 16px 12px" }}>
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
+        <Icon name="activity" size={15} color="var(--rs-muted)" />
+        <span className="rs-eyebrow">Started from</span>
+        <code className="mono" style={{ fontSize: 12 }}>{shortCkpt(source)}</code>
+        <span className="rs-sub" style={{ fontSize: 11 }}>
+          {chosen ? "you chose this" : "inherited — no warm start was named"}
+        </span>
+      </div>
+      {ignoredPartial && (
+        <div className="rs-sub" style={{ fontSize: 11 }}>
+          An interrupted attempt left <code className="mono">{shortCkpt(ignoredPartial)}</code> on
+          disk. Your choice wins; that partial was not used.
+        </div>
+      )}
+      {noise && (
+        <div className="rs-sub" style={{ fontSize: 11 }}>
+          Carried action-noise std {noise.before.toFixed(2)}, above this task's fresh-init{" "}
+          {noise.ceiling.toFixed(2)} — clamped to {noise.after.toFixed(2)}. Inherited noise is
+          paid every step through the action-rate penalty, so it is bounded rather than compounded
+          across runs.
+        </div>
+      )}
     </div>
   );
 }
