@@ -284,10 +284,14 @@ input, textarea, select { font: inherit; color: inherit; }
 
 /* spec table */
 .rs-kv { display: grid; grid-template-columns: max-content 1fr; gap: 0; font-size: 13px; }
-.rs-kv > div { padding: 8px 14px; border-bottom: 1px solid var(--hairline-soft); }
+/* WorldTab and WorldEntityInspector build their cells from <span>, everything
+   else from <div>. With the selector limited to div those two got no padding,
+   so the widest label — the one that defines the max-content column — ran
+   straight into its value: "Objects / zones0 object(s) · 0 zone(s)". */
+.rs-kv > div, .rs-kv > span { padding: 8px 14px; border-bottom: 1px solid var(--hairline-soft); }
 .rs-kv .k { color: var(--rs-muted); font-family: var(--font-mono); font-size: 12px; }
 .rs-kv .v { color: var(--ink); font-family: var(--font-mono); font-size: 12.5px; }
-.rs-kv > div:nth-last-child(-n+2) { border-bottom: 0; }
+.rs-kv > div:nth-last-child(-n+2), .rs-kv > span:nth-last-child(-n+2) { border-bottom: 0; }
 
 /* prompt hero */
 .rs-prompt { background: var(--surface-card); border: 1px solid var(--hairline-strong); border-radius: var(--radius-lg); padding: 14px; }
