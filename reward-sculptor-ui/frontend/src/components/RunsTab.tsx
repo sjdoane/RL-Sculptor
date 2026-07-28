@@ -2410,6 +2410,22 @@ function IterationDetailCard({ iter, exportHref }: { iter: IterEventSummary | nu
             </div>
           </div>
         )}
+        {iter.edits_rejected && iter.edits_rejected.reasons.length > 0 && (
+          <div>
+            <div className="rs-eyebrow" style={{ marginBottom: 4 }}>
+              reward edits filtered ({iter.edits_rejected.count})
+            </div>
+            <div className="rs-vgap-8">
+              {iter.edits_rejected.reasons.map((r, i) => (
+                <div key={`er-${i}`} className="rs-sub mono"
+                     style={{ fontSize: 10, lineHeight: 1.5,
+                              color: "var(--st-amber)", wordBreak: "break-word" }}>
+                  {r}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {iter.paper_refs.length > 0 && (
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 4 }}>paper refs</div>
@@ -2456,6 +2472,9 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     best_fitness: winner.best_fitness ?? loser.best_fitness,
     progress: winner.progress ?? loser.progress,
     env_spec_update: winner.env_spec_update ?? loser.env_spec_update,
+    // `edits_rejected` arrives at pre-flight, well before `iter_completed`
+    // wins the slot — take whichever half actually saw it.
+    edits_rejected: winner.edits_rejected ?? loser.edits_rejected,
   };
 }
 
@@ -2641,6 +2660,14 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
       if (ev.type === "diagnosed") {
         slot.diagnosed = true;
         slot.failure_modes = Array.isArray(ev.failure_modes) ? (ev.failure_modes as string[]) : slot.failure_modes;
+      }
+      if (ev.type === "edits_rejected") {
+        const reasons = Array.isArray(ev.reasons)
+          ? (ev.reasons as unknown[]).map(String) : [];
+        slot.edits_rejected = {
+          count: typeof ev.count === "number" ? ev.count : reasons.length,
+          reasons,
+        };
       }
       if (ev.type === "edit_applied") {
         if (ev.reward_version_after !== undefined) slot.reward_version_after = Number(ev.reward_version_after);

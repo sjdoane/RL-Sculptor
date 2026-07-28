@@ -534,6 +534,12 @@ export interface IterEventSummary {
     applied: string[];
     rejected: Array<{ parameter: string; reason: string }>;
   } | null;
+  // Reward edits the pre-flight grounding check threw out, verbatim. The
+  // count alone reads as "the diagnoser had nothing useful"; the reasons
+  // say whether the edit was wrong or the checker couldn't see the term
+  // it named. Four iterations of the platform-ascent campaign were lost
+  // to that difference. null until an iter rejects something.
+  edits_rejected?: { count: number; reasons: string[] } | null;
   // Populated by `iter_progress` events emitted from inside the mjlab
   // training subprocess. Lets the Timeline panel render a live progress
   // bar for the running iter instead of a silent "running" spinner.
