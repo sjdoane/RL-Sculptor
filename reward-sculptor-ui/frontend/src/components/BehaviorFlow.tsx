@@ -54,6 +54,21 @@ type Step = {
   blocked?: string;
 };
 
+/** Scroll to an element that does not exist yet.
+ *
+ *  Switching tabs mounts a lazily-loaded route, so the target is absent for
+ *  a frame or several. Without the retry the flow's "author a reward per
+ *  mode" button lands you at the top of the Rewards tab, with the panel it
+ *  means still below a 420px editor and two other cards. Gives up quietly. */
+function scrollToWhenReady(id: string, tries = 40) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  if (tries > 0) requestAnimationFrame(() => scrollToWhenReady(id, tries - 1));
+}
+
 export function BehaviorFlow({
   slug, project, robotConfigured, onGoTo,
 }: {
@@ -180,6 +195,10 @@ export function BehaviorFlow({
           : undefined,
         tab: "rewards",
         action: modeCount ? "Continue authoring" : "Scaffold modes",
+        // Both this step and the next one target the Rewards tab, and the
+        // panel each of them means is off-screen on arrival. Land on the
+        // control, not the tab.
+        run: () => { onGoTo("rewards"); scrollToWhenReady("mode-reward-panel"); },
         optional: true,
       },
       {
@@ -191,6 +210,11 @@ export function BehaviorFlow({
         evidence: rewardEvidence,
         tab: "rewards",
         action: modesReadyUnpromoted ? "Promote it" : "Open rewards",
+        // "Promote it" means the button at the bottom of the mode panel, so
+        // go there; plain "Open rewards" means the version chain at the top.
+        run: modesReadyUnpromoted
+          ? () => { onGoTo("rewards"); scrollToWhenReady("mode-reward-panel"); }
+          : undefined,
       },
       {
         key: "train",
@@ -224,7 +248,7 @@ export function BehaviorFlow({
       },
     ];
   }, [project, robotConfigured, world.data, rewards.data, policies.data,
-      draft.data, modeRewards.data]);
+      draft.data, modeRewards.data, onGoTo]);
 
   // Don't flash a wrong list while the queries settle.
   if (world.isLoading || rewards.isLoading || policies.isLoading) return null;

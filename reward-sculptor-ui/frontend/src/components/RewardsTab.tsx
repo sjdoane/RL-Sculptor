@@ -656,6 +656,10 @@ function ReadOnlyPane({
           already names one, but shown either way: authoring a per-mode reward
           is what you do BEFORE there is a tracking reward, so gating it on
           one would hide the feature exactly when it is wanted. */}
+      {/* Anchored: this panel sits below a 420px editor and two other
+          panels, so arriving on the tab leaves it off-screen. The Behavior
+          flow's "author a reward per mode" step scrolls to this id. */}
+      <div id="mode-reward-panel">
       <ModeRewardPanel
         slug={slug}
         // Three sources, most specific first. A promoted per-mode reward has
@@ -673,6 +677,7 @@ function ReadOnlyPane({
         robot={referenceRobotForProject(project)}
         goal={detail.spec.description || draft.data?.behavior_goal || ""}
       />
+      </div>
     </>
   );
 }
