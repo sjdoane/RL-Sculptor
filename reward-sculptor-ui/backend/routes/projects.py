@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
 
 from backend.models.project import (
     CreateProjectRequest,
@@ -752,6 +753,54 @@ def get_project_settings(
     known = set(IterationSettings.model_fields.keys())
     clean = {k: v for k, v in data.items() if k in known}
     return ProjectSettings(iteration=IterationSettings(**clean))
+
+
+class BehaviorDraft(BaseModel):
+    """What the user is building, carried across the steps that build it.
+
+    Composing a motion, authoring per-mode rewards for it and launching a run
+    that trains it were three disconnected screens. The composed clip id lived
+    only in whichever dialog had just produced it, so the user had to re-find
+    the same id by hand in a ~6000-clip library twice. This is intent, not
+    configuration: every step still reads the authoritative artifact (the
+    selection file, the reward chain, the run's own params) for truth.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    behavior_goal: Optional[str] = None
+    reference_clip_id: Optional[str] = None
+    reference_robot: Optional[str] = None
+    mode_reward_filename: Optional[str] = None
+
+
+@router.get("/{slug}/behavior-draft",
+            responses={404: {"model": ProblemDetail}})
+def get_behavior_draft(
+    slug: str, store: ProjectStore = Depends(get_store),
+) -> Any:
+    if store.get(slug) is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "project not found",
+                        type_="/problems/not-found")
+    return store.read_behavior_draft(slug)
+
+
+@router.patch("/{slug}/behavior-draft",
+              responses={404: {"model": ProblemDetail}})
+def patch_behavior_draft(
+    slug: str, body: BehaviorDraft,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Merge, not replace — each step knows only its own field."""
+    if store.get(slug) is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "project not found",
+                        type_="/problems/not-found")
+    try:
+        with store.acquire_lock(slug):
+            return store.write_behavior_draft(
+                slug, body.model_dump(exclude_unset=True))
+    except BusyError as e:
+        return _problem(status.HTTP_409_CONFLICT, "project is busy",
+                        detail=str(e), type_="/problems/state-conflict")
 
 
 @router.patch(

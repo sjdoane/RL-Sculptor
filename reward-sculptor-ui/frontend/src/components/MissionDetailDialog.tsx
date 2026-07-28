@@ -15,6 +15,8 @@ import { useDetachStageReference } from "@/hooks/useReferences";
 import { useJob } from "@/hooks/useJob";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
+import { useProject } from "@/hooks/useProjects";
+import { referenceRobotForProject } from "@/lib/referenceRobot";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError, stageCheckpointUrl, stageExportUrl, stageRolloutUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
@@ -446,6 +448,8 @@ function ReferenceRow({
   stage: StageSchema;
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Cached by react-query; this is the same fetch the project page made.
+  const project = useProject(slug);
   const detach = useDetachStageReference(slug);
 
   const doDetach = () => {
@@ -547,6 +551,14 @@ function ReferenceRow({
           stageName={stage.name}
           currentClipId={stage.reference_clip_id}
           initialQuery={stage.goal_text}
+          // Was omitted, so the picker fell back to its "g1" default. On a
+          // Go1 project that offered G1 motion, the attach succeeded (the
+          // backend scans every robot directory), the stage card rendered
+          // fine, and the stage failed hours later at training time with
+          // `reference_tracking_seed_failed` — unrecoverable without
+          // hand-editing mission.json, because a Stage stores a clip id with
+          // no embodiment beside it.
+          robot={project.data ? referenceRobotForProject(project.data) : undefined}
           onClose={() => setPickerOpen(false)}
         />
       )}

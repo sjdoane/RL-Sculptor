@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/rs/icon";
 import { Btn } from "@/components/rs/primitives";
-import { ModeTimeline } from "@/components/ModeTimeline";
+import { ModeTimeline, modesFromGraph } from "@/components/ModeTimeline";
+import { useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import {
   ApiError,
   authorModeReward,
@@ -63,6 +64,7 @@ export function ModeRewardPanel({
   const [confirmRescaffold, setConfirmRescaffold] = useState(false);
   const [confirmPartial, setConfirmPartial] = useState(false);
   const qc = useQueryClient();
+  const saveDraft = useSaveBehaviorDraft(slug);
 
   useEffect(() => {
     if (!clipId) {
@@ -169,7 +171,11 @@ export function ModeRewardPanel({
               className="rs-btn rs-btn-quiet rs-btn-sm"
               style={{ justifyContent: "flex-start", fontSize: 12,
                        border: "1px solid var(--hairline)" }}
-              onClick={() => setClipId(h.clip_id)}
+              onClick={() => {
+                setClipId(h.clip_id);
+                saveDraft.mutate({ reference_clip_id: h.clip_id,
+                                   reference_robot: robot });
+              }}
             >
               <span className="mono">{h.clip_id}</span>
               {h.text && (
@@ -240,6 +246,13 @@ export function ModeRewardPanel({
       setPromoted(null);
       setResumed(false);
       setConfirmRescaffold(false);
+      // Record what is being built so the run dialog and the flow card can
+      // find it without the user re-searching the library for the clip.
+      saveDraft.mutate({
+        reference_clip_id: clipId,
+        reference_robot: robot,
+        mode_reward_filename: r.filename,
+      });
       setLog((l) => [...l, `scaffolded ${r.filename} — ${r.modes.length} modes`]);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
@@ -374,7 +387,11 @@ export function ModeRewardPanel({
           rendered once, and then thrown away — this is the screen where
           "which slice am I authoring" actually matters. */}
       <div style={{ marginBottom: 12 }}>
-        <ModeTimeline graph={graph} />
+        <ModeTimeline
+          modes={modesFromGraph(graph)}
+          fps={graph.fps}
+          transitions={graph.transitions}
+        />
       </div>
 
       {resumed && (

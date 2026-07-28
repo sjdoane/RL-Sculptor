@@ -250,6 +250,37 @@ def browse_references(
     }
 
 
+def _project_reference_robot(project_dir: Path) -> str:
+    """The library namespace this project's clips must come from.
+
+    Mirrors `sculptor.sculpt._stage_reference_robot_slug`, which is what
+    actually resolves the clip at training time — deliberately the same
+    task_id-shaped string ("Mjlab-Velocity-Flat-Unitree-G1"). Returns "" when
+    it cannot tell, so an unknown adapter never blocks an attach.
+    """
+    try:
+        from sculptor.sculpt import _STAGE_REFERENCE_ROBOT_SLUGS
+    except Exception:  # noqa: BLE001 — never block an attach on an import
+        return ""
+    config_path = project_dir / "config.toml"
+    if not config_path.is_file():
+        return ""
+    try:
+        import tomllib
+        with config_path.open("rb") as f:
+            cfg = tomllib.load(f)
+        task_id = str(
+            ((cfg.get("adapter") or {}).get("config") or {})
+            .get("task_id", "") or "")
+    except Exception:  # noqa: BLE001 — best-effort resolution only
+        return ""
+    hint = task_id.lower()
+    for candidate in _STAGE_REFERENCE_ROBOT_SLUGS:
+        if candidate in hint:
+            return candidate
+    return ""
+
+
 def _normalize(s: str) -> str:
     """Lowercase, and treat `_`/`-`/`.` as word breaks."""
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower())
@@ -588,6 +619,27 @@ def attach_stage_reference(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
             detail=f"no reference clip {body.clip_id!r}",
             type_="/problems/not-found")
+
+    # A Stage stores a clip id with no embodiment beside it, and at training
+    # time `_stage_reference_robot_slug` re-derives the robot from the
+    # project's own task_id. `_find_index_row` scans every robot directory, so
+    # attaching a g1 clip to a Go1 project used to succeed, render correctly
+    # in the stage card, and then fail hours later with
+    # `reference_tracking_seed_failed` — unrecoverable without hand-editing
+    # mission.json, because the mismatch is not representable in the state.
+    project_robot = _project_reference_robot(project_dir)
+    clip_robot = str(row.get("robot") or "")
+    if project_robot and clip_robot and clip_robot != project_robot:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference clip is for a different robot",
+            detail=(
+                f"{body.clip_id!r} is retargeted to {clip_robot!r}, but this "
+                f"project trains {project_robot!r}. A stage records only the "
+                f"clip id, so the robot is re-derived from the project at "
+                f"training time and this would fail the stage after the run "
+                f"had already started."),
+            type_="/problems/reference-motion")
 
     err = _validate_mission_and_stage(project_dir, slug, mission_slug, stage)
     if err is not None:

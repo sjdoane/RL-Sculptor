@@ -1274,6 +1274,47 @@ export async function browseReferences(opts?: {
   return handle<BrowseReferencesResult>(await fetch(u.pathname + u.search));
 }
 
+/** What the user is building, carried across the steps that build it.
+ *
+ *  Compose → per-mode reward → run were three disconnected screens: the
+ *  composed clip id lived only in whichever dialog had just produced it, so
+ *  the same id had to be re-found by hand in a ~6000-clip library twice.
+ *  Intent, not configuration — every step still reads the authoritative
+ *  artifact for truth. */
+export type BehaviorDraft = {
+  behavior_goal?: string;
+  reference_clip_id?: string;
+  reference_robot?: string;
+  mode_reward_filename?: string;
+};
+
+/** `null` clears a field; an omitted field is left alone. The two are
+ *  distinct, which is why this is not just `Partial<BehaviorDraft>`. */
+export type BehaviorDraftPatch = {
+  [K in keyof BehaviorDraft]?: string | null;
+};
+
+export async function getBehaviorDraft(slug: string): Promise<BehaviorDraft> {
+  return handle<BehaviorDraft>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/behavior-draft`),
+  );
+}
+
+/** Merge, not replace — each step knows only its own field. Send `null` to
+ *  clear one. */
+export async function patchBehaviorDraft(
+  slug: string,
+  patch: BehaviorDraftPatch,
+): Promise<BehaviorDraft> {
+  return handle<BehaviorDraft>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/behavior-draft`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  );
+}
+
 export type ModeRewardFile = {
   filename: string;
   path: string;

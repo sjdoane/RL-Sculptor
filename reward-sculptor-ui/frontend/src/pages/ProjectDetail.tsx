@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, FactChip } from "@/components/rs/primitives";
+import { BehaviorFlow } from "@/components/BehaviorFlow";
 import { KnowledgeGraphTab } from "@/components/KnowledgeGraphTab";
 import { PhysicsTab } from "@/components/PhysicsTab";
 import { ProjectSettingsDialog } from "@/components/ProjectSettingsDialog";
@@ -14,9 +15,7 @@ import WorldTab, { courseBreakdownText } from "@/components/WorldTab";
 import { useLibraryRobot } from "@/hooks/useLibrary";
 import { useWorldSelection } from "@/hooks/useWorlds";
 import { usePhysics } from "@/hooks/usePhysics";
-import { usePolicies } from "@/hooks/usePolicies";
 import { useProject } from "@/hooks/useProjects";
-import { useRewards } from "@/hooks/useRewards";
 import { useRobot } from "@/hooks/useRobot";
 import { formatRelative } from "@/lib/utils";
 import type { ProjectDetail as ProjectDetailShape, RobotStateResponse, SelectedStage } from "@/lib/types";
@@ -333,7 +332,7 @@ function OverviewTab({
         </div>
 
         <div className="rs-vgap-16">
-          <WorkflowCard
+          <BehaviorFlow
             slug={slug}
             project={project}
             robotConfigured={configured}
@@ -402,104 +401,6 @@ function AuthoredWorldCard({ slug, onGoTo }: { slug: string; onGoTo: (tab: TabVa
           Sculpt runs on this project train and evaluate inside this world
           (atomic selection <span className="mono">{s.selection.evaluation_lineage}</span>).
         </p>
-      </div>
-    </div>
-  );
-}
-
-// ── Getting-started workflow (first-time-user orientation) ────────────
-function WorkflowCard({
-  slug, project, robotConfigured, onGoTo,
-}: {
-  slug: string;
-  project: ProjectDetailShape;
-  robotConfigured: boolean;
-  onGoTo: (tab: TabValue) => void;
-}) {
-  const policies = usePolicies(slug);
-  const rewards = useRewards(slug);
-  const world = useWorldSelection(slug);
-  // Don't flash a wrong checklist while the queries settle (or mislead
-  // forever if one errors) — the card is orientation, not status-critical.
-  if (
-    policies.isLoading || rewards.isLoading || world.isLoading
-    || policies.error || rewards.error
-  ) {
-    return null;
-  }
-  const hasIters = project.n_iterations_completed > 0;
-  const hasPolicies = (policies.data?.length ?? 0) > 0;
-  const rewardShaped = (rewards.data?.length ?? 0) > 1 || hasIters;
-  const worldAuthored = !!world.data;
-  const steps: Array<{
-    label: string; done: boolean; tab: TabValue; hint: string;
-  }> = [
-    {
-      label: "Configure the robot", done: robotConfigured, tab: "overview",
-      hint: "Pick a library robot or upload a URDF/MJCF.",
-    },
-    {
-      label: "Author the world", done: worldAuthored, tab: "world",
-      hint: "Describe terrain, objects, task semantics, and train variations.",
-    },
-    {
-      label: "Shape the reward", done: rewardShaped, tab: "rewards",
-      hint: "Review the grounded starting reward — the sculptor iterates from here.",
-    },
-    {
-      label: "Train", done: hasIters, tab: "training",
-      hint: "Launch a run or decompose a goal into a mission.",
-    },
-    {
-      label: "Export the policy", done: hasPolicies && !!project.n_iterations_completed, tab: "results",
-      hint: "Download a deployment bundle for sim-to-real.",
-    },
-  ];
-  const next = steps.find((s) => !s.done);
-  // Everything done and exported → the checklist has served its purpose.
-  if (!next && hasPolicies) return null;
-  return (
-    <div className="rs-card">
-      <div className="rs-card-head">
-        <div className="rs-card-title"><Icon name="list" size={16} />Getting started</div>
-      </div>
-      <div className="rs-card-pad rs-vgap-8">
-        {steps.map((s, i) => {
-          const isNext = next === s;
-          return (
-            <button
-              key={s.label}
-              onClick={() => onGoTo(s.tab)}
-              className="rs-flex rs-gap-8"
-              style={{
-                background: "none", border: "none", padding: "4px 0",
-                cursor: "pointer", textAlign: "left", width: "100%",
-                alignItems: "flex-start", font: "inherit", color: "inherit",
-              }}
-              title={s.hint}
-            >
-              <Icon
-                name={s.done ? "check-circle" : "circle"}
-                size={15}
-                color={s.done ? "var(--st-emerald)" : isNext ? "var(--rs-primary)" : "var(--rs-muted)"}
-              />
-              <span style={{ minWidth: 0 }}>
-                <span style={{
-                  display: "block", fontSize: 13,
-                  fontWeight: isNext ? 600 : 400,
-                  color: s.done ? "var(--rs-muted)" : "var(--ink)",
-                }}>
-                  {i + 1}. {s.label}
-                </span>
-                {isNext && (
-                  <span className="rs-sub" style={{ display: "block", fontSize: 11.5, marginTop: 1 }}>
-                    {s.hint}
-                  </span>
-                )}
-              </span>
-            </button>
-          );
-        })}
       </div>
     </div>
   );

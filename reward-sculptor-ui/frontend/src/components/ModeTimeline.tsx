@@ -57,18 +57,45 @@ export function deriveModes(
 const BAND = ["var(--rs-primary)", "var(--st-blue, #3b82f6)", "var(--st-emerald, #10b981)",
   "var(--st-amber, #f59e0b)", "var(--st-rose, #f43f5e)"];
 
-export function ModeTimeline({
-  segments, seamFrames, nFrames, fps, compact,
-}: {
-  segments: ModeSegment[];
-  seamFrames: number[];
-  nFrames: number;
+/** The same modes, read off a graph the backend already derived.
+ *
+ *  `GET /references/{clip}/modes` returns the authoritative automaton, so a
+ *  caller holding one should not re-derive it from segments — that is a
+ *  second place for the boundary rule to drift. */
+export function modesFromGraph(graph: {
   fps: number;
+  modes: { name: string; frame_range: [number, number]; start_s: number;
+           end_s: number; source_clip_id: string | null }[];
+}): DerivedMode[] {
+  return graph.modes.map((m) => ({
+    name: m.name,
+    startFrame: m.frame_range[0],
+    endFrame: m.frame_range[1],
+    startS: m.start_s,
+    endS: m.end_s,
+    sourceId: m.source_clip_id,
+  }));
+}
+
+export function ModeTimeline({
+  segments, seamFrames, nFrames, fps, compact, modes: given, transitions,
+}: {
+  segments?: ModeSegment[];
+  seamFrames?: number[];
+  nFrames?: number;
+  fps?: number;
   compact?: boolean;
+  /** Pre-derived modes. Takes precedence over the segment inputs. */
+  modes?: DerivedMode[];
+  /** Rendered as the guard label between bands when supplied. Previously
+   *  fetched alongside the mode graph and then discarded. */
+  transitions?: { from_mode: string; to_mode: string; guard_kind: string;
+                  at_phase: number | null }[];
 }) {
-  const modes = deriveModes(segments, seamFrames, nFrames, fps);
+  const modes = given ?? deriveModes(
+    segments ?? [], seamFrames ?? [], nFrames ?? 0, fps ?? 0);
   if (!modes.length) return null;
-  const total = nFrames || 1;
+  const total = (nFrames || modes[modes.length - 1].endFrame) || 1;
 
   return (
     <div>
@@ -77,6 +104,13 @@ export function ModeTimeline({
         <span className="rs-sub" style={{ fontSize: 10.5 }}>
           {modes.length} modes · {modes.length - 1} guarded transition
           {modes.length - 1 === 1 ? "" : "s"}
+          {transitions?.length ? (
+            <>
+              {" · "}
+              {Array.from(new Set(transitions.map((t) => t.guard_kind))).join(", ")}
+              {" guards"}
+            </>
+          ) : null}
         </span>
       </div>
 

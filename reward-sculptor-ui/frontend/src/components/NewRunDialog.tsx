@@ -1,16 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
 import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
 import { courseBreakdownText } from "@/components/WorldTab";
+import { useBehaviorDraft, useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
+import { referenceRobotForProject } from "@/lib/referenceRobot";
 import { useSystemInfo } from "@/hooks/useDashboard";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
 import { useWorldSelection, useWorldValidation } from "@/hooks/useWorlds";
-import { ApiError } from "@/lib/api";
+import { ApiError, getProjectSettings } from "@/lib/api";
 import type { ProjectDetail } from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
 
@@ -32,31 +35,6 @@ const LEGACY_SECONDS_PER_CYCLE: Record<string, number> = {
 
 const MAX_BEHAVIOR_GOAL_LENGTH = 500;
 
-function referenceRobotForProject(project: ProjectDetail): string {
-  const hints = [
-    project.adapter_config?.reference_robot,
-    project.library_slug,
-    project.adapter_config?.robot,
-    project.adapter_config?.task_id,
-    project.env_id,
-  ];
-  for (const raw of hints) {
-    if (typeof raw !== "string" || !raw.trim()) continue;
-    const tokens = raw.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-    for (const token of [...tokens].reverse()) {
-      // Asset-family suffixes such as "29dof" carry morphology detail but
-      // are not library namespaces; prefer the preceding embodiment token.
-      if (/^\d+$/.test(token) || /^\d+dof$/.test(token)) continue;
-      if (["mjlab", "velocity", "flat", "unitree", "booster"].includes(token)) {
-        continue;
-      }
-      return token;
-    }
-  }
-  // Unknown embodiments fail closed with an empty picker instead of silently
-  // borrowing another robot's motion namespace.
-  return "unassigned";
-}
 
 const MJLAB_TIMING: Record<string, {
   fixedSeconds: number;
@@ -214,7 +192,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
     iterations: 10,
     training_iterations: 1000,
     num_envs: Number(project.adapter_config?.num_envs) || 1024,
-    device: String(project.adapter_config?.device) || "cuda:0",
+    device: adapterDevice(project) || "cuda:0",
     training_label: "rsl_rl iters / cycle",
   };
 }
@@ -342,6 +320,17 @@ export function NewRunDialog({
     open ? slug : undefined,
     !!worldSel.data,
   );
+  // What this project is building, shared with compose and per-mode reward.
+  const draft = useBehaviorDraft(open ? slug : undefined);
+  // The persistent `[iteration]` defaults this dialog's Advanced tab
+  // overrides. Disclosed there so the user can see which value wins.
+  const projectSettings = useQuery({
+    queryKey: ["project-settings", slug],
+    queryFn: () => getProjectSettings(slug),
+    enabled: open && tab === "advanced",
+    staleTime: 30_000,
+  });
+  const saveDraft = useSaveBehaviorDraft(slug);
   // A tracking-first run binds its generated reward to the authored world
   // atomically, so `sculpt` refuses to start without a promoted selection.
   // Block at the button rather than letting the run die in the subprocess.
@@ -415,11 +404,19 @@ export function NewRunDialog({
   const isLongRun = etaSeconds >= 30 * 60; // 30 min
   const hasPriorIters = project.n_iterations_completed > 0;
 
-  // Pre-fill behavior from sidecar description; reset advanced fields
-  // when the adapter changes (defaults drift with the project).
+  // Pre-fill behavior from the project's behavior draft (falling back to the
+  // sidecar description); reset advanced fields when the adapter changes
+  // (defaults drift with the project).
+  //
+  // The draft is why the goal and the motion prior survive between launches.
+  // Before it, both were cleared on every open — so the documented flow was
+  // literally "re-paste the goal and re-attach the motion prior; the dialog
+  // remembers neither", including immediately after composing the clip in a
+  // dialog two clicks away.
   useEffect(() => {
     if (open) {
-      setBehavior((current) => current || project.description || "");
+      setBehavior((current) =>
+        current || draft.data?.behavior_goal || project.description || "");
       setIterations(defaults.iterations);
       setTrainingIters(defaults.training_iterations);
       setNumEnvs(defaults.num_envs);
@@ -429,11 +426,19 @@ export function NewRunDialog({
       setWarmStartIteration("");
       setAllowDefaultWorld(false);
       setAllowRobotMismatch(false);
-      setReferenceClipId(null);
+      // Only carry a draft clip that belongs to this project's embodiment;
+      // a clip from another robot's namespace would fail at launch.
+      setReferenceClipId(
+        draft.data?.reference_clip_id
+        && (!draft.data.reference_robot
+            || draft.data.reference_robot === referenceRobot)
+          ? draft.data.reference_clip_id
+          : null,
+      );
       setReferencePickerOpen(false);
       setRenderEnvIndex(0);
     }
-  }, [open, project.description, defaults]);
+  }, [open, project.description, defaults, draft.data, referenceRobot]);
 
   const applyProfile = (next: Exclude<RunProfile, "custom">) => {
     const budget = profileBudget(next, defaults);
@@ -590,6 +595,13 @@ export function NewRunDialog({
     };
     launch.mutate(body, {
       onSuccess: (r) => {
+        // Remember what was actually launched, so the next open starts from
+        // it instead of from a blank box.
+        saveDraft.mutate({
+          behavior_goal: behavior.trim() || null,
+          reference_clip_id: referenceClipId,
+          reference_robot: referenceClipId ? referenceRobot : null,
+        });
         setOpen(false);
         onLaunched(r.run_id);
         toast.success("Sculpt run launched", {
@@ -948,6 +960,61 @@ export function NewRunDialog({
             </>
           ) : (
             <>
+              {/* The same knobs appear under three names in three places, and
+                  nothing said which one wins. Settings (gear icon) edits the
+                  persistent `[iteration]` block in config.toml; this tab
+                  overrides it for one run only; project creation seeds it.
+                  Show the stored value beside every field that has one so
+                  "am I changing the default or just this run" is answerable
+                  without leaving the dialog. */}
+              <div
+                style={{
+                  border: "1px solid var(--hairline)",
+                  borderRadius: "var(--radius-md)",
+                  padding: "10px 12px",
+                  background: "var(--surface-strong)",
+                  fontSize: 11, lineHeight: 1.5,
+                }}
+              >
+                <div className="rs-flex rs-gap-8" style={{ alignItems: "center" }}>
+                  <Icon name="info" size={13} color="var(--rs-muted)" />
+                  <strong style={{ fontSize: 11.5 }}>
+                    These override the project defaults, for this run only
+                  </strong>
+                </div>
+                <div className="rs-sub" style={{ marginTop: 4 }}>
+                  Persistent defaults live in <code className="mono">config.toml</code>
+                  {" "}under <code className="mono">[iteration]</code> and are edited
+                  from the gear icon in the project header. A field left blank
+                  here falls back to that value; a field with a number in it
+                  wins for this launch and is not saved back.
+                  {projectSettings.data && (
+                    <>
+                      {" "}Stored now:{" "}
+                      <code className="mono">
+                        steps_per_iter={String(
+                          projectSettings.data.iteration?.steps_per_iter ?? "unset")}
+                      </code>,{" "}
+                      <code className="mono">
+                        max_episode_steps={String(
+                          projectSettings.data.iteration?.max_episode_steps ?? "unset")}
+                      </code>,{" "}
+                      <code className="mono">
+                        rollout_episodes={String(
+                          projectSettings.data.iteration?.rollout_episodes ?? "unset")}
+                      </code>.
+                    </>
+                  )}
+                </div>
+                <div className="rs-sub" style={{ marginTop: 6 }}>
+                  <strong>Note:</strong> the field this dialog calls
+                  {" "}<code className="mono">training_iterations</code> is the same
+                  flag Settings calls <code className="mono">steps_per_iter</code>.
+                  Its unit depends on the adapter — rsl_rl policy-update
+                  iterations on mjlab, environment steps on gym_sb3 — which is
+                  why the two screens show different sensible ranges for it.
+                </div>
+              </div>
               {hasPriorIters && worldSel.data && (
                 <ToggleRow
                   on={resumeExactTuple}
@@ -1318,7 +1385,14 @@ export function NewRunDialog({
           currentClipId={referenceClipId}
           initialQuery={behavior}
           robot={referenceRobot}
-          onPick={({ clipId }) => setReferenceClipId(clipId)}
+          onPick={({ clipId }) => {
+            setReferenceClipId(clipId);
+            // Persist immediately, not only on launch: composing a motion and
+            // then closing the dialog to author its per-mode rewards is the
+            // documented order, and the clip has to survive that.
+            saveDraft.mutate({ reference_clip_id: clipId,
+                               reference_robot: referenceRobot });
+          }}
           onClose={() => setReferencePickerOpen(false)}
         />
       )}

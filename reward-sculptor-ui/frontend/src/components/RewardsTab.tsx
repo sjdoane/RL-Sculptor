@@ -4,6 +4,8 @@ import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
 import { ModeRewardPanel } from "@/components/ModeRewardPanel";
+import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
+import { referenceRobotForProject } from "@/lib/referenceRobot";
 import { AuthorBadge, Btn, Delta, Modal } from "@/components/rs/primitives";
 import { MonacoDiffLazy, MonacoLazy } from "@/components/MonacoLazy";
 import { useJob, useJobEvents } from "@/hooks/useJob";
@@ -288,6 +290,7 @@ export function RewardsTab({
             {detail.data && !isDrafting && (
               <ReadOnlyPane
                 slug={slug}
+                project={project}
                 detail={detail.data}
                 canEdit={!isRunning && !editsLockedByStageScope}
                 stageScope={effectiveScope}
@@ -585,15 +588,17 @@ function LockBanner({ note }: { note: string }) {
 
 // ── Read-only pane ────────────────────────────────────────────────────
 function ReadOnlyPane({
-  slug, detail, canEdit, stageScope, onNewHumanEdit,
+  slug, project, detail, canEdit, stageScope, onNewHumanEdit,
 }: {
   slug: string;
+  project: ProjectDetail;
   detail: RewardVersionDetail;
   canEdit: boolean;
   stageScope: string | null;
   onNewHumanEdit: () => void;
 }) {
   const [diffMode, setDiffMode] = useState(false);
+  const draft = useBehaviorDraft(slug);
   const parentVersion = detail.version > 0 ? detail.version - 1 : null;
   const parent = useReward(diffMode && parentVersion !== null ? slug : undefined, parentVersion ?? undefined, stageScope);
 
@@ -653,12 +658,20 @@ function ReadOnlyPane({
           one would hide the feature exactly when it is wanted. */}
       <ModeRewardPanel
         slug={slug}
+        // Three sources, most specific first. A promoted per-mode reward has
+        // no `composition` block — that key belongs to the flat tracking
+        // reward — so without the draft the panel could not re-open on its
+        // own output and made the user search a 6015-clip library by hand.
         clipId={
-          detail.spec.composition?.type === "reference_tracking_residual"
+          (detail.spec.composition?.type === "reference_tracking_residual"
             ? detail.spec.composition.reference_clip_id ?? undefined
-            : undefined
+            : undefined)
+          ?? draft.data?.reference_clip_id
         }
-        goal={detail.spec.description ?? ""}
+        // Was hardcoded "g1": on a Go1 project this offered G1 motion, the
+        // attach succeeded, and training failed with a seed error.
+        robot={referenceRobotForProject(project)}
+        goal={detail.spec.description || draft.data?.behavior_goal || ""}
       />
     </>
   );

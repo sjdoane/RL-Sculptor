@@ -137,7 +137,14 @@ function IterationSettingsSection({
         <span className="rs-caption" style={{ margin: 0 }}>Iteration settings (config.toml)</span>
         {q.isLoading && <Icon name="loader" size={12} className="rs-spin" />}
       </div>
-      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>Persistent project defaults — used whenever a run omits the override.</p>
+      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>
+        Persistent project defaults — used whenever a run omits the override.
+        Note that New run → <strong>Advanced</strong> pre-fills its fields with
+        adapter defaults rather than leaving them blank, so in practice a
+        launch overrides most of these unless you clear the field. Same knobs,
+        different names: <code className="mono">steps_per_iter</code> here is
+        <code className="mono"> training_iterations</code> there.
+      </p>
       <div className="rs-row2">
         {fields.map((f) => (
           <Field key={String(f.key)} label={f.label} htmlFor={`set-${String(f.key)}`}>

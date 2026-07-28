@@ -2,13 +2,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   attachStageReference,
+  browseReferences,
   composeReference,
   detachStageReference,
-  listReferences,
   searchReferences,
+  type BrowseReferencesResult,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
-import type { MissionDetail, RefIndexRow, RefMatch } from "@/lib/types";
+import type { MissionDetail, RefMatch } from "@/lib/types";
 
 /** GET /references?q=... — deterministic (llm=0) search, the picker's
  *  as-you-type path. Disabled for an empty/whitespace query — the
@@ -28,16 +29,25 @@ export function useReferenceSearch(
   });
 }
 
-/** GET /references (no q) — slim index listing, used when the search
- *  box is empty so the picker still shows something browsable. */
+/** GET /references/browse — the browsable library, used when the search box
+ *  is empty.
+ *
+ *  This used to call `listReferences({ robot })`, whose `k` defaults to 10
+ *  against a ~6015-clip library with no offset. The picker's own copy calls
+ *  it "a 6k-clip library"; it was showing the ten alphabetically-first rows,
+ *  and a clip you had just composed was not among them. Browse returns a
+ *  total, pages, and leads with composites. */
 export function useReferenceIndex(
-  opts?: { robot?: string; enabled?: boolean },
+  opts?: { robot?: string; enabled?: boolean; limit?: number; offset?: number },
 ) {
   const robot = opts?.robot ?? "g1";
-  return useQuery<RefIndexRow[]>({
-    queryKey: qk.referenceIndex(robot),
-    queryFn: () => listReferences({ robot }),
+  const limit = opts?.limit ?? 50;
+  const offset = opts?.offset ?? 0;
+  return useQuery<BrowseReferencesResult>({
+    queryKey: [...qk.referenceIndex(robot), limit, offset],
+    queryFn: () => browseReferences({ robot, limit, offset }),
     enabled: opts?.enabled ?? true,
+    placeholderData: (prev) => prev,
   });
 }
 

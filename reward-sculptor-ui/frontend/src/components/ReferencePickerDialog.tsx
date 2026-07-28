@@ -100,6 +100,9 @@ function ResultRow({
   );
 }
 
+/** Page size for the no-query browse listing. */
+const BROWSE_PAGE = 40;
+
 export function ReferencePickerDialog({
   slug,
   missionSlug,
@@ -139,6 +142,7 @@ export function ReferencePickerDialog({
 
   const [selectedClipId, setSelectedClipId] = useState<string | null>(currentClipId ?? null);
   const [composing, setComposing] = useState(false);
+  const [browseOffset, setBrowseOffset] = useState(0);
 
   const trimmed = debouncedQuery.trim();
   const search = useReferenceSearch(trimmed, {
@@ -146,11 +150,14 @@ export function ReferencePickerDialog({
   });
   const browse = useReferenceIndex({
     robot, enabled: trimmed.length === 0,
+    limit: BROWSE_PAGE, offset: browseOffset,
   });
+  // A new query starts from the top of its own result set.
+  useEffect(() => { setBrowseOffset(0); }, [trimmed]);
 
   const rows: PickerRow[] = trimmed.length > 0
     ? (search.data ?? []).map(toRow)
-    : (browse.data ?? []).map(indexToRow);
+    : (browse.data?.rows ?? []).map(indexToRow);
   const isLoading = trimmed.length > 0 ? search.isLoading : browse.isLoading;
   const isError = trimmed.length > 0 ? search.isError : browse.isError;
   const libraryEmpty = trimmed.length === 0 && !browse.isLoading && !browse.isError && rows.length === 0;
@@ -269,6 +276,40 @@ export function ReferencePickerDialog({
               onSelect={() => setSelectedClipId(row.clip_id)}
             />
           ))}
+        </div>
+      )}
+
+      {/* Say how much of the library is on screen. The browse listing used to
+          be a silent `rows[:10]` of ~6015, which read as "this is the
+          library" — including right after composing a clip that was not in
+          those ten. */}
+      {trimmed.length === 0 && browse.data && browse.data.total > rows.length && (
+        <div
+          className="rs-flex rs-gap-8"
+          style={{ marginTop: 8, alignItems: "center", fontSize: 11 }}
+        >
+          <span className="rs-sub">
+            {browseOffset + 1}–{browseOffset + rows.length} of{" "}
+            {browse.data.total} clips
+            {browse.data.facets.composed > 0 && (
+              <> · {browse.data.facets.composed} composed</>
+            )}
+          </span>
+          <span className="rs-grow" />
+          <Btn
+            kind="quiet" size="xs" icon="chevron-left"
+            disabled={browseOffset === 0}
+            onClick={() => setBrowseOffset((o) => Math.max(0, o - BROWSE_PAGE))}
+          >
+            Prev
+          </Btn>
+          <Btn
+            kind="quiet" size="xs" icon="chevron-right"
+            disabled={browseOffset + rows.length >= browse.data.total}
+            onClick={() => setBrowseOffset((o) => o + BROWSE_PAGE)}
+          >
+            Next
+          </Btn>
         </div>
       )}
 

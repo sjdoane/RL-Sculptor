@@ -913,7 +913,7 @@ function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery
               <ReferenceCertificationRow
                 key={reference.clip_id}
                 reference={reference}
-                indexRow={refIndex.data?.find((r) => r.clip_id === reference.clip_id) ?? null}
+                indexRow={refIndex.data?.rows.find((r) => r.clip_id === reference.clip_id) ?? null}
               />
             ))}
           </div>
