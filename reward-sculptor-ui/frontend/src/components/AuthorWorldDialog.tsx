@@ -12,7 +12,7 @@
  *      same gates. Every question still shows its explicit choices AND
  *      the disclosed "System decides" default; unanswered = default.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -24,6 +24,7 @@ import {
   useAuthorWorld,
   usePreviewWorldDraft,
 } from "@/hooks/useWorlds";
+import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { ApiError } from "@/lib/api";
 import type { WorldAuthorResponse, WorldDraftPreview } from "@/lib/types";
 
@@ -70,7 +71,20 @@ export default function AuthorWorldDialog({
   slug, onApplied,
 }: { slug: string; onApplied?: () => void }) {
   const [open, setOpen] = useState(false);
+  // Seeded from what the project already says it is building, so the task
+  // description isn't typed once here and again into the run dialog's
+  // behavior goal. A starting point only — it is freely editable, and this
+  // never writes back, so a goal set elsewhere is not clobbered.
+  const draftIntent = useBehaviorDraft(slug);
   const [prompt, setPrompt] = useState("");
+  const [promptSeeded, setPromptSeeded] = useState(false);
+  const seed = draftIntent.data?.behavior_goal ?? "";
+  useEffect(() => {
+    if (open && !promptSeeded && !prompt && seed) {
+      setPrompt(seed);
+      setPromptSeeded(true);
+    }
+  }, [open, promptSeeded, prompt, seed]);
   const [robot, setRobot] = useState("");
   const [kgGrounding, setKgGrounding] = useState(true);
   const [draft, setDraft] = useState<WorldAuthorResponse | null>(null);

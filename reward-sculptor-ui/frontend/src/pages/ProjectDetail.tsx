@@ -319,7 +319,10 @@ function OverviewTab({
   return (
     <div className="rs-scroll">
       <div className="rs-pad" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.6fr) minmax(300px,1fr)", gap: 22, alignItems: "start" }}>
-        <div className="rs-vgap-16">
+        {/* Anchored so the Behavior flow's first step can bring it into
+            view. Both cards live in the other column of this same screen, so
+            that step's button used to switch to the tab it was already on. */}
+        <div className="rs-vgap-16" id="robot-config">
           {configured ? (
             <RobotViewer slug={slug} selectedStage={selectedStage} setSelectedStage={setSelectedStage} />
           ) : (

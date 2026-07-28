@@ -15,16 +15,18 @@
  * chain, the mode-reward files, the iteration count — and the project's
  * behavior draft only for "what are we building".
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
 import { Icon } from "@/components/rs/icon";
 import { Btn } from "@/components/rs/primitives";
-import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
+import { useBehaviorDraft, useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useRewards } from "@/hooks/useRewards";
 import { useWorldSelection } from "@/hooks/useWorlds";
 import { listModeRewards } from "@/lib/api";
+import { referenceRobotForProject } from "@/lib/referenceRobot";
 import type { ProjectDetail } from "@/lib/types";
 
 export type FlowTab =
@@ -43,6 +45,13 @@ type Step = {
   action: string;
   /** True when this step is genuinely optional for a working run. */
   optional?: boolean;
+  /** Do the step HERE instead of navigating to the tab that hosts it.
+   *  Without this the card is a table of contents: its only interaction was
+   *  a tab switch, so the answer to "you have to go to five different
+   *  places" was a list of the five places. */
+  run?: () => void;
+  /** Why the button is unavailable right now; also disables it. */
+  blocked?: string;
 };
 
 export function BehaviorFlow({
@@ -57,6 +66,9 @@ export function BehaviorFlow({
   const rewards = useRewards(slug);
   const policies = usePolicies(slug);
   const draft = useBehaviorDraft(slug);
+  const saveDraft = useSaveBehaviorDraft(slug);
+  const [pickingMotion, setPickingMotion] = useState(false);
+  const referenceRobot = referenceRobotForProject(project);
   const modeRewards = useQuery({
     queryKey: ["modeRewards", slug],
     queryFn: () => listModeRewards(slug),
@@ -66,10 +78,18 @@ export function BehaviorFlow({
 
   const steps: Step[] = useMemo(() => {
     const hasIters = project.n_iterations_completed > 0;
+    const training = project.status === "running";
     const clipId = draft.data?.reference_clip_id ?? "";
-    const modeFile = modeRewards.data?.mode_rewards.find(
-      (f) => !clipId || f.clip_id === clipId,
-    );
+    // Match the chosen clip, or — with no clip chosen — whatever is actually
+    // promoted. The old `!clipId || ...` fell through to the FIRST file in an
+    // mtime-sorted list, so a project with no motion chosen could show
+    // "Choose a reference motion" unchecked and "4/4 authored" checked
+    // directly beneath it, for a clip the user had never selected.
+    const promotedClip = modeRewards.data?.promoted?.clip_id ?? "";
+    const matchClip = clipId || promotedClip;
+    const modeFile = matchClip
+      ? modeRewards.data?.mode_rewards.find((f) => f.clip_id === matchClip)
+      : undefined;
     const authoredCount =
       modeFile?.modes.filter((m) => m.authored).length ?? 0;
     const modeCount = modeFile?.modes.length ?? 0;
@@ -82,6 +102,13 @@ export function BehaviorFlow({
     // "2 versions" is true and useless; what the user needs to know is whether
     // the four windows they authored are the ones a run will pay.
     const promoted = modeRewards.data?.promoted ?? null;
+    // A fully authored per-mode reward that was never promoted is inert —
+    // the chain still trains something else. Counting the reward step done
+    // then puts a green check immediately above a row reading "not promoted
+    // yet", which is the exact confusion this card exists to prevent.
+    const modesReadyUnpromoted =
+      modeCount > 0 && authoredCount === modeCount
+      && !(promoted && promoted.clip_id === modeFile?.clip_id);
     const rewardEvidence = promoted
       ? `v${promoted.version}.py · ${promoted.modes.length} modes`
         + (promoted.unauthored.length
@@ -99,7 +126,13 @@ export function BehaviorFlow({
         done: robotConfigured,
         evidence: project.library_slug || undefined,
         tab: "overview",
-        action: "Configure",
+        action: robotConfigured ? "Show robot" : "Configure",
+        // The card only ever renders on the Overview tab, so `onGoTo(
+        // "overview")` was a button that provably did nothing. The robot
+        // card is in the other column of this same screen.
+        run: () => document
+          .getElementById("robot-config")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" }),
       },
       {
         key: "world",
@@ -122,6 +155,12 @@ export function BehaviorFlow({
         evidence: clipId || undefined,
         tab: "training",
         action: clipId ? "Change motion" : "Find motion",
+        // Opened here. The button used to navigate to the Training tab,
+        // which contains no motion control at all — the picker is mounted
+        // only inside the run dialog, four unsignposted clicks and three
+        // modal levels down. That was the "how to reference the novel task"
+        // complaint, verbatim.
+        run: () => setPickingMotion(true),
         optional: true,
       },
       {
@@ -148,21 +187,29 @@ export function BehaviorFlow({
         label: "Put a reward in the chain",
         hint: "Only v<n>.py counts. Promote the per-mode reward, or let the "
             + "sculptor iterate from the grounded starting reward.",
-        done: rewardShaped || !!promoted,
+        done: !modesReadyUnpromoted && (rewardShaped || !!promoted),
         evidence: rewardEvidence,
         tab: "rewards",
-        action: "Open rewards",
+        action: modesReadyUnpromoted ? "Promote it" : "Open rewards",
       },
       {
         key: "train",
         label: "Train",
         hint: "Launch a run, or decompose the goal into a staged mission.",
         done: hasIters,
-        evidence: hasIters
-          ? `${project.n_iterations_completed} iteration${project.n_iterations_completed === 1 ? "" : "s"}`
-          : undefined,
+        // A run can go hours before its first sculpt iteration lands, and
+        // `n_iterations_completed` is the only training signal here — so
+        // this row used to sit unchecked, highlighted, offering "New run"
+        // to someone who had just started one.
+        evidence: training
+          ? (hasIters
+              ? `running · ${project.n_iterations_completed} done`
+              : "running")
+          : hasIters
+            ? `${project.n_iterations_completed} iteration${project.n_iterations_completed === 1 ? "" : "s"}`
+            : undefined,
         tab: "training",
-        action: "New run",
+        action: training ? "Watch run" : "New run",
       },
       {
         key: "export",
@@ -279,7 +326,9 @@ export function BehaviorFlow({
               <Btn
                 kind={isNext ? "primary" : "quiet"}
                 size="xs"
-                onClick={() => onGoTo(s.tab)}
+                disabled={!!s.blocked}
+                title={s.blocked}
+                onClick={s.run ?? (() => onGoTo(s.tab))}
               >
                 {s.action}
               </Btn>
@@ -287,6 +336,27 @@ export function BehaviorFlow({
           );
         })}
       </div>
+
+      {/* Standalone mode: the pick comes back here rather than mutating a
+          mission stage, and is written to the draft immediately — the run
+          dialog and the mode-reward panel both read it from there, so the
+          clip survives closing this and never has to be re-found in a
+          6000-clip library. Composing is reachable from inside the picker. */}
+      {pickingMotion && (
+        <ReferencePickerDialog
+          slug={slug}
+          robot={referenceRobot}
+          currentClipId={draft.data?.reference_clip_id ?? null}
+          initialQuery={goal}
+          onPick={({ clipId, robot }) => {
+            saveDraft.mutate({
+              reference_clip_id: clipId,
+              reference_robot: robot,
+            });
+          }}
+          onClose={() => setPickingMotion(false)}
+        />
+      )}
     </div>
   );
 }
