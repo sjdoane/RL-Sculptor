@@ -609,7 +609,13 @@ export interface RunEvent {
   type: string;
   seq: number;
   ts: string;
-  source?: "fs" | "stdout" | "user" | "cancel";
+  /** Where the event came from. Set by the backend on every event. */
+  origin?: "fs" | "stdout" | "user" | "cancel";
+  /** Payload field, NOT provenance — emitters use it for real data (a warm
+   *  start's checkpoint path, a selection's origin, a clip's dataset). It
+   *  falls back to the origin only when the emitter left it unset, so read
+   *  it as event-specific and validate before display. */
+  source?: string;
   [extra: string]: unknown;
 }
 

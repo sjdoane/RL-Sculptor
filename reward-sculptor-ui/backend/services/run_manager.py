@@ -959,7 +959,13 @@ async def _stream_stdout(
                     ev = dict(payload)
                     # Mark its provenance so the frontend can dedupe
                     # against filesystem-derived events of the same type.
-                    ev["source"] = "stdout"
+                    # Under its own key: `source` is a field the emitters
+                    # already use for real data — a warm start's checkpoint
+                    # path, a selection's origin, a clip's dataset — and
+                    # overwriting it silently replaced all of those with
+                    # the string "stdout" by the time they reached the UI.
+                    ev["origin"] = "stdout"
+                    ev.setdefault("source", "stdout")
                     job.emit(ev)
     finally:
         if logf is not None:

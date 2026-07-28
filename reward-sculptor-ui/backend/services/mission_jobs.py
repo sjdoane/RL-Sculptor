@@ -532,7 +532,11 @@ async def _stream_stdout(
             if not (isinstance(payload, dict) and payload.get("type")):
                 continue
             ev = dict(payload)
-            ev["source"] = "stdout"
+            # Provenance under its own key — `source` is a payload field the
+            # emitters use for real data (stage_warm_start_resolved carries a
+            # checkpoint path there), and overwriting it lost that.
+            ev["origin"] = "stdout"
+            ev.setdefault("source", "stdout")
             ev_type = ev["type"]
 
             # Always emit on the parent (mission_execute) job.

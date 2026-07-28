@@ -21,6 +21,8 @@ from pydantic import BaseModel, ConfigDict
 from backend.models.project import (
     CreateProjectRequest,
     EnvSpecInfo,
+    EnvSpecTrainEditRequest,
+    EnvSpecTrainEditResult,
     IterationSettings,
     ProblemDetail,
     ProjectDetail,
@@ -714,8 +716,79 @@ def get_project_env_spec(
             if p.stem[1:].isdigit():
                 versions.append(p.stem)
         versions.sort(key=lambda s: int(s[1:]))
+    from sculptor.env_spec import ITERABLE_TRAIN_KEYS
+
     return EnvSpecInfo(
-        active=current is not None, current=current, versions=versions)
+        active=current is not None, current=current, versions=versions,
+        editable_train_keys=sorted(ITERABLE_TRAIN_KEYS))
+
+
+# ── PUT /projects/{slug}/env-spec/train ────────────────────────────────
+@router.put(
+    "/{slug}/env-spec/train",
+    response_model=EnvSpecTrainEditResult,
+    responses={404: {"model": ProblemDetail},
+               422: {"model": ProblemDetail}},
+)
+def edit_project_env_spec_train(
+    slug: str, body: EnvSpecTrainEditRequest,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Change train-section knobs on the project's env spec.
+
+    These decide whether a run can succeed and were previously reachable
+    only by the diagnoser between iterations. `entropy_coef_scale` is the
+    clearest case: at 3.0 it triples PPO's entropy bonus, the policy's
+    action-noise std climbs all run, and mjlab's `action_rate_l2` penalty
+    (which grows as 2*sigma^2) ends up costing more per step than the task
+    reward pays — measured on platform-ascent-showcase, mean return fell
+    from 358 to 38 while std went 0.91 -> 1.37. With no write path the only
+    remedy was to wait for the diagnoser to try it.
+
+    Delegates to `sculptor.env_spec.apply_env_edits`, so a hand edit gets
+    exactly the gates a diagnoser edit does: the key must be iterable,
+    the value must land inside its bounds, and the whole spec must still
+    validate afterwards. Writes the next `v<N>.json` and repoints
+    `current.json`. Rejections are returned with reasons rather than
+    silently dropped; 422 only when NOTHING applied.
+    """
+    from sculptor.env_spec import apply_env_edits, read_current_env_spec
+
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+    env_dir = Path(detail.project_dir) / "env"
+    try:
+        result = apply_env_edits(
+            env_dir, [e.model_dump() for e in body.edits], author="user")
+    except (OSError, ValueError) as e:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "env spec unusable",
+            detail=f"{type(e).__name__}: {e}",
+            type_="/problems/invalid-env-spec",
+        )
+    rejected = [[str(p), str(r)] for p, r in result.get("rejected", [])]
+    if not result.get("applied"):
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "no edit applied",
+            detail="; ".join(f"{p}: {r}" for p, r in rejected)
+                   or "no edits supplied",
+            type_="/problems/invalid-env-spec",
+        )
+    try:
+        current = read_current_env_spec(env_dir)
+    except (OSError, ValueError):
+        current = None
+    return EnvSpecTrainEditResult(
+        applied=[str(a) for a in result.get("applied", [])],
+        rejected=rejected,
+        new_version=result.get("new_version"),
+        current=current,
+    )
 
 
 # ── §Ship-8: per-project settings (editable config.toml [iteration]) ───

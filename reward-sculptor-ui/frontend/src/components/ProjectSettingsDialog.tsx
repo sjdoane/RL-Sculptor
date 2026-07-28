@@ -8,6 +8,8 @@ import { Btn, Field, IconBtn, Modal } from "@/components/rs/primitives";
 import { useDeleteProject } from "@/hooks/useProjects";
 import {
   ApiError,
+  editProjectEnvSpecTrain,
+  getProjectEnvSpec,
   getProjectSettings,
   patchProjectSettings,
   type IterationSettings,
@@ -38,6 +40,7 @@ export function ProjectSettingsDialog({
         >
           <SummarySection project={project} />
           <IterationSettingsSection project={project} open={open} />
+          <EnvSpecTrainSection project={project} open={open} />
           <DangerZone project={project} onDeleted={() => setOpen(false)} />
         </Modal>
       )}
@@ -220,6 +223,143 @@ function IterationSettingsSection({
       <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 12 }}>
         <Btn kind="quiet" size="sm" onClick={() => setForm(loaded)} disabled={!dirty || mut.isPending}>Revert</Btn>
         <Btn kind="primary" size="sm" icon={mut.isPending ? "loader" : "check"} onClick={() => mut.mutate(form)} disabled={!dirty || mut.isPending}>Save</Btn>
+      </div>
+    </section>
+  );
+}
+
+/** Short, plain-language notes for the knobs whose effect is not obvious
+ *  from the name. Everything else is rendered generically — the editable
+ *  set comes from the backend so this list can lag without hiding a key. */
+const ENV_TRAIN_HINTS: Record<string, string> = {
+  entropy_coef_scale:
+    "Multiplies PPO's entropy bonus. Above 1 the policy's action-noise std " +
+    "climbs all run, and the action-rate penalty grows with the square of it " +
+    "— at 3.0 that penalty overtook the task reward and mean return fell from " +
+    "358 to 38. Raise it only for short explosive skills.",
+  min_base_height_termination_m:
+    "Ends the episode when the base drops below this world height. Pairs with " +
+    "RSI resets; too high and it kills legitimate crouches.",
+  fell_over_termination:
+    "Train-only. Turn off for a stage that RESETS in a fallen pose (get-up), " +
+    "or every episode ends at step 0.",
+  com_offset_m: "Per-link centre-of-mass jitter for sim2real. Keep small (0.02–0.05).",
+};
+
+/** The environment the loop trains under. Read-only until now: these decide
+ *  whether a run can succeed, and the only way to change one was to wait for
+ *  the diagnoser to try it between iterations. */
+function EnvSpecTrainSection({
+  project, open,
+}: { project: ProjectDetail; open: boolean }) {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ["project-env-spec", project.slug],
+    queryFn: () => getProjectEnvSpec(project.slug),
+    enabled: open,
+  });
+  const [form, setForm] = useState<Record<string, string>>({});
+  const loaded = (q.data?.current?.train ?? {}) as Record<string, unknown>;
+
+  useEffect(() => {
+    if (q.data) {
+      setForm(Object.fromEntries(Object.entries(
+        (q.data.current?.train ?? {}) as Record<string, unknown>,
+      ).map(([k, v]) => [k, JSON.stringify(v)])));
+    }
+  }, [q.data]);
+
+  const mut = useMutation({
+    mutationFn: (edits: Array<{ parameter: string; new_value: unknown; rationale: string }>) =>
+      editProjectEnvSpecTrain(project.slug, edits),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["project-env-spec", project.slug] });
+      toast.success(`Saved as ${res.new_version}`, {
+        description: res.applied.join(", "),
+      });
+      // Partial success is a normal outcome here, so say what did not land.
+      for (const [param, reason] of res.rejected) {
+        toast.error(`${param} not applied`, { description: reason });
+      }
+    },
+    onError: (err) => {
+      const msg = err instanceof ApiError
+        ? err.problem.detail ?? err.problem.title
+        : (err as Error).message;
+      toast.error("Could not save environment settings", { description: msg });
+    },
+  });
+
+  // Only keys the backend will accept, and only ones the spec actually sets —
+  // an empty spec has nothing meaningful to edit.
+  const keys = (q.data?.editable_train_keys ?? [])
+    .filter((k) => k in loaded);
+  const edits = keys.flatMap((k) => {
+    const raw = form[k] ?? "";
+    if (raw === JSON.stringify(loaded[k])) return [];
+    try {
+      return [{ parameter: k, new_value: JSON.parse(raw),
+                rationale: "edited from project settings" }];
+    } catch {
+      return [];  // mid-typing / not valid JSON yet — not an edit
+    }
+  });
+  const malformed = keys.filter((k) => {
+    const raw = form[k] ?? "";
+    if (raw === JSON.stringify(loaded[k])) return false;
+    try { JSON.parse(raw); return false; } catch { return true; }
+  });
+
+  if (q.data && !q.data.active) return null;
+
+  return (
+    <section style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", background: "var(--surface-strong)", padding: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+        <span className="rs-caption" style={{ margin: 0 }}>
+          Environment the loop trains under
+          {q.data?.current?.meta && typeof (q.data.current.meta as { version?: string }).version === "string" && (
+            <> · <code className="mono">{(q.data.current.meta as { version: string }).version}</code></>
+          )}
+        </span>
+        {(q.isLoading || mut.isPending) && <Icon name="loader" size={12} className="rs-spin" />}
+      </div>
+      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>
+        Train-only knobs — resets, terminations and PPO exploration. Saving
+        writes a new spec version and repoints <code className="mono">current</code>;
+        the next run picks it up. Values are JSON, so a range is{" "}
+        <code className="mono">[0.0, 1.5]</code> and a switch is{" "}
+        <code className="mono">false</code>.
+      </p>
+      <div className="rs-row2">
+        {keys.map((k) => (
+          <Field key={k} label={k} htmlFor={`env-${k}`}>
+            <input
+              id={`env-${k}`}
+              className="rs-input mono"
+              value={form[k] ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, [k]: e.target.value }))}
+              disabled={mut.isPending || q.isLoading}
+            />
+            {ENV_TRAIN_HINTS[k] && <p className="rs-hintline">{ENV_TRAIN_HINTS[k]}</p>}
+          </Field>
+        ))}
+      </div>
+      {malformed.length > 0 && (
+        <p className="rs-hintline" style={{ color: "var(--st-amber)", marginTop: 8 }}>
+          Not valid JSON yet: {malformed.join(", ")}
+        </p>
+      )}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 12 }}>
+        <Btn kind="quiet" size="sm" disabled={edits.length === 0 || mut.isPending}
+             onClick={() => setForm(Object.fromEntries(
+               Object.entries(loaded).map(([k, v]) => [k, JSON.stringify(v)])))}>
+          Revert
+        </Btn>
+        <Btn kind="primary" size="sm" icon={mut.isPending ? "loader" : "check"}
+             disabled={edits.length === 0 || mut.isPending}
+             onClick={() => mut.mutate(edits)}>
+          Save
+        </Btn>
       </div>
     </section>
   );

@@ -842,3 +842,113 @@ def test_clamped_noise_stays_trainable():
     dist.log_prob(torch.zeros(2, 4)).sum().backward()
     assert dist.std_param.grad is not None
     assert torch.isfinite(dist.std_param.grad).all()
+
+
+def _vitals_logger():
+    """A stand-in shaped like rsl_rl's `Logger` (rewbuffer / lenbuffer /
+    ep_extras, and a `log` taking action_std as its 5th variadic arg)."""
+    import torch
+
+    class Logger:
+        def __init__(self):
+            self.rewbuffer = [100.0, 120.0]
+            self.lenbuffer = [200.0, 240.0]
+            self.ep_extras = [{
+                "Episode_Reward/sculptor_primary": torch.tensor([15.0, 17.0]),
+                "Episode_Reward/action_rate_l2": torch.tensor([-26.0, -27.0]),
+                "Episode_Reward/upright": 0.5,
+                "Episode_Termination/fell_over": torch.tensor([2.0]),
+            }]
+            self.calls = []
+
+        def log(self, it, start_it, total_it, *a, **kw):
+            self.calls.append((it, a, kw))
+
+    runner = type("R", (), {})()
+    runner.logger = Logger()
+    return runner
+
+
+def _emitted(capsys) -> list[dict]:
+    import json as _json
+    return [_json.loads(ln[len("[SCULPT-EVENT]"):])
+            for ln in capsys.readouterr().out.splitlines()
+            if ln.startswith("[SCULPT-EVENT]")]
+
+
+def test_learning_vitals_report_what_pays_and_what_costs(capsys):
+    """The pair that decides whether a policy should bother trying.
+
+    Both failures diagnosed on platform-ascent-showcase were an action-rate
+    penalty quietly outgrowing the task reward. Visible in one line here;
+    previously only in an hour of unstructured console text.
+    """
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = _vitals_logger()
+    assert runner_mod._install_learning_vitals(runner, 1500) is True
+    runner.logger.log(186, 0, 1500, 0.1, 0.2, {}, 1e-3,
+                      torch.full((29,), 1.37), None)
+
+    (ev,) = _emitted(capsys)
+    assert ev["type"] == "learning_vitals"
+    assert (ev["rl_iter"], ev["rl_total"]) == (186, 1500)
+    assert ev["mean_reward"] == pytest.approx(110.0)
+    assert ev["mean_ep_len"] == pytest.approx(220.0)
+    assert ev["action_std"] == pytest.approx(1.37, abs=1e-4)
+    assert ev["top_reward"] == {"term": "sculptor_primary", "value": 16.0}
+    assert ev["top_penalty"] == {"term": "action_rate_l2", "value": -26.5}
+    # Reporting on the run must never replace the run's own logging.
+    assert runner.logger.calls[0][0] == 186
+
+
+def test_learning_vitals_never_break_the_run_they_report_on(capsys):
+    """A telemetry failure costs telemetry, not training."""
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    class Broken:
+        rewbuffer, lenbuffer = [1.0], [2.0]
+        def __init__(self): self.calls = []
+        @property
+        def ep_extras(self): raise RuntimeError("boom")
+        def log(self, *a, **kw): self.calls.append(a)
+
+    runner = type("R", (), {})()
+    runner.logger = Broken()
+    assert runner_mod._install_learning_vitals(runner, 10) is True
+    runner.logger.log(1, 0, 10, 0.1, 0.2, {}, 1e-3, torch.full((4,), 0.5), None)
+
+    assert runner.logger.calls, "the wrapped call must still happen"
+    assert _emitted(capsys) == []
+    # A runner with no logger is a supported shape, not an error.
+    assert runner_mod._install_learning_vitals(object(), 10) is False
+
+
+def test_learning_vitals_survive_a_log_signature_change(capsys):
+    """Losing one field beats losing the event."""
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = _vitals_logger()
+    runner_mod._install_learning_vitals(runner, 10)
+    runner.logger.log(3, 0, 10)  # no action_std at all
+
+    (ev,) = _emitted(capsys)
+    assert ev["action_std"] is None
+    assert ev["mean_reward"] == pytest.approx(110.0)
+    assert ev["top_penalty"]["term"] == "action_rate_l2"
+
+
+def test_learning_vitals_ignore_non_reward_extras(capsys):
+    """`Episode_Termination/*` is not a reward component."""
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = _vitals_logger()
+    runner_mod._install_learning_vitals(runner, 10)
+    runner.logger.log(1, 0, 10, 0.1, 0.2, {}, 1e-3, torch.full((4,), 0.9), None)
+
+    (ev,) = _emitted(capsys)
+    assert "fell_over" not in (ev["top_reward"]["term"], ev["top_penalty"]["term"])

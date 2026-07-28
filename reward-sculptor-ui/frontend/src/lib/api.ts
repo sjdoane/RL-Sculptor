@@ -303,6 +303,49 @@ export async function patchProjectSettings(
   );
 }
 
+/** The project's env spec: what the sculpt loop trains under. */
+export interface EnvSpecInfo {
+  active: boolean;
+  current: { meta?: Record<string, unknown>; shared?: Record<string, unknown>;
+             train?: Record<string, unknown> } | null;
+  versions: string[];
+  /** Train keys the backend will accept an edit for. Rendered from here
+   *  rather than hardcoded, so the UI can't drift from the validator. */
+  editable_train_keys: string[];
+}
+
+export interface EnvSpecTrainEditResult {
+  applied: string[];
+  /** `[parameter, reason]` — surfaced, never swallowed. */
+  rejected: string[][];
+  new_version: string | null;
+  current: EnvSpecInfo["current"];
+}
+
+export async function getProjectEnvSpec(
+  projectSlug: string,
+): Promise<EnvSpecInfo> {
+  return handle<EnvSpecInfo>(
+    await fetch(`/api/projects/${projectSlug}/env-spec`),
+  );
+}
+
+/** PUT .../env-spec/train — change the knobs the loop trains under.
+ *  Partial success is normal: a rejected edit comes back with its reason
+ *  while the valid ones still land. */
+export async function editProjectEnvSpecTrain(
+  projectSlug: string,
+  edits: Array<{ parameter: string; new_value: unknown; rationale?: string }>,
+): Promise<EnvSpecTrainEditResult> {
+  return handle<EnvSpecTrainEditResult>(
+    await fetch(`/api/projects/${projectSlug}/env-spec/train`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ edits }),
+    }),
+  );
+}
+
 /** §Ship-9b: structured motor-spec payload for POST /physics/motor-limits. */
 export interface MotorSpec {
   peak_torque_nm?: number | null;

@@ -2288,6 +2288,105 @@ def _clamp_warm_started_noise(runner: Any, ceiling: float) -> Optional[dict]:
                 "ceiling": ceiling}
 
 
+def _install_learning_vitals(runner: Any, total_iters: int) -> bool:
+    """Emit per-iteration `learning_vitals` events by wrapping the logger.
+
+    rsl_rl prints everything a person needs to judge a run — mean return,
+    episode length, exploration std, and the per-component reward breakdown —
+    but only as console text, so the UI sees an hour of unstructured log lines
+    behind a percentage bar. Every failure diagnosed on this project so far was
+    a number sitting in that text: an inherited action std that made the
+    action-rate penalty outgrow the task reward, then the same penalty growing
+    back under a tripled entropy bonus. Both are obvious the moment the
+    strongest positive and negative components are put side by side.
+
+    Wraps `runner.logger.log` rather than reimplementing it, so the numbers
+    reported are exactly the numbers rsl_rl computed. Returns False when the
+    runner has no logger to wrap — telemetry must never be a reason a run
+    fails to start.
+    """
+    import statistics
+
+    logger = getattr(runner, "logger", None)
+    original = getattr(logger, "log", None)
+    if not callable(original):
+        return False
+
+    def _mean(buf: Any) -> Optional[float]:
+        try:
+            return float(statistics.mean(buf)) if len(buf) else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _components() -> dict[str, float]:
+        """Mean of each `Episode_Reward/<name>` term over the window.
+
+        Averaged across `ep_extras` the same way rsl_rl averages them for its
+        own console block, so the two never disagree. Must be read before the
+        wrapped call — `log` clears the buffer on its way out.
+        """
+        import torch
+
+        acc: dict[str, list[float]] = {}
+        for ep in getattr(logger, "ep_extras", None) or []:
+            for key, val in ep.items():
+                name = str(key)
+                if not name.startswith("Episode_Reward/"):
+                    continue
+                try:
+                    v = (float(val.mean()) if isinstance(val, torch.Tensor)
+                         else float(val))
+                except (TypeError, ValueError):
+                    continue
+                acc.setdefault(name[len("Episode_Reward/"):], []).append(v)
+        return {k: statistics.mean(v) for k, v in acc.items() if v}
+
+    def _logged(it, start_it, total_it, *a, **kw):
+        # The wrapped call must happen no matter what: it is the run's own
+        # logging, not ours. Anything we add is best-effort on top.
+        try:
+            # rsl_rl calls this positionally:
+            #   log(it, start_it, total_it, collect_time, learn_time,
+            #       loss_dict, learning_rate, action_std, rnd_weight, ...)
+            # so after the three named parameters `action_std` is a[4].
+            # Guarded rather than indexed blindly: a signature change should
+            # cost this one field, not the whole event.
+            action_std = kw.get("action_std")
+            if action_std is None and len(a) >= 5:
+                action_std = a[4]
+            std = (float(action_std.mean())
+                   if hasattr(action_std, "mean") else None)
+            comps = _components()
+            top = max(comps.items(), key=lambda kv: kv[1], default=None)
+            bottom = min(comps.items(), key=lambda kv: kv[1], default=None)
+            payload = {
+                "type": "learning_vitals",
+                "rl_iter": int(it),
+                "rl_total": int(total_it or total_iters),
+                "mean_reward": _mean(getattr(logger, "rewbuffer", [])),
+                "mean_ep_len": _mean(getattr(logger, "lenbuffer", [])),
+                "action_std": std,
+            }
+            # The pair that decides whether the task is worth doing: what pays
+            # most, and what costs most. When the cost outgrows the pay, the
+            # policy's best move is to stop trying — which reads from outside
+            # as "the reward does nothing".
+            if top is not None and top[1] > 0:
+                payload["top_reward"] = {"term": top[0],
+                                         "value": round(top[1], 4)}
+            if bottom is not None and bottom[1] < 0:
+                payload["top_penalty"] = {"term": bottom[0],
+                                          "value": round(bottom[1], 4)}
+            print("[SCULPT-EVENT] " + json.dumps(payload), flush=True)
+        except Exception as e:  # noqa: BLE001 — never break a run to report on it
+            print(f"[runner] learning vitals skipped: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+        return original(it, start_it, total_it, *a, **kw)
+
+    logger.log = _logged
+    return True
+
+
 def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
     """Keep directly-parameterized Gaussian policy noise positive.
 
@@ -2734,6 +2833,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
     _poll_thread = _threading.Thread(target=_progress_poller, daemon=True)
     _poll_thread.start()
     std_guard_handle = _install_scalar_std_guard(runner)
+    # The progress poller above says how far along the run is; this says
+    # whether it is going anywhere.
+    if not _install_learning_vitals(runner, int(args.max_iterations)):
+        print("[runner] learning vitals unavailable: runner exposes no logger",
+              file=sys.stderr, flush=True)
     try:
         runner.learn(
             num_learning_iterations=args.max_iterations,
