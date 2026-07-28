@@ -34,12 +34,15 @@ type PickerRow = {
   duration_s: number;
   score?: number;
   match_confidence?: number | null;
+  /** One-line LLM rationale; only the reranked path produces one. */
+  reason?: string | null;
 };
 
 function toRow(m: RefMatch): PickerRow {
   return {
     clip_id: m.clip_id, text: m.text, tier: m.tier, license: m.license,
     duration_s: m.duration_s, score: m.score, match_confidence: m.match_confidence,
+    reason: m.reason,
   };
 }
 function indexToRow(r: RefIndexRow): PickerRow {
@@ -94,6 +97,17 @@ function ResultRow({
           {row.score != null && <span>score {row.score.toFixed(2)}</span>}
           {row.match_confidence != null && <span>confidence {row.match_confidence.toFixed(2)}</span>}
         </div>
+        {/* The rerank's own reason for the ranking. It was being returned
+            and dropped, which made a reranked list look like an unexplained
+            reshuffle of the deterministic one. */}
+        {row.reason && (
+          <div
+            className="rs-sub"
+            style={{ marginTop: 3, fontSize: 10.5, fontStyle: "italic", whiteSpace: "normal" }}
+          >
+            {row.reason}
+          </div>
+        )}
       </div>
       {selected && <Icon name="check" size={14} color="var(--rs-primary)" />}
     </button>
@@ -155,8 +169,14 @@ export function ReferencePickerDialog({
 
   const trimmed = debouncedQuery.trim();
   const maxDurationS = Number.parseFloat(maxDur);
+  // The exact query the user asked to rerank. Comparing against the live
+  // query (rather than holding a boolean) means editing the text drops
+  // straight back to the cheap deterministic path — an LLM call per
+  // keystroke is what the endpoint's llm=0 default exists to prevent.
+  const [rerankedQuery, setRerankedQuery] = useState<string | null>(null);
+  const reranked = rerankedQuery !== null && rerankedQuery === trimmed;
   const search = useReferenceSearch(trimmed, {
-    robot, enabled: trimmed.length > 0,
+    robot, enabled: trimmed.length > 0, useLlm: reranked,
   });
   const browse = useReferenceIndex({
     robot, enabled: trimmed.length === 0,
@@ -285,6 +305,24 @@ export function ReferencePickerDialog({
           autoFocus
           style={{ border: 0, background: "none", outline: "none", fontSize: 13, width: "100%", color: "var(--ink)" }}
         />
+        {/* Semantic search runs deterministic so it can keep up with typing.
+            The LLM rerank was therefore unreachable — this asks for it once,
+            for the query on screen, and each hit comes back with a stated
+            reason. */}
+        {trimmed.length > 0 && (
+          <Btn
+            kind={reranked ? "primary" : "quiet"}
+            size="xs"
+            icon={reranked && search.isFetching ? "loader" : "sparkles"}
+            disabled={reranked && search.isFetching}
+            title="Re-rank these results with an LLM, with a one-line reason per clip."
+            onClick={() => setRerankedQuery(reranked ? null : trimmed)}
+          >
+            {reranked
+              ? (search.isFetching ? "Ranking…" : "AI-ranked")
+              : "AI rank"}
+          </Btn>
+        )}
       </div>
 
       {/* Filters apply to browsing, not to the semantic search endpoint —

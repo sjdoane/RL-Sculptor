@@ -17,14 +17,19 @@ import type { MissionDetail, RefMatch } from "@/lib/types";
  *  empty state instead of hitting the search endpoint with "". */
 export function useReferenceSearch(
   query: string,
-  opts?: { robot?: string; enabled?: boolean },
+  opts?: { robot?: string; enabled?: boolean; useLlm?: boolean },
 ) {
   const robot = opts?.robot ?? "g1";
   const trimmed = query.trim();
   const enabled = trimmed.length > 0 && (opts?.enabled ?? true);
+  // Opt-in per query, never per keystroke. The rerank is an LLM call, so a
+  // caller flips this on for a query the user explicitly asked to rerank —
+  // which is also why it belongs in the cache key, so the deterministic and
+  // reranked results for the same text don't overwrite each other.
+  const useLlm = opts?.useLlm ?? false;
   return useQuery<RefMatch[]>({
-    queryKey: qk.referenceSearch(trimmed, robot),
-    queryFn: () => searchReferences(trimmed, { robot, useLlm: false }),
+    queryKey: [...qk.referenceSearch(trimmed, robot), useLlm],
+    queryFn: () => searchReferences(trimmed, { robot, useLlm }),
     enabled,
   });
 }
