@@ -1024,3 +1024,43 @@ def test_the_promoted_module_still_imports_and_pays_per_mode(tmp_path):
         _info(0.5))
     assert isinstance(total, float)
     assert any(k.startswith(MODE_COMPONENT_PREFIX) for k in comps)
+
+
+def test_grafting_carries_a_helper_bound_by_tuple_unpacking(tmp_path):
+    """The shape that killed a real authoring run.
+
+    A model asked to reward "come to rest between 4.92s and 6.92s" writes its
+    window bounds as one statement — `_SETTLE_LO, _SETTLE_HI = 4.92, 6.92` —
+    and `_module_bindings` only collected bare-`Name` assignment targets. The
+    graft therefore did not believe the donor defined those names, dropped the
+    statement, and the module died at the contract probe with
+    `NameError: name '_SETTLE_HI' is not defined` after a three-minute call.
+    """
+    from sculptor.mode_rewards import _fn_span
+
+    g = _graph(fps=120.0, span=80)
+    full = generate_mode_reward_scaffold(g, clip=_tracking_clip())
+    twin = generate_mode_reward_scaffold(g)
+
+    fn = f"{MODE_FN_PREFIX}launch"
+    start, end = _fn_span(twin, fn)
+    twin = twin[:start] + (
+        f"def {fn}(state, action, next_state, info):\n"
+        '    """launch: authored."""\n'
+        "    del state, action, next_state, info\n"
+        "    return _LAUNCH_HI - _LAUNCH_LO, {}\n") + twin[end:]
+    start, end = _fn_span(twin, fn + BATCHED_FN_SUFFIX)
+    twin = twin[:start] + (
+        f"def {fn}{BATCHED_FN_SUFFIX}(state, action, next_state, info, like):\n"
+        '    """launch: authored."""\n'
+        "    del state, action, next_state, info\n"
+        "    return like + (_LAUNCH_HI - _LAUNCH_LO), {}\n") + twin[end:]
+    twin = "_LAUNCH_LO, _LAUNCH_HI = 0.25, 0.75\n\n" + twin
+
+    grafted = graft_mode_bodies(full, twin, ["launch"])
+
+    assert grafted.count("_LAUNCH_LO, _LAUNCH_HI = 0.25, 0.75") == 1, (
+        "one statement binding two wanted names must be emitted once")
+    assert validate_mode_reward_source(grafted, g) == []
+    mod = _load(grafted, tmp_path, name="gr_tuple")
+    assert mod._LAUNCH_HI == 0.75 and mod._LAUNCH_LO == 0.25

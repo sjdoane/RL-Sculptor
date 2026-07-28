@@ -722,7 +722,14 @@ def _module_bindings(source: str) -> dict[str, tuple[int, int]]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names = [node.name]
         elif isinstance(node, ast.Assign):
-            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            # Every name the statement binds, not just the bare-Name targets.
+            # `_SETTLE_LO, _SETTLE_HI = 4.92, 6.92` is how a model naturally
+            # writes a window pair, and skipping tuple targets meant
+            # `_carry_helpers` did not know the module defined those names —
+            # so the graft dropped the statement and the batched probe died on
+            # `NameError: name '_SETTLE_HI' is not defined`.
+            names = [n.id for t in node.targets
+                     for n in ast.walk(t) if isinstance(n, ast.Name)]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names = [node.target.id]
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -795,9 +802,13 @@ def _carry_helpers(base: str, authored: str, fn_names: Sequence[str]) -> str:
     if not wanted:
         return base
     # Emit in the donor's own order so a helper that references another still
-    # reads top-down, and so the result is stable across runs.
+    # reads top-down, and so the result is stable across runs. Dedupe by span:
+    # one statement can bind several names (`_LO, _HI = ...`), and emitting it
+    # once per name would redefine it — harmless for a constant, a silent
+    # double-definition for anything else.
     wanted.sort(key=lambda n: donor[n][0])
-    blocks = [authored[donor[n][0]:donor[n][1]].rstrip("\n") for n in wanted]
+    spans = list(dict.fromkeys(donor[n] for n in wanted))
+    blocks = [authored[lo:hi].rstrip("\n") for lo, hi in spans]
     return (base.rstrip("\n") + "\n\n\n"
             + "\n\n\n".join(blocks) + "\n")
 
@@ -1433,6 +1444,45 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
             f"the right function.")
     return {"source": grafted, "prompt": prompt, "authored": authored,
             "pending": [n for n, ok in authored.items() if not ok]}
+
+
+def reward_spec_from_source(source: str) -> dict:
+    """`REWARD_SPEC` read out of a reward module without importing it.
+
+    Read rather than imported because a per-mode module builds its numpy
+    target tables at import time, and every caller here only wants a couple of
+    scalars out of the header.
+
+    Regex is not an option: the scaffold writes the dict across many lines with
+    double-quoted keys, and `_rewrite_reward_spec` — which every promotion runs
+    — replaces it with a single-line `repr`, so the same key appears as
+    `"reference_clip_id":` before promotion and `'reference_clip_id':` after.
+    Matching one shape silently returned nothing for the other.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    for node in tree.body:
+        named = (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "REWARD_SPEC"
+                    for t in node.targets)
+        ) or (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "REWARD_SPEC"
+        )
+        if not named or node.value is None:
+            continue
+        try:
+            spec = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return {}
+        return spec if isinstance(spec, dict) else {}
+    return {}
 
 
 def _rewrite_reward_spec(source: str, updates: Mapping[str, Any]) -> str:

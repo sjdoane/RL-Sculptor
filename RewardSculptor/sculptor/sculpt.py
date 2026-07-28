@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import ast
 import json
 import math
 import re
@@ -458,6 +459,43 @@ def _promote_iteration_selection(
     return promoted.tuple_hash, pinned
 
 
+#: A per-mode module always defines both; a flat tracking reward never does.
+_MODE_REWARD_MARKERS = ("MODE_ORDER", "MODE_WINDOWS_S")
+
+
+def _promoted_mode_reward_clip(rewards_dir: Path) -> Optional[str]:
+    """The clip the newest promoted reward already tracks per mode, if any.
+
+    `promote_mode_reward` and `_prepare_reference_guided_run` are two separate
+    reward installers and both finish by repointing `current.py`. Promoting an
+    authored per-mode reward and then launching with `--reference-clip` for
+    that SAME clip used to build a flat tracking reward as the next version and
+    silently drop every authored mode: the bodies stayed on disk as
+    `mode_reward_v<n>.py`, `current.py` moved off them, and nothing in the
+    event stream said the modes were no longer being trained.
+
+    Read, never import: a per-mode module builds numpy tables at import time,
+    and the scaffold records its clip in `REWARD_SPEC["reference_clip_id"]`
+    precisely so this question is answerable from the source text.
+    """
+    try:
+        _n, latest = _find_latest_reward_version(rewards_dir)
+    except FileNotFoundError:
+        return None
+    if latest is None or not Path(latest).is_file():
+        return None
+    try:
+        source = Path(latest).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not all(marker in source for marker in _MODE_REWARD_MARKERS):
+        return None
+    from sculptor.mode_rewards import reward_spec_from_source
+
+    value = reward_spec_from_source(source).get("reference_clip_id")
+    return value if isinstance(value, str) and value else None
+
+
 def _prepare_reference_guided_run(
     *,
     adapter: Any,
@@ -505,6 +543,48 @@ def _prepare_reference_guided_run(
         behavior_goal=behavior_goal,
     )
     cache_path = project / "reports" / "reference_motion_current.json"
+    # An authored per-mode reward for THIS clip is already a reference-guided
+    # reward — it carries the same tracking backbone plus the authored mode
+    # windows on top. Rebuilding the flat one here would be a strict downgrade
+    # that also discarded the authored work, so bind what is promoted instead
+    # of replacing it. The selection is still re-promoted so the pinned tuple
+    # names the reward that actually trains.
+    promoted_clip = _promoted_mode_reward_clip(rewards_dir)
+    if promoted_clip is not None and promoted_clip == clip_id:
+        latest_n, latest_path = _find_latest_reward_version(rewards_dir)
+        tuple_hash, pinned = _promote_iteration_selection(
+            adapter,
+            project,
+            reward_path=Path(latest_path),
+            env_spec_version=(selection.refs["env_spec"].version
+                              if selection.refs.get("env_spec") else "v0"),
+            base_selection=selection_path,
+        )
+        result = {
+            "schema": 1,
+            "input_hash": input_hash,
+            "clip_id": clip_id,
+            "robot": robot,
+            "clip_sha256": clip_sha256,
+            "reference_target_sha256": None,
+            "phase_mode": "per_mode",
+            "phase_duration_s": None,
+            "task_residual_authored": True,
+            "reward_version": f"v{latest_n}",
+            "reward_path": str(Path(latest_path).resolve()),
+            "reward_sha256": file_sha256(Path(latest_path)),
+            "selection_path": (str(pinned.resolve()) if pinned
+                               else str(selection_path)),
+            "tuple_hash": tuple_hash or selection.tuple_hash,
+            "source": "promoted_mode_reward",
+        }
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        _emit_event({"type": "reference_motion_reused", **result})
+        return result
+
     selected_reward_ref = selection.refs.get("reward")
     selected_reward_path: Optional[Path] = None
     if selected_reward_ref is not None:
