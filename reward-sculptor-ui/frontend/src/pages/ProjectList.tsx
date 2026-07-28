@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, IconBtn, Modal, Sparkline } from "@/components/rs/primitives";
+import { useRunningSlugs } from "@/hooks/useDashboard";
 import { useDeleteProject, useProjects } from "@/hooks/useProjects";
 import { formatRelative } from "@/lib/utils";
 import type { ProjectSummary } from "@/lib/types";
@@ -29,6 +30,7 @@ export default function ProjectList() {
   const del = useDeleteProject();
   const [confirm, setConfirm] = useState<ProjectSummary | null>(null);
   const projects = data ?? [];
+  const runningSlugs = useRunningSlugs();
 
   return (
     <div className="rs-scroll">
@@ -94,7 +96,9 @@ export default function ProjectList() {
                     style={{ cursor: "pointer" }}
                   >
                     <td className="name" style={{ fontFamily: "var(--font-sans)" }}>{p.display_name}</td>
-                    <td><Badge status={p.status} /></td>
+                    {/* §Ship 37: `p.status` is "draft" for every project on
+                        this install — see `useRunningSlugs`. */}
+                    <td><Badge status={runningSlugs.has(p.slug) ? "running" : p.status} /></td>
                     <td>{adapterShort(p.adapter_class)}</td>
                     <td style={{ fontFamily: "var(--font-sans)" }}>{humanizeSlug(p.library_slug) || p.env_id || "—"}</td>
                     <td style={{ color: p.primary_metric == null ? "var(--rs-muted)" : "var(--st-amber)" }}>
