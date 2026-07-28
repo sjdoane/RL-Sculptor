@@ -9,7 +9,7 @@ import {
   useReferenceIndex,
   useReferenceSearch,
 } from "@/hooks/useReferences";
-import { ApiError, getReferencePreviewUrl } from "@/lib/api";
+import { ApiError, getReferenceClipUrl, getReferencePreviewUrl } from "@/lib/api";
 import type { RefIndexRow, RefMatch } from "@/lib/types";
 
 // Search-as-you-type debounce. Deterministic endpoint (llm=0) is cheap,
@@ -144,23 +144,66 @@ export function ReferencePickerDialog({
   const [composing, setComposing] = useState(false);
   const [browseOffset, setBrowseOffset] = useState(0);
 
+  // Browse filters. Every one is a query param the endpoint already
+  // accepted and nothing sent — which is why a 6k-clip library could only
+  // be paged through in one fixed order.
+  const [tier, setTier] = useState("");
+  const [label, setLabel] = useState("");
+  const [sort, setSort] = useState<"recent" | "duration" | "name">("recent");
+  const [composedOnly, setComposedOnly] = useState(false);
+  const [maxDur, setMaxDur] = useState("");
+
   const trimmed = debouncedQuery.trim();
+  const maxDurationS = Number.parseFloat(maxDur);
   const search = useReferenceSearch(trimmed, {
     robot, enabled: trimmed.length > 0,
   });
   const browse = useReferenceIndex({
     robot, enabled: trimmed.length === 0,
     limit: BROWSE_PAGE, offset: browseOffset,
+    tier: tier || undefined,
+    label: label || undefined,
+    composed: composedOnly ? true : undefined,
+    maxDurationS: Number.isFinite(maxDurationS) ? maxDurationS : undefined,
+    sort,
   });
-  // A new query starts from the top of its own result set.
-  useEffect(() => { setBrowseOffset(0); }, [trimmed]);
+  const filtered = !!(tier || label || composedOnly || maxDur.trim());
+  // A new query — or a new filter — starts from the top of its own result
+  // set. Keeping the old offset would page past the end of a smaller one.
+  useEffect(() => {
+    setBrowseOffset(0);
+  }, [trimmed, tier, label, sort, composedOnly, maxDur]);
+
+  // Facets come back with every browse response and describe the WHOLE
+  // library for this robot, not the filtered page — so the options don't
+  // vanish as you narrow. Keep the last non-empty set so they don't flicker
+  // to empty while a filtered page is in flight.
+  const facets = browse.data?.facets;
+  const tierOptions = Object.entries(facets?.tiers ?? {}).sort();
+  // Labels are derived from clip ids, so the raw top-of-list is filename
+  // debris — `120`, `100`, `1`, `f`. Those partition the library without
+  // describing anything, so they aren't offered; `novel`, `composed`,
+  // `locomotion` and friends survive.
+  const labelOptions = Object.entries(facets?.labels ?? {})
+    .filter(([l]) => l.length > 2 && !/^\d+$/.test(l))
+    .sort((a, b) => b[1] - a[1]).slice(0, 24);
+  // One distinct tier means the control can only ever be a no-op. Today the
+  // whole corpus is tier K (kinematic-only); it earns its place as soon as a
+  // clip is dynamics-certified, so the control appears then rather than
+  // sitting there inert.
+  const showTier = tierOptions.length > 1 || !!tier;
 
   const rows: PickerRow[] = trimmed.length > 0
     ? (search.data ?? []).map(toRow)
     : (browse.data?.rows ?? []).map(indexToRow);
   const isLoading = trimmed.length > 0 ? search.isLoading : browse.isLoading;
   const isError = trimmed.length > 0 ? search.isError : browse.isError;
-  const libraryEmpty = trimmed.length === 0 && !browse.isLoading && !browse.isError && rows.length === 0;
+  const browseEmpty = trimmed.length === 0 && !browse.isLoading && !browse.isError && rows.length === 0;
+  // An empty filtered page is not an empty library. Saying "run `sculpt refs
+  // ingest`" to someone who just narrowed to Tier A would send them to fix
+  // something that isn't broken.
+  const libraryEmpty = browseEmpty && !filtered;
+  const filteredEmpty = browseEmpty && filtered;
 
   const attach = useAttachStageReference(slug);
   const isStandalone = onPick !== undefined;
@@ -244,6 +287,97 @@ export function ReferencePickerDialog({
         />
       </div>
 
+      {/* Filters apply to browsing, not to the semantic search endpoint —
+          that one ranks by embedding similarity and takes no facets. Rather
+          than let a set filter silently stop applying the moment you type,
+          the bar disables itself and says so. */}
+      <div
+        className="rs-flex rs-gap-6"
+        style={{ flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}
+      >
+        <Icon name="filter" size={13} color="var(--rs-muted)" />
+        <div className="rs-select">
+          <select
+            value={sort}
+            onChange={(e) => setSort(e.target.value as typeof sort)}
+            disabled={trimmed.length > 0}
+            aria-label="Sort clips"
+          >
+            <option value="recent">Newest first</option>
+            <option value="duration">Longest first</option>
+            <option value="name">By name</option>
+          </select>
+        </div>
+        {showTier && (
+          <div className="rs-select">
+            <select
+              value={tier}
+              onChange={(e) => setTier(e.target.value)}
+              disabled={trimmed.length > 0}
+              aria-label="Filter by retarget tier"
+            >
+              <option value="">Any tier</option>
+              {tierOptions.map(([t, n]) => (
+                <option key={t} value={t}>Tier {t} ({n})</option>
+              ))}
+            </select>
+          </div>
+        )}
+        <div className="rs-select">
+          <select
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            disabled={trimmed.length > 0}
+            aria-label="Filter by label"
+          >
+            <option value="">Any label</option>
+            {labelOptions.map(([l, n]) => (
+              <option key={l} value={l}>{l} ({n})</option>
+            ))}
+          </select>
+        </div>
+        <input
+          value={maxDur}
+          onChange={(e) => setMaxDur(e.target.value)}
+          disabled={trimmed.length > 0}
+          inputMode="decimal"
+          placeholder="max s"
+          aria-label="Maximum clip duration in seconds"
+          style={{
+            width: 66, height: 28, fontSize: 12, padding: "0 8px",
+            background: "var(--surface-card)", color: "var(--ink)",
+            border: "1px solid var(--hairline)",
+            borderRadius: "var(--radius-sm)",
+          }}
+        />
+        <Btn
+          kind={composedOnly ? "primary" : "quiet"}
+          size="xs"
+          icon="sparkles"
+          disabled={trimmed.length > 0}
+          onClick={() => setComposedOnly((v) => !v)}
+        >
+          Composed{facets?.composed ? ` (${facets.composed})` : ""}
+        </Btn>
+        {filtered && trimmed.length === 0 && (
+          <Btn
+            kind="quiet" size="xs" icon="x"
+            onClick={() => {
+              setTier(""); setLabel(""); setComposedOnly(false); setMaxDur("");
+            }}
+          >
+            Clear
+          </Btn>
+        )}
+        {trimmed.length > 0 && (
+          <span className="rs-sub" style={{ fontSize: 11 }}>
+            {filtered
+              ? "Filters are paused — semantic search ranks the whole library."
+              : "Clear the search box to filter and sort the library."}
+          </span>
+        )}
+      </div>
+
       {isLoading && <p className="rs-sub">Searching…</p>}
       {isError && (
         <div className="rs-banner err">
@@ -256,6 +390,13 @@ export function ReferencePickerDialog({
           icon="video"
           title="Reference library is empty"
           sub="No clips have been ingested yet. Run `sculpt refs ingest` to populate it."
+        />
+      )}
+      {filteredEmpty && (
+        <EmptyState
+          icon="filter"
+          title="No clips match these filters"
+          sub={`The library has ${facets?.total ?? 0} ${robot} clips. Widen or clear the filters to see them.`}
         />
       )}
       {!isLoading && !isError && !libraryEmpty && trimmed.length > 0 && rows.length === 0 && (
@@ -283,15 +424,21 @@ export function ReferencePickerDialog({
           be a silent `rows[:10]` of ~6015, which read as "this is the
           library" — including right after composing a clip that was not in
           those ten. */}
-      {trimmed.length === 0 && browse.data && browse.data.total > rows.length && (
+      {trimmed.length === 0 && browse.data && rows.length > 0
+        && (browse.data.total > rows.length || filtered) && (
         <div
           className="rs-flex rs-gap-8"
           style={{ marginTop: 8, alignItems: "center", fontSize: 11 }}
         >
           <span className="rs-sub">
             {browseOffset + 1}–{browseOffset + rows.length} of{" "}
-            {browse.data.total} clips
-            {browse.data.facets.composed > 0 && (
+            {browse.data.total} {filtered ? "matching" : ""} clips
+            {/* When filtered, `total` is the match count — say what it was
+                narrowed from, so the filter's effect is legible. */}
+            {filtered && browse.data.facets.total > browse.data.total && (
+              <> (of {browse.data.facets.total})</>
+            )}
+            {!filtered && browse.data.facets.composed > 0 && (
               <> · {browse.data.facets.composed} composed</>
             )}
           </span>
@@ -315,7 +462,24 @@ export function ReferencePickerDialog({
 
       {selectedClipId && (
         <div style={{ marginTop: 12, borderTop: "1px solid var(--hairline)", paddingTop: 12 }}>
-          <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>Preview</div>
+          <div
+            className="rs-flex rs-gap-8"
+            style={{ alignItems: "baseline", marginBottom: 6 }}
+          >
+            <span className="rs-sub" style={{ fontSize: 10.5 }}>Preview</span>
+            <span className="rs-grow" />
+            {/* A composed clip existed only inside the app: there was no way
+                to get its arrays out to inspect or archive them. */}
+            <a
+              className="rs-sub"
+              href={getReferenceClipUrl(selectedClipId)}
+              download={`${selectedClipId}.npz`}
+              style={{ fontSize: 10.5, display: "inline-flex", alignItems: "center", gap: 4 }}
+            >
+              <Icon name="download" size={12} />
+              clip.npz
+            </a>
+          </div>
           <PreviewImage clipId={selectedClipId} />
         </div>
       )}

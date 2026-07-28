@@ -68,6 +68,9 @@ export function ModeRewardPanel({
   const [promoted, setPromoted] = useState<PromotedModeReward | null>(null);
   const [resumed, setResumed] = useState(false);
   const [confirmRescaffold, setConfirmRescaffold] = useState(false);
+  // Include the reference-tracking backbone. On by default, matching the
+  // endpoint — see the checkbox below for what turning it off costs.
+  const [tracking, setTracking] = useState(true);
   const [confirmPartial, setConfirmPartial] = useState(false);
   const qc = useQueryClient();
   const saveDraft = useSaveBehaviorDraft(slug);
@@ -246,7 +249,7 @@ export function ModeRewardPanel({
       const r = await scaffoldModeReward(slug, clipId, {
         robot,
         goal,
-        tracking: true,
+        tracking,
         overwrite,
       });
       setReward(r);
@@ -420,10 +423,38 @@ export function ModeRewardPanel({
       )}
 
       {!reward && (
-        <Btn kind="primary" size="sm" icon="layers"
-             disabled={busy !== null} onClick={() => onScaffold(false)}>
-          {busy === "scaffold" ? "Scaffolding…" : "Scaffold reward"}
-        </Btn>
+        <div style={{ display: "grid", gap: 8 }}>
+          <Btn kind="primary" size="sm" icon="layers"
+               disabled={busy !== null} onClick={() => onScaffold(false)}>
+            {busy === "scaffold" ? "Scaffolding…" : "Scaffold reward"}
+          </Btn>
+          {/* The backbone was hardcoded on, so pure-task OGMP — modes that
+              pay for what the robot achieves rather than for matching the
+              clip pose-by-pose — could not be scaffolded from the UI at
+              all. It is off the happy path, hence a plain checkbox with the
+              consequence stated rather than a prominent control. */}
+          <label
+            className="rs-flex rs-gap-6"
+            style={{ fontSize: 11.5, color: "var(--rs-muted)", alignItems: "flex-start" }}
+          >
+            <input
+              type="checkbox"
+              checked={!tracking}
+              disabled={busy !== null}
+              onChange={(e) => setTracking(!e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              Task terms only — omit the reference-tracking backbone.
+              {!tracking && (
+                <b style={{ color: "var(--st-amber, #d97706)", display: "block" }}>
+                  Every mode starts as a stub paying zero, so the reward is not
+                  trainable until you have authored all {graph.modes.length}.
+                </b>
+              )}
+            </span>
+          </label>
+        </div>
       )}
 
       {reward && (

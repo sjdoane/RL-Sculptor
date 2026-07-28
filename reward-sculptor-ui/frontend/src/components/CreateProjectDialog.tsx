@@ -70,6 +70,7 @@ export function CreateProjectDialog({ robot, onClose }: CreateProjectDialogProps
   // Form state — initialised (and re-initialised) from the incoming robot.
   const defaultTask = robot?.preconfigured_tasks?.[0];
   const [name, setName] = useState(robot?.display_name ?? "");
+  const [description, setDescription] = useState("");
   const [taskId, setTaskId] = useState<string>(defaultTask?.task_id ?? "");
   const [numEnvs, setNumEnvs] = useState(
     defaultTask?.recommended_num_envs ?? 1024,
@@ -113,6 +114,7 @@ export function CreateProjectDialog({ robot, onClose }: CreateProjectDialogProps
       return createProject({
         name: payload.name,
         adapter: payload.adapter,
+        ...(description.trim() && { description: description.trim() }),
         // library_slug only applies to ready adapters that correspond to
         // the library's training_support. When a user overrides to a
         // coming-soon adapter, the library association is still
@@ -218,6 +220,24 @@ export function CreateProjectDialog({ robot, onClose }: CreateProjectDialogProps
           onChange={(e) => setName(e.target.value)}
           placeholder={robot.display_name}
           autoFocus
+        />
+      </Field>
+
+      {/* The project header renders this, and with nothing able to set it,
+          every project read "No description." permanently. */}
+      <Field
+        label="Description"
+        hint="optional"
+        htmlFor="cpd-description"
+      >
+        <textarea
+          id="cpd-description"
+          className="rs-input"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="What should this robot learn to do? Shown on the project header."
+          rows={2}
+          style={{ resize: "vertical", minHeight: 46 }}
         />
       </Field>
 

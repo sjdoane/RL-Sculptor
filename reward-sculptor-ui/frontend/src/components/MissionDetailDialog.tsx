@@ -12,6 +12,7 @@ import {
   useStageIterations,
 } from "@/hooks/useMissions";
 import { useDetachStageReference } from "@/hooks/useReferences";
+import { useSaveMission } from "@/hooks/useSaved";
 import { useJob } from "@/hooks/useJob";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
@@ -58,6 +59,7 @@ export function MissionDetailDialog({
   // / Goal A / Goal B per launch. The actual mutation is owned by
   // RunMissionDialog. We still keep `del` here for the Delete button.
   const del = useDeleteMission(slug);
+  const save = useSaveMission(slug);
 
   // §Ship 20 (de-siloing): which stage's disk-truth iterations to show.
   // null = the collapsed stage list; selecting a stage expands its panel.
@@ -229,6 +231,37 @@ export function MissionDetailDialog({
             )}
           </div>
           <div style={{ display: "flex", gap: 8 }}>
+            {/* The archive page tells users to "save a mission from its
+                detail view". Until now that control did not exist here or
+                anywhere else — the endpoint was only reachable by hand. */}
+            {mission && missionSlug && (
+              <Btn
+                kind="quiet"
+                icon={save.isPending ? "loader" : "package"}
+                disabled={save.isPending}
+                title="Snapshot this mission's stages and checkpoints into Saved missions."
+                onClick={() => {
+                  save.mutate(
+                    { missionSlug },
+                    {
+                      onSuccess: () =>
+                        toast.success("Archiving mission", {
+                          description:
+                            "Snapshot is being written — it will appear under Saved missions.",
+                        }),
+                      onError: (err) => {
+                        const detailMsg = err instanceof ApiError
+                          ? err.problem.detail ?? err.problem.title
+                          : err.message;
+                        toast.error("Could not save mission", { description: String(detailMsg) });
+                      },
+                    },
+                  );
+                }}
+              >
+                {save.isPending ? "Saving…" : "Save snapshot"}
+              </Btn>
+            )}
             {mission && mission.lifecycle !== "errored" && missionSlug && (
               <RunMissionDialog
                 slug={slug}

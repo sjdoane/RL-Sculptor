@@ -1398,6 +1398,13 @@ export function getReferencePreviewUrl(clipId: string): string {
   return `/api/references/${encodeURIComponent(clipId)}/preview`;
 }
 
+/** GET /references/{clip_id}/file/clip.npz — the clip's raw motion arrays.
+ *  A plain href rather than a fetch: this is a file download, and letting
+ *  the browser stream it avoids buffering a multi-MB npz in JS. */
+export function getReferenceClipUrl(clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/file/clip.npz`;
+}
+
 /** POST .../stages/{stage}/reference body {clip_id} — attach a
  *  reference clip to a stage. 409 if mission-scoped jobs are live (same
  *  guard family as regenerateStageMetric). Returns the updated mission. */

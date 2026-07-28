@@ -79,9 +79,22 @@ function IterationSettingsSection({
 
   // Local form state; seeded from the loaded iteration block.
   const [form, setForm] = useState<IterationSettings>({});
+  // Raw text for the comma-separated list fields. Parsing on every keystroke
+  // and re-joining for display would swallow the separator the instant you
+  // typed it, so what the user is typing is held verbatim here and parsed
+  // into an array only on the way into `form`.
+  const [listDraft, setListDraft] = useState<Record<string, string>>({});
   useEffect(() => {
     if (q.data) {
-      setForm(q.data.iteration ?? {});
+      const iteration = q.data.iteration ?? {};
+      setForm(iteration);
+      setListDraft(
+        Object.fromEntries(
+          Object.entries(iteration)
+            .filter(([, v]) => Array.isArray(v))
+            .map(([k, v]) => [k, (v as string[]).join(", ")]),
+        ),
+      );
     }
   }, [q.data]);
 
@@ -92,9 +105,11 @@ function IterationSettingsSection({
     | { key: keyof IterationSettings; label: string; type: "number"; step?: number; min?: number; max?: number; hint?: string }
     | { key: keyof IterationSettings; label: string; type: "bool"; hint?: string }
     | { key: keyof IterationSettings; label: string; type: "text"; hint?: string }
+    | { key: keyof IterationSettings; label: string; type: "list"; hint?: string }
   > = [
     { key: "steps_per_iter", label: "steps_per_iter (training)", type: "number", min: 100, max: 500_000, hint: "rsl_rl max_iterations for mjlab" },
     { key: "primary_metric", label: "primary_metric", type: "text", hint: "e.g. mean_return, max_episode_length" },
+    { key: "behavior_metrics", label: "behavior_metrics", type: "list", hint: "comma-separated; which behavior metrics each iteration computes (blank = adapter default)" },
     { key: "rollout_episodes", label: "rollout_episodes", type: "number", min: 1, max: 32, hint: "episodes captured per iter" },
     { key: "auto_adjust_physics", label: "auto_adjust_physics", type: "bool", hint: "§7.4 — suggest MJCF edit on severe realism verdict" },
     { key: "max_episode_steps", label: "max_episode_steps (rollout)", type: "number", min: 50, max: 5000, hint: "env steps per rollout episode" },
@@ -107,6 +122,12 @@ function IterationSettingsSection({
     { key: "fresh_eval_seeds", label: "fresh_eval_seeds", type: "number", min: 0, max: 10, hint: "end-of-run re-rolls of the kept best on held-out seeds (0 = off)" },
     { key: "hack_income_screen", label: "hack_income_screen", type: "bool", hint: "reject edits that make a caught exploit MORE profitable" },
   ];
+
+  const updateList = (key: keyof IterationSettings, raw: string) => {
+    setListDraft((d) => ({ ...d, [String(key)]: raw }));
+    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    setForm((prev) => ({ ...prev, [key]: parts.length > 0 ? parts : null }));
+  };
 
   const update = (key: keyof IterationSettings, raw: string | boolean) => {
     setForm((prev) => {
@@ -168,6 +189,16 @@ function IterationSettingsSection({
                   <option value="false">false</option>
                 </select>
               </div>
+            ) : f.type === "list" ? (
+              <input
+                id={`set-${String(f.key)}`}
+                className="rs-input mono"
+                type="text"
+                value={listDraft[String(f.key)] ?? ""}
+                onChange={(e) => updateList(f.key, e.target.value)}
+                placeholder="(unset)"
+                disabled={mut.isPending || q.isLoading}
+              />
             ) : (
               <input
                 id={`set-${String(f.key)}`}
