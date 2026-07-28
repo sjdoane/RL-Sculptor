@@ -1229,3 +1229,76 @@ def test_promoting_a_missing_file_is_404(
     r = client.post(PROMOTE_URL.format(slug=slug),
                     json={"filename": "mode_reward_v9.py"})
     assert r.status_code == 404, r.text
+
+
+def test_mode_rewards_reports_nothing_promoted_until_promotion(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """Authored on disk is not the same as trained.
+
+    Both states rendered identically in the UI: the panel listed
+    `mode_reward_v<n>.py` either way, and the Rewards tab — which matches
+    `^v(\\d+)\\.py$` — could not see the file at all. So a user who authored
+    four modes and never pressed Promote saw four green modes over a run that
+    trained the starter reward.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    _author_all(client, slug, monkeypatch)
+
+    body = client.get(f"/projects/{slug}/mode-rewards").json()
+
+    assert [f["filename"] for f in body["mode_rewards"]], "authoring wrote files"
+    assert body["promoted"] is None
+
+
+def test_mode_rewards_promoted_names_what_a_run_would_train(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    final = _author_all(client, slug, monkeypatch)
+    assert client.post(PROMOTE_URL.format(slug=slug),
+                       json={"filename": final}).status_code == 200
+
+    promoted = client.get(f"/projects/{slug}/mode-rewards").json()["promoted"]
+
+    assert promoted is not None
+    assert promoted["version"] == 1
+    assert promoted["filename"] == "v1.py"
+    assert promoted["clip_id"] == "novel-jump-kick--g1"
+    assert promoted["unauthored"] == []
+    assert len(promoted["modes"]) >= 1
+    assert all(m["authored"] for m in promoted["modes"])
+
+
+def test_mode_rewards_promoted_clears_when_a_flat_reward_supersedes_it(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """A later flat version means the modes stopped being what trains.
+
+    This is the state a reference-guided run used to leave behind silently:
+    it writes the next `v<n>.py` and repoints `current.py`, and the authored
+    mode bodies stay on disk looking untouched.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    final = _author_all(client, slug, monkeypatch)
+    client.post(PROMOTE_URL.format(slug=slug), json={"filename": final})
+
+    (tmp_projects_root / slug / "rewards" / "v2.py").write_text(
+        "REWARD_SPEC = {'version': 'v2'}\n"
+        "def compute_reward(state, action, next_state, info):\n"
+        "    return 0.0, {}\n",
+        encoding="utf-8")
+
+    body = client.get(f"/projects/{slug}/mode-rewards").json()
+
+    assert body["promoted"] is None
+    assert [f["filename"] for f in body["mode_rewards"]], "the files remain"

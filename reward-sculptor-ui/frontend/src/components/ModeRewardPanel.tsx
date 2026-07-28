@@ -13,7 +13,9 @@ import {
   listModeRewards,
   promoteModeReward,
   scaffoldModeReward,
+  type ModeRewardFile,
   type ModeRewardResult,
+  type PromotedModeReward,
   type ReferenceModeGraph,
 } from "@/lib/api";
 import type { RefIndexRow } from "@/lib/types";
@@ -59,7 +61,11 @@ export function ModeRewardPanel({
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [modeGoals, setModeGoals] = useState<Record<string, string>>({});
-  const [promoted, setPromoted] = useState<number | null>(null);
+  // What the reward chain actually holds, not "did I press Promote in this
+  // browser tab". The version number alone was session state: reloading the
+  // page after promoting showed "Not in the reward chain yet" over a reward
+  // that was already training, and offered to promote it a second time.
+  const [promoted, setPromoted] = useState<PromotedModeReward | null>(null);
   const [resumed, setResumed] = useState(false);
   const [confirmRescaffold, setConfirmRescaffold] = useState(false);
   const [confirmPartial, setConfirmPartial] = useState(false);
@@ -93,8 +99,9 @@ export function ModeRewardPanel({
     // whose only button was "Scaffold reward" — which overwrote the very
     // bodies the reload had hidden.
     listModeRewards(slug)
-      .then((files) => {
+      .then(({ mode_rewards: files, promoted }) => {
         if (!live) return;
+        setPromoted(promoted);
         const mine = files.find((f) => f.clip_id === clipId);
         if (!mine) return;
         setReward({
@@ -258,7 +265,9 @@ export function ModeRewardPanel({
       if (e instanceof ApiError && e.status === 409) {
         // Reload what is actually there rather than reporting a conflict the
         // user can do nothing about.
-        const files = await listModeRewards(slug).catch(() => []);
+        const files = await listModeRewards(slug)
+          .then((r) => r.mode_rewards)
+          .catch(() => [] as ModeRewardFile[]);
         const mine = files.find((f) => f.clip_id === clipId);
         if (mine) {
           setReward({
@@ -345,7 +354,13 @@ export function ModeRewardPanel({
         filename: reward.filename,
         allow_unauthored: allowUnauthored,
       });
-      setPromoted(r.version);
+      setPromoted({
+        version: r.version,
+        filename: `v${r.version}.py`,
+        clip_id: clipId,
+        modes: reward.modes,
+        unauthored: r.unauthored ?? reward.unauthored,
+      });
       setConfirmPartial(false);
       // The Rewards tab reads the version chain through react-query; without
       // this the new v<n>.py did not appear until a manual reload, which read
@@ -462,8 +477,8 @@ export function ModeRewardPanel({
           <div className="rs-grow rs-sub" style={{ fontSize: 11 }}>
             {promoted !== null ? (
               <>
-                Promoted to <b>v{promoted}.py</b> — a run will train this
-                reward.
+                Promoted as <b>v{promoted.version}.py</b> — <code>current.py</code>{" "}
+                points at it, so this is what a run trains.
               </>
             ) : confirmPartial ? (
               <>
@@ -515,7 +530,7 @@ export function ModeRewardPanel({
             {busy === "promote"
               ? "Promoting…"
               : promoted !== null
-                ? `Training v${promoted}`
+                ? `Training v${promoted.version}`
                 : confirmPartial
                   ? "Promote incomplete"
                   : "Use for training"}

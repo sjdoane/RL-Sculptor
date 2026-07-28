@@ -1324,6 +1324,26 @@ export type ModeRewardFile = {
   unauthored: string[];
 };
 
+/** The per-mode reward a run would actually train, if the newest version in
+ *  the chain is one.
+ *
+ *  `mode_reward_v<n>.py` is not a version — `promote` copies it to `v<n>.py`
+ *  and repoints `current.py`. Until then the authored bodies are inert, and
+ *  nothing on screen distinguished "four modes authored" from "four modes
+ *  will train". */
+export type PromotedModeReward = {
+  version: number;
+  filename: string;
+  clip_id: string;
+  modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
+  unauthored: string[];
+};
+
+export type ModeRewardsResult = {
+  mode_rewards: ModeRewardFile[];
+  promoted: PromotedModeReward | null;
+};
+
 /** GET /projects/{slug}/mode-rewards — the mode-reward files already on disk.
  *
  *  The read side that makes per-mode authoring resumable. Without it, all
@@ -1332,11 +1352,11 @@ export type ModeRewardFile = {
  *  the very bodies the reload had hidden. */
 export async function listModeRewards(
   slug: string,
-): Promise<ModeRewardFile[]> {
-  const d = await handle<{ mode_rewards: ModeRewardFile[] }>(
+): Promise<ModeRewardsResult> {
+  const d = await handle<Partial<ModeRewardsResult>>(
     await fetch(`/api/projects/${slug}/mode-rewards`),
   );
-  return d.mode_rewards ?? [];
+  return { mode_rewards: d.mode_rewards ?? [], promoted: d.promoted ?? null };
 }
 
 /** POST /references/compose — build ONE novel clip out of spans of several

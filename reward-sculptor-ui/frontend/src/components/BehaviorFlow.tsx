@@ -67,7 +67,7 @@ export function BehaviorFlow({
   const steps: Step[] = useMemo(() => {
     const hasIters = project.n_iterations_completed > 0;
     const clipId = draft.data?.reference_clip_id ?? "";
-    const modeFile = modeRewards.data?.find(
+    const modeFile = modeRewards.data?.mode_rewards.find(
       (f) => !clipId || f.clip_id === clipId,
     );
     const authoredCount =
@@ -78,6 +78,18 @@ export function BehaviorFlow({
     // exists — so "all modes authored" is not the same as "in use".
     const versionCount = rewards.data?.length ?? 0;
     const rewardShaped = versionCount > 1 || hasIters;
+    // When the newest version IS a per-mode module, say so in its own terms.
+    // "2 versions" is true and useless; what the user needs to know is whether
+    // the four windows they authored are the ones a run will pay.
+    const promoted = modeRewards.data?.promoted ?? null;
+    const rewardEvidence = promoted
+      ? `v${promoted.version}.py · ${promoted.modes.length} modes`
+        + (promoted.unauthored.length
+            ? ` · ${promoted.unauthored.length} still a stub`
+            : " · all authored")
+      : versionCount
+        ? `${versionCount} version${versionCount === 1 ? "" : "s"}`
+        : undefined;
 
     return [
       {
@@ -120,6 +132,12 @@ export function BehaviorFlow({
         done: modeCount > 0 && authoredCount === modeCount,
         evidence: modeCount
           ? `${authoredCount}/${modeCount} authored · ${modeFile?.filename}`
+            // The gap this closes: authoring writes mode_reward_v<n>.py, which
+            // is not a version. Fully authored and never promoted looked
+            // identical to fully authored and training.
+            + (promoted && promoted.clip_id === modeFile?.clip_id
+                ? ` · promoted as v${promoted.version}.py`
+                : " · not promoted yet")
           : undefined,
         tab: "rewards",
         action: modeCount ? "Continue authoring" : "Scaffold modes",
@@ -130,8 +148,8 @@ export function BehaviorFlow({
         label: "Put a reward in the chain",
         hint: "Only v<n>.py counts. Promote the per-mode reward, or let the "
             + "sculptor iterate from the grounded starting reward.",
-        done: rewardShaped,
-        evidence: versionCount ? `${versionCount} version${versionCount === 1 ? "" : "s"}` : undefined,
+        done: rewardShaped || !!promoted,
+        evidence: rewardEvidence,
         tab: "rewards",
         action: "Open rewards",
       },

@@ -13,7 +13,7 @@ import { useSystemGpu } from "@/hooks/useLibrary";
 import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
 import { useWorldSelection, useWorldValidation } from "@/hooks/useWorlds";
-import { ApiError, getProjectSettings } from "@/lib/api";
+import { ApiError, getProjectSettings, listModeRewards } from "@/lib/api";
 import type { ProjectDetail } from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
 
@@ -336,6 +336,16 @@ export function NewRunDialog({
   // Block at the button rather than letting the run die in the subprocess.
   const referenceNeedsWorld =
     !!referenceClipId && worldSel.isFetched && !worldSel.data?.selection;
+  // The per-mode reward the chain actually holds, if any. Needed here because
+  // picking a motion and promoting a per-mode reward are two ways to install
+  // a reference, and the dialog has to say which one this run will use.
+  const modeReward = useQuery({
+    queryKey: ["modeRewards", slug],
+    queryFn: () => listModeRewards(slug),
+    enabled: open,
+    retry: false,
+    staleTime: 10_000,
+  }).data?.promoted ?? null;
   const systemInfo = useSystemInfo();
   const gpuInfo = useSystemGpu();
   // §Ship 35: per-project generated metrics + the generate action.
@@ -907,9 +917,33 @@ export function NewRunDialog({
                     }}
                   >
                     {referenceClipId
-                      ? <><code className="mono">{referenceRobot}/{referenceClipId}</code> becomes the immutable tracking base; this goal can only add a bounded task residual.</>
+                      ? modeReward && modeReward.clip_id === referenceClipId
+                        ? <>Your promoted <code className="mono">v{modeReward.version}.py</code> already tracks this clip across {modeReward.modes.length} authored modes. It is kept as-is — the run will not rebuild a flat tracking reward over it.</>
+                        : <><code className="mono">{referenceRobot}/{referenceClipId}</code> becomes the immutable tracking base; this goal can only add a bounded task residual.</>
                       : "Choose a retargeted clip to preserve its gait or pose sequence while the authored world and route RSI teach the novel task."}
                   </div>
+                  {/* Two reward installers both finish by repointing
+                      current.py. Launching with a clip that is NOT the one the
+                      promoted per-mode reward tracks builds a flat tracking
+                      reward as the next version — the authored mode bodies stay
+                      on disk and stop being trained, with nothing on screen
+                      saying so. */}
+                  {referenceClipId && modeReward
+                    && modeReward.clip_id !== referenceClipId && (
+                    <div
+                      style={{
+                        marginTop: 6, fontSize: 10.8, lineHeight: 1.45,
+                        color: "var(--st-amber)",
+                      }}
+                    >
+                      This project's promoted <code className="mono">
+                      v{modeReward.version}.py</code> is a per-mode reward for{" "}
+                      <code className="mono">{modeReward.clip_id}</code>.
+                      Launching against a different clip replaces it with a
+                      flat tracking reward, and those {modeReward.modes.length}
+                      {" "}authored modes stop being trained.
+                    </div>
+                  )}
                   {/* A tracking-first run binds its generated reward to the
                       authored world atomically and refuses to start without a
                       promoted selection. That refusal used to happen inside

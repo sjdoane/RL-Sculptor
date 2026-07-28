@@ -891,7 +891,42 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
             "unauthored": [n for n, done in authored.items() if not done],
         })
     out.sort(key=lambda r: r["mtime"], reverse=True)
-    return {"mode_rewards": out}
+
+    # What a run would actually train. `promote_mode_reward` copies a
+    # `mode_reward_v<n>.py` into the version chain as `v<n>.py` and repoints
+    # `current.py`; until then the authored bodies are inert. Reporting the
+    # promoted side here is what lets the Behavior flow say "4 modes will
+    # train" rather than "4 modes exist on disk somewhere".
+    promoted: dict[str, Any] | None = None
+    best_n = -1
+    best_path: Path | None = None
+    for path in rewards_dir.glob("v*.py"):
+        m = re.fullmatch(r"v(\d+)", path.stem)
+        if m and int(m.group(1)) > best_n:
+            best_n, best_path = int(m.group(1)), path
+    if best_path is not None:
+        try:
+            source = best_path.read_text(encoding="utf-8")
+        except OSError:
+            source = ""
+        authored = authored_modes(source) if source else {}
+        if authored:
+            windows = _mode_windows_from_source(source)
+            promoted = {
+                "version": best_n,
+                "filename": best_path.name,
+                "clip_id": _spec_str_from_source(source, "reference_clip_id"),
+                "modes": [
+                    {"name": name,
+                     "start_s": windows.get(name, (0.0, 0.0))[0],
+                     "end_s": windows.get(name, (0.0, 0.0))[1],
+                     "authored": bool(done)}
+                    for name, done in authored.items()
+                ],
+                "unauthored": [n for n, done in authored.items() if not done],
+            }
+
+    return {"mode_rewards": out, "promoted": promoted}
 
 
 def _mode_windows_from_source(source: str) -> dict[str, tuple[float, float]]:
@@ -917,15 +952,18 @@ def _mode_windows_from_source(source: str) -> dict[str, tuple[float, float]]:
 
 
 def _spec_str_from_source(source: str, key: str) -> str:
-    m = re.search(rf'^\s*"{re.escape(key)}":\s*(".*?"|\'.*?\'|None),\s*$',
-                  source, re.M)
-    if not m:
-        return ""
-    try:
-        val = ast.literal_eval(m.group(1))
-    except (ValueError, SyntaxError):
-        return ""
-    return str(val) if isinstance(val, str) else ""
+    """A string field of `REWARD_SPEC`, read out of the source text.
+
+    Parsed, not matched. The scaffold writes the dict over many lines with
+    double-quoted keys, and every promotion runs it back out as a single-line
+    `repr` with single-quoted keys — so a line-anchored pattern for one shape
+    returned "" for the other, and `/mode-rewards` reported an empty clip_id
+    for exactly the promoted rewards the field exists to identify.
+    """
+    from sculptor.mode_rewards import reward_spec_from_source
+
+    val = reward_spec_from_source(source).get(key)
+    return val if isinstance(val, str) else ""
 
 
 @router.post(
