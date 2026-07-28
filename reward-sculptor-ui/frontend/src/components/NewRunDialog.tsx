@@ -1102,7 +1102,21 @@ export function NewRunDialog({
                 </Field>
                 <Field label={defaults.training_label} htmlFor="run-trainiters">
                   {numField(trainingIters, setTrainingIters, { id: "run-trainiters", min: 100, max: 200000 })}
-                  <p className="rs-hintline">Inner-loop budget per cycle. Blank → config.toml.</p>
+                  {/* Same knob, two names. Settings calls it `steps_per_iter`
+                      and this tab sends `training_iterations`; naming them
+                      differently in the two places that set them is what made
+                      it impossible to tell whether they were one control or
+                      two competing ones. Name the alias and show the stored
+                      value the blank field falls back to. */}
+                  <p className="rs-hintline">
+                    Inner-loop budget per cycle — this is{" "}
+                    <code className="mono">steps_per_iter</code> in Settings
+                    {projectSettings.data?.iteration?.steps_per_iter != null && (
+                      <> (currently{" "}
+                        <b>{String(projectSettings.data.iteration.steps_per_iter)}</b>)</>
+                    )}
+                    . Blank falls back to it.
+                  </p>
                 </Field>
               </div>
 
