@@ -278,6 +278,14 @@ export function ModeRewardPanel({
   // reward the user believes they replaced.
   const promotedIsCurrent =
     promoted !== null && digest !== "" && promoted.source_sha256 === digest;
+  // How far the automaton reaches on each clock. The graph is clip seconds;
+  // the scaffold's windows are the episode it was fitted to.
+  const clipSpan = Math.max(
+    0,
+    ...(graph?.modes ?? []).map((m) => m.frame_range[1] / (graph?.fps || 1)),
+  );
+  const episodeSpan = Math.max(0, ...(reward?.modes ?? []).map((m) => m.end_s));
+  const stretched = clipSpan > 0 && episodeSpan / clipSpan > 1.01;
 
   async function onScaffold(overwrite = false) {
     setBusy("scaffold");
@@ -442,11 +450,28 @@ export function ModeRewardPanel({
           rendered once, and then thrown away — this is the screen where
           "which slice am I authoring" actually matters. */}
       <div style={{ marginBottom: 12 }}>
+        <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 4 }}>
+          The clip's own timeline, in clip seconds.
+        </div>
         <ModeTimeline
           modes={modesFromGraph(graph)}
           fps={graph.fps}
           transitions={graph.transitions}
         />
+        {/* Two different numbers for the same mode, stacked, is the panel's
+            most confusing moment: the timeline above is clip time and the
+            per-mode rows below are the episode the reward is fitted to. When
+            a 6.92 s composite gates a 20 s episode they differ by ~2.9x, and
+            with nothing distinguishing them the fitted windows read as a bug. */}
+        {reward && stretched && (
+          <div className="rs-sub" style={{ fontSize: 10.5, marginTop: 6 }}>
+            The episode is longer than the clip, so the windows below are
+            stretched {(episodeSpan / clipSpan).toFixed(2)}× to span it — the
+            clip plays across the whole {episodeSpan.toFixed(1)} s rather than
+            finishing early and leaving the rest of every episode in the last
+            mode.
+          </div>
+        )}
       </div>
 
       {resumed && (
