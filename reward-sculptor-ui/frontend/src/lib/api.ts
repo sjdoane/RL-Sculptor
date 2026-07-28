@@ -1372,6 +1372,8 @@ export async function composeReference(body: {
   text?: string;
   labels?: string[];
   blend_s?: number;
+  /** Resample every phase to this rate. Omitted means the first phase's fps. */
+  target_fps?: number;
   strict?: boolean;
 }): Promise<ComposeResult> {
   return handle<ComposeResult>(

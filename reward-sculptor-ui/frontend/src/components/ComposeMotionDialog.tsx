@@ -281,6 +281,17 @@ export function ComposeMotionDialog({
   // Labels as they were AT SUBMIT — editing a phase afterwards must not
   // relabel a composite that is already registered.
   const [composedLabels, setComposedLabels] = useState<string[]>([]);
+  // Seam handling. The backend has always taken these; the dialog never sent
+  // them, so every composite was built at blend_s=0.2 / strict / source fps.
+  // That mattered most on a refusal: `strict` reports the seam gap in radians
+  // and the crossfade length is the knob that closes it, so the one control
+  // that could act on the error message was the one not on screen.
+  const [blendS, setBlendS] = useState("0.2");
+  const [targetFps, setTargetFps] = useState("");
+  //: Set only by "Compose anyway" after the gate has already refused once, so
+  //  turning the gate off is a reply to a specific measurement rather than a
+  //  checkbox someone leaves unticked.
+  const [seamRefusal, setSeamRefusal] = useState<string | null>(null);
   const compose = useComposeReference();
 
   const clipId = toClipId(name, robot);
@@ -300,8 +311,10 @@ export function ComposeMotionDialog({
       return next;
     });
 
-  const submit = () => {
+  const submit = (opts: { strict?: boolean } = {}) => {
     if (!ready) return;
+    const strict = opts.strict !== false;
+    const fps = numOrNull(targetFps);
     compose.mutate(
       {
         clip_id: clipId,
@@ -314,10 +327,14 @@ export function ComposeMotionDialog({
           t_start_s: numOrNull(d.startS),
           t_end_s: numOrNull(d.endS),
         })),
+        blend_s: numOrNull(blendS) ?? 0.2,
+        ...(fps === null ? {} : { target_fps: fps }),
+        strict,
       },
       {
         onSuccess: (res) => {
           setResult(res);
+          setSeamRefusal(null);
           setComposedLabels(
             drafts.map((d, i) => d.label.trim() || `phase_${i + 1}`));
           toast.success("Motion composed", { description: res.clip_id });
@@ -331,6 +348,14 @@ export function ComposeMotionDialog({
           // gap in radians), so surface it verbatim rather than a generic
           // "failed" — it is what tells the user which phase to re-pick.
           toast.error("Could not compose these phases", { description: String(detail) });
+          // Only a refusal BY the gate offers to bypass the gate. Any other
+          // failure (a missing clip, a span past the end) is not something
+          // `strict=false` would fix, and offering it there would just teach
+          // people to turn the gate off on every error.
+          setSeamRefusal(
+            strict && /seam|blend|discontinu|jump/i.test(String(detail))
+              ? String(detail)
+              : null);
         },
       },
     );
@@ -347,10 +372,21 @@ export function ComposeMotionDialog({
           <Btn kind="quiet" onClick={onClose} disabled={compose.isPending}>
             {result ? "Done" : "Cancel"}
           </Btn>
+          {seamRefusal && !result && (
+            <Btn
+              kind="danger"
+              icon="alert-triangle"
+              onClick={() => submit({ strict: false })}
+              disabled={!ready || compose.isPending}
+              title="Register the composite even though a seam exceeds the gate"
+            >
+              Compose anyway
+            </Btn>
+          )}
           <Btn
             kind="primary"
             icon={compose.isPending ? "loader" : "plus"}
-            onClick={submit}
+            onClick={() => submit()}
             disabled={!ready || compose.isPending}
           >
             {compose.isPending ? "Composing…" : "Compose"}
@@ -403,6 +439,80 @@ export function ComposeMotionDialog({
       <Btn kind="quiet" icon="plus" onClick={() => setDrafts((ds) => [...ds, emptyDraft()])}>
         Add phase
       </Btn>
+
+      {!result && (
+        <div
+          style={{
+            marginTop: 14, paddingTop: 12,
+            borderTop: "1px solid var(--hairline)",
+          }}
+        >
+          <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>
+            Seam handling
+          </div>
+          <div className="rs-flex rs-gap-10" style={{ alignItems: "flex-end" }}>
+            <label style={{ flex: 1, minWidth: 0 }}>
+              <span className="rs-sub" style={{ fontSize: 10, display: "block" }}>
+                Crossfade (s)
+              </span>
+              <input
+                value={blendS}
+                onChange={(e) => setBlendS(e.target.value)}
+                inputMode="decimal"
+                aria-label="Crossfade seconds"
+                style={{
+                  width: "100%", fontSize: 12.5, height: 28, padding: "0 8px",
+                  marginTop: 3,
+                  border: "1px solid var(--hairline-strong)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--canvas-soft)", color: "var(--ink)",
+                  outline: "none",
+                }}
+              />
+            </label>
+            <label style={{ flex: 1, minWidth: 0 }}>
+              <span className="rs-sub" style={{ fontSize: 10, display: "block" }}>
+                Resample to fps (optional)
+              </span>
+              <input
+                value={targetFps}
+                onChange={(e) => setTargetFps(e.target.value)}
+                inputMode="decimal"
+                placeholder="source fps"
+                aria-label="Target fps"
+                style={{
+                  width: "100%", fontSize: 12.5, height: 28, padding: "0 8px",
+                  marginTop: 3,
+                  border: "1px solid var(--hairline-strong)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--canvas-soft)", color: "var(--ink)",
+                  outline: "none",
+                }}
+              />
+            </label>
+          </div>
+          <div className="rs-sub" style={{ fontSize: 10, marginTop: 5, lineHeight: 1.45 }}>
+            A longer crossfade is what closes a seam the gate refuses; phases
+            of different fps are resampled to the first one unless you set a
+            target.
+          </div>
+          {seamRefusal && (
+            <div
+              style={{
+                marginTop: 8, fontSize: 10.8, lineHeight: 1.45,
+                color: "var(--st-amber)",
+              }}
+            >
+              The kinematic gate refused this composition — either a seam jump
+              or a peak joint velocity the blend is too short to cover. Widen
+              the crossfade or move a phase boundary and compose again, or use{" "}
+              <b>Compose anyway</b> to register it as measured. The result is
+              tier K and uncertified either way, so anything the gate flagged
+              becomes a tracking target the robot cannot physically follow.
+            </div>
+          )}
+        </div>
+      )}
 
       {result && (
         <div style={{ marginTop: 14 }}>
