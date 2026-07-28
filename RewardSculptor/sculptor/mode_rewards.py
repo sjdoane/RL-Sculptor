@@ -99,6 +99,56 @@ def mode_windows_s(graph: ModeGraph) -> dict[str, tuple[float, float]]:
     return mode_phase_windows(graph)
 
 
+def scale_windows(
+    windows: Mapping[str, tuple[float, float]], time_scale: float,
+) -> dict[str, tuple[float, float]]:
+    """Stretch clip-time mode windows onto the episode's clock.
+
+    `mode_phase_windows` returns CLIP seconds — literally `frame / clip_fps`.
+    That number knows nothing about how long the episode runs or how far the
+    course reaches, and for an authored world the two disagree badly.
+
+    Measured on platform-ascent-showcase: a 6.92 s composite gating a 20 s
+    episode. `active_mode` clamps everything past the last window into the
+    terminal mode, so 75% of every episode was paid as `settle` — a mode whose
+    terms reward stillness — while the robot was still standing on flat ground
+    in front of the first box. Worse, the entry window (`approach`, 0.82 s)
+    demanded 1.31 m of travel, which needs 1.60 m/s against a runtime command
+    cap of 1.0 m/s: unreachable inside its own window, by construction. Across
+    three sculpt iterations the policy never mounted the platform, and every
+    `bound.*`/`settle.*` term read 0.00 because the robot was never in the
+    state a mode expected at the time that mode expected it.
+
+    Standing still was the reward-optimal policy. Scaling the automaton to span
+    the episode removes both failures: the entry window becomes long enough to
+    physically reach the first waypoint, and there is no clamp region left for
+    the terminal mode to swallow.
+    """
+    if time_scale <= 0.0 or abs(time_scale - 1.0) < 1e-12:
+        return {n: (float(lo), float(hi)) for n, (lo, hi) in windows.items()}
+    return {
+        n: (round(float(lo) * time_scale, 4), round(float(hi) * time_scale, 4))
+        for n, (lo, hi) in windows.items()
+    }
+
+
+def clip_time_scale(
+    windows: Mapping[str, tuple[float, float]], horizon_s: Optional[float],
+) -> float:
+    """`horizon_s / clip_duration`, or 1.0 when there is no horizon to fit.
+
+    1.0 keeps the historical clip-time behaviour byte-for-byte, so a caller
+    that cannot determine an episode horizon (no authored world) is unchanged.
+    """
+    if not horizon_s or horizon_s <= 0.0:
+        return 1.0
+    clip_duration_s = max((float(hi) for _, hi in windows.values()),
+                          default=0.0)
+    if clip_duration_s <= 0.0:
+        return 1.0
+    return float(horizon_s) / clip_duration_s
+
+
 def _format_windows_literal(windows: Mapping[str, tuple[float, float]],
                             idents: Mapping[str, str]) -> str:
     rows = [
@@ -152,7 +202,8 @@ def _stub_body_batched(mode: Mode) -> str:
 
 
 def _tracking_block(clip: Mapping[str, Any], n_phase: int,
-                    placeholder: bool = False) -> tuple[str, str, str]:
+                    placeholder: bool = False,
+                    time_scale: float = 1.0) -> tuple[str, str, str]:
     """`(constants, scalar_fns, batched_fns)` for the reference-tracking
     backbone, or three empty strings when `clip` is None.
 
@@ -187,7 +238,10 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int,
 
     fps = float(clip.get("fps") or 0.0) or 30.0
     n_frames = int(np.asarray(clip["root_pos_z"]).shape[0])
-    duration_s = n_frames / fps if fps > 0 else 0.0
+    # Scaled by the SAME factor as the mode windows. If only one of the two
+    # were stretched, the mode gate and the phase clock would disagree and the
+    # backbone would be tracking a different instant than the mode being paid.
+    duration_s = (n_frames / fps if fps > 0 else 0.0) * float(time_scale)
     joint_pos = downsample_phase_targets(
         np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase)
     root_z = downsample_phase_targets(
@@ -374,6 +428,7 @@ def generate_mode_reward_scaffold(
     clip: Optional[Mapping[str, Any]] = None,
     n_phase: int = 32,
     placeholder_targets: bool = False,
+    horizon_s: Optional[float] = None,
 ) -> str:
     """Emit a reward module whose mode gating is correct by construction.
 
@@ -413,7 +468,16 @@ def generate_mode_reward_scaffold(
                 "rename one — two modes sharing a function body is silent")
         idents[m.name] = ident
 
+    # `horizon_s` is the episode the automaton has to cover. Absent it the
+    # windows stay in clip time, which is only right when the episode happens
+    # to be the clip's length — see `scale_windows` for what that cost live.
     windows = mode_windows_s(graph)
+    time_scale = clip_time_scale(windows, horizon_s)
+    windows = scale_windows(windows, time_scale)
+    # A horizon we could not use is not a horizon. Normalize so 0.0/negative
+    # record identically to "no authored world" instead of leaving a number in
+    # the spec that no window was ever fitted to.
+    horizon_s = float(horizon_s) if horizon_s and horizon_s > 0.0 else None
     goals = dict(goal_by_mode or {})
     order = [m.name for m in graph.modes]
 
@@ -433,7 +497,8 @@ def generate_mode_reward_scaffold(
 
     has_track = clip is not None
     track_const, track_scalar, track_batched = (
-        _tracking_block(clip, int(n_phase), bool(placeholder_targets))
+        _tracking_block(clip, int(n_phase), bool(placeholder_targets),
+                        time_scale=time_scale)
         if has_track else ("", "", ""))
     # The calls are spliced rather than always emitted-and-zeroed: a stubs-only
     # scaffold must not require `qpos` in the contract, since it does not read
@@ -476,6 +541,12 @@ REWARD_SPEC: dict = {{
     # its own reward — it had to make the user search the clip library for it
     # by hand, twice.
     "reference_clip_id": {clip_id!r},
+    # The episode the automaton was stretched to cover, and by how much. 1.0
+    # means the windows are raw clip seconds — correct only when the episode
+    # IS the clip's length. Recorded so a reader can tell which clock a
+    # promoted reward is on without re-deriving it from the windows.
+    "episode_horizon_s": {horizon_s!r},
+    "clip_time_scale": {round(time_scale, 6)!r},
     "hyperparameters": {{}},
     "references": [],
 }}

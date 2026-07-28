@@ -31,6 +31,7 @@ same v1 surface, just by passing `?robot=t1` — no route change needed.
 from __future__ import annotations
 
 import ast
+import json
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -741,6 +742,42 @@ class ModeRewardRequest(BaseModel):
     overwrite: bool = False
 
 
+def _episode_horizon_s(project_dir: Path) -> Optional[float]:
+    """The episode the mode automaton has to cover, or None if unknowable.
+
+    A per-mode reward's windows are raw CLIP seconds. When the project has an
+    authored world those are the wrong clock: on platform-ascent-showcase a
+    6.92 s composite gated a 20 s episode, so `active_mode` clamped 75% of
+    every episode into the terminal mode (which pays stillness) and the entry
+    window demanded a speed above the runtime's own command cap. Three sculpt
+    iterations later the robot had never left the ground. See
+    `sculptor.mode_rewards.scale_windows`.
+
+    Read from the promoted selection's task ref rather than the compiler's
+    `traversal_window_s`: that value is derived at runtime and never persisted
+    (it reaches stderr and nothing else), while `episode_length_s` is on disk
+    and is the quantity the automaton actually has to span.
+
+    None whenever anything is missing — no authored world, no promoted
+    selection, malformed json — so projects without a world keep clip time and
+    byte-identical output.
+    """
+    sel = project_dir / "env" / "selection_current.json"
+    try:
+        refs = (json.loads(sel.read_text(encoding="utf-8")) or {}).get("refs")
+        task_rel = ((refs or {}).get("task") or {}).get("path")
+        if not task_rel:
+            return None
+        task = json.loads(
+            (project_dir / task_rel).read_text(encoding="utf-8")) or {}
+        value = (((task.get("shared") or {}).get("termination") or {})
+                 .get("episode_length_s"))
+        horizon = float(value)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return horizon if horizon > 0.0 else None
+
+
 def _load_mode_graph(clip_id: str, robot: str):
     """`(clip, graph)` or a `_problem(...)` response. Never raises."""
     from sculptor.modes import ModeError, modes_from_composition
@@ -1022,7 +1059,8 @@ def scaffold_mode_reward(
     try:
         source = generate_mode_reward_scaffold(
             graph, behavior_goal=body.goal, clip_id=clip_id,
-            clip=clip if body.tracking else None)
+            clip=clip if body.tracking else None,
+            horizon_s=_episode_horizon_s(project_dir))
     except ModeError as e:
         return _problem(
             status.HTTP_422_UNPROCESSABLE_ENTITY,

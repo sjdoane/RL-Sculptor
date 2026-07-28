@@ -1064,3 +1064,67 @@ def test_grafting_carries_a_helper_bound_by_tuple_unpacking(tmp_path):
     assert validate_mode_reward_source(grafted, g) == []
     mod = _load(grafted, tmp_path, name="gr_tuple")
     assert mod._LAUNCH_HI == 0.75 and mod._LAUNCH_LO == 0.25
+
+
+# ── episode-horizon scaling ────────────────────────────────────────────
+# A per-mode reward's windows are CLIP seconds (`frame / clip_fps`). Nothing in
+# that number knows the episode length, and on an authored world the two
+# disagree: platform-ascent-showcase gated a 20 s episode with a 6.92 s
+# composite, so `active_mode` clamped 75% of every episode into the terminal
+# mode — which pays stillness — and the entry window demanded 1.60 m/s against
+# a 1.0 m/s command cap. The policy stood still for three sculpt iterations.
+
+
+def test_no_horizon_keeps_clip_time_byte_for_byte():
+    """The default path must be unchanged — a project with no authored world
+    has no horizon to fit and must keep producing exactly what it did."""
+    g = _graph()
+    assert (generate_mode_reward_scaffold(g, behavior_goal="x")
+            == generate_mode_reward_scaffold(g, behavior_goal="x",
+                                             horizon_s=None))
+
+
+def test_windows_stretch_to_span_the_episode(tmp_path):
+    """The whole point: after scaling no time is left over for the
+    terminal-mode clamp to swallow."""
+    g = _graph()                      # 3 modes x 30 frames @ 30 fps = 3.0 s
+    mod = _load(generate_mode_reward_scaffold(
+        g, behavior_goal="x", horizon_s=12.0), tmp_path, name="scaled")
+    assert mod.MODE_WINDOWS_S["approach"] == (0.0, 4.0)
+    assert mod.MODE_WINDOWS_S["land"][1] == pytest.approx(12.0)
+    assert mod.REWARD_SPEC["clip_time_scale"] == pytest.approx(4.0)
+    assert mod.REWARD_SPEC["episode_horizon_s"] == 12.0
+
+
+def test_scaling_moves_the_gate_not_just_the_literal(tmp_path):
+    """Execute it. At t=3.5 s the unscaled automaton is past its last window
+    and clamps to the terminal mode; the scaled one is still in the first."""
+    g = _graph()
+    clipt = _load(generate_mode_reward_scaffold(g, behavior_goal="x"),
+                  tmp_path, name="clipt")
+    scaled = _load(generate_mode_reward_scaffold(g, behavior_goal="x",
+                                                 horizon_s=12.0),
+                   tmp_path, name="scaledt")
+    assert clipt.active_mode(_info(3.5)) == "land"
+    assert scaled.active_mode(_info(3.5)) == "approach"
+
+
+def test_tracking_duration_scales_with_the_windows(tmp_path):
+    """`REFERENCE_DURATION_S` and the windows must share one clock. Stretch
+    only the gate and the backbone tracks a different instant than the mode
+    being paid."""
+    mod = _load(generate_mode_reward_scaffold(
+        _graph(), behavior_goal="x", clip=_tracking_clip(n=90, fps=30.0),
+        horizon_s=12.0), tmp_path, name="dur")
+    assert mod.REFERENCE_DURATION_S == pytest.approx(12.0)
+    assert mod.MODE_WINDOWS_S["land"][1] == pytest.approx(
+        mod.REFERENCE_DURATION_S)
+
+
+def test_degenerate_horizons_fall_back_to_clip_time():
+    """None/0/negative mean 'unknown', not 'collapse the automaton'."""
+    g = _graph()
+    base = generate_mode_reward_scaffold(g, behavior_goal="x")
+    for bad in (0.0, -5.0):
+        assert generate_mode_reward_scaffold(
+            g, behavior_goal="x", horizon_s=bad) == base
