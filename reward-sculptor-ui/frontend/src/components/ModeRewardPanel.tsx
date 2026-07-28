@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/rs/icon";
 import { Btn } from "@/components/rs/primitives";
@@ -66,6 +66,11 @@ export function ModeRewardPanel({
   // page after promoting showed "Not in the reward chain yet" over a reward
   // that was already training, and offered to promote it a second time.
   const [promoted, setPromoted] = useState<PromotedModeReward | null>(null);
+  // sha256 of the mode-reward file on disk. Compared against the promoted
+  // version's `source_sha256` to answer "is what trains still what I
+  // authored?" — a filename cannot, because authoring chains to a new name
+  // every call while a re-scaffold rewrites the same one.
+  const [digest, setDigest] = useState<string>("");
   const [resumed, setResumed] = useState(false);
   const [confirmRescaffold, setConfirmRescaffold] = useState(false);
   // Include the reference-tracking backbone. On by default, matching the
@@ -83,6 +88,39 @@ export function ModeRewardPanel({
   useEffect(() => {
     if (initialClipId && !clipId) setClipId(initialClipId);
   }, [initialClipId, clipId]);
+
+  /** Re-read what is on disk: which version is promoted, and the digest of
+   *  this clip's mode-reward file.
+   *
+   *  Called after every action that changes either. Scaffolding and authoring
+   *  used to call `setPromoted(null)` instead, which re-enabled the promote
+   *  button by pretending nothing was promoted — true enough until the page
+   *  reloaded, at which point the real promoted version came back from disk
+   *  and the button locked again, permanently, over a stale reward.
+   *
+   *  `adopt` also pulls the file itself into view, for the first-visit case
+   *  where the panel has no `reward` yet.
+   */
+  const refresh = useCallback(
+    async ({ adopt = false }: { adopt?: boolean } = {}) => {
+      const { mode_rewards: files, promoted: p } = await listModeRewards(slug);
+      setPromoted(p);
+      const mine = files.find((f) => f.clip_id === clipId);
+      setDigest(mine?.digest ?? "");
+      if (adopt && mine) {
+        setReward({
+          path: mine.path,
+          filename: mine.filename,
+          clip_id: mine.clip_id,
+          tracking: true,
+          modes: mine.modes,
+          unauthored: mine.unauthored,
+        });
+        setResumed(true);
+      }
+    },
+    [clipId, slug],
+  );
 
   useEffect(() => {
     if (!clipId) {
@@ -110,27 +148,13 @@ export function ModeRewardPanel({
     // used to live only in this component's state, so a reload showed a panel
     // whose only button was "Scaffold reward" — which overwrote the very
     // bodies the reload had hidden.
-    listModeRewards(slug)
-      .then(({ mode_rewards: files, promoted }) => {
-        if (!live) return;
-        setPromoted(promoted);
-        const mine = files.find((f) => f.clip_id === clipId);
-        if (!mine) return;
-        setReward({
-          path: mine.path,
-          filename: mine.filename,
-          clip_id: mine.clip_id,
-          tracking: true,
-          modes: mine.modes,
-          unauthored: mine.unauthored,
-        });
-        setResumed(true);
-      })
-      .catch(() => {/* no scaffold yet is the normal first-visit case */});
+    refresh({ adopt: true }).catch(() => {
+      /* no scaffold yet is the normal first-visit case */
+    });
     return () => {
       live = false;
     };
-  }, [clipId, robot, slug]);
+  }, [clipId, refresh, robot, slug]);
 
   async function runSearch() {
     setSearching(true);
@@ -247,6 +271,13 @@ export function ModeRewardPanel({
     (reward?.modes ?? []).filter((m) => m.authored).map((m) => m.name),
   );
   const doneCount = authored.size;
+  // Is the version `current.py` points at the file in front of me, byte for
+  // byte? An empty digest on either side means "cannot tell", which resolves
+  // to false — the safe direction, since the cost of a needless second
+  // promotion is a file copy and the cost of the other error is training a
+  // reward the user believes they replaced.
+  const promotedIsCurrent =
+    promoted !== null && digest !== "" && promoted.source_sha256 === digest;
 
   async function onScaffold(overwrite = false) {
     setBusy("scaffold");
@@ -262,9 +293,9 @@ export function ModeRewardPanel({
         overwrite,
       });
       setReward(r);
-      setPromoted(null);
       setResumed(false);
       setConfirmRescaffold(false);
+      await refresh();
       // Record what is being built so the run dialog and the flow card can
       // find it without the user re-searching the library for the clip.
       saveDraft.mutate({
@@ -337,7 +368,7 @@ export function ModeRewardPanel({
                 }
               : prev,
           );
-          setPromoted(null);
+          await refresh();
           setLog((l) => [...l, `${mode}: authored → ${out.filename}`]);
           break;
         }
@@ -366,13 +397,10 @@ export function ModeRewardPanel({
         filename: reward.filename,
         allow_unauthored: allowUnauthored,
       });
-      setPromoted({
-        version: r.version,
-        filename: `v${r.version}.py`,
-        clip_id: clipId,
-        modes: reward.modes,
-        unauthored: r.unauthored ?? reward.unauthored,
-      });
+      // Re-read rather than construct: the promoted record now carries the
+      // digest of the file it came from, and a locally-built one would be
+      // guessing at it.
+      await refresh();
       setConfirmPartial(false);
       // The Rewards tab reads the version chain through react-query; without
       // this the new v<n>.py did not appear until a manual reload, which read
@@ -515,10 +543,18 @@ export function ModeRewardPanel({
                    borderTop: "1px solid var(--hairline)" }}
         >
           <div className="rs-grow rs-sub" style={{ fontSize: 11 }}>
-            {promoted !== null ? (
+            {promotedIsCurrent ? (
               <>
-                Promoted as <b>v{promoted.version}.py</b> — <code>current.py</code>{" "}
+                Promoted as <b>v{promoted!.version}.py</b> — <code>current.py</code>{" "}
                 points at it, so this is what a run trains.
+              </>
+            ) : promoted !== null ? (
+              <>
+                A run still trains <b>v{promoted.version}.py</b>
+                {promoted.source_filename
+                  ? <>, promoted from <code>{promoted.source_filename}</code></>
+                  : null}
+                {" "}— not the file above. Promote to replace it.
               </>
             ) : confirmPartial ? (
               <>
@@ -554,7 +590,12 @@ export function ModeRewardPanel({
             }
             size="sm"
             icon="check-circle"
-            disabled={busy !== null || promoted !== null}
+            // Gated on "the promoted version IS this exact file", not on
+            // "something is promoted". The latter meant the first promotion
+            // disabled the control forever: re-scaffold with a corrected clock,
+            // re-author all four modes, and there was no click anywhere that
+            // could make the new reward the one a run trains.
+            disabled={busy !== null || promotedIsCurrent}
             onClick={() => {
               // `allow_unauthored` used to be passed automatically whenever a
               // mode was unauthored, which turned the backend's explicit
@@ -569,11 +610,13 @@ export function ModeRewardPanel({
           >
             {busy === "promote"
               ? "Promoting…"
-              : promoted !== null
-                ? `Training v${promoted.version}`
+              : promotedIsCurrent
+                ? `Training v${promoted!.version}`
                 : confirmPartial
                   ? "Promote incomplete"
-                  : "Use for training"}
+                  : promoted !== null
+                    ? `Use for training (replaces v${promoted.version})`
+                    : "Use for training"}
           </Btn>
         </div>
       )}

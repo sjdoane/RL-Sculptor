@@ -31,6 +31,7 @@ same v1 surface, just by passing `?robot=t1` — no route change needed.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -961,6 +962,11 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
             "path": str(path),
             "clip_id": clip_id,
             "mtime": path.stat().st_mtime,
+            # Matched against the promoted version's `source_sha256` to answer
+            # "is what trains still what I authored?". A filename comparison
+            # cannot: authoring chains to a new name every call, and the
+            # promoted copy keeps the name it was promoted under.
+            "digest": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "modes": [
                 {"name": name,
                  "start_s": windows.get(name, (0.0, 0.0))[0],
@@ -996,6 +1002,13 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
                 "version": best_n,
                 "filename": best_path.name,
                 "clip_id": _spec_str_from_source(source, "reference_clip_id"),
+                # "" for a version promoted before this was recorded, which
+                # reads as "matches nothing" — the safe direction: the UI
+                # offers to promote again rather than claiming a stale reward
+                # is what trains.
+                "source_sha256": _spec_str_from_source(source, "source_sha256"),
+                "source_filename": _spec_str_from_source(
+                    source, "source_filename"),
                 "modes": [
                     {"name": name,
                      "start_s": windows.get(name, (0.0, 0.0))[0],

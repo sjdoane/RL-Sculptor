@@ -1320,6 +1320,10 @@ export type ModeRewardFile = {
   path: string;
   clip_id: string;
   mtime: number;
+  /** sha256 of the file, to match against the promoted version's
+   *  `source_sha256`. Filenames cannot answer it: authoring chains to a new
+   *  name every call. */
+  digest: string;
   modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
   unauthored: string[];
 };
@@ -1335,6 +1339,12 @@ export type PromotedModeReward = {
   version: number;
   filename: string;
   clip_id: string;
+  /** The mode-reward file this version was promoted from, and its exact bytes.
+   *  `""` for a version promoted before these were recorded — which reads as
+   *  "matches nothing", so the UI offers to promote again rather than claiming
+   *  a stale reward is what trains. */
+  source_sha256: string;
+  source_filename: string;
   modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
   unauthored: string[];
 };

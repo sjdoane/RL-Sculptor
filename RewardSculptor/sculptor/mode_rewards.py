@@ -1972,11 +1972,19 @@ def promote_mode_reward(path, *, contract=None, allow_unauthored: bool = False,
             (rewards_dir / f"v{versions[-1]}.py").read_text(encoding="utf-8")
             .encode("utf-8")).hexdigest()[:16]
 
+    # Which mode-reward file this version came from, and its exact bytes.
+    # Promotion rewrites REWARD_SPEC, so the copy never digests equal to its
+    # source and "is the promoted version still this file?" cannot be answered
+    # by comparing them. Without an answer the UI could only assume, and it
+    # assumed "yes" — so after re-authoring, the button that promotes was
+    # disabled behind a reward two versions stale, with no way to advance it.
+    source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
     promoted = _rewrite_reward_spec(source, {
-        "version": f"v{n}", "parent_hash": parent_hash, "author": author})
+        "version": f"v{n}", "parent_hash": parent_hash, "author": author,
+        "source_filename": path.name, "source_sha256": source_sha256})
     dest = rewards_dir / f"v{n}.py"
     dest.write_text(promoted, encoding="utf-8")
     _write_current_reexport(rewards_dir, dest)
     return {"version": n, "path": str(dest), "filename": dest.name,
             "unauthored": unauthored, "parent_hash": parent_hash,
-            "source_filename": path.name}
+            "source_filename": path.name, "source_sha256": source_sha256}

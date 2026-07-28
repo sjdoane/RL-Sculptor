@@ -932,10 +932,10 @@ def test_scaffolding_for_an_unknown_project_is_404(
 AUTHOR_URL = "/projects/{slug}/references/novel-jump-kick--g1/mode-reward/author"
 
 
-def _scaffold(client: TestClient, slug: str) -> dict:
+def _scaffold(client: TestClient, slug: str, overwrite: bool = False) -> dict:
     r = client.post(
         f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
-        json={"clip_id": "novel-jump-kick--g1"})
+        json={"clip_id": "novel-jump-kick--g1", "overwrite": overwrite})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -1406,3 +1406,53 @@ def test_a_scaffold_on_a_world_project_carries_both_fixes(
     assert f"TRACKING_W = {WORLD_TRACKING_WEIGHT!r}" in src
     assert '"episode_horizon_s": 20.0' in src
     assert "REFERENCE_DURATION_S = 20.0" in src
+
+
+def test_promotion_records_which_file_it_came_from(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """`promote` rewrites REWARD_SPEC, so the copy never digests equal to its
+    source. Without the source digest recorded, "is what trains still what I
+    authored?" is unanswerable — and the panel answered "yes" unconditionally,
+    which disabled the promote button forever after the first promotion."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    final = _author_all(client, slug, monkeypatch)
+    client.post(PROMOTE_URL.format(slug=slug), json={"filename": final})
+
+    body = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(f for f in body["mode_rewards"] if f["filename"] == final)
+
+    assert body["promoted"]["source_filename"] == final
+    assert body["promoted"]["source_sha256"] == mine["digest"]
+
+
+def test_re_authoring_after_a_promotion_reads_as_not_yet_training(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """The state the user was stuck in: everything re-authored, and the only
+    control that could make it train was disabled behind a stale version."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    final = _author_all(client, slug, monkeypatch)
+    client.post(PROMOTE_URL.format(slug=slug), json={"filename": final})
+
+    # Re-scaffold in place: same filename, different bytes.
+    _scaffold(client, slug, overwrite=True)
+    body = client.get(f"/projects/{slug}/mode-rewards").json()
+
+    # The listing is newest-first, and the panel adopts the first match — so
+    # this is the file the user is looking at.
+    current = body["mode_rewards"][0]
+    assert body["promoted"] is not None, "v<n>.py is still what trains"
+    assert current["digest"] != body["promoted"]["source_sha256"], (
+        "the file on screen is not the one training, and the panel has to be "
+        "able to say so")
+    # The earlier chained file the promotion DID come from is still on disk;
+    # matching by filename alone would therefore have said "this is training".
+    assert any(f["digest"] == body["promoted"]["source_sha256"]
+               for f in body["mode_rewards"])
