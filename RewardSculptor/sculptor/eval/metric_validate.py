@@ -698,6 +698,29 @@ def _requires_uninterrupted_hold(behavior_goal: Optional[str]) -> bool:
     return explicit or (duration and dwell)
 
 
+def _requested_terminal_hold_steps(
+    behavior_goal: Optional[str], *, step_dt: float = 0.02,
+) -> int:
+    """Parse an explicit terminal hold budget for the competent exemplar."""
+    goal = (behavior_goal or "").lower()
+    candidates: list[int] = []
+    for match in re.finditer(
+        r"\b(\d+)\s*"
+        r"(?:(?:uninterrupted|continuous|consecutive|post-completion)\s+){0,3}"
+        r"frames?\b",
+        goal,
+    ):
+        candidates.append(int(match.group(1)))
+    for match in re.finditer(
+        r"\b(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b",
+        goal,
+    ):
+        candidates.append(int(np.ceil(float(match.group(1)) / step_dt)))
+    # Bound validator memory while preserving any practical motion-evaluation
+    # dwell.  Unspecified holds keep the historical synthetic minimum.
+    return min(500, max(candidates, default=0))
+
+
 def _interrupted_hold_probe(
     arrays: Mapping[str, Any], *, step_dt: float = 0.02,
 ) -> dict[str, Any]:
@@ -930,57 +953,17 @@ def _abstract_objective_program(
     return phases[:12]
 
 
-def _abstract_objective_probe(
-    phases: Sequence[str], *, behavior_goal: Optional[str] = None,
-) -> Optional[dict[str, np.ndarray]]:
-    """Retarget an abstract phase program onto the validator's universal channels.
-
-    This is a kinematic *validator exemplar*, not a stored robot trajectory.  Root and
-    gravity live in task space; generic articulation is projected onto the synthetic
-    named body and later subjected to the existing joint-permutation gate.  Therefore
-    the same prompt-derived oracle works for quadrupeds, bipeds, and arms whenever the
-    authored metric uses their persisted universal/task channels.
-    """
+def _abstract_phase_bounds(
+    phases: Sequence[str], *, probe_steps: int, final_hold_steps: int = 0,
+) -> tuple[list[str], np.ndarray]:
+    """Return the single authoritative timing schedule for an abstract probe."""
     clean = [str(p) for p in phases if str(p) in _ABSTRACT_PHASES][:12]
     if not clean:
-        return None
-    goal_tokens = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
-    # ``climb`` is intentionally embodiment-neutral and can mean a supported
-    # stair ascent or a ballistic box mount.  Preserve that distinction from
-    # the prompt: only mount/parkour/jump language gives climb phases a flight
-    # window.  This lets honest box-chain metrics count takeoff/landing events
-    # without teaching every generic climb to hop.
-    airborne_climb = bool(goal_tokens & {
-        "box", "boxes", "hop", "hops", "hopping", "jump", "jumps",
-        "jumping", "leap", "leaps", "leaping", "mount", "mounting",
-        "parkour", "vault", "vaulting",
-    })
-
+        return [], np.asarray([], dtype=int)
     # Compound prompt-native tasks need enough physical time for repeated
     # transition + hold semantics.  Keep the fixed archetype battery at its
     # historical 120 frames, but give this independent exemplar 3.6 s so four
     # real 0.25 s dwells remain observable after a metric's smoothing window.
-    probe_steps = max(T, 180)
-    root = np.zeros((probe_steps, E, 3), dtype=np.float64)
-    root[..., 2] = 0.55
-    gravity = _upright_g(probe_steps)
-    joints = np.zeros((probe_steps, E, J), dtype=np.float64)
-    # Physically-consistent end-effector channels: a nominal grounded stance whose
-    # support schedule LIFTS both feet during flight phases and whose left foot
-    # SWINGS forward during a kick. The former exemplar fabricated both feet as
-    # permanently in-contact at the origin — strictly WORSE than omitting them: the
-    # metric prompt tells authors to read the foot-contact SUPPORT SCHEDULE to
-    # detect a jump/leap flight phase, so an always-in-contact probe scored EVERY
-    # such (correct) metric 0 (the live "climb … jump off" non-degeneracy all-zero).
-    # An ABSENT channel abstains to a neutral 1.0; a present-but-wrong one FAILS.
-    lfoot = np.zeros((probe_steps, E, 3), dtype=np.float64)
-    rfoot = np.zeros((probe_steps, E, 3), dtype=np.float64)
-    lfoot[..., 1] = 0.10   # nominal pelvis-frame stance (foot below + to the side)
-    rfoot[..., 1] = -0.10
-    lfoot[..., 2] = -0.55
-    rfoot[..., 2] = -0.55
-    contact_l = np.ones((probe_steps, E), dtype=np.float64)
-    contact_r = np.ones((probe_steps, E), dtype=np.float64)
     start = max(5, int(0.10 * probe_steps))
     # A pause is a duration constraint, not an instantaneous pose.  Equal-sized
     # slices made a multi-waypoint program's dwell windows too short for the
@@ -1013,7 +996,7 @@ def _abstract_objective_probe(
         elif phase in {"land", "recover"}:
             minimum[index] = 15
     if clean[-1] in {"dwell", "land", "recover"}:
-        minimum[-1] = 35
+        minimum[-1] = max(35, int(final_hold_steps) + 10)
 
     if int(minimum.sum()) <= available:
         extra = available - int(minimum.sum())
@@ -1035,13 +1018,120 @@ def _abstract_objective_probe(
         ).astype(int)
         bounds[0] = start
         bounds[-1] = probe_steps
+    return clean, bounds
+
+
+def _abstract_route_window(
+    phases: Sequence[str], *, probe_steps: int, final_hold_steps: int = 0,
+) -> tuple[int, int] | None:
+    """Locate the physical route block before a post-route extension skill.
+
+    Authored route channels describe traversal progress, while the abstract
+    program may continue with a jump, landing, recovery, or dwell.  A route
+    phase after an explicit jump boundary is ambiguous in today's flat phase
+    schema, so this helper abstains instead of inventing ownership.  Future
+    objective contracts can replace this conservative rule with explicit
+    ``route``/``extension`` phase roles.
+    """
+    clean, bounds = _abstract_phase_bounds(
+        phases,
+        probe_steps=probe_steps,
+        final_hold_steps=final_hold_steps,
+    )
+    route_phases = {
+        "climb", "move_forward", "move_backward", "move_left", "move_right",
+    }
+    all_route_indices = [
+        index for index, phase in enumerate(clean) if phase in route_phases
+    ]
+    if not all_route_indices:
+        return None
+    extension_indices = [
+        index for index, phase in enumerate(clean)
+        if phase in {"jump", "jump_off"}
+    ]
+    if extension_indices:
+        extension_start = extension_indices[0]
+        if any(index > extension_start for index in all_route_indices):
+            return None
+        route_indices = [
+            index for index in all_route_indices if index < extension_start
+        ]
+        if not route_indices:
+            return None
+    else:
+        route_indices = all_route_indices
+    return (
+        int(bounds[route_indices[0]]),
+        int(bounds[route_indices[-1] + 1]),
+    )
+
+
+def _abstract_objective_probe(
+    phases: Sequence[str], *, behavior_goal: Optional[str] = None,
+) -> Optional[dict[str, np.ndarray]]:
+    """Retarget an abstract phase program onto the validator's universal channels.
+
+    This is a kinematic *validator exemplar*, not a stored robot trajectory.  Root and
+    gravity live in task space; generic articulation is projected onto the synthetic
+    named body and later subjected to the existing joint-permutation gate.  Therefore
+    the same prompt-derived oracle works for quadrupeds, bipeds, and arms whenever the
+    authored metric uses their persisted universal/task channels.
+    """
+    probe_steps = max(T, 180)
+    final_hold_steps = _requested_terminal_hold_steps(behavior_goal)
+    clean, bounds = _abstract_phase_bounds(
+        phases,
+        probe_steps=probe_steps,
+        final_hold_steps=final_hold_steps,
+    )
+    if not clean:
+        return None
+    goal_tokens = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    # ``climb`` is intentionally embodiment-neutral and can mean a supported
+    # stair ascent or a ballistic box mount.  Preserve that distinction from
+    # the prompt: only mount/parkour/jump language gives climb phases a flight
+    # window.  This lets honest box-chain metrics count takeoff/landing events
+    # without teaching every generic climb to hop.
+    airborne_climb = bool(goal_tokens & {
+        "box", "boxes", "hop", "hops", "hopping", "jump", "jumps",
+        "jumping", "leap", "leaps", "leaping", "mount", "mounting",
+        "parkour", "vault", "vaulting",
+    })
+
+    root = np.zeros((probe_steps, E, 3), dtype=np.float64)
+    root[..., 2] = 0.55
+    gravity = _upright_g(probe_steps)
+    joints = np.zeros((probe_steps, E, J), dtype=np.float64)
+    # Physically-consistent end-effector channels: a nominal grounded stance whose
+    # support schedule LIFTS both feet during flight phases and whose left foot
+    # SWINGS forward during a kick. The former exemplar fabricated both feet as
+    # permanently in-contact at the origin — strictly WORSE than omitting them: the
+    # metric prompt tells authors to read the foot-contact SUPPORT SCHEDULE to
+    # detect a jump/leap flight phase, so an always-in-contact probe scored EVERY
+    # such (correct) metric 0 (the live "climb … jump off" non-degeneracy all-zero).
+    # An ABSENT channel abstains to a neutral 1.0; a present-but-wrong one FAILS.
+    lfoot = np.zeros((probe_steps, E, 3), dtype=np.float64)
+    rfoot = np.zeros((probe_steps, E, 3), dtype=np.float64)
+    lfoot[..., 1] = 0.10   # nominal pelvis-frame stance (foot below + to the side)
+    rfoot[..., 1] = -0.10
+    lfoot[..., 2] = -0.55
+    rfoot[..., 2] = -0.55
+    contact_l = np.ones((probe_steps, E), dtype=np.float64)
+    contact_r = np.ones((probe_steps, E), dtype=np.float64)
     x = y = 0.0
     z = 0.55
     tilt = 0.0
 
-    for phase, a, b in zip(clean, bounds[:-1], bounds[1:]):
+    phase_windows = list(zip(clean, bounds[:-1], bounds[1:]))
+    for phase_index, (phase, a, b) in enumerate(phase_windows):
         if b <= a:
             continue
+        next_phase = (
+            clean[phase_index + 1]
+            if phase_index + 1 < len(clean)
+            else None
+        )
         n = b - a
         u = np.linspace(0.0, 1.0, n)
         root[a:b, :, 0] = x
@@ -1074,9 +1164,7 @@ def _abstract_objective_probe(
             root[a:b, :, 1] = (y - 2.00 * u)[:, None]
             y -= 2.00
         elif phase == "jump":
-            root[a:b, :, 0] = (x + 0.70 * u)[:, None]
             root[a:b, :, 2] = (z + 0.45 * np.sin(np.pi * u))[:, None]
-            x += 0.70
         elif phase == "jump_off":
             root[a:b, :, 0] = (x + 1.20 * u)[:, None]
             arc = (1.0 - u) * z + u * 0.55 + 0.25 * np.sin(np.pi * u)
@@ -1136,14 +1224,24 @@ def _abstract_objective_probe(
         # End-effector support schedule + kick swing (see the channel note above):
         # flight phases LIFT both feet so a support-schedule metric sees a real
         # airborne window; a kick swings the left foot forward (signed anterior +x)
-        # so a foot-direction metric reads a correctly-directed strike. Every window
-        # ENDS grounded (touchdown), so the final frame certifies a landed stance.
+        # so a foot-direction metric reads a correctly-directed strike. Standalone
+        # flight windows end grounded. When an explicit ``land`` phase follows, keep
+        # the boundary airborne so ``jump -> land`` remains one physical flight bout
+        # rather than two bouts separated by a fabricated one-frame touchdown.
         if phase == "climb" and airborne_climb:
             air = (u > 0.12) & (u < 0.78)
         elif phase == "jump":
-            air = np.sin(np.pi * u) > 0.25
+            air = (
+                u > 0.12
+                if next_phase == "land"
+                else np.sin(np.pi * u) > 0.25
+            )
         elif phase == "jump_off":
-            air = (u > 0.12) & (u < 0.92)
+            air = (
+                u > 0.12
+                if next_phase == "land"
+                else (u > 0.12) & (u < 0.92)
+            )
         elif phase == "land":
             air = u < 0.85
         else:
@@ -2418,6 +2516,14 @@ def validate_generated_metric(
             )
         )
     )
+    abstract_catalog_route_window: tuple[int, int] | None = None
+    if abstract_is_prompt_native and has_route_catalog:
+        probe_steps = int(next(iter(abstract_probe.values())).shape[0])
+        abstract_catalog_route_window = _abstract_route_window(
+            abstract_program,
+            probe_steps=probe_steps,
+            final_hold_steps=_requested_terminal_hold_steps(behavior_goal),
+        )
     if abstract_is_prompt_native:
         arche["prompt_competent"] = abstract_probe
     catalog_cases: dict[str, str] = {}
@@ -2440,7 +2546,23 @@ def validate_generated_metric(
             } else "far_idle")
             case_steps = int(next(iter(arrays.values())).shape[0])
             arrays.update(catalog_fixture_arrays(
-                catalog, time_steps=case_steps, num_envs=E, case=case))
+                catalog,
+                time_steps=case_steps,
+                num_envs=E,
+                case=case,
+                competent_route_start_step=(
+                    abstract_catalog_route_window[0]
+                    if name == "prompt_competent"
+                    and abstract_catalog_route_window is not None
+                    else None
+                ),
+                competent_route_completion_step=(
+                    abstract_catalog_route_window[1]
+                    if name == "prompt_competent"
+                    and abstract_catalog_route_window is not None
+                    else None
+                ),
+            ))
         for name, case in catalog_cases.items():
             # The authored-world competent case must demonstrate BOTH physical
             # competence and task-channel completion.  For a prompt-native
@@ -2459,7 +2581,23 @@ def validate_generated_metric(
             }
             case_steps = int(next(iter(fixture_base.values())).shape[0])
             fixture_base.update(catalog_fixture_arrays(
-                catalog, time_steps=case_steps, num_envs=E, case=case))
+                catalog,
+                time_steps=case_steps,
+                num_envs=E,
+                case=case,
+                competent_route_start_step=(
+                    abstract_catalog_route_window[0]
+                    if name == "catalog_competent"
+                    and abstract_catalog_route_window is not None
+                    else None
+                ),
+                competent_route_completion_step=(
+                    abstract_catalog_route_window[1]
+                    if name == "catalog_competent"
+                    and abstract_catalog_route_window is not None
+                    else None
+                ),
+            ))
             arche[name] = fixture_base
         if _requires_uninterrupted_hold(behavior_goal):
             arche["catalog_interrupted_hold"] = _interrupted_hold_probe(

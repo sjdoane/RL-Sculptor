@@ -13,6 +13,7 @@ from sculptor.eval.generated_metric import (
 from sculptor.eval.metric_validate import (
     _abstract_objective_program,
     _abstract_objective_probe,
+    _abstract_route_window,
     discrimination_of_metric,
     validate_generated_metric,
 )
@@ -343,6 +344,115 @@ def test_prompt_native_traversal_composes_physics_and_world_without_reference(
     assert scores["catalog_competent"] > 0.9
     assert scores["catalog_far_idle"] == pytest.approx(0.0)
     assert scores["prompt_competent"] > 0.9
+
+
+def test_abstract_jump_then_land_is_one_continuous_flight_bout() -> None:
+    """An explicit landing continues the preceding flight until touchdown.
+
+    A fabricated grounded frame at the phase boundary turns one jump into two
+    contact bouts and makes every honest exactly-once metric reject the validator's
+    own competent example.
+    """
+    goal = (
+        "navigate, jump exactly once, land, recover, and hold 100 "
+        "uninterrupted post-completion frames"
+    )
+    probe = _abstract_objective_probe(
+        ["move_forward", "jump", "land", "recover", "dwell"],
+        behavior_goal=goal,
+    )
+    assert probe is not None
+
+    flight = (
+        (probe["left_foot_contact"][:, 0] < 0.5)
+        & (probe["right_foot_contact"][:, 0] < 0.5)
+    )
+    changes = np.diff(np.pad(flight.astype(np.int8), (1, 1)))
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+
+    assert len(starts) == len(ends) == 1
+    assert ends[0] - starts[0] >= 3
+    assert not flight[-35:].any()
+    assert np.ptp(probe["root_link_pos_w"][flight, 0, 0]) == pytest.approx(0.0)
+
+    root_xy = probe["root_link_pos_w"][:, 0, :2]
+    horizontal_speed = np.linalg.norm(np.diff(root_xy, axis=0), axis=1) / 0.02
+    assert np.all(horizontal_speed[-100:] < 0.12)
+    assert np.all(probe["left_foot_contact"][-100:, 0] > 0.5)
+    assert np.all(probe["right_foot_contact"][-100:, 0] > 0.5)
+    assert np.max(np.abs(probe["joint_vel"][-100:, 0])) < 1e-9
+
+
+def test_competent_route_truth_precedes_post_route_jump() -> None:
+    """Catalog progress and physical skill phases must share one timeline."""
+    program = ["move_forward", "jump", "land", "recover", "dwell"]
+    goal = (
+        "navigate, jump exactly once, land, recover, and hold 100 "
+        "uninterrupted post-completion frames"
+    )
+    probe = _abstract_objective_probe(
+        program,
+        behavior_goal=goal,
+    )
+    assert probe is not None
+    probe_steps = probe["root_link_pos_w"].shape[0]
+    route_window = _abstract_route_window(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    assert route_window is not None
+    route_start, route_completion = route_window
+
+    draft = author_environment(
+        "Build a slalom around four boxes with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    arrays = catalog_fixture_arrays(
+        catalog,
+        time_steps=probe_steps,
+        num_envs=2,
+        case="competent",
+        competent_route_start_step=route_start,
+        competent_route_completion_step=route_completion,
+    )
+    waypoint_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_state"
+    )
+    waypoint_distance_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_distance"
+    )
+    waypoint = arrays[waypoint_spec.name][:, 0]
+    waypoint_distance = arrays[waypoint_distance_spec.name][:, 0]
+    terminal_index = int(waypoint_spec.source["waypoint_count"])
+    terminal_frame = int(np.flatnonzero(waypoint >= terminal_index)[0])
+
+    flight = (
+        (probe["left_foot_contact"][:, 0] < 0.5)
+        & (probe["right_foot_contact"][:, 0] < 0.5)
+    )
+    flight_start = int(np.flatnonzero(flight)[0])
+
+    assert np.all(waypoint[:route_start] == 0)
+    assert np.all(waypoint_distance[:route_start] > 0.9)
+    assert terminal_frame == route_completion
+    assert terminal_frame < flight_start
+    assert np.all(waypoint_distance[route_completion:] == 0.0)
+
+
+def test_abstract_route_window_abstains_after_extension_boundary() -> None:
+    """Flat phase programs must not guess route ownership when ordering is mixed."""
+    staged = _abstract_route_window(
+        ["climb", "dwell", "climb", "dwell", "jump_off", "land"],
+        probe_steps=180,
+    )
+    assert staged is not None
+
+    ambiguous = _abstract_route_window(
+        ["jump_off", "land", "move_forward", "recover"],
+        probe_steps=180,
+    )
+    assert ambiguous is None
 
 
 def test_prompt_native_planar_route_composes_motion_with_world_state(
