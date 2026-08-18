@@ -22,20 +22,20 @@ episode-level score, with each recovery iteration adding another global
 constraint. Nothing in that loop could say *which part of the route* had
 collapsed, because nothing scored a part.
 
-Wall time is the common currency
---------------------------------
-A mode's window comes from `modes.mode_phase_windows`, which is in SECONDS —
-and that is load-bearing, not a formatting choice. A `ModeGraph`'s `fps` is the
-REFERENCE clip's rate (60 or 120 fps for retargeted mocap); a rollout's time
-axis is the CONTROL rate (50 Hz on mjlab). Converting the two through a frame
-COUNT requires assuming a rate at build time, and that assumption has been
-wrong twice in this repo: `build_track_project` set `episode_len_steps` from
-mjlab's `max_iterations` (a count of PPO updates), and the Physics tab reported
-the MJCF's compiled 500 Hz while training ran at 200 Hz (HANDOFF §10). So the
-rollout's own `step_dt` is READ, never assumed — `resolve_step_dt` raises
-rather than falling back to 0.02, because a silently-wrong clock produces
-per-mode scores that look entirely plausible and are attributed to the wrong
-mode.
+One recorded clock is the common currency
+-----------------------------------------
+A generated reward publishes a `ModeExecutionManifest` whose windows are in
+SECONDS on the exact per-environment episode clock training used. That is
+load-bearing, not formatting: a 2 s reference may be followed by an explicit
+18 s terminal hold, so re-deriving only raw clip windows would omit behavior
+the terminal reward trained. A
+`ModeGraph`'s `fps` is the REFERENCE rate (60 or 120 fps for retargeted mocap);
+a rollout's time axis is the CONTROL rate (50 Hz on mjlab). Converting either
+through frame COUNT requires assuming a rate at build time, and that assumption
+has been wrong twice in this repo. So the rollout's own `step_dt` is READ,
+never assumed, and the reward's manifest is consumed when available. Legacy
+callers without a manifest retain raw graph-time behavior explicitly rather
+than masquerading as evidence from a horizon-fitted reward.
 
 What this module deliberately does NOT gate
 -------------------------------------------
@@ -63,6 +63,7 @@ gate against the mode, not to build a softer one.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import re
@@ -74,9 +75,14 @@ import numpy as np
 
 from sculptor.modes import (
     Mode,
+    ModeError,
+    ModeExecutionManifest,
     ModeGraph,
     Transition,
+    build_mode_execution_manifest,
+    mode_graph_sha256,
     mode_phase_windows,
+    validate_mode_execution_manifest,
     validate_mode_graph,
 )
 
@@ -93,6 +99,10 @@ MODE_DIR_PREFIX = "mode_"
 #: fabricated pass/fail.
 FIRED_UNKNOWN = None
 
+#: Persisted rollout evidence emitted by the production sculpt loop. This is
+#: intentionally a diagnostics schema, not a success-certificate schema.
+MODE_DIAGNOSTICS_SCHEMA_VERSION = 1
+
 
 class ModeMetricError(ValueError):
     """Raised when a rollout cannot be resolved against a mode graph.
@@ -102,6 +112,38 @@ class ModeMetricError(ValueError):
     between the graph and a concrete rollout (an unreadable clock, a frame
     range the clip cannot support).
     """
+
+
+def resolve_mode_execution_manifest(
+    graph: ModeGraph,
+    execution_manifest: Optional[
+        ModeExecutionManifest | Mapping[str, Any]
+    ] = None,
+) -> ModeExecutionManifest:
+    """The validated schedule shared with the generated training reward.
+
+    ``None`` preserves the pre-manifest/raw-clip behavior for older callers.
+    Once a reward has been scaffolded, callers should pass its
+    ``REWARD_SPEC['mode_execution_manifest']``; that is the only schedule known
+    to match what training executed, including an explicit terminal hold.
+    """
+    try:
+        manifest = (
+            build_mode_execution_manifest(graph)
+            if execution_manifest is None
+            else ModeExecutionManifest.from_dict(execution_manifest)
+            if isinstance(execution_manifest, Mapping)
+            else execution_manifest
+        )
+        errors = validate_mode_execution_manifest(manifest, graph)
+    except (ModeError, TypeError, ValueError) as exc:
+        raise ModeMetricError(str(exc)) from exc
+    if errors:
+        raise ModeMetricError(
+            "mode execution manifest does not match the graph:\n  - "
+            + "\n  - ".join(errors)
+        )
+    return manifest
 
 
 # ── the clock ────────────────────────────────────────────────────────────
@@ -232,28 +274,33 @@ class ModeSlice:
 
 def mode_slices(
     graph: ModeGraph, *, rollout_frames: int, step_dt: float,
+    execution_manifest: Optional[
+        ModeExecutionManifest | Mapping[str, Any]
+    ] = None,
 ) -> list[ModeSlice]:
     """Resolve every mode's window against a rollout of `rollout_frames`.
 
-    Windows come from `modes.mode_phase_windows` (seconds), so a 120 fps
-    reference and a 50 Hz rollout line up without either side knowing the
-    other's rate. Slices are clamped into `[0, rollout_frames]`; a mode whose
-    window starts past the end of the rollout yields an EMPTY slice rather than
-    an error, because "the policy never got here" is a result this module
-    exists to report.
+    Windows come from the reward's execution manifest when supplied.  That
+    distinction is load-bearing: a 2 s reference can have an 18 s terminal
+    hold, and scoring only raw graph windows would omit the phase training
+    paid. With no manifest, legacy callers retain raw
+    graph-time behavior. Slices are clamped into `[0, rollout_frames]`; a mode
+    whose window starts past the rollout yields an EMPTY slice rather than an
+    error, because "the policy never got here" is a result to report.
     """
     if rollout_frames < 0:
         raise ModeMetricError(f"rollout_frames must be >= 0, got {rollout_frames}")
     step_dt = resolve_step_dt(step_dt=step_dt)
-    windows = mode_phase_windows(graph)
+    manifest = resolve_mode_execution_manifest(graph, execution_manifest)
+    windows = manifest.window_map
     out: list[ModeSlice] = []
-    for mode in graph.modes:
-        start_s, end_s = windows[mode.name]
+    for name in manifest.mode_order:
+        start_s, end_s = windows[name]
         req_lo, req_hi = frame_at(start_s, step_dt), frame_at(end_s, step_dt)
         lo = min(max(req_lo, 0), rollout_frames)
         hi = min(max(req_hi, lo), rollout_frames)
         out.append(ModeSlice(
-            name=mode.name, start_s=start_s, end_s=end_s,
+            name=name, start_s=start_s, end_s=end_s,
             lo=lo, hi=hi, requested_lo=req_lo, requested_hi=req_hi,
             rollout_frames=rollout_frames))
     return out
@@ -333,6 +380,9 @@ def score_modes(
     *,
     step_dt: Optional[float] = None,
     metrics_by_mode: Optional[Mapping[str, Callable[..., Mapping[str, Any]]]] = None,
+    execution_manifest: Optional[
+        ModeExecutionManifest | Mapping[str, Any]
+    ] = None,
 ) -> dict[str, Any]:
     """Score a rollout PER MODE — the whole point of the formalization.
 
@@ -370,7 +420,11 @@ def score_modes(
             + "\n  - ".join(errors))
     dt = resolve_step_dt(behavior, step_dt=step_dt, meta=meta)
     n_frames = rollout_frames_of(arrays)
-    slices = mode_slices(graph, rollout_frames=n_frames, step_dt=dt)
+    manifest = resolve_mode_execution_manifest(graph, execution_manifest)
+    slices = mode_slices(
+        graph, rollout_frames=n_frames, step_dt=dt,
+        execution_manifest=manifest,
+    )
 
     def _run(metric, sub_arrays, sub_behavior) -> tuple[float, dict, Optional[str]]:
         try:
@@ -451,6 +505,7 @@ def score_modes(
                             if not e["slice"]["entered"]],
         "step_dt": dt,
         "rollout_frames": n_frames,
+        "mode_execution_manifest": manifest.to_dict(),
     }
 
 
@@ -459,6 +514,9 @@ def score_modes(
 
 def guard_fire_time_s(
     graph: ModeGraph, transition: Transition,
+    execution_manifest: Optional[
+        ModeExecutionManifest | Mapping[str, Any]
+    ] = None,
 ) -> Optional[float]:
     """Wall-clock offset at which a PHASE guard hands over, or None for a
     predicate guard (whose firing is a state condition, not a time).
@@ -469,7 +527,10 @@ def guard_fire_time_s(
     """
     if transition.guard.kind != "phase" or transition.guard.at_phase is None:
         return None
-    start_s, end_s = mode_phase_windows(graph)[transition.from_mode]
+    windows = resolve_mode_execution_manifest(
+        graph, execution_manifest,
+    ).window_map
+    start_s, end_s = windows[transition.from_mode]
     return round(start_s + float(transition.guard.at_phase) * (end_s - start_s), 6)
 
 
@@ -479,6 +540,9 @@ def check_transitions(
     rollout_frames: int,
     step_dt: float,
     namespace: Optional[Mapping[str, Any]] = None,
+    execution_manifest: Optional[
+        ModeExecutionManifest | Mapping[str, Any]
+    ] = None,
 ) -> list[dict[str, Any]]:
     """Did each transition guard ACTUALLY FIRE in this rollout?
 
@@ -516,7 +580,8 @@ def check_transitions(
             + "\n  - ".join(errors))
     dt = resolve_step_dt(step_dt=step_dt)
     duration_s = rollout_frames * dt
-    windows = mode_phase_windows(graph)
+    manifest = resolve_mode_execution_manifest(graph, execution_manifest)
+    windows = manifest.window_map
     out: list[dict[str, Any]] = []
     for index, transition in enumerate(graph.transitions):
         entry: dict[str, Any] = {
@@ -533,7 +598,9 @@ def check_transitions(
         to_lo = frame_at(windows[transition.to_mode][0], dt)
         entry["to_mode_entered"] = to_lo < rollout_frames
         if transition.guard.kind == "phase":
-            fire_s = guard_fire_time_s(graph, transition)
+            fire_s = guard_fire_time_s(
+                graph, transition, execution_manifest=manifest,
+            )
             fire_frame = frame_at(fire_s, dt) if fire_s is not None else None
             entry["fire_time_s"] = fire_s
             entry["fire_frame"] = fire_frame
@@ -603,6 +670,338 @@ def _evaluate_predicate_guard(
 
 
 # ── per-mode goals, references, and prompt context ───────────────────────
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    """Content digest for a finite, data-only JSON value."""
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ModeMetricError(
+            "mode diagnostics are not canonical JSON: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def mode_diagnostics_digest(record: Mapping[str, Any]) -> str:
+    """Recompute the record digest (the digest field itself is excluded)."""
+    payload = dict(record)
+    payload.pop("diagnostic_digest", None)
+    return _canonical_json_sha256(payload)
+
+
+def _require_sha256(value: Any, *, label: str) -> str:
+    digest = str(value or "")
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ModeMetricError(f"{label} must be a lowercase SHA-256")
+    return digest
+
+
+def _first_episode_mask(
+    arrays: Mapping[str, Any], behavior: Mapping[str, Any],
+) -> np.ndarray:
+    """Validate the all-lane, first-episode support of an official rollout.
+
+    Phase windows run on a per-environment episode clock. The mjlab rollout
+    freezes state after each lane's first termination and persists this mask;
+    ignoring it would count frozen post-termination samples as time spent in a
+    later mode. Production evidence therefore requires the mask rather than
+    guessing episode boundaries from an aggregate behavior scalar.
+    """
+    raw = arrays.get("first_episode_valid_mask")
+    if raw is None:
+        raise ModeMetricError(
+            "official phase diagnostics require first_episode_valid_mask; "
+            "without it, per-environment resets cannot be separated"
+        )
+    mask_raw = np.asarray(raw)
+    if mask_raw.ndim != 2 or not mask_raw.shape[0] or not mask_raw.shape[1]:
+        raise ModeMetricError(
+            "first_episode_valid_mask must have non-empty shape (T, E), got "
+            f"{mask_raw.shape}"
+        )
+    if mask_raw.dtype != np.bool_:
+        try:
+            numeric = np.asarray(mask_raw, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ModeMetricError(
+                "first_episode_valid_mask is not boolean/0-or-1"
+            ) from exc
+        if not np.isfinite(numeric).all() or not np.isin(numeric, (0.0, 1.0)).all():
+            raise ModeMetricError(
+                "first_episode_valid_mask contains values other than 0 or 1"
+            )
+    mask = mask_raw.astype(bool, copy=False)
+    # A first-episode mask is a prefix of True values for each lane. False to
+    # True means reset samples were stitched into the same claimed episode.
+    if mask.shape[0] > 1 and np.any((~mask[:-1]) & mask[1:]):
+        raise ModeMetricError(
+            "first_episode_valid_mask re-enters after termination; the "
+            "trajectory stitches multiple episodes"
+        )
+    declared_envs = behavior.get("rollout_num_envs")
+    if declared_envs is not None:
+        try:
+            declared_envs = int(declared_envs)
+        except (TypeError, ValueError) as exc:
+            raise ModeMetricError(
+                "behavior['rollout_num_envs'] is not an integer"
+            ) from exc
+        if declared_envs != mask.shape[1]:
+            raise ModeMetricError(
+                "behavior rollout_num_envs disagrees with trajectory: "
+                f"{declared_envs} != {mask.shape[1]}"
+            )
+    return mask
+
+
+def _finite_masked_summary(values: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
+    """Small, JSON-safe telemetry summary over valid lane/frame samples."""
+    selected = np.asarray(values)[mask]
+    if selected.size == 0:
+        return {"sample_count": 0, "finite_fraction": None, "mean": None,
+                "p10": None, "median": None, "p90": None,
+                "min": None, "max": None}
+    flat = np.asarray(selected, dtype=np.float64).reshape(-1)
+    finite = flat[np.isfinite(flat)]
+    finite_fraction = float(finite.size / flat.size)
+    if finite.size == 0:
+        return {"sample_count": int(flat.size), "finite_fraction": 0.0,
+                "mean": None, "p10": None, "median": None, "p90": None,
+                "min": None, "max": None}
+    return {
+        "sample_count": int(flat.size),
+        "finite_fraction": round(finite_fraction, 6),
+        "mean": round(float(np.mean(finite)), 8),
+        "p10": round(float(np.quantile(finite, 0.10)), 8),
+        "median": round(float(np.median(finite)), 8),
+        "p90": round(float(np.quantile(finite, 0.90)), 8),
+        "min": round(float(np.min(finite)), 8),
+        "max": round(float(np.max(finite)), 8),
+    }
+
+
+def build_mode_diagnostics(
+    graph: ModeGraph,
+    *,
+    execution_manifest: ModeExecutionManifest | Mapping[str, Any],
+    mode_binding: Mapping[str, Any],
+    arrays: Mapping[str, Any],
+    behavior: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build digest-bound all-lane phase diagnostics for one rollout.
+
+    The record is deliberately not a calibrated success or selection
+    authority. It states which fixed elapsed-time windows each first episode
+    reached, whether each clock handover was reachable per lane, and the
+    environment reward telemetry observed inside each window. This is the
+    production evidence supported by today's phase-window scaffold; it does
+    not claim an OGMP oracle, predicate executor, or mode-conditioned policy.
+
+    Both joins fail closed: the execution manifest must validate against the
+    supplied canonical graph snapshot, and the promoted reward binding must
+    name the same graph and normalized manifest digest.
+    """
+    manifest = resolve_mode_execution_manifest(graph, execution_manifest)
+    graph_digest = mode_graph_sha256(graph)
+    try:
+        from sculptor.mode_rewards import mode_execution_manifest_digest
+
+        manifest_digest = mode_execution_manifest_digest(manifest.to_dict())
+    except (ModeError, TypeError, ValueError) as exc:
+        raise ModeMetricError(str(exc)) from exc
+
+    required_binding_keys = {
+        "schema", "clip_id", "robot", "clip_sha256", "graph_sha256",
+        "context_refs", "execution_manifest_digest",
+    }
+    if not isinstance(mode_binding, Mapping):
+        raise ModeMetricError("promoted phase reward is missing mode_binding")
+    actual_binding_keys = set(mode_binding)
+    if actual_binding_keys != required_binding_keys:
+        raise ModeMetricError(
+            "mode_binding fields are incomplete or unsupported: expected "
+            f"{sorted(required_binding_keys)!r}, got "
+            f"{sorted(str(k) for k in actual_binding_keys)!r}"
+        )
+    if mode_binding.get("schema") != 1:
+        raise ModeMetricError("mode_binding schema must be 1")
+    if mode_binding.get("graph_sha256") != graph_digest:
+        raise ModeMetricError(
+            "mode_binding graph_sha256 is stale: expected "
+            f"{graph_digest}, got {mode_binding.get('graph_sha256')}"
+        )
+    if mode_binding.get("execution_manifest_digest") != manifest_digest:
+        raise ModeMetricError(
+            "mode_binding execution_manifest_digest is stale: expected "
+            f"{manifest_digest}, got "
+            f"{mode_binding.get('execution_manifest_digest')}"
+        )
+    clip_sha = _require_sha256(
+        mode_binding.get("clip_sha256"), label="mode_binding clip_sha256"
+    )
+    if not str(mode_binding.get("clip_id") or ""):
+        raise ModeMetricError("mode_binding clip_id is missing")
+    if not str(mode_binding.get("robot") or ""):
+        raise ModeMetricError("mode_binding robot is missing")
+    context_refs = mode_binding.get("context_refs")
+    if not isinstance(context_refs, Mapping):
+        raise ModeMetricError("mode_binding context_refs must be a mapping")
+    for kind, digest in context_refs.items():
+        _require_sha256(digest, label=f"mode_binding context_refs[{kind!r}]")
+
+    required_provenance = (
+        "reward_sha256", "trajectory_sha256", "behavior_sha256",
+        "reference_clip_sha256", "artifact_tuple_sha256",
+    )
+    normalized_provenance = dict(provenance)
+    for key in required_provenance:
+        normalized_provenance[key] = _require_sha256(
+            normalized_provenance.get(key), label=f"provenance {key}"
+        )
+    if normalized_provenance["reference_clip_sha256"] != clip_sha:
+        raise ModeMetricError(
+            "provenance reference_clip_sha256 does not match mode_binding"
+        )
+
+    valid_mask = _first_episode_mask(arrays, behavior)
+    rollout_frames, n_envs = map(int, valid_mask.shape)
+    step_dt = resolve_step_dt(behavior)
+    # The caller supplies only official time-indexed channels. A ragged
+    # channel is corruption, not something to silently truncate to the mask.
+    normalized_arrays: dict[str, np.ndarray] = {}
+    for key, raw in arrays.items():
+        array = np.asarray(raw)
+        if array.ndim < 1:
+            continue
+        if array.shape[0] != rollout_frames:
+            raise ModeMetricError(
+                f"trajectory channel {key!r} has {array.shape[0]} frames, "
+                f"expected {rollout_frames}"
+            )
+        normalized_arrays[str(key)] = array
+
+    rendered_env = behavior.get("rendered_env_index")
+    if rendered_env is not None:
+        try:
+            rendered_env = int(rendered_env)
+        except (TypeError, ValueError) as exc:
+            raise ModeMetricError(
+                "behavior['rendered_env_index'] is not an integer"
+            ) from exc
+        if not 0 <= rendered_env < n_envs:
+            raise ModeMetricError(
+                f"rendered_env_index {rendered_env} is outside 0..{n_envs - 1}"
+            )
+
+    windows = mode_slices(
+        graph,
+        rollout_frames=rollout_frames,
+        step_dt=step_dt,
+        execution_manifest=manifest,
+    )
+    reward_terms = {
+        key: array for key, array in normalized_arrays.items()
+        if key.startswith("reward_term__")
+    }
+    mode_entries: dict[str, Any] = {}
+    for window in windows:
+        requested_frames = max(1, window.requested_hi - window.requested_lo)
+        window_mask = valid_mask[window.lo:window.hi]
+        valid_per_env = window_mask.sum(axis=0, dtype=np.int64)
+        coverage_per_env = np.clip(
+            valid_per_env.astype(np.float64) / requested_frames, 0.0, 1.0
+        )
+        entered = valid_per_env > 0
+        completed = valid_per_env >= requested_frames
+        term_summaries: dict[str, Any] = {}
+        for key, array in reward_terms.items():
+            if array.ndim < 2 or tuple(array.shape[:2]) != tuple(valid_mask.shape):
+                raise ModeMetricError(
+                    f"reward telemetry {key!r} must begin with (T, E)="
+                    f"{tuple(valid_mask.shape)}, got {array.shape}"
+                )
+            term_summaries[key[len("reward_term__"):]] = _finite_masked_summary(
+                array[window.lo:window.hi], window_mask
+            )
+        entry: dict[str, Any] = {
+            "slice": window.to_dict(),
+            "entered_env_count": int(np.count_nonzero(entered)),
+            "entered_env_fraction": round(float(np.mean(entered)), 6),
+            "completed_window_env_count": int(np.count_nonzero(completed)),
+            "completed_window_env_fraction": round(float(np.mean(completed)), 6),
+            "valid_frames_per_env": [int(v) for v in valid_per_env],
+            "coverage_per_env": [round(float(v), 6) for v in coverage_per_env],
+            "mean_env_coverage": round(float(np.mean(coverage_per_env)), 6),
+            "reward_terms": term_summaries,
+        }
+        if rendered_env is not None:
+            entry["rendered_env"] = {
+                "index": rendered_env,
+                "entered": bool(entered[rendered_env]),
+                "completed_window": bool(completed[rendered_env]),
+                "valid_frames": int(valid_per_env[rendered_env]),
+                "coverage": round(float(coverage_per_env[rendered_env]), 6),
+            }
+        mode_entries[window.name] = entry
+
+    transitions = check_transitions(
+        graph,
+        rollout_frames=rollout_frames,
+        step_dt=step_dt,
+        execution_manifest=manifest,
+    )
+    for transition in transitions:
+        fire_frame = transition.get("fire_frame")
+        per_env = np.zeros(n_envs, dtype=bool)
+        if isinstance(fire_frame, int) and 0 <= fire_frame < rollout_frames:
+            per_env = np.any(valid_mask[fire_frame:], axis=0)
+        transition["recording_reached_guard"] = transition.pop("fired", None)
+        transition["fired_env_count"] = int(np.count_nonzero(per_env))
+        transition["fired_env_fraction"] = round(float(np.mean(per_env)), 6)
+        transition["fired_per_env"] = [bool(v) for v in per_env]
+        if rendered_env is not None:
+            transition["rendered_env_fired"] = bool(per_env[rendered_env])
+
+    record: dict[str, Any] = {
+        "schema_version": MODE_DIAGNOSTICS_SCHEMA_VERSION,
+        "authority": {
+            "classification": "diagnostic_only",
+            "calibrated_success_authority": False,
+            "fitness_or_selection_authority": False,
+            "execution_model": "fixed_linear_phase_windows",
+            "not_implemented": [
+                "closed_loop_oracle", "rho_bounded_exploration",
+                "predicate_or_branch_executor", "mode_conditioned_policy",
+            ],
+        },
+        "provenance": normalized_provenance,
+        "mode_binding": dict(mode_binding),
+        "canonical_graph": graph.to_dict(),
+        "graph_sha256": graph_digest,
+        "mode_execution_manifest": manifest.to_dict(),
+        "execution_manifest_digest": manifest_digest,
+        "rollout": {
+            "frames": rollout_frames,
+            "environments": n_envs,
+            "step_dt": step_dt,
+            "first_episode_valid_fraction": round(float(np.mean(valid_mask)), 6),
+            "rendered_env_index": rendered_env,
+            "time_indexed_channels": sorted(normalized_arrays),
+        },
+        "modes": mode_entries,
+        "transitions": transitions,
+    }
+    record["diagnostic_digest"] = mode_diagnostics_digest(record)
+    return record
 
 
 def mode_goal_text(

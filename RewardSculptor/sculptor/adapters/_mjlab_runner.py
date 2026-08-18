@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -2671,16 +2672,35 @@ def _cmd_train(args: argparse.Namespace) -> None:
             raise FileNotFoundError(
                 f"--load-pretrained-policy not found: {ckpt}"
             )
+        load_role = str(args.pretrained_load_role or "actor_critic")
+        if load_role not in ("actor_only", "actor_critic"):
+            raise ValueError(
+                "--pretrained-load-role must be actor_only or actor_critic"
+            )
         load_cfg = {
             "actor": True,
-            "critic": True,
+            "critic": load_role == "actor_critic",
             "optimizer": False,
             "iteration": False,
             "rnd": False,
         }
-        # Cheap forensics: short checksum so Ship-16's mission orchestrator
-        # can later verify the path matches its known stage checkpoint.
-        source_sha8 = _hashlib.sha256(ckpt.read_bytes()).hexdigest()[:8]
+        source_digest = _hashlib.sha256()
+        with ckpt.open("rb") as checkpoint_stream:
+            for chunk in iter(lambda: checkpoint_stream.read(1 << 20), b""):
+                source_digest.update(chunk)
+        source_sha256 = source_digest.hexdigest()
+        expected_source_sha256 = os.environ.get(
+            "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"
+        )
+        if (
+            expected_source_sha256
+            and source_sha256 != expected_source_sha256
+        ):
+            raise RuntimeError(
+                "pretrained policy digest differs from the immutable "
+                "starting-skill launch pin: expected "
+                f"{expected_source_sha256}, got {source_sha256}"
+            )
         try:
             _ = runner.load(str(ckpt), load_cfg=load_cfg)
         except (RuntimeError, OSError, EOFError, Exception) as e:
@@ -2706,7 +2726,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
             "[SCULPT-EVENT] " + json.dumps({
                 "type": "warm_start_loaded",
                 "source": str(ckpt),
-                "source_sha8": source_sha8,
+                "source_sha256": source_sha256,
+                # Retained for older log consumers; authority uses the full
+                # digest above.
+                "source_sha8": source_sha256[:8],
                 "load_cfg_keys": sorted(
                     k for k, v in load_cfg.items() if v
                 ),
@@ -4148,6 +4171,14 @@ def main() -> None:
             "actor+critic weights from this file BEFORE training begins, "
             "skipping optimizer / iteration / RND state. Used by the "
             "mission orchestrator to chain skills across stages."
+        ),
+    )
+    p_train.add_argument(
+        "--pretrained-load-role", default="actor_critic",
+        choices=("actor_only", "actor_critic"),
+        help=(
+            "Select which compatible state dictionaries to inherit. "
+            "Optimizer/iteration/RND are always reset."
         ),
     )
 

@@ -131,6 +131,16 @@ class Stage:
     reference_clip_id: Optional[str] = None
     reference_tier: Optional[str] = None
     reference_match_confidence: Optional[float] = None
+    # Immutable Tier-D admission receipt.  A clip id is not globally unique
+    # across embodiments and a display-tier string is not execution evidence,
+    # so mission training requires this exact robot + clip bytes + verified
+    # certificate tuple.  Older missions deserialize with None and fail closed
+    # at the training boundary until the reference is re-attached.
+    reference_robot: Optional[str] = None
+    reference_clip_sha256: Optional[str] = None
+    reference_certificate_sha256: Optional[str] = None
+    reference_execution_contract_sha256: Optional[str] = None
+    reference_execution_boundary_sha256: Optional[str] = None
     # §D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): the goal-
     # aligned SUB-SPAN of `reference_clip_id`, selected by
     # `sculptor.refs.spans.select_reference_span`. D23 diagnosed a live

@@ -14,8 +14,8 @@ from typing import Any, Optional
 
 import typer
 
-from sculptor.kg.schema import NODE_TYPES, Paper, Technique
-from sculptor.kg.store import SculptorKG, default_db_path
+from sculptor.kg.schema import Paper, Technique
+from sculptor.kg.store import SculptorKG
 
 app = typer.Typer(
     name="sculpt",
@@ -1127,6 +1127,9 @@ def kg_extract(
     seeds: Optional[Path] = typer.Option(
         None, "--seeds", exists=True, readable=True,
         help="Restrict extraction to Paper IDs in this campaign seeds YAML."),
+    arxiv: Optional[str] = typer.Option(
+        None, "--arxiv",
+        help="Extract exactly one already-ingested arXiv paper (for example 2410.01030)."),
     tier: Optional[str] = typer.Option(
         None, "--tier", help="Restrict to a structured tier (for example S)."),
     tag: Optional[str] = typer.Option(
@@ -1142,12 +1145,19 @@ def kg_extract(
     FailureMode, RewardComponent, Environment nodes and their edges.
     """
     from sculptor.kg.extract import cli_extract_all, paper_ids_from_seeds
+    from sculptor.kg.ingest import _normalize_arxiv_id
+    from sculptor.kg.schema import make_paper_id
 
-    if not (all_ or force or seeds or tier or tag):
-        typer.echo("specify --all, --seeds, --tier, or --tag")
+    if arxiv and (all_ or seeds or tier or tag):
+        typer.echo("--arxiv selects one exact paper and cannot be combined with "
+                   "--all, --seeds, --tier, or --tag")
         raise typer.Exit(code=2)
-    paper_ids = (
-        paper_ids_from_seeds(seeds, tier=tier, tag=tag) if seeds else None)
+    if not (all_ or force or seeds or arxiv or tier or tag):
+        typer.echo("specify --all, --arxiv, --seeds, --tier, or --tag")
+        raise typer.Exit(code=2)
+    paper_ids = ({make_paper_id(_normalize_arxiv_id(arxiv))} if arxiv else
+                 paper_ids_from_seeds(seeds, tier=tier, tag=tag)
+                 if seeds else None)
     if seeds and not paper_ids:
         typer.echo("selection matched no papers")
         raise typer.Exit(code=2)
@@ -1335,6 +1345,10 @@ def run(
         help="rsl_rl checkpoint to warm-start the FIRST iteration's "
              "training from (actor+critic only; optimizer/iteration "
              "state skipped). Task obs/action spaces must match."),
+    init_policy_mode: str = typer.Option(
+        "actor_critic", "--init-policy-mode",
+        help="Warm-start inheritance: actor_only or actor_critic. "
+             "full_resume is intentionally unsupported by sculpt runs."),
     # §Ship 39 (H1): interactive human-in-the-loop control.
     control_file: Optional[Path] = typer.Option(
         None, "--control-file",
@@ -1352,6 +1366,9 @@ def run(
     reference_robot: Optional[str] = typer.Option(
         None, "--reference-robot",
         help="Exact reference-library robot namespace for --reference-clip."),
+    expected_active_reference_reward_sha256: Optional[str] = typer.Option(
+        None, "--expected-active-reference-reward-sha256", hidden=True,
+        help="Backend admission pin for the active reference-bearing reward."),
 ):
     """Run the inner loop: train → rollout → diagnose → edit → commit."""
     from sculptor.sculpt import sculpt_run
@@ -1361,6 +1378,10 @@ def run(
     if device is not None and not re.fullmatch(r"(?:cpu|cuda(?::\d+)?)", device):
         raise typer.BadParameter(
             "--device must be 'cpu', 'cuda', or 'cuda:N'"
+        )
+    if init_policy_mode not in ("actor_only", "actor_critic"):
+        raise typer.BadParameter(
+            "--init-policy-mode must be 'actor_only' or 'actor_critic'"
         )
 
     # Resolve the metric (built-in name or generated-metric path) to a
@@ -1397,10 +1418,14 @@ def run(
         fitness_observe_only=(fitness_mode == "observe"),
         fitness_revert=fitness_revert,
         init_policy_path=init_policy,
+        init_policy_mode=init_policy_mode,
         control_file=control_file,
         feedback_timeout=feedback_timeout,
         reference_clip_id=reference_clip,
         reference_robot=reference_robot,
+        expected_active_reference_reward_sha256=(
+            expected_active_reference_reward_sha256
+        ),
     )
     # Only override sculpt_run's defaults when explicitly provided.
     if fitness_target is not None:
@@ -1732,16 +1757,32 @@ def _build_skill_library_handle(
         )
         return None
 
+    from sculptor.policy_contract import build_project_policy_contract
+    from sculptor.project_robot import resolve_project_reference_robot
     from sculptor.skill_library import SkillLibrary, SkillLibraryHandle
+
+    try:
+        robot_slug = resolve_project_reference_robot(config_path.parent)
+        compatibility_contract = build_project_policy_contract(
+            config_path.parent,
+        )
+    except Exception as exc:  # noqa: BLE001 - disable unsafe reuse cleanly
+        typer.echo(
+            "[skill-library] disabled — exact robot/policy contract is "
+            f"unavailable: {type(exc).__name__}: {exc}",
+            err=True,
+        )
+        return None
 
     library = SkillLibrary(root=library_root) if library_root else SkillLibrary()
     return SkillLibraryHandle(
         library=library,
         adapter_class=adapter_class,
         task_id=task_id,
-        robot_slug=None,  # CLI doesn't know UI's library_slug; UI may
-                          # set this when it grows a Ship 19b surface.
+        robot_slug=robot_slug,
         publish=True,
+        compatibility_contract=compatibility_contract,
+        strict_runtime_admission=True,
     )
 
 
@@ -1981,7 +2022,6 @@ def mission_run_cli(
     stage's seed prompt, calls sculpt_run with warm-start, evaluates
     success criteria, and re-decomposes on failure.
     """
-    from sculptor.adapters.base import load_adapter
     from sculptor.kg.store import SculptorKG
     from sculptor.mission import load_mission
     from sculptor.sculpt import mission_run
@@ -2139,24 +2179,37 @@ def export(
         help="Iteration to export (default: latest with a checkpoint)."),
     out: Optional[Path] = typer.Option(
         None, "--out", "-o",
-        help="Output zip path (default: <project>/exports/policy_<name>_iter<N>.zip)."),
+        help="Output path. Defaults to a deployment .zip, or a data-only "
+             ".rskill with --portable."),
     runs_root: Optional[Path] = typer.Option(
         None, "--runs-root",
         help="Alternate runs/ tree, e.g. a mission stage's "
              ".missions/<m>/stages/<s>/runs (default: <project>/runs)."),
     list_only: bool = typer.Option(
         False, "--list", help="List exportable iterations and exit."),
+    portable: bool = typer.Option(
+        False, "--portable",
+        help="Export a strict data-only .rskill for policy transfer instead "
+             "of the executable/raw-checkpoint deployment ZIP."),
+    robot_slug: Optional[str] = typer.Option(
+        None, "--robot",
+        help="Exact robot-library slug for a portable export (for example "
+             "g1). Derived from project metadata when available; required "
+             "otherwise. Ignored for deployment ZIPs."),
 ):
-    """Export a trained policy as a self-contained deployment bundle.
+    """Export a deployment ZIP or a data-only portable starting skill.
 
-    The zip contains the raw checkpoint, best-effort ONNX + TorchScript
+    By default, the ZIP contains the raw checkpoint, best-effort ONNX + TorchScript
     exports of the actor network, the exact reward version + env spec the
     iteration trained under, the project config, metrics, and a DEPLOY.md
-    loading recipe — everything a sim-to-real pipeline needs in one file.
+    loading recipe — everything a trusted sim-to-real pipeline needs in one
+    file. ``--portable`` instead emits only validated safetensors and an exact
+    compatibility manifest; it is the only format accepted by upload.
     """
     from sculptor.export import (
         ExportError,
         export_policy_bundle,
+        export_starting_skill_bundle,
         list_exportable_iters,
     )
 
@@ -2178,8 +2231,18 @@ def export(
         return
 
     try:
-        result = export_policy_bundle(
-            project, iter_index=iter_index, runs_root=root, out_path=out)
+        if portable:
+            result = export_starting_skill_bundle(
+                project,
+                iter_index=iter_index,
+                runs_root=root,
+                out_path=out,
+                robot_slug=robot_slug,
+            )
+        else:
+            result = export_policy_bundle(
+                project, iter_index=iter_index, runs_root=root, out_path=out,
+            )
     except (ExportError, OSError) as e:
         typer.echo(f"[export] {e}", err=True)
         raise typer.Exit(1)
@@ -2315,9 +2378,8 @@ def reference_jump(
 # ── sculpt refs: reference motion library (§R1_BUILD_SPEC) ──────────────
 refs_app = typer.Typer(
     name="refs",
-    help="Reference motion library: ingest/index/list retargeted mocap "
-         "clips (LAFAN1-g1, fleaven-g1) for RSI. `refs search` lands in a "
-         "later worker.",
+    help="Reference motion library: ingest, inspect, track, and export exact "
+         "robot-scoped motion clips as data-only starting skills.",
     no_args_is_help=True,
 )
 app.add_typer(refs_app, name="refs")
@@ -2393,6 +2455,57 @@ def refs_index() -> None:
 
     rows = rebuild_index()
     typer.echo(f"[refs index] rebuilt {len(rows)} row(s)")
+
+
+@refs_app.command("export-skill")
+def refs_export_skill(
+    robot: str = typer.Option(
+        ..., "--robot",
+        help="Exact reference-library robot slug (for example g1).",
+    ),
+    clip_id: str = typer.Option(
+        ..., "--clip",
+        help="Exact clip ID under the selected robot; aliases are not used.",
+    ),
+    out: Path = typer.Option(
+        ..., "--out", "-o",
+        help="Destination .rskill path. Written atomically.",
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name",
+        help="Stable researcher-facing name (default: <robot>/<clip> reference).",
+    ),
+) -> None:
+    """Create an uploadable, data-only starting skill from a library clip.
+
+    The exporter re-verifies the selected provenance and clip digest, then
+    writes only the exact motion and provenance. Upload registers a reference
+    candidate; a target-specific Tier-D gate is still required before a
+    research training run may consume it.
+    """
+    from sculptor.export import ExportError, export_reference_starting_skill_bundle
+
+    try:
+        result = export_reference_starting_skill_bundle(
+            robot_slug=robot,
+            clip_id=clip_id,
+            out_path=out,
+            name=name,
+        )
+    except (ExportError, OSError) as exc:
+        typer.echo(f"[refs export-skill] refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    reference = result.manifest["reference"]
+    typer.echo(f"[refs export-skill] wrote {result.bundle_path}")
+    typer.echo(
+        "[refs export-skill] pinned "
+        f"{reference['robot_slug']}/{reference['clip_id']} "
+        f"clip_sha256={reference['content_sha256']}"
+    )
+    typer.echo(
+        "[refs export-skill] candidate only; target-specific Tier-D "
+        "admission remains required"
+    )
 
 
 @refs_app.command("list")
@@ -2885,6 +2998,18 @@ def modes_author(
         # write terms for a window that has since moved. Regenerate instead.
         for err in stale:
             typer.echo(f"[modes author] {err}", err=True)
+        fresh_path = path.with_name(
+            f"{path.stem}_rescaffolded{path.suffix or '.py'}"
+        )
+        typer.echo(
+            "[modes author] Refusing to author from this stale scaffold. "
+            "Regenerate/re-scaffold the execution manifest from the current "
+            "clip graph at a new path, then re-author its mode bodies; the "
+            "stale file was not changed:\n"
+            f"  sculpt modes scaffold --clip-id {clip_id} --robot {robot} "
+            f"--out {fresh_path}",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     prompt = mode_authoring_prompt(

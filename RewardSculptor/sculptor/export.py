@@ -42,12 +42,17 @@ Checkpoint formats understood:
 Everything network-related is best-effort by design: the raw checkpoint +
 DEPLOY.md recipe are always present, so a bundle is never useless even
 when torch/onnx/sb3 are missing from the environment doing the export.
+
+This deployment ZIP is intentionally not a portable upload.  Use
+``export_starting_skill_bundle`` (CLI: ``sculptor export --portable``) for the
+closed, data-only ``.rskill`` format accepted at the hostile-upload boundary.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -58,6 +63,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 EXPORT_SCHEMA_VERSION = 1
+DEPLOYMENT_BUNDLE_KIND = "reward-sculptor-deployment-bundle"
+PORTABLE_SKILL_SCHEMA_VERSION = 2
+PORTABLE_SKILL_BUNDLE_KIND = "reward-sculptor-starting-skill"
+
+_PORTABLE_ROBOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_REFERENCE_ARCHIVE_MAX_BYTES = 512 * 1024**2
+_REFERENCE_EXPANDED_MAX_BYTES = 1024**3
+_REFERENCE_MEMBER_MAX = 128
 
 _ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
 _MLP_KEY_RE = re.compile(r"^mlp\.(\d+)\.(weight|bias)$")
@@ -236,16 +249,47 @@ def export_policy_bundle(
         if ckpt.suffix == ".pt":
             net_meta = _export_rsl_rl_actor(
                 ckpt, project, stage, files, warnings)
+            # The actor reconstruction performs the strict architecture and
+            # normalizer checks. Only expose a trainable interchange payload
+            # after those checks prove the policy surface is understood; a
+            # safetensors file is memory-safe, but that alone does not make an
+            # unknown architecture semantically loadable.
+            if "obs_dim" in net_meta and "action_dim" in net_meta:
+                trainable_meta = _export_rsl_rl_safetensors(
+                    ckpt, stage, files, warnings,
+                )
+                if trainable_meta:
+                    net_meta["trainable_checkpoint"] = trainable_meta
         elif ckpt.suffix == ".zip":
             net_meta = _export_sb3_actor(ckpt, stage, files, warnings)
 
         # Sim→real hardware contract (joint order, action scale/offset, control
         # rate, obs layout) — the interface the raw network cannot carry.
         deployment = _deployment_contract(project, net_meta, warnings)
+        compatibility_contract = None
+        compatibility_contract_digest = None
+        if net_meta.get("trainable_checkpoint"):
+            try:
+                from sculptor.policy_contract import (
+                    build_project_policy_contract,
+                    contract_fingerprint,
+                )
+
+                compatibility_contract = build_project_policy_contract(
+                    project, observed_network=net_meta,
+                )
+                compatibility_contract_digest = contract_fingerprint(
+                    compatibility_contract,
+                )
+            except Exception as exc:  # noqa: BLE001 — export remains usable
+                warnings.append(
+                    "trainable compatibility contract unavailable "
+                    f"({type(exc).__name__}: {exc}); import will be blocked"
+                )
 
         manifest: dict[str, Any] = {
             "schema_version": EXPORT_SCHEMA_VERSION,
-            "kind": "reward-sculptor-policy-bundle",
+            "kind": DEPLOYMENT_BUNDLE_KIND,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "sculptor_version": _sculptor_version(),
             "project": project.name,
@@ -259,6 +303,8 @@ def export_policy_bundle(
             "env_spec_source": env_spec_source,
             "network": net_meta,
             "deployment": deployment,
+            "compatibility_contract": compatibility_contract,
+            "compatibility_contract_digest": compatibility_contract_digest,
             "warnings": warnings,
         }
 
@@ -292,6 +338,473 @@ def export_policy_bundle(
         shutil.move(str(tmp_zip), str(out))
 
     return ExportResult(bundle_path=out, manifest=manifest, warnings=warnings)
+
+
+def export_starting_skill_bundle(
+    project_dir: Path | str,
+    *,
+    iter_index: Optional[int] = None,
+    runs_root: Path | str | None = None,
+    out_path: Path | str | None = None,
+    robot_slug: Optional[str] = None,
+) -> ExportResult:
+    """Build a strict data-only `.rskill` policy-transfer artifact.
+
+    Deployment exports intentionally retain the raw checkpoint, generated
+    Python, TorchScript/ONNX, reward source, and environment snapshots.  Those
+    files are useful to a trusted operator but are forbidden at an untrusted
+    upload boundary.  This exporter reuses the local checkpoint conversion and
+    contract checks, then emits only canonical safetensors plus a descriptor-
+    complete portable manifest.
+    """
+    project = Path(project_dir).resolve()
+    metadata_robot_slug: Optional[str] = None
+    metadata_path = project / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            robot_source = metadata.get("robot_source") or {}
+            if isinstance(robot_source, dict):
+                raw_robot = (
+                    robot_source.get("library_slug")
+                    or robot_source.get("library_name")
+                )
+                if isinstance(raw_robot, str) and raw_robot.strip():
+                    metadata_robot_slug = raw_robot.strip()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            metadata_robot_slug = None
+    if robot_slug and metadata_robot_slug and robot_slug != metadata_robot_slug:
+        raise ExportError(
+            "portable robot identity conflicts with project metadata "
+            f"({robot_slug!r} != {metadata_robot_slug!r})"
+        )
+    resolved_robot_slug = robot_slug or metadata_robot_slug
+    if not resolved_robot_slug:
+        raise ExportError(
+            "portable starting-skill export requires an exact robot identity; "
+            "configure the project from the robot library or pass robot_slug"
+        )
+    with tempfile.TemporaryDirectory(prefix="rs_portable_export_") as td:
+        stage = Path(td)
+        deployment_result = export_policy_bundle(
+            project,
+            iter_index=iter_index,
+            runs_root=runs_root,
+            out_path=stage / "deployment.zip",
+        )
+        source_manifest = deployment_result.manifest
+        source_network = source_manifest.get("network") or {}
+        trainable = source_network.get("trainable_checkpoint")
+        contract = source_manifest.get("compatibility_contract")
+        contract_digest = source_manifest.get("compatibility_contract_digest")
+        if not isinstance(trainable, dict) or not isinstance(contract, dict):
+            raise ExportError(
+                "iteration cannot produce a portable starting skill: "
+                "canonical safetensors and an exact compatibility contract "
+                "are required"
+            )
+        weights_name = trainable.get("file")
+        roles = trainable.get("policy_roles")
+        if (
+            weights_name != "policy/weights.safetensors"
+            or not isinstance(roles, list)
+            or "actor" not in roles
+            or any(role not in {"actor", "critic"} for role in roles)
+        ):
+            raise ExportError(
+                "iteration produced an unsupported portable policy payload"
+            )
+        identity = contract.get("identity") or {}
+        adapter_class = identity.get("adapter_class")
+        task_id = identity.get("task_id")
+        if not isinstance(adapter_class, str) or not adapter_class:
+            raise ExportError("portable policy contract has no adapter identity")
+        if not isinstance(task_id, str) or not task_id:
+            raise ExportError("portable policy contract has no task identity")
+
+        try:
+            with zipfile.ZipFile(deployment_result.bundle_path, "r") as source:
+                weights = source.read(weights_name)
+        except (KeyError, OSError, zipfile.BadZipFile) as exc:
+            raise ExportError(
+                "deployment conversion did not produce readable safetensors"
+            ) from exc
+        weights_sha = hashlib.sha256(weights).hexdigest()
+        portable_warnings = [
+            "Portable transfer excludes the raw checkpoint, optimizer state, "
+            "reward/environment source, Python, ONNX, and TorchScript; use the "
+            "separate deployment ZIP for trusted deployment workflows."
+        ]
+        starting_skill: dict[str, Any] = {
+            "name": f"{project.name} iter {source_manifest['iter_index']}",
+            "weights_file": weights_name,
+            "policy_roles": list(roles),
+            "adapter_class": adapter_class,
+            "task_id": task_id,
+        }
+        starting_skill["robot_slug"] = str(resolved_robot_slug)
+        manifest: dict[str, Any] = {
+            "schema_version": PORTABLE_SKILL_SCHEMA_VERSION,
+            "kind": PORTABLE_SKILL_BUNDLE_KIND,
+            "created_at": source_manifest.get("created_at"),
+            "sculptor_version": source_manifest.get("sculptor_version"),
+            "project": project.name,
+            "iter_index": source_manifest["iter_index"],
+            "starting_skill": starting_skill,
+            "deployment": {
+                "task_id": task_id,
+                "robot_slug": str(resolved_robot_slug),
+            },
+            "checkpoint": {
+                "format": (source_manifest.get("checkpoint") or {}).get("format"),
+                "sha256": (source_manifest.get("checkpoint") or {}).get("sha256"),
+                "included": False,
+            },
+            "network": {
+                key: value
+                for key, value in source_network.items()
+                if key != "exports"
+            },
+            "compatibility_contract": contract,
+            "compatibility_contract_digest": contract_digest,
+            "warnings": portable_warnings,
+            "files": [{
+                "path": weights_name,
+                "sha256": weights_sha,
+                "bytes": len(weights),
+            }],
+        }
+
+        if out_path is None:
+            exports_dir = project / "exports"
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            out = exports_dir / (
+                f"skill_{project.name}_iter{source_manifest['iter_index']}.rskill"
+            )
+        else:
+            out = Path(out_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+        if out.suffix.lower() != ".rskill":
+            raise ExportError("portable starting-skill output must end in .rskill")
+
+        manifest_path = stage / "portable-manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        pending = stage / "portable.rskill"
+        with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(manifest_path, "manifest.json")
+            archive.writestr(weights_name, weights)
+        shutil.move(str(pending), str(out))
+    return ExportResult(
+        bundle_path=out,
+        manifest=manifest,
+        warnings=portable_warnings,
+    )
+
+
+def export_reference_starting_skill_bundle(
+    *,
+    robot_slug: str,
+    clip_id: str,
+    out_path: Path | str | None = None,
+    name: str | None = None,
+    references_root: Path | str | None = None,
+) -> ExportResult:
+    """Export one exact library trajectory as a data-only ``.rskill``.
+
+    The reference library remains the authority: the caller selects a
+    robot-scoped ``(robot_slug, clip_id)`` identity, and this function refuses
+    to substitute an index row, a filename, or target-project metadata.  Both
+    source files are revalidated and content-attested immediately before the
+    archive is written.  The output contains only ``manifest.json``,
+    ``motion/clip.npz``, and ``motion/provenance.json``; controller, world,
+    policy, Python, pickle, and raw checkpoint bytes are never included.
+
+    A reference-only import is still a candidate.  Target-project Tier-D
+    certification/admission happens later at run launch and is intentionally
+    not claimed by this transfer artifact.
+    """
+    from sculptor import reference
+    from sculptor.refs import library as refs
+    from sculptor.skill_bundle import reference_source_provenance_sha256
+
+    if (
+        not isinstance(robot_slug, str)
+        or not _PORTABLE_ROBOT_RE.fullmatch(robot_slug)
+    ):
+        raise ExportError(
+            "reference robot must be a safe stable library identifier"
+        )
+    try:
+        refs.validate_clip_id(clip_id)
+    except (TypeError, ValueError) as exc:
+        raise ExportError(f"invalid reference clip identity: {exc}") from exc
+
+    library_root = Path(
+        references_root if references_root is not None else refs.references_root()
+    ).expanduser().resolve()
+    source_dir = (library_root / robot_slug / clip_id).resolve()
+    try:
+        source_dir.relative_to(library_root)
+    except ValueError as exc:
+        raise ExportError(
+            "reference identity resolves outside the configured library"
+        ) from exc
+
+    clip_path = source_dir / refs.CLIP_FILENAME
+    provenance_path = source_dir / refs.PROVENANCE_FILENAME
+    if not clip_path.is_file():
+        raise ExportError(
+            f"reference clip bytes are missing for {robot_slug}/{clip_id}"
+        )
+    if not provenance_path.is_file():
+        raise ExportError(
+            f"reference provenance is missing for {robot_slug}/{clip_id}"
+        )
+    if provenance_path.stat().st_size > 2 * 1024**2:
+        raise ExportError("reference provenance exceeds the 2 MiB limit")
+
+    try:
+        provenance_bytes = provenance_path.read_bytes()
+        provenance = _load_strict_json_object(
+            provenance_bytes, label="reference provenance",
+        )
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"invalid reference provenance: {exc}") from exc
+    provenance_errors = refs.validate_provenance(provenance)
+    if provenance_errors:
+        raise ExportError(
+            "invalid reference provenance: " + "; ".join(provenance_errors)
+        )
+    if provenance.get("schema") != refs.PROVENANCE_SCHEMA:
+        raise ExportError(
+            "reference provenance schema is unsupported "
+            f"({provenance.get('schema')!r})"
+        )
+    if provenance.get("robot") != robot_slug:
+        raise ExportError(
+            "reference provenance robot does not match the selected library "
+            f"identity ({provenance.get('robot')!r} != {robot_slug!r})"
+        )
+    if provenance.get("clip_id") != clip_id:
+        raise ExportError(
+            "reference provenance clip_id does not match the selected library "
+            f"identity ({provenance.get('clip_id')!r} != {clip_id!r})"
+        )
+
+    expected_clip_sha = provenance.get("content_sha256")
+    if (
+        not isinstance(expected_clip_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_clip_sha)
+    ):
+        raise ExportError(
+            "reference provenance content_sha256 must be lowercase SHA-256"
+        )
+    _validate_reference_clip_container(clip_path)
+    actual_clip_sha = _sha256(clip_path)
+    if actual_clip_sha != expected_clip_sha:
+        raise ExportError(
+            "reference clip digest does not match provenance "
+            f"({actual_clip_sha} != {expected_clip_sha})"
+        )
+    try:
+        reference.load_clip(clip_path)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+        raise ExportError(f"reference clip is invalid: {exc}") from exc
+
+    if name is None:
+        display_name = f"{robot_slug}/{clip_id} reference"
+    elif not isinstance(name, str) or not name.strip():
+        raise ExportError("starting-skill name must be non-empty")
+    else:
+        display_name = name.strip()
+    if len(display_name) > 160 or any(ord(char) < 32 for char in display_name):
+        raise ExportError(
+            "starting-skill name must be at most 160 characters with no "
+            "control characters"
+        )
+
+    if out_path is None:
+        exports_dir = library_root / "exports"
+        out = exports_dir / f"reference_{robot_slug}_{clip_id}.rskill"
+    else:
+        out = Path(out_path).expanduser()
+    if out.suffix.lower() != ".rskill":
+        raise ExportError("reference starting-skill output must end in .rskill")
+    out = out.resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    provenance_sha = hashlib.sha256(provenance_bytes).hexdigest()
+    clip_size = clip_path.stat().st_size
+    source_provenance_sha = reference_source_provenance_sha256(provenance)
+    warnings = [
+        "This upload registers a reference candidate only. Training remains "
+        "blocked until the selected target re-verifies an exact Tier-D "
+        "execution contract and evidence chain."
+    ]
+    manifest: dict[str, Any] = {
+        "schema_version": PORTABLE_SKILL_SCHEMA_VERSION,
+        "kind": PORTABLE_SKILL_BUNDLE_KIND,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "project": f"reference:{robot_slug}/{clip_id}",
+        "starting_skill": {
+            "name": display_name,
+            "robot_slug": robot_slug,
+        },
+        "deployment": {"robot_slug": robot_slug},
+        "reference": {
+            "robot_slug": robot_slug,
+            "clip_id": clip_id,
+            "clip_member": "motion/clip.npz",
+            "provenance_member": "motion/provenance.json",
+            "content_sha256": actual_clip_sha,
+            "provenance_sha256": provenance_sha,
+            "source_provenance_sha256": source_provenance_sha,
+            "tier_at_export": provenance.get("tier", "K"),
+        },
+        "warnings": warnings,
+        "files": [
+            {
+                "path": "motion/clip.npz",
+                "sha256": actual_clip_sha,
+                "bytes": clip_size,
+            },
+            {
+                "path": "motion/provenance.json",
+                "sha256": provenance_sha,
+                "bytes": len(provenance_bytes),
+            },
+        ],
+    }
+    manifest_bytes = json.dumps(
+        manifest,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    fd, pending_name = tempfile.mkstemp(
+        prefix=f".{out.name}.", suffix=".tmp", dir=out.parent,
+    )
+    os.close(fd)
+    pending = Path(pending_name)
+    try:
+        with zipfile.ZipFile(
+            pending, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True,
+        ) as archive:
+            archive.writestr("manifest.json", manifest_bytes)
+            _write_zip_member_verified(
+                archive,
+                clip_path,
+                "motion/clip.npz",
+                expected_sha256=actual_clip_sha,
+                expected_bytes=clip_size,
+            )
+            archive.writestr("motion/provenance.json", provenance_bytes)
+        with pending.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(pending, out)
+    except Exception:
+        pending.unlink(missing_ok=True)
+        raise
+
+    return ExportResult(bundle_path=out, manifest=manifest, warnings=warnings)
+
+
+def _export_rsl_rl_safetensors(
+    ckpt: Path,
+    stage: Path,
+    files: list[tuple[Path, str]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Export the trainable actor/critic maps without Python pickle.
+
+    The raw checkpoint remains in the deployment bundle for local recovery,
+    but an importer never needs to deserialize it: it consumes this
+    safetensors member and constructs a fresh server-owned checkpoint.
+    """
+    try:
+        import torch
+        from safetensors.torch import save_file
+    except ImportError:
+        warnings.append("safetensors unavailable — bundle is deployment-only")
+        return {}
+    try:
+        try:
+            payload = torch.load(ckpt, map_location="cpu", weights_only=True)
+        except Exception:  # local, server-produced historical checkpoint
+            payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    except Exception as exc:  # noqa: BLE001 — export remains best-effort
+        warnings.append(
+            "could not create trainable safetensors export "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    allowed = (
+        "actor_state_dict",
+        "critic_state_dict",
+        "actor_obs_normalizer_state_dict",
+        "critic_obs_normalizer_state_dict",
+    )
+    tensors: dict[str, Any] = {}
+    roles: list[str] = []
+    for group in allowed:
+        state = payload.get(group)
+        if not isinstance(state, dict):
+            continue
+        for key, value in state.items():
+            if isinstance(key, str) and torch.is_tensor(value):
+                tensors[f"{group}::{key}"] = value.detach().cpu().contiguous()
+        if group == "actor_state_dict" and any(
+            key.startswith(f"{group}::") for key in tensors
+        ):
+            roles.append("actor")
+        if group == "critic_state_dict" and any(
+            key.startswith(f"{group}::") for key in tensors
+        ):
+            roles.append("critic")
+    # Historical rsl_rl checkpoints may keep EmpiricalNormalization in
+    # ``obs_norm_state_dict`` rather than the newer explicit actor group.
+    # The strict actor-export gate above has already validated this mapping;
+    # preserve its tensor stats under the canonical data-only group name.
+    legacy_norm = payload.get("obs_norm_state_dict")
+    if isinstance(legacy_norm, dict):
+        for key, value in legacy_norm.items():
+            if isinstance(key, str) and torch.is_tensor(value):
+                tensors[
+                    f"actor_obs_normalizer_state_dict::{key}"
+                ] = value.detach().cpu().contiguous()
+    if "actor" not in roles:
+        warnings.append(
+            "checkpoint has no tensor-only actor_state_dict; "
+            "bundle cannot be imported as a starting skill"
+        )
+        return {}
+    path = stage / "policy_weights.safetensors"
+    try:
+        save_file(
+            tensors,
+            str(path),
+            metadata={"format": "reward-sculptor-rsl-rl-v1"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(
+            "safetensors export failed "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return {}
+    arcname = "policy/weights.safetensors"
+    files.append((path, arcname))
+    return {
+        "file": arcname,
+        "format": "reward-sculptor-rsl-rl-v1",
+        "policy_roles": roles,
+    }
 
 
 # ── rsl_rl (.pt) actor reconstruction ──────────────────────────────────────
@@ -1017,6 +1530,113 @@ def _export_sb3_actor(
 
 
 # ── misc ───────────────────────────────────────────────────────────────────
+
+def _load_strict_json_object(data: bytes, *, label: str) -> dict[str, Any]:
+    """Parse a bounded JSON object without duplicate keys or non-finite data."""
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{label} contains forbidden constant {value!r}")
+
+    def reject_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} root must be an object")
+    return parsed
+
+
+def _validate_reference_clip_container(path: Path) -> None:
+    """Bound the nested NPZ before NumPy allocates any of its arrays."""
+    size = path.stat().st_size
+    if size <= 0:
+        raise ExportError("reference clip is empty")
+    if size > _REFERENCE_ARCHIVE_MAX_BYTES:
+        raise ExportError(
+            "reference clip exceeds the 512 MiB portable-export limit"
+        )
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            infos = archive.infolist()
+            if len(infos) > _REFERENCE_MEMBER_MAX:
+                raise ExportError("reference clip has too many NPZ members")
+            seen: set[str] = set()
+            expanded = 0
+            for info in infos:
+                if info.flag_bits & 0x1:
+                    raise ExportError("reference clip contains encrypted data")
+                unix_mode = (info.external_attr >> 16) & 0xFFFF
+                file_kind = unix_mode & 0o170000
+                if file_kind not in (0, 0o100000):
+                    raise ExportError(
+                        "reference clip contains a link or special NPZ member"
+                    )
+                member = info.filename
+                if (
+                    not member
+                    or "\\" in member
+                    or member.startswith("/")
+                    or any(part in ("", ".", "..") for part in member.split("/"))
+                ):
+                    raise ExportError(
+                        f"reference clip contains unsafe NPZ member {member!r}"
+                    )
+                if info.is_dir() or not member.endswith(".npy"):
+                    raise ExportError(
+                        f"reference clip contains non-array member {member!r}"
+                    )
+                folded = member.casefold()
+                if folded in seen:
+                    raise ExportError(
+                        f"reference clip contains colliding member {member!r}"
+                    )
+                seen.add(folded)
+                expanded += int(info.file_size)
+                if expanded > _REFERENCE_EXPANDED_MAX_BYTES:
+                    raise ExportError(
+                        "expanded reference clip exceeds the 1 GiB limit"
+                    )
+    except zipfile.BadZipFile as exc:
+        raise ExportError("reference clip is not a valid NPZ container") from exc
+
+
+def _write_zip_member_verified(
+    archive: zipfile.ZipFile,
+    source_path: Path,
+    archive_name: str,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
+) -> None:
+    """Stream one file into the ZIP and attest the bytes actually written."""
+    digest = hashlib.sha256()
+    written = 0
+    with source_path.open("rb") as source, archive.open(
+        archive_name, "w", force_zip64=True,
+    ) as destination:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            destination.write(chunk)
+            digest.update(chunk)
+            written += len(chunk)
+    if written != expected_bytes or digest.hexdigest() != expected_sha256:
+        raise ExportError(
+            "reference clip changed while it was being exported; retry from "
+            "a stable library snapshot"
+        )
+
 
 def _sha256(p: Path) -> str:
     h = hashlib.sha256()

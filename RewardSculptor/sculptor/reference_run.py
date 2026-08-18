@@ -110,6 +110,7 @@ def build_reference_guided_reward(
     base_source = generate_tracking_residual_reward_source(
         clip=clip,
         clip_id=clip_id,
+        robot=robot,
         version=reward_version,
     )
 

@@ -677,6 +677,19 @@ def make_generated_fitness_fn(
     """`fitness_fn(iter_dir) -> float` for a generated metric module —
     scores `iter_dir/rollout` (0.0 on any failure)."""
     module_path = Path(module_path)
+    metric_meta: dict[str, Any] = {}
+    try:
+        loaded_meta = json.loads(
+            (module_path.parent / "meta.json").read_text(encoding="utf-8")
+        )
+        if isinstance(loaded_meta, dict):
+            metric_meta = loaded_meta
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    try:
+        metric_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    except OSError:
+        metric_sha256 = None
 
     def _fitness(iter_dir: Any) -> float:
         result = compute_generated_metric(
@@ -716,6 +729,17 @@ def make_generated_fitness_fn(
     catalog = resolve_channel_catalog(channel_catalog)
     _fitness.channel_catalog_hash = (  # type: ignore[attr-defined]
         catalog.catalog_hash if catalog else None)
+    # Persisted by sculpt.py into each fitness.json. These attributes are
+    # provenance only; they do not grant the generated metric steering rights.
+    _fitness.metric_id = (  # type: ignore[attr-defined]
+        str(metric_meta.get("id") or module_path.parent.name)
+    )
+    _fitness.metric_version = (  # type: ignore[attr-defined]
+        str(metric_meta["version"])
+        if metric_meta.get("version") is not None else None
+    )
+    _fitness.metric_source = "generated"  # type: ignore[attr-defined]
+    _fitness.metric_sha256 = metric_sha256  # type: ignore[attr-defined]
     return _fitness
 
 

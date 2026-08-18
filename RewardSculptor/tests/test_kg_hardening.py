@@ -25,7 +25,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from typer.testing import CliRunner
 
+from sculptor.cli import app
 import sculptor.kg.query as qmod
 from sculptor.kg.cases import _case_text, _ensure_case_embeddings
 from sculptor.kg.doctor import format_report, run_doctor
@@ -511,6 +513,39 @@ def test_seed_tier_selector_returns_exact_campaign_ids(tmp_path):
         make_paper_id("2400.00001"), make_paper_id("2400.00002"),
         make_paper_id("2400.00003"),
     }
+
+
+def test_extract_cli_can_select_one_exact_arxiv_paper(monkeypatch):
+    import sculptor.kg.extract as extract_mod
+
+    captured = {}
+
+    def fake_extract(store, force, limit, print_one, **kwargs):
+        captured.update({
+            "store": store,
+            "force": force,
+            "limit": limit,
+            "print_one": print_one,
+            **kwargs,
+        })
+        return 0
+
+    monkeypatch.setattr(extract_mod, "cli_extract_all", fake_extract)
+    result = CliRunner().invoke(app, [
+        "kg", "extract", "--arxiv", "2410.01030v3", "--force",
+        "--no-print-one",
+    ])
+    assert result.exit_code == 0, result.output
+    assert captured["paper_ids"] == {make_paper_id("2410.01030")}
+    assert captured["force"] is True
+
+
+def test_extract_cli_rejects_ambiguous_exact_and_campaign_selection():
+    result = CliRunner().invoke(app, [
+        "kg", "extract", "--arxiv", "2410.01030", "--all",
+    ])
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
 
 
 def test_selective_extraction_reports_campaign_papers_missing_from_store(

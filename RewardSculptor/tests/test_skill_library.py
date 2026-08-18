@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -261,6 +261,152 @@ def test_publish_full_file_sha256_in_metadata(tmp_path: Path):
     assert rec.checkpoint_sha256 == expected
 
 
+def test_reference_stage_publish_retains_exact_flat_tracking_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A mission reference shaped this policy, but does not become a hidden
+    phase executor or independently reusable reference starting point."""
+    digests = {
+        "clip": "1" * 64,
+        "certificate": "2" * 64,
+        "rollout": "3" * 64,
+        "contract": "4" * 64,
+        "boundary": "5" * 64,
+    }
+    stage = _make_stage()
+    stage.reference_clip_id = "complex_motion"
+    stage.reference_robot = "g1"
+    stage.reference_tier = "D"
+    stage.reference_clip_sha256 = digests["clip"]
+    stage.reference_certificate_sha256 = digests["certificate"]
+    stage.reference_execution_contract_sha256 = digests["contract"]
+    stage.reference_execution_boundary_sha256 = digests["boundary"]
+    certificate = SimpleNamespace(
+        clip_id="complex_motion",
+        robot="g1",
+        clip_content_sha256=digests["clip"],
+        certificate_sha256=digests["certificate"],
+        rollout_sha256=digests["rollout"],
+        execution_contract_sha256=digests["contract"],
+        execution_boundary_sha256=digests["boundary"],
+    )
+    reward = tmp_path / "stage" / "rewards" / "v3.py"
+    reward.parent.mkdir(parents=True)
+    reward.write_text(
+        "REWARD_SPEC = {'version': 'v3', 'reference_clip_id': "
+        "'complex_motion'}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "stage" / "runs" / "iter_3" / "checkpoint.pt"
+    _write_ckpt(checkpoint)
+    library = SkillLibrary(root=tmp_path / "library")
+
+    record = library.publish_from_stage(
+        stage=stage,
+        mission=_make_mission(stages=[stage]),
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        checkpoint_path=checkpoint,
+        final_metric=0.9,
+        source_iter_index=3,
+        source_reward_path=reward,
+        reference_certificate=certificate,
+    )
+
+    assert record.execution_model == "flat_reference_tracking_residual"
+    assert record.mode_reuse_supported is False
+    assert record.reference_robot == "g1"
+    assert record.reference_clip_id == "complex_motion"
+    assert record.reference_sha256 == digests["clip"]
+    assert (
+        record.reference_dynamics_certificate_sha256
+        == digests["certificate"]
+    )
+    assert record.reference_rollout_sha256 == digests["rollout"]
+    assert record.reference_execution_contract_sha256 == digests["contract"]
+    assert record.reference_execution_boundary_sha256 == digests["boundary"]
+    assert record.mode_execution_manifest_digest is None
+    assert record.initialization_modes == ["actor_only", "actor_critic"]
+    assert "reference_only" not in record.initialization_modes
+
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_tierd_admission",
+        lambda *_a, **_kw: certificate,
+    )
+    assert library.verify_execution_provenance(record) is certificate
+
+    retained = (
+        library.root
+        / record.skill_id
+        / record.provenance_files["active_reward"]["filename"]
+    )
+    retained.write_text("changed", encoding="utf-8")
+    with pytest.raises(SkillLibraryError, match="digest mismatch"):
+        library.checkpoint_path_for(record)
+
+
+def test_world_tuple_provenance_is_relocatable_and_missing_bytes_reject(
+    tmp_path: Path,
+):
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    project = tmp_path / "project"
+    project.mkdir()
+    reward = project / "rewards" / "v1.py"
+    reward.parent.mkdir()
+    reward.write_text(
+        "REWARD_SPEC = {'version': 'v1'}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n",
+        encoding="utf-8",
+    )
+    refs: dict[str, ArtifactRef] = {
+        "reward": ArtifactRef.from_path("reward", "v1", reward, base=project),
+    }
+    for kind in (
+        "env_spec", "world", "task", "resolved_eval",
+        "channel_catalog", "clarifications",
+    ):
+        path = project / "env" / f"{kind}_source.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"kind": kind}), encoding="utf-8")
+        refs[kind] = ArtifactRef.from_path(kind, "v1", path, base=project)
+    store = WorldArtifactStore(project)
+    selection = store.promote(refs, evaluation_lineage="test")
+    selection_path = store.env_dir / f"selection_v{selection.selection_version}.json"
+
+    checkpoint = project / "runs" / "iter_0" / "checkpoint.pt"
+    _write_ckpt(checkpoint)
+    library = SkillLibrary(root=tmp_path / "library")
+    record = library.publish_from_stage(
+        stage=_make_stage(),
+        mission=_make_mission(),
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        checkpoint_path=checkpoint,
+        final_metric=0.7,
+        source_iter_index=0,
+        source_reward_path=reward,
+        world_selection_path=selection_path,
+        world_selection_hash=selection.tuple_hash,
+    )
+
+    assert record.world_tuple_hash == selection.tuple_hash
+    assert set(record.world_artifact_sha256) == set(refs)
+    library.verify_execution_provenance(record)
+
+    retained_task = (
+        library.root
+        / record.skill_id
+        / record.provenance_files["world:task"]["filename"]
+    )
+    retained_task.unlink()
+    with pytest.raises(SkillLibraryError, match="missing or escapes"):
+        library.verify_execution_provenance(record)
+
+
 def test_publish_raises_on_missing_checkpoint(tmp_path: Path):
     lib = SkillLibrary(root=tmp_path / "lib")
     with pytest.raises(SkillLibraryError, match="checkpoint not found"):
@@ -350,6 +496,229 @@ def test_list_compatible_skips_corrupt_metadata(tmp_path: Path):
 def test_load_unknown_skill_returns_none(tmp_path: Path):
     lib = SkillLibrary(root=tmp_path / "lib")
     assert lib.load("000000000000") is None
+
+
+def _published_record_and_metadata(
+    tmp_path: Path,
+) -> tuple[SkillLibrary, SkillRecord, Path]:
+    lib = SkillLibrary(root=tmp_path / "lib")
+    checkpoint = tmp_path / "source" / "checkpoint.pt"
+    _write_ckpt(checkpoint)
+    record = lib.publish_from_stage(
+        stage=_make_stage(),
+        mission=_make_mission(),
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        checkpoint_path=checkpoint,
+        final_metric=0.5,
+        source_iter_index=0,
+    )
+    metadata = lib.root / record.skill_id / METADATA_FILENAME
+    return lib, record, metadata
+
+
+def _rewrite_metadata(path: Path, **changes: Any) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(changes)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_load_rejects_noncanonical_requested_id_before_path_resolution(
+    tmp_path: Path,
+):
+    lib = SkillLibrary(root=tmp_path / "lib")
+    outside = tmp_path / "metadata.json"
+    outside.write_text("{}", encoding="utf-8")
+    assert lib.load("../") is None
+    assert lib.load("ABCDEF123456") is None
+    assert lib.load("0" * 13) is None
+
+
+def test_load_rejects_metadata_skill_id_that_differs_from_directory(
+    tmp_path: Path,
+):
+    lib, record, metadata = _published_record_and_metadata(tmp_path)
+    _rewrite_metadata(metadata, skill_id="f" * 12)
+    assert lib.load(record.skill_id) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adapter_class", "OtherAdapter"),
+        ("task_id", "OtherTask"),
+        ("checkpoint_sha256", "f" * 64),
+    ],
+)
+def test_load_recomputes_trained_skill_identity(
+    tmp_path: Path, field: str, value: str,
+):
+    lib, record, metadata = _published_record_and_metadata(tmp_path)
+    _rewrite_metadata(metadata, **{field: value})
+    assert lib.load(record.skill_id) is None
+
+
+@pytest.mark.parametrize(
+    "checkpoint_filename",
+    [
+        "../escape.pt",
+        "subdir/checkpoint.pt",
+        "subdir\\checkpoint.pt",
+        "/tmp/x.pt",
+        "metadata.json",
+        "CON.pt",
+    ],
+)
+def test_load_rejects_unsafe_checkpoint_filename(
+    tmp_path: Path, checkpoint_filename: str,
+):
+    lib, record, metadata = _published_record_and_metadata(tmp_path)
+    _rewrite_metadata(metadata, checkpoint_filename=checkpoint_filename)
+    assert lib.load(record.skill_id) is None
+
+
+def test_checkpoint_resolution_rejects_symlink_escape(tmp_path: Path):
+    lib, record, _metadata = _published_record_and_metadata(tmp_path)
+    checkpoint = lib.root / record.skill_id / record.checkpoint_filename
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(checkpoint.read_bytes())
+    checkpoint.unlink()
+    try:
+        checkpoint.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    assert lib.load(record.skill_id) is None
+    with pytest.raises(SkillLibraryError, match="symlink"):
+        lib.checkpoint_path_for(record)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source", "uploaded_pickle"),
+        ("trust_status", "trusted_by_filename"),
+        ("checkpoint_format", "pickle"),
+        ("source_format", "torchscript"),
+        ("compatibility_status", "reference_only"),
+        ("initialization_modes", ["actor_only", "execute_python"]),
+        ("policy_roles", ["actor", "critic", "optimizer"]),
+        ("policy_roles", ["critic"]),
+    ],
+)
+def test_load_rejects_tampered_execution_enums_and_mode_contract(
+    tmp_path: Path, field: str, value: Any,
+):
+    lib, record, metadata = _published_record_and_metadata(tmp_path)
+    _rewrite_metadata(metadata, **{field: value})
+    assert lib.load(record.skill_id) is None
+
+
+def _exact_policy_contract() -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "robot_slug": "g1",
+        "identity": {"adapter_class": "A", "task_id": "T"},
+        "joints": {"ordered_names": ["joint_0"]},
+        "observations": {
+            "ordered_terms": ["qpos"],
+            "shape": [1],
+            "critic_ordered_terms": ["qpos"],
+            "critic_shape": [1],
+        },
+        "actions": {
+            "ordered_names": ["joint_0"],
+            "term_names": ["joint_position"],
+            "shape": [1],
+        },
+        "policy": {
+            "actor": {"hidden_dims": [32], "activation": "elu"},
+            "critic": {"hidden_dims": [32], "activation": "elu"},
+            "normalizer": {"actor_present": False, "critic_present": False},
+        },
+        "timing": {
+            "sim_timestep_s": 0.005,
+            "decimation": 4,
+            "control_dt_s": 0.02,
+        },
+        "versions": {
+            "torch": "2.7",
+            "mjlab": "0.1.0",
+            "rsl_rl": "3.0.1",
+            "adapter": "0.1.0",
+        },
+    }
+
+
+def _publish_imported_policy(tmp_path: Path) -> tuple[SkillLibrary, SkillRecord, Path]:
+    from sculptor.policy_contract import contract_fingerprint
+
+    lib = SkillLibrary(root=tmp_path / "lib")
+    checkpoint = tmp_path / "sanitized" / "checkpoint.pt"
+    _write_ckpt(checkpoint, b"SERVER_OWNED_CHECKPOINT")
+    contract = _exact_policy_contract()
+    record = lib.publish_imported_checkpoint(
+        checkpoint_path=checkpoint,
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        alias="import",
+        manifest_digest="a" * 64,
+        manifest_schema_version=1,
+        original_checkpoint_sha256=None,
+        source_weights_sha256="b" * 64,
+        reference_clip_id=None,
+        reference_robot=None,
+        reference_sha256=None,
+        reference_provenance_sha256=None,
+        world_bundle_sha256=None,
+        compatibility_contract=contract,
+        compatibility_contract_digest=contract_fingerprint(contract),
+        tensor_contract_verified=True,
+        tensor_signature_sha256="c" * 64,
+        compatibility_status="transfer_actor_critic",
+        initialization_modes=["actor_only", "actor_critic"],
+        policy_roles=["actor", "critic"],
+        controller_kind=None,
+        controller_sha256=None,
+        bundled_world=False,
+        warnings=[],
+    )
+    metadata = lib.root / record.skill_id / METADATA_FILENAME
+    return lib, record, metadata
+
+
+def test_load_rejects_imported_compatibility_contract_tampering(tmp_path: Path):
+    lib, record, metadata = _publish_imported_policy(tmp_path)
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload["compatibility_contract"]["robot_slug"] = "go1"
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    assert lib.load(record.skill_id) is None
+
+
+def test_load_rejects_imported_component_identity_tampering(tmp_path: Path):
+    lib, record, metadata = _publish_imported_policy(tmp_path)
+    _rewrite_metadata(metadata, manifest_digest="d" * 64)
+    assert lib.load(record.skill_id) is None
+
+
+def test_listing_skips_metadata_with_mismatched_identity(tmp_path: Path):
+    lib, _record, metadata = _published_record_and_metadata(tmp_path)
+    _rewrite_metadata(metadata, task_id="tampered-task")
+    assert list(lib) == []
+
+
+def test_load_rejects_coherent_imported_mode_downgrade(tmp_path: Path):
+    """Even internally consistent role/mode edits are not the admitted skill."""
+    lib, record, metadata = _publish_imported_policy(tmp_path)
+    _rewrite_metadata(
+        metadata,
+        compatibility_status="transfer_actor",
+        initialization_modes=["actor_only"],
+        policy_roles=["actor"],
+    )
+    assert lib.load(record.skill_id) is None
 
 
 # ── Concurrent publish via filelock ──────────────────────────────────
@@ -504,6 +873,78 @@ def test_handle_maybe_load_returns_path_on_match(tmp_path: Path):
     assert out is not None
     assert out.is_file()
     assert "skill_warm_start_skipped" not in [e.get("type") for e in events]
+
+
+def test_strict_handle_admits_only_exact_policy_contract(tmp_path: Path):
+    lib, record, _metadata = _publish_imported_policy(tmp_path)
+    handle = SkillLibraryHandle(
+        library=lib,
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        compatibility_contract=_exact_policy_contract(),
+        strict_runtime_admission=True,
+    )
+    events, emit = _record_emit()
+
+    assert [item.skill_id for item in handle.list_for_decompose()] == [
+        record.skill_id
+    ]
+    checkpoint = handle.maybe_load_for_stage(
+        _make_stage(init_skill_id=record.skill_id), emit,
+    )
+
+    assert checkpoint is not None and checkpoint.is_file()
+    assert any(
+        event.get("type") == "skill_warm_start_admitted"
+        and event.get("checkpoint_sha256") == record.checkpoint_sha256
+        and event.get("initialization_mode") == "actor_only"
+        for event in events
+    )
+
+
+def test_strict_handle_rejects_contract_drift_instead_of_cold_starting(
+    tmp_path: Path,
+) -> None:
+    lib, record, _metadata = _publish_imported_policy(tmp_path)
+    drifted_contract = json.loads(json.dumps(_exact_policy_contract()))
+    drifted_contract["actions"]["ordered_names"] = ["different_joint"]
+    handle = SkillLibraryHandle(
+        library=lib,
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        compatibility_contract=drifted_contract,
+        strict_runtime_admission=True,
+    )
+    events, emit = _record_emit()
+
+    assert handle.list_for_decompose() == []
+    with pytest.raises(SkillLibraryError, match="exact robot"):
+        handle.maybe_load_for_stage(
+            _make_stage(init_skill_id=record.skill_id), emit,
+        )
+    assert any(
+        event.get("reason") == "exact_contract_mismatch" for event in events
+    )
+
+
+def test_strict_handle_rejects_missing_explicit_skill(tmp_path: Path) -> None:
+    handle = SkillLibraryHandle(
+        library=SkillLibrary(root=tmp_path / "lib"),
+        adapter_class="A",
+        task_id="T",
+        robot_slug="g1",
+        compatibility_contract=_exact_policy_contract(),
+        strict_runtime_admission=True,
+    )
+    events, emit = _record_emit()
+
+    with pytest.raises(SkillLibraryError, match="is missing"):
+        handle.maybe_load_for_stage(
+            _make_stage(init_skill_id="missing-skill"), emit,
+        )
+    assert events[-1]["reason"] == "skill_not_found"
 
 
 # ── SkillLibraryHandle.maybe_publish gates ───────────────────────────

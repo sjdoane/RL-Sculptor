@@ -1,8 +1,9 @@
 """sculptor/mode_rewards.py — per-mode reward authoring over a ModeGraph.
 
-`sculptor.modes` writes down the hybrid automaton (OGMP, arXiv 2403.04205;
-docs/RESEARCH_DIRECTION.md §4) but stops short of authoring reward code — its
-own docstring says so. This module is that missing half: it turns a validated
+`sculptor.modes` writes down an OGMP-inspired phase graph over one fixed,
+composed reference. It is intentionally not paper-faithful OGMP: there is no
+closed-loop oracle, rho-bound, learned mode latent, or mode-conditioned policy.
+This module turns that narrower, validated
 `ModeGraph` into a reward module in which **each mode owns its own terms, paid
 only inside its own window**.
 
@@ -46,11 +47,22 @@ inferred.
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import re
 from typing import Any, Mapping, Optional, Sequence
 
 from sculptor.edit import SYSTEM_PROMPT_MAX_CHARS as _SYSTEM_PROMPT_MAX_CHARS
-from sculptor.modes import Mode, ModeGraph, ModeError, validate_mode_graph
+from sculptor.modes import (
+    Mode,
+    ModeError,
+    ModeExecutionManifest,
+    ModeGraph,
+    build_mode_execution_manifest,
+    mode_graph_sha256,
+    validate_mode_execution_manifest,
+    validate_phase_window_execution_graph,
+)
 
 #: Identifier-safe form of a mode name, for the generated function names.
 _IDENT_RE = re.compile(r"[^0-9a-zA-Z_]+")
@@ -79,6 +91,19 @@ MAX_PROMPT_CHARS = _SYSTEM_PROMPT_MAX_CHARS
 #: the batched half is not optional for the Tier-D path — it IS the training
 #: path. See `sculpt.py:3540`.
 BATCHED_FN_SUFFIX = "_batched"
+
+# The reward is one member of the atomic world selection, so it cannot bind
+# itself without creating a circular digest.  Every other authored input that
+# may affect phase-reward semantics is included.  Keep this list in core so
+# the authoring API and the launch path cannot drift.
+MODE_BINDING_CONTEXT_REFS = (
+    "env_spec",
+    "world",
+    "task",
+    "resolved_eval",
+    "channel_catalog",
+    "clarifications",
+)
 
 
 def mode_ident(name: str) -> str:
@@ -110,27 +135,13 @@ def mode_windows_s(graph: ModeGraph) -> dict[str, tuple[float, float]]:
 def scale_windows(
     windows: Mapping[str, tuple[float, float]], time_scale: float,
 ) -> dict[str, tuple[float, float]]:
-    """Stretch clip-time mode windows onto the episode's clock.
+    """Legacy uniform window transform; never apply to a Tier-D artifact.
 
-    `mode_phase_windows` returns CLIP seconds — literally `frame / clip_fps`.
-    That number knows nothing about how long the episode runs or how far the
-    course reaches, and for an authored world the two disagree badly.
+    Kept for reading and diagnosing older generated rewards. New generation
+    preserves certified clip cadence and declares terminal holds. A caller
+    that truly needs a retimed motion must materialize new clip bytes and
+    obtain a new dynamics certificate.
 
-    Measured on platform-ascent-showcase: a 6.92 s composite gating a 20 s
-    episode. `active_mode` clamps everything past the last window into the
-    terminal mode, so 75% of every episode was paid as `settle` — a mode whose
-    terms reward stillness — while the robot was still standing on flat ground
-    in front of the first box. Worse, the entry window (`approach`, 0.82 s)
-    demanded 1.31 m of travel, which needs 1.60 m/s against a runtime command
-    cap of 1.0 m/s: unreachable inside its own window, by construction. Across
-    three sculpt iterations the policy never mounted the platform, and every
-    `bound.*`/`settle.*` term read 0.00 because the robot was never in the
-    state a mode expected at the time that mode expected it.
-
-    Standing still was the reward-optimal policy. Scaling the automaton to span
-    the episode removes both failures: the entry window becomes long enough to
-    physically reach the first waypoint, and there is no clamp region left for
-    the terminal mode to swallow.
     """
     if time_scale <= 0.0 or abs(time_scale - 1.0) < 1e-12:
         return {n: (float(lo), float(hi)) for n, (lo, hi) in windows.items()}
@@ -143,7 +154,11 @@ def scale_windows(
 def clip_time_scale(
     windows: Mapping[str, tuple[float, float]], horizon_s: Optional[float],
 ) -> float:
-    """`horizon_s / clip_duration`, or 1.0 when there is no horizon to fit.
+    """Legacy diagnostic ratio of horizon to clip duration.
+
+    This is not an admission to execute a certified reference at that ratio;
+    new rewards always use a cadence of 1.0 and represent extra time as a
+    terminal hold.
 
     1.0 keeps the historical clip-time behaviour byte-for-byte, so a caller
     that cannot determine an episode horizon (no authored world) is unchanged.
@@ -481,16 +496,20 @@ def generate_mode_reward_scaffold(
     and even then it has nothing telling the policy to follow the reference.
     With it the scaffold is trainable IMMEDIATELY (it is the tracking reward
     that already works), and authoring adds mode-specific task terms on top.
-    That layering is OGMP's own shape: one oracle to track throughout, a
-    per-mode objective on top of it.
+    That layering is inspired by OGMP's separation between an oracle ansatz and
+    task optimization, but the reference here is an open-loop clip sampled by
+    episode time rather than an online receding-horizon oracle.
 
     Raises `ModeError` when the graph is structurally invalid, when two mode
     names collide once sanitized to identifiers, or when `clip` carries no
     per-joint target to track.
     """
-    errors = validate_mode_graph(graph)
+    errors = validate_phase_window_execution_graph(graph)
     if errors:
-        raise ModeError("; ".join(errors))
+        raise ModeError(
+            "this reward has only an elapsed-time phase executor:\n  - "
+            + "\n  - ".join(errors)
+        )
 
     idents: dict[str, str] = {}
     for m in graph.modes:
@@ -502,16 +521,30 @@ def generate_mode_reward_scaffold(
                 "rename one — two modes sharing a function body is silent")
         idents[m.name] = ident
 
-    # `horizon_s` is the episode the automaton has to cover. Absent it the
-    # windows stay in clip time, which is only right when the episode happens
-    # to be the clip's length — see `scale_windows` for what that cost live.
     windows = mode_windows_s(graph)
-    time_scale = clip_time_scale(windows, horizon_s)
-    windows = scale_windows(windows, time_scale)
-    # A horizon we could not use is not a horizon. Normalize so 0.0/negative
-    # record identically to "no authored world" instead of leaving a number in
-    # the spec that no window was ever fitted to.
+    # A Tier-D certificate covers this exact clip at its recorded cadence.
+    # Stretching the windows to fill an episode creates an uncertified motion
+    # while retaining the old content identity. Execute in clip time and make
+    # any remaining budget an explicit terminal hold instead.
+    clip_duration_s = max(
+        (float(hi) for _, hi in windows.values()), default=0.0
+    )
     horizon_s = float(horizon_s) if horizon_s and horizon_s > 0.0 else None
+    if horizon_s is not None and horizon_s + 1e-6 < clip_duration_s:
+        raise ModeError(
+            f"episode horizon {horizon_s:g}s is shorter than the certified "
+            f"motion ({clip_duration_s:g}s); truncate/materialize the motion "
+            "and obtain a new Tier-D certificate rather than silently "
+            "retiming it"
+        )
+    time_scale = 1.0
+    terminal_hold_s = max(
+        0.0, (horizon_s or clip_duration_s) - clip_duration_s
+    )
+    execution_manifest = build_mode_execution_manifest(
+        graph, terminal_hold_s=terminal_hold_s,
+    )
+    execution_windows = execution_manifest.window_map
     goals = dict(goal_by_mode or {})
     order = [m.name for m in graph.modes]
 
@@ -569,23 +602,31 @@ REWARD_SPEC: dict = {{
     "supports_batched": True,
     # Consumed by the per-mode metric layer: it slices a rollout by these
     # windows instead of scoring the episode as one undifferentiated blob.
-    "mode_windows_s": {{{", ".join(f"{n!r}: {list(w)}" for n, w in windows.items())}}},
+    "mode_windows_s": {{{", ".join(f"{n!r}: {list(w)}" for n, w in execution_windows.items())}}},
+    # Authoritative join between training and evaluation. Evaluators consume
+    # these exact emitted windows instead of re-deriving raw clip time from the
+    # graph. Certified clips are never fitted/retimed to an episode.
+    "mode_execution_manifest": {execution_manifest.to_dict()!r},
     # Which composed clip this automaton came from. Load-bearing after
     # promotion: `promote_mode_reward` copies this module into the version
     # chain, and without the id the UI could not re-open the per-mode panel on
     # its own reward — it had to make the user search the clip library for it
     # by hand, twice.
     "reference_clip_id": {clip_id!r},
-    # The episode the automaton was stretched to cover, and by how much. 1.0
-    # means the windows are raw clip seconds — correct only when the episode
-    # IS the clip's length. Recorded so a reader can tell which clock a
-    # promoted reward is on without re-deriving it from the windows.
+    # The episode budget is provenance, not a retiming instruction. The
+    # reference cadence remains 1.0 and any remainder is an explicit hold of
+    # the terminal mode and final reference frame.
     "episode_horizon_s": {horizon_s!r},
     "clip_time_scale": {round(time_scale, 6)!r},
+    "schedule_policy": "certified_clip_cadence_then_terminal_hold",
+    "terminal_hold_s": {round(terminal_hold_s, 6)!r},
     # How much the imitation backbone is worth relative to the authored task
     # terms. Below 1.0 the clip is a style prior and the mission is the
     # objective; at 1.0 it is the other way round.
     "tracking_weight": {float(tracking_weight)!r},
+    # Explicit capability bit for API/UI consumers. Inferring this by grepping
+    # generated source made task-only scaffolds look like imitation rewards.
+    "tracking_enabled": {has_track!r},
     "hyperparameters": {{}},
     "references": [],
 }}
@@ -593,7 +634,7 @@ REWARD_SPEC: dict = {{
 #: Mode name -> (start_s, end_s), half-open. Seconds because the clock reads
 #: `info["step_dt"]`; a step count would have to assume a control rate at build
 #: time, which is exactly the assumption that broke Tier-D twice.
-MODE_WINDOWS_S: dict = {_format_windows_literal(windows, idents)}
+MODE_WINDOWS_S: dict = {_format_windows_literal(execution_windows, idents)}
 
 #: Authoring order — also the order `active_mode_index` refers to.
 MODE_ORDER: list = {order!r}
@@ -1199,7 +1240,7 @@ def validate_mode_reward_source(source: str, graph: ModeGraph) -> list[str]:
     partially authored scaffold is a normal intermediate state. Callers that
     require completeness should check `authored_modes` explicitly.
     """
-    errors: list[str] = []
+    errors: list[str] = list(validate_phase_window_execution_graph(graph))
     if "def compute_reward(" not in source:
         errors.append("source defines no compute_reward")
     if "def compute_reward_batched(" not in source:
@@ -1228,6 +1269,30 @@ def validate_mode_reward_source(source: str, graph: ModeGraph) -> list[str]:
                 "training")
 
     errors.extend(_window_agreement_errors(source, graph))
+    # New scaffolds publish the authoritative train/eval schedule. Keep legacy
+    # modules readable, but when the manifest exists it must agree with both the
+    # graph and the literal the reward actually dispatches against.
+    raw_manifest = reward_spec_from_source(source).get(
+        "mode_execution_manifest"
+    )
+    if raw_manifest is not None:
+        from sculptor.modes import (
+            ModeExecutionManifest,
+            validate_mode_execution_manifest,
+        )
+
+        try:
+            manifest = ModeExecutionManifest.from_dict(raw_manifest)
+        except ModeError as exc:
+            errors.append(str(exc))
+        else:
+            errors.extend(validate_mode_execution_manifest(manifest, graph))
+            if manifest.window_map != windows_in_source(source):
+                errors.append(
+                    "REWARD_SPEC mode_execution_manifest windows do not match "
+                    "MODE_WINDOWS_S — training and evaluation would use "
+                    "different schedules"
+                )
     return errors
 
 
@@ -1283,48 +1348,66 @@ def _declared_time_scale(source: str) -> Optional[float]:
 def _window_agreement_errors(source: str, graph: ModeGraph) -> list[str]:
     """Do the module's windows still describe THIS graph?
 
-    This used to demand the clip-time literal verbatim. That conflated two
-    different things: whether the scaffold belongs to this automaton, and which
-    clock it is on. A scaffold fitted to an episode horizon is not stale — its
-    windows are the graph's windows times one shared factor — so check the
-    property that actually matters: same modes, same order, same proportions,
-    no window moved by hand relative to its neighbours.
+    New scaffolds carry a validated execution manifest. Its non-terminal
+    windows are the certified clip cadence and its terminal window may include
+    one explicit post-clip hold. The literal the reward dispatches against
+    must equal that manifest exactly. Legacy modules without a manifest retain
+    exact raw graph-time validation; no proportional retiming is accepted.
     """
-    want = mode_windows_s(graph)
     got = windows_in_source(source)
     if not got:
         return ["source has an unreadable MODE_WINDOWS_S — mode gating cannot "
                 "be verified against the automaton"]
+    declared = _declared_time_scale(source)
+    if declared is not None and abs(declared - 1.0) > 1e-6:
+        return [
+            f"clip_time_scale {declared:.4f} retimes a certified reference; "
+            "materialize the transformed clip under a new identity and obtain "
+            "a new Tier-D certificate before promotion"
+        ]
+    raw_manifest = reward_spec_from_source(source).get(
+        "mode_execution_manifest"
+    )
+    if raw_manifest is None:
+        want = mode_windows_s(graph)
+    else:
+        from sculptor.modes import (
+            ModeExecutionManifest,
+            validate_mode_execution_manifest,
+        )
+
+        try:
+            manifest = ModeExecutionManifest.from_dict(raw_manifest)
+        except ModeError as exc:
+            return [str(exc)]
+        manifest_errors = validate_mode_execution_manifest(manifest, graph)
+        if manifest_errors:
+            return [
+                f"execution manifest is stale relative to the graph: {error}"
+                for error in manifest_errors
+            ]
+        want = manifest.window_map
+
     missing = [n for n in want if n not in got]
     if missing:
         return [f"mode {n!r}: no window in MODE_WINDOWS_S — the scaffold is "
                 f"stale relative to the graph; regenerate it" for n in missing]
-
-    # The scale must be the one the module DECLARES, not merely some uniform
-    # one. Otherwise a scaffold built from a proportionally different graph —
-    # the same clip re-exported at another fps, say — is numerically
-    # indistinguishable from a horizon fit and would slip through. A module
-    # that declares nothing is a pre-horizon scaffold and must still be exact.
-    declared = _declared_time_scale(source)
-    span = max((hi for _, hi in want.values()), default=0.0)
-    got_span = max((hi for n, (_, hi) in got.items() if n in want), default=0.0)
-    observed = (got_span / span) if span > 0 and got_span > 0 else 1.0
-    scale = declared if declared is not None else 1.0
-    if abs(observed - scale) > 1e-3:
+    extras = [n for n in got if n not in want]
+    if extras:
         return [
-            f"MODE_WINDOWS_S spans {got_span:g}s where this automaton spans "
-            f"{span:g}s — a factor of {observed:.4f}, but the module declares "
-            f"{scale:.4f}. The scaffold is stale relative to the graph; "
-            f"regenerate it."]
+            "MODE_WINDOWS_S contains modes absent from the graph/manifest: "
+            f"{extras!r}"
+        ]
     errors: list[str] = []
     for name, (lo, hi) in want.items():
         glo, ghi = got[name]
-        # 1 ms, comfortably above the 4-dp rounding the scaler applies.
-        if abs(glo - lo * scale) > 1e-3 or abs(ghi - hi * scale) > 1e-3:
+        # 1 ms, comfortably above the 4-dp reference-window rounding.
+        if abs(glo - lo) > 1e-3 or abs(ghi - hi) > 1e-3:
             errors.append(
                 f"mode {name!r}: window {(round(glo, 4), round(ghi, 4))} is not "
-                f"{(lo, hi)} scaled by {scale:.4f} — the scaffold is stale "
-                f"relative to the graph, or a window was moved by hand; "
+                f"the admitted execution window {(lo, hi)} — the scaffold is "
+                "stale relative to the graph/manifest, or a window was moved "
+                "by hand; "
                 f"regenerate it")
     return errors
 
@@ -1837,6 +1920,164 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
             f"the right function.")
     return {"source": grafted, "prompt": prompt, "authored": authored,
             "pending": [n for n, ok in authored.items() if not ok]}
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    """Digest a JSON value exactly as persisted across UI/core processes."""
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ModeError(
+            "mode provenance is not canonical JSON: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def mode_execution_manifest_digest(value: Mapping[str, Any]) -> str:
+    """Strict digest of the authoritative schedule stored in REWARD_SPEC."""
+    manifest = ModeExecutionManifest.from_dict(value)
+    # Digest the normalized form, not an input mapping with extra fields or a
+    # different numeric spelling.  This makes every process attest one object.
+    return _canonical_json_sha256(manifest.to_dict())
+
+
+def build_mode_reward_binding(
+    *,
+    clip_id: str,
+    robot: str,
+    clip_sha256: str,
+    graph_sha256: str,
+    context_refs: Mapping[str, str],
+    execution_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the non-circular, content-addressed phase-reward reuse key.
+
+    This function is deliberately data-only.  Routes resolve the current clip
+    and selection bytes; the core launch path resolves them independently and
+    compares the same normalized object before it may reuse a promoted reward.
+    """
+    manifest = ModeExecutionManifest.from_dict(execution_manifest)
+    if manifest.graph_sha256 != graph_sha256:
+        raise ModeError(
+            "mode binding graph does not match its execution manifest: "
+            f"{graph_sha256} != {manifest.graph_sha256}"
+        )
+    if not clip_id or not robot:
+        raise ModeError("mode binding requires non-empty clip_id and robot")
+    if len(clip_sha256) != 64:
+        raise ModeError("mode binding requires the exact reference SHA-256")
+
+    normalized_refs: dict[str, str] = {}
+    unknown = sorted(set(context_refs) - set(MODE_BINDING_CONTEXT_REFS))
+    if unknown:
+        raise ModeError(f"mode binding contains unknown context refs: {unknown}")
+    for kind in MODE_BINDING_CONTEXT_REFS:
+        digest = context_refs.get(kind)
+        if digest is None:
+            continue
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ModeError(
+                f"mode binding context ref {kind!r} is not a SHA-256"
+            )
+        normalized_refs[kind] = digest
+
+    return {
+        "schema": 1,
+        "clip_id": clip_id,
+        "robot": robot,
+        "clip_sha256": clip_sha256,
+        "graph_sha256": graph_sha256,
+        "context_refs": normalized_refs,
+        "execution_manifest_digest": mode_execution_manifest_digest(
+            execution_manifest
+        ),
+    }
+
+
+def mode_reward_binding_errors(
+    spec: Mapping[str, Any],
+    *,
+    clip_id: str,
+    robot: str,
+    clip_sha256: str,
+    context_refs: Mapping[str, str],
+    graph_sha256: Optional[str] = None,
+    graph: Optional[ModeGraph] = None,
+) -> list[str]:
+    """Explain why a promoted phase reward is not reusable for this run."""
+    binding = spec.get("mode_binding")
+    manifest = spec.get("mode_execution_manifest")
+    if not isinstance(binding, Mapping):
+        return ["REWARD_SPEC.mode_binding is missing"]
+    if not isinstance(manifest, Mapping):
+        return ["REWARD_SPEC.mode_execution_manifest is missing"]
+    if graph is not None:
+        independently_derived_graph_sha256 = mode_graph_sha256(graph)
+        if (
+            graph_sha256 is not None
+            and graph_sha256 != independently_derived_graph_sha256
+        ):
+            return [
+                "independently derived mode graph disagrees with the supplied "
+                f"graph_sha256: {independently_derived_graph_sha256} != "
+                f"{graph_sha256}"
+            ]
+        try:
+            parsed_manifest = ModeExecutionManifest.from_dict(manifest)
+        except ModeError as exc:
+            return [str(exc)]
+        manifest_errors = validate_mode_execution_manifest(
+            parsed_manifest, graph
+        )
+        if manifest_errors:
+            return [
+                "execution manifest is stale relative to the independently "
+                f"derived clip graph: {error}"
+                for error in manifest_errors
+            ]
+        claimed_graph = independently_derived_graph_sha256
+    else:
+        claimed_graph = graph_sha256 or binding.get("graph_sha256")
+    if not isinstance(claimed_graph, str) or len(claimed_graph) != 64:
+        return ["mode binding graph_sha256 is missing or invalid"]
+    try:
+        expected = build_mode_reward_binding(
+            clip_id=clip_id,
+            robot=robot,
+            clip_sha256=clip_sha256,
+            graph_sha256=claimed_graph,
+            context_refs=context_refs,
+            execution_manifest=manifest,
+        )
+    except ModeError as exc:
+        return [str(exc)]
+    actual = dict(binding)
+    if actual == expected:
+        return []
+
+    errors: list[str] = []
+    for key in (
+        "schema",
+        "clip_id",
+        "robot",
+        "clip_sha256",
+        "graph_sha256",
+        "context_refs",
+        "execution_manifest_digest",
+    ):
+        if actual.get(key) != expected.get(key):
+            errors.append(
+                f"mode binding {key} is stale: expected "
+                f"{expected.get(key)!r}, got {actual.get(key)!r}"
+            )
+    return errors or ["mode binding contains unsupported fields"]
 
 
 def reward_spec_from_source(source: str) -> dict:

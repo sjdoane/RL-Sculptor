@@ -755,6 +755,56 @@ def test_train_or_resume_falls_through_on_corrupt_checkpoint(tmp_path: Path):
     assert result is not None
 
 
+def test_mode_admission_event_is_emitted_only_at_fresh_train_boundary(
+    tmp_path: Path, monkeypatch,
+):
+    import torch
+    import sculptor.sculpt as sculpt_mod
+    from sculptor.adapters.base import TrainResult
+
+    event = {"type": "mode_execution_admitted", "reward_sha256": "a" * 64}
+    observed: list[dict] = []
+    monkeypatch.setattr(sculpt_mod, "_emit_event", observed.append)
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+
+    class _Adapter:
+        def train(self, **_kwargs):
+            assert observed == [event]
+            return TrainResult(
+                checkpoint_path=fresh / "checkpoint.pt",
+                metrics_dict={},
+                component_means={},
+                logs_path=fresh / "logs",
+            )
+
+    sculpt_mod._train_or_resume(
+        adapter=_Adapter(),
+        iter_index=0,
+        iter_dir=fresh,
+        reward_module_path=tmp_path / "reward.py",
+        steps=1,
+        seed=0,
+        pre_train_event=event,
+    )
+
+    observed.clear()
+    resumed = tmp_path / "resumed"
+    resumed.mkdir()
+    torch.save({"model": "ok"}, resumed / "checkpoint.pt")
+    sculpt_mod._train_or_resume(
+        adapter=_Adapter(),
+        iter_index=1,
+        iter_dir=resumed,
+        reward_module_path=tmp_path / "reward.py",
+        steps=1,
+        seed=0,
+        pre_train_event=event,
+    )
+    assert not any(item.get("type") == "mode_execution_admitted" for item in observed)
+
+
 def test_rollout_or_resume_skips_when_artifacts_present(tmp_path: Path):
     """Rollout artifacts on disk → skip `adapter.rollout`. Partial
     artifacts (missing one) → re-run."""
@@ -1044,6 +1094,11 @@ def test_iter_fitness_event_carries_components_dict(
                 "error": None,
             }
 
+        metric_id = "test-metric"
+        metric_version = "v1"
+        metric_source = "test"
+        metric_sha256 = "d" * 64
+
     result = sculpt_run(
         config_path=proj / "config.toml", behavior_goal="dummy goal",
         iterations=1, no_kg=True, dry_run=True,
@@ -1071,6 +1126,12 @@ def test_iter_fitness_event_carries_components_dict(
     assert record["fitness"] == pytest.approx(0.0)
     assert record["components"] == {
         "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+    assert record["metric"] == {
+        "id": "test-metric",
+        "version": "v1",
+        "source": "test",
+        "sha256": "d" * 64,
     }
     assert record["source"] == "live"
     assert record["observe_only"] is False
@@ -1119,10 +1180,15 @@ def test_iter_fitness_event_components_null_on_plain_float_fallback(
     assert fitness_events[0]["components"] is None
 
 
-def test_dangling_current_reexport_is_repaired(tmp_path: Path):
-    """A generated current.py whose target v<n>.py was deleted would crash
-    mid-train on import; the iter must repair the re-export to the latest
-    version before training."""
+def test_dangling_current_reexport_fails_closed_without_latest_fallback(
+    tmp_path: Path,
+):
+    """A missing selected reward is lost authority, not permission to guess.
+
+    Selecting the newest surviving version would silently change the reward
+    the researcher chose. Launch must stop before adapter work and leave the
+    selector untouched so the repair is explicit and reviewable.
+    """
     global _SCHEDULE
     _SCHEDULE = [1.0]
     proj = _write_minimal_project(tmp_path)
@@ -1136,15 +1202,13 @@ def test_dangling_current_reexport_is_repaired(tmp_path: Path):
     (rewards / "v0.py").unlink()
     assert _current_reward_target(rewards) is None
 
-    result = sculpt_run(
-        config_path=proj / "config.toml", behavior_goal="dummy goal",
-        iterations=1, resume=True, no_kg=True, dry_run=True,
-    )
-    (outcome,) = result.completed_iters
-    # Repaired: trained the latest surviving version, records agree.
-    assert outcome.reward_path_trained == rewards / "v1.py"
-    assert "v1.py" in (rewards / "current.py").read_text(encoding="utf-8") \
-        or "v2.py" in (rewards / "current.py").read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="selects a missing"):
+        sculpt_run(
+            config_path=proj / "config.toml", behavior_goal="dummy goal",
+            iterations=1, resume=True, no_kg=True, dry_run=True,
+        )
+    assert "v0.py" in (rewards / "current.py").read_text(encoding="utf-8")
+    assert (rewards / "v1.py").is_file()
 
 
 def test_current_reward_target_parses_ui_backend_format(tmp_path: Path):

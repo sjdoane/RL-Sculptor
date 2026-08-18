@@ -16,11 +16,13 @@ import pytest
 
 from sculptor.eval.mode_metrics import (
     ModeMetricError,
+    build_mode_diagnostics,
     calibrate_mode_metrics,
     check_transitions,
     generate_mode_metrics,
     mode_gauntlet_report,
     mode_goal_text,
+    mode_diagnostics_digest,
     mode_prompt_context,
     mode_reference_clip,
     mode_slices,
@@ -30,7 +32,14 @@ from sculptor.eval.mode_metrics import (
     slice_behavior,
     validate_mode_metrics,
 )
-from sculptor.modes import Guard, Mode, ModeGraph, Transition
+from sculptor.modes import (
+    Guard,
+    Mode,
+    ModeError,
+    ModeGraph,
+    Transition,
+    build_mode_execution_manifest,
+)
 
 FPS = 60.0
 DT = 0.02
@@ -167,6 +176,252 @@ def test_mode_slices_tile_the_rollout_without_gaps_or_overlap():
     assert slices[-1].hi == T
     for earlier, later in zip(slices, slices[1:]):
         assert earlier.hi == later.lo
+
+
+def test_episode_fitted_execution_manifest_is_rejected():
+    """A certified 2 s clip cannot silently become a 20 s trajectory."""
+    graph = _graph()  # raw windows: [0, 1), [1, 2)
+    with pytest.raises(ModeError, match="certified-cadence"):
+        build_mode_execution_manifest(
+            graph,
+            windows_s={"approach": (0.0, 10.0), "strike": (10.0, 20.0)},
+        )
+
+
+def test_transition_check_uses_the_same_certified_manifest_as_training():
+    graph = _graph()
+    manifest = build_mode_execution_manifest(graph)
+    # A partial rollout has not crossed the exact certified 1 s seam.
+    [transition] = check_transitions(
+        graph, rollout_frames=20, step_dt=DT,
+        execution_manifest=manifest.to_dict(),
+    )
+    assert transition["fire_time_s"] == pytest.approx(1.0)
+    assert transition["fired"] is False
+    assert transition["to_mode_entered"] is False
+
+
+def test_terminal_hold_is_an_explicit_runtime_and_diagnostic_window():
+    """A 2 s clip in a 5 s episode scores the full 3 s terminal hold.
+
+    The certified clip cadence stays unchanged: only the terminal execution
+    window is extended, and official all-lane diagnostics consume that exact
+    manifest rather than silently ending at the reference boundary.
+    """
+    from sculptor.mode_rewards import build_mode_reward_binding
+    from sculptor.modes import mode_graph_sha256
+
+    graph = _graph()
+    manifest = build_mode_execution_manifest(graph, terminal_hold_s=3.0)
+    assert manifest.window_map == {
+        "approach": (0.0, 1.0),
+        "strike": (1.0, 5.0),
+    }
+    binding = build_mode_reward_binding(
+        clip_id="two-second-clip",
+        robot="g1",
+        clip_sha256="a" * 64,
+        graph_sha256=mode_graph_sha256(graph),
+        context_refs={},
+        execution_manifest=manifest.to_dict(),
+    )
+    frames, envs = 250, 2
+    arrays = {
+        "first_episode_valid_mask": np.ones((frames, envs), dtype=bool),
+        "reward_term__tracking": np.ones((frames, envs), dtype=np.float32),
+    }
+    record = build_mode_diagnostics(
+        graph,
+        execution_manifest=manifest,
+        mode_binding=binding,
+        arrays=arrays,
+        behavior={
+            "rollout_num_envs": envs,
+            "max_episode_steps": frames,
+            "step_dt": DT,
+            "rendered_env_index": 0,
+        },
+        provenance={
+            "reward_sha256": "b" * 64,
+            "trajectory_sha256": "c" * 64,
+            "behavior_sha256": "d" * 64,
+            "reference_clip_sha256": "a" * 64,
+            "artifact_tuple_sha256": "e" * 64,
+        },
+    )
+    terminal = record["modes"]["strike"]
+    assert terminal["slice"]["requested_lo"] == 50
+    assert terminal["slice"]["requested_hi"] == 250
+    assert terminal["completed_window_env_count"] == envs
+    assert terminal["reward_terms"]["tracking"]["sample_count"] == 400
+
+
+def test_an_execution_manifest_for_another_graph_is_rejected():
+    manifest = build_mode_execution_manifest(_graph()).to_dict()
+    manifest["graph_sha256"] = "0" * 64
+    with pytest.raises(ModeMetricError, match="graph_sha256"):
+        mode_slices(
+            _graph(), rollout_frames=T, step_dt=DT,
+            execution_manifest=manifest,
+        )
+
+
+def test_score_modes_records_and_uses_the_execution_manifest():
+    graph = _graph()
+    manifest = build_mode_execution_manifest(graph)
+    result = score_modes(
+        _motion_metric, _half_active_rollout(), _behavior(), {}, graph,
+        execution_manifest=manifest,
+    )
+    assert result["modes"]["approach"]["slice"]["requested_hi"] == 50
+    assert result["modes"]["strike"]["slice"]["requested_lo"] == 50
+    assert result["modes"]["strike"]["slice"]["entered"] is True
+    assert result["mode_execution_manifest"] == manifest.to_dict()
+
+
+def _bound_diagnostic_inputs():
+    from sculptor.mode_rewards import build_mode_reward_binding
+    from sculptor.modes import mode_graph_sha256
+
+    graph = _graph()
+    manifest = build_mode_execution_manifest(graph)
+    binding = build_mode_reward_binding(
+        clip_id="composite-1",
+        robot="g1",
+        clip_sha256="a" * 64,
+        graph_sha256=mode_graph_sha256(graph),
+        context_refs={"world": "b" * 64},
+        execution_manifest=manifest.to_dict(),
+    )
+    mask = np.zeros((T, E), dtype=bool)
+    mask[:, 0] = True
+    mask[:75, 1] = True
+    mask[:40, 2] = True
+    arrays = {
+        "first_episode_valid_mask": mask,
+        "joint_pos": np.zeros((T, E, J), dtype=np.float32),
+        "reward_term__tracking": np.arange(T * E, dtype=np.float32).reshape(T, E),
+    }
+    behavior = {
+        "rollout_num_envs": E,
+        "max_episode_steps": T,
+        "step_dt": DT,
+        "rendered_env_index": 1,
+    }
+    provenance = {
+        "reward_sha256": "c" * 64,
+        "trajectory_sha256": "d" * 64,
+        "behavior_sha256": "e" * 64,
+        "reference_clip_sha256": "a" * 64,
+        "artifact_tuple_sha256": "f" * 64,
+    }
+    return graph, manifest, binding, arrays, behavior, provenance
+
+
+def test_production_mode_diagnostics_are_all_lane_digest_bound_and_advisory():
+    graph, manifest, binding, arrays, behavior, provenance = (
+        _bound_diagnostic_inputs()
+    )
+    record = build_mode_diagnostics(
+        graph,
+        execution_manifest=manifest,
+        mode_binding=binding,
+        arrays=arrays,
+        behavior=behavior,
+        provenance=provenance,
+    )
+
+    assert record["authority"] == {
+        "classification": "diagnostic_only",
+        "calibrated_success_authority": False,
+        "fitness_or_selection_authority": False,
+        "execution_model": "fixed_linear_phase_windows",
+        "not_implemented": [
+            "closed_loop_oracle", "rho_bounded_exploration",
+            "predicate_or_branch_executor", "mode_conditioned_policy",
+        ],
+    }
+    assert record["diagnostic_digest"] == mode_diagnostics_digest(record)
+    assert record["canonical_graph"] == graph.to_dict()
+    assert record["graph_sha256"] == manifest.graph_sha256
+    assert record["modes"]["approach"]["entered_env_count"] == 3
+    assert record["modes"]["strike"]["entered_env_count"] == 2
+    assert record["modes"]["strike"]["completed_window_env_count"] == 1
+    assert record["modes"]["strike"]["rendered_env"] == {
+        "index": 1,
+        "entered": True,
+        "completed_window": False,
+        "valid_frames": 25,
+        "coverage": 0.5,
+    }
+    [transition] = record["transitions"]
+    assert transition["fired_per_env"] == [True, True, False, False]
+    assert transition["fired_env_fraction"] == 0.5
+    assert transition["rendered_env_fired"] is True
+    assert record["modes"]["approach"]["reward_terms"]["tracking"]["mean"] \
+        is not None
+    for forbidden in ("ok", "passed", "fitness", "success"):
+        assert forbidden not in record
+
+
+def test_production_mode_diagnostics_refuse_stale_graph_or_manifest_binding():
+    graph, manifest, binding, arrays, behavior, provenance = (
+        _bound_diagnostic_inputs()
+    )
+    stale_graph = dict(binding)
+    stale_graph["graph_sha256"] = "0" * 64
+    with pytest.raises(ModeMetricError, match="graph_sha256 is stale"):
+        build_mode_diagnostics(
+            graph,
+            execution_manifest=manifest,
+            mode_binding=stale_graph,
+            arrays=arrays,
+            behavior=behavior,
+            provenance=provenance,
+        )
+
+    stale_manifest = dict(binding)
+    stale_manifest["execution_manifest_digest"] = "0" * 64
+    with pytest.raises(ModeMetricError, match="execution_manifest_digest is stale"):
+        build_mode_diagnostics(
+            graph,
+            execution_manifest=manifest,
+            mode_binding=stale_manifest,
+            arrays=arrays,
+            behavior=behavior,
+            provenance=provenance,
+        )
+
+
+def test_production_mode_diagnostics_require_unstitched_first_episode_masks():
+    graph, manifest, binding, arrays, behavior, provenance = (
+        _bound_diagnostic_inputs()
+    )
+    no_mask = dict(arrays)
+    no_mask.pop("first_episode_valid_mask")
+    with pytest.raises(ModeMetricError, match="require first_episode_valid_mask"):
+        build_mode_diagnostics(
+            graph,
+            execution_manifest=manifest,
+            mode_binding=binding,
+            arrays=no_mask,
+            behavior=behavior,
+            provenance=provenance,
+        )
+
+    stitched = dict(arrays)
+    bad_mask = np.asarray(arrays["first_episode_valid_mask"]).copy()
+    bad_mask[80, 1] = True
+    stitched["first_episode_valid_mask"] = bad_mask
+    with pytest.raises(ModeMetricError, match="re-enters after termination"):
+        build_mode_diagnostics(
+            graph,
+            execution_manifest=manifest,
+            mode_binding=binding,
+            arrays=stitched,
+            behavior=behavior,
+            provenance=provenance,
+        )
 
 
 # ── unentered vs degenerate ─────────────────────────────────────────────

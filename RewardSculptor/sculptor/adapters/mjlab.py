@@ -38,6 +38,7 @@ Design notes (see MJLAB_PIVOT_DESIGN §1.2 for rationale):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -153,6 +154,81 @@ def _run_with_cleanup(
 
 
 _RUNNER_MODULE = "sculptor.adapters._mjlab_runner"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_warm_start_loaded(
+    stdout: str,
+    *,
+    expected_source: str | Path,
+    expected_sha256: str,
+    expected_mode: str,
+) -> dict[str, Any]:
+    """Attest the runner's exact warm-start load before accepting output.
+
+    A zero exit code and a new checkpoint only prove that training ran; they
+    do not prove that the requested source weights were loaded.  The runner
+    emits a data-only receipt immediately after ``runner.load`` succeeds.
+    Require one and only one receipt and bind it to the exact source path,
+    full digest, and requested actor/critic role.
+    """
+    marker = "[SCULPT-EVENT] "
+    receipts: list[dict[str, Any]] = []
+    for line in str(stdout or "").splitlines():
+        marker_index = line.find(marker)
+        if marker_index < 0:
+            continue
+        try:
+            payload = json.loads(line[marker_index + len(marker):])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "warm_start_loaded":
+            receipts.append(payload)
+
+    if len(receipts) != 1:
+        raise RuntimeError(
+            "mjlab runner did not provide exactly one warm_start_loaded "
+            f"receipt (found {len(receipts)}); refusing to accept an "
+            "unproven warm-start output"
+        )
+
+    receipt = receipts[0]
+    received_source = receipt.get("source")
+    if not isinstance(received_source, str) or not received_source:
+        raise RuntimeError("warm_start_loaded receipt is missing its source path")
+    expected_path = Path(expected_source).resolve(strict=False)
+    received_path = Path(received_source).resolve(strict=False)
+    if received_path != expected_path:
+        raise RuntimeError(
+            "warm_start_loaded source path mismatch: expected "
+            f"{expected_path}, got {received_path}"
+        )
+
+    received_sha256 = str(receipt.get("source_sha256") or "").lower()
+    normalized_expected_sha256 = str(expected_sha256).lower()
+    if received_sha256 != normalized_expected_sha256:
+        raise RuntimeError(
+            "warm_start_loaded source digest mismatch: expected "
+            f"{normalized_expected_sha256}, got {received_sha256 or '<missing>'}"
+        )
+
+    expected_keys = (
+        ["actor"] if expected_mode == "actor_only" else ["actor", "critic"]
+    )
+    received_keys = receipt.get("load_cfg_keys")
+    if received_keys != expected_keys:
+        raise RuntimeError(
+            "warm_start_loaded role mismatch: expected load_cfg_keys "
+            f"{expected_keys}, got {received_keys!r}"
+        )
+    return receipt
 
 # State schema per task family (MJLAB_PIVOT_DESIGN §1.4). Velocity and
 # tracking share the locomotion schema; Yam manipulation extends.
@@ -709,6 +785,7 @@ class MjlabAdapter(SculptorAdapter):
         seed: int,
         *,
         init_policy_path: Optional[Path] = None,
+        init_policy_mode: str = "actor_critic",
     ) -> TrainResult:
         """Subprocess-train. `steps` is interpreted as `max_iterations`
         for rsl_rl's OnPolicyRunner (one iteration = num_envs *
@@ -724,6 +801,10 @@ class MjlabAdapter(SculptorAdapter):
         action spaces must match or `runner.load` raises.
         """
         reward_module_path = Path(reward_module_path).resolve() if reward_module_path else None  # type: ignore[assignment]
+        if init_policy_mode not in ("actor_only", "actor_critic"):
+            raise ValueError(
+                "init_policy_mode must be 'actor_only' or 'actor_critic'"
+            )
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -762,6 +843,12 @@ class MjlabAdapter(SculptorAdapter):
                     f"init_policy_path not found: {init}"
                 )
             cmd += ["--load-pretrained-policy", str(init)]
+            cmd += ["--pretrained-load-role", str(init_policy_mode)]
+            init_policy_sha256 = _sha256_file(init)
+            expected_runtime_source: str | Path = init
+        else:
+            init_policy_sha256 = None
+            expected_runtime_source = ""
         # Always pass the per-task schema keys to the subprocess so
         # SculptorRewardTerm uses the correct key set (bug: previously
         # only passed when `self.schema_keys` was explicitly set, so the
@@ -825,7 +912,9 @@ class MjlabAdapter(SculptorAdapter):
                 # rewards/ dir must exist at its mirror path on the pod.
                 aux_dir_list.append(Path(reward_module_path).resolve().parent)
             if init_policy_path is not None:
-                input_paths["--load-pretrained-policy"] = Path(init_policy_path).resolve()
+                local_init = Path(init_policy_path).resolve()
+                input_paths["--load-pretrained-policy"] = local_init
+                options["--pretrained-load-role"] = str(init_policy_mode)
             job = RunnerJob(
                 subcommand="train",
                 options=options,
@@ -838,6 +927,11 @@ class MjlabAdapter(SculptorAdapter):
                 aux_dirs=tuple(dict.fromkeys(aux_dir_list)),
             )
             proc = executor.execute(job)
+            if init_policy_path is not None:
+                # ``execute`` has resolved and cached the remote home used by
+                # its path mirror.  Derive the exact argv path only now so
+                # attestation does not trigger a redundant SSH connection.
+                expected_runtime_source = executor._mirror(local_init)
         else:
             proc = _run_with_cleanup(cmd, env=env)
         if proc.returncode != 0:
@@ -845,6 +939,15 @@ class MjlabAdapter(SculptorAdapter):
                 f"mjlab runner exited {proc.returncode}\n"
                 f"stdout: {(proc.stdout or '')[-2000:]}\n"
                 f"stderr: {(proc.stderr or '')[-2000:]}"
+            )
+
+        if init_policy_path is not None:
+            assert init_policy_sha256 is not None
+            _require_warm_start_loaded(
+                proc.stdout or "",
+                expected_source=expected_runtime_source,
+                expected_sha256=init_policy_sha256,
+                expected_mode=init_policy_mode,
             )
 
         ckpt_path = output_dir / "checkpoint.pt"

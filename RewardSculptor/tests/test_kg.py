@@ -11,26 +11,41 @@ from pathlib import Path
 import pytest
 
 from sculptor.kg.schema import (
+    ArtifactAttestation,
     Edge,
     Environment,
     FailureMode,
     Paper,
+    PolicyArtifact,
+    PROVENANCE_ATTESTED_ARTIFACT,
     PROVENANCE_LLM_EXTRACTION,
     PROVENANCE_OBSERVED_RUN,
     PROVENANCE_PAPER_CLAIM,
     PROVENANCE_SEED,
     Relation,
+    ReferenceMotion,
     RewardComponent,
     Result,
     RunCase,
+    RobotEmbodiment,
+    SoftwareEnvironment,
     Technique,
+    TrainingRun,
+    WorldArtifact,
     evidence_tag,
     make_environment_id,
+    make_artifact_attestation_id,
     make_failure_mode_id,
     make_paper_id,
+    make_policy_artifact_id,
+    make_reference_motion_id,
+    make_robot_embodiment_id,
+    make_software_environment_id,
     make_reward_component_id,
     make_result_id,
     make_technique_id,
+    make_training_run_id,
+    make_world_artifact_id,
 )
 from sculptor.kg.store import SculptorKG
 
@@ -73,6 +88,136 @@ def test_node_roundtrip_all_kinds(kg):
         assert fetched is not None
         assert type(fetched) is type(node)
         assert fetched == node
+
+
+def test_curated_seed_coverage_binds_source_curation_and_concepts(
+    kg, tmp_path: Path,
+):
+    from sculptor.kg.ingest import assert_seed_coverage, seed_coverage_report
+
+    source = tmp_path / "2403.04205.txt"
+    source.write_text("exact paper text", encoding="utf-8")
+    paper = Paper(
+        id=make_paper_id("2403.04205"),
+        arxiv_id="2403.04205",
+        title="OGMP",
+        rationale="Ground the real oracle boundary.",
+        tags=["ogmp", "rho-bounded-exploration"],
+        full_text_path=str(source),
+        extracted=True,
+    )
+    technique = Technique(
+        id=make_technique_id("receding horizon rho oracle"),
+        name="Receding horizon rho oracle",
+        description="Oracle-guided multi-mode permissible-state exploration.",
+    )
+    kg.add_node(paper)
+    kg.add_node(technique)
+    kg.add_edge(Edge(
+        src=paper.id,
+        dst=technique.id,
+        relation=Relation.INTRODUCES,
+    ))
+    seeds = tmp_path / "seeds.yml"
+    seeds.write_text(
+        "papers:\n"
+        "  - arxiv_id: '2403.04205'\n"
+        "    tags: [ogmp, rho-bounded-exploration]\n"
+        "    expected_concepts: [oracle, rho, multi-mode]\n",
+        encoding="utf-8",
+    )
+
+    report = assert_seed_coverage(seeds, store=kg)
+    assert report["ok"] is True
+    row = report["papers"]["2403.04205"]
+    assert len(row["source_sha256"]) == 64
+    assert row["missing_concepts"] == []
+
+    source.unlink()
+    incomplete = seed_coverage_report(seeds, store=kg)
+    assert incomplete["ok"] is False
+    assert incomplete["papers"]["2403.04205"]["source_sha256"] is None
+    with pytest.raises(ValueError, match="2403.04205"):
+        assert_seed_coverage(seeds, store=kg)
+
+
+def test_artifact_lineage_nodes_and_edges_roundtrip(kg):
+    policy_sha = "a" * 64
+    motion_sha = "b" * 64
+    world_sha = "c" * 64
+    contract_sha = "d" * 64
+    software_sha = "e" * 64
+    manifest_sha = "f" * 64
+    policy = PolicyArtifact(
+        id=make_policy_artifact_id(policy_sha),
+        sha256=policy_sha,
+        artifact_format="sanitized_pt",
+        size_bytes=4096,
+    )
+    motion = ReferenceMotion(
+        id=make_reference_motion_id(motion_sha),
+        sha256=motion_sha,
+    )
+    world = WorldArtifact(
+        id=make_world_artifact_id(world_sha),
+        sha256=world_sha,
+    )
+    attestation = ArtifactAttestation(
+        id=make_artifact_attestation_id(manifest_sha),
+        manifest_digest=manifest_sha,
+        trust_status="sanitized",
+        source_format="safetensors",
+        declared={
+            "alias": "G1 parkour prior",
+            "task_id": "Mjlab-G1-Parkour",
+            "robot_slug": "g1",
+            "policy_roles": ["actor", "critic"],
+            "initialization_modes": ["actor_only", "actor_critic"],
+        },
+    )
+    robot = RobotEmbodiment(
+        id=make_robot_embodiment_id("g1", contract_sha),
+        slug="g1",
+        contract_digest=contract_sha,
+        joint_names=["left_hip_pitch_joint"],
+    )
+    software = SoftwareEnvironment(
+        id=make_software_environment_id(software_sha),
+        lock_digest=software_sha,
+        versions={"torch": "2.11.0"},
+    )
+    run = TrainingRun(
+        id=make_training_run_id("parkour", "run-42"),
+        project="parkour",
+        run_id="run-42",
+        requested_initialization_mode="actor_only",
+        observed_initialization_mode="actor_only",
+    )
+    for node in (policy, motion, world, attestation, robot, software, run):
+        kg.add_node(node)
+        assert kg.get_node(node.id) == node
+    for edge in (
+        Edge(run.id, policy.id, Relation.INITIALIZED_FROM),
+        Edge(run.id, motion.id, Relation.TRACKS),
+        Edge(
+            run.id, world.id, Relation.EXECUTES_IN,
+            data={"activation_status": "active"},
+        ),
+        Edge(run.id, software.id, Relation.EXECUTES_IN),
+        Edge(attestation.id, policy.id, Relation.ATTESTS),
+        Edge(attestation.id, robot.id, Relation.DECLARES_TARGET),
+        Edge(policy.id, robot.id, Relation.COMPATIBLE_WITH),
+        Edge(run.id, policy.id, Relation.PRODUCED),
+    ):
+        kg.add_edge(edge)
+    assert kg.count_edges(Relation.EXECUTES_IN) == 2
+    assert kg.neighbors(run.id, relation=Relation.INITIALIZED_FROM)[0][1] == policy.id
+    assert policy.provenance == PROVENANCE_ATTESTED_ARTIFACT
+
+
+def test_artifact_ids_reject_non_sha256() -> None:
+    with pytest.raises(ValueError, match="sha256"):
+        make_policy_artifact_id("not-a-digest")
 
 
 def test_add_node_is_upsert(kg):

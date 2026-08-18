@@ -14,6 +14,8 @@ artifacts train()/rollout() post-checks expect. Verifies:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -39,11 +41,25 @@ ROLLOUT_ARTIFACTS = {
 
 def _fake_execute(captured: dict, artifacts: dict[str, bytes]):
     def execute(self, job):
+        self._remote_home = "/root"
         captured["job"] = job
         captured["cfg"] = self.cfg
         for name, data in artifacts.items():
             (Path(job.output_dir) / name).write_bytes(data)
-        return subprocess.CompletedProcess(["<remote>"], 0, "", "")
+        stdout = ""
+        source = job.input_paths.get("--load-pretrained-policy")
+        if source is not None:
+            mode = job.options.get("--pretrained-load-role", "actor_critic")
+            payload = {
+                "type": "warm_start_loaded",
+                "source": self._mirror(source),
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "load_cfg_keys": (
+                    ["actor"] if mode == "actor_only" else ["actor", "critic"]
+                ),
+            }
+            stdout = "[SCULPT-EVENT] " + json.dumps(payload)
+        return subprocess.CompletedProcess(["<remote>"], 0, stdout, "")
 
     return execute
 

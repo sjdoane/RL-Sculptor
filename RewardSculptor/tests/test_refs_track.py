@@ -10,9 +10,11 @@ directly; the real GPU tracking pass is the orchestrator's job later
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -26,16 +28,22 @@ from sculptor.refs.track import (
     ORIGIN_RELATIVE_MAX_ROOT_Z_M,
     ROOT_Z_RMSE_THRESHOLD_M,
     STATIC_BASELINE_RATIO_MAX,
+    TierDAdmissionError,
     TierDCertificate,
     TrackError,
     TrackingErrors,
+    build_tierd_execution_contract,
     build_track_project,
     clip_root_frame,
+    compare_tierd_target_contract,
     compute_tracking_errors,
     downsample_phase_targets,
     generate_tracking_residual_reward_source,
     generate_tracking_reward_source,
     read_donor_adapter_config,
+    require_stage_tierd_admission,
+    require_tierd_admission,
+    require_tierd_target_compatibility,
     select_tracking_phase_window,
     track_clip,
     update_provenance_tier_d,
@@ -88,6 +96,79 @@ def _write_donor_project(path: Path) -> Path:
         'num_envs = 64, device = "cuda:0" }\n'
     )
     return path
+
+
+def _policy_contract(
+    *,
+    robot_joints: list[str] | None = None,
+    task_id: str = "Mjlab-Velocity-Flat-Unitree-G1",
+    sim_timestep_s: float = 0.005,
+    decimation: int = 4,
+) -> dict:
+    joints = robot_joints or [
+        "left_hip_pitch_joint", "right_hip_pitch_joint",
+    ]
+    return {
+        "schema": 2,
+        "identity": {
+            "adapter_class": "sculptor.adapters.mjlab.MjlabAdapter",
+            "task_id": task_id,
+        },
+        "joints": {"ordered_names": joints},
+        "actions": {
+            "ordered_names": joints,
+            "term_names": ["joint_position"],
+            "shape": [len(joints)],
+        },
+        # Retained in the full policy digest but deliberately outside the
+        # Tier-D physical boundary. This gives tests a way to prove that
+        # legitimate network/optimizer changes do not invalidate dynamics
+        # evidence for an otherwise identical execution interface.
+        "policy": {"actor": {"hidden_dims": [128, 128]}},
+        "timing": {
+            "sim_timestep_s": sim_timestep_s,
+            "decimation": decimation,
+            "control_dt_s": sim_timestep_s * decimation,
+        },
+        "versions": {
+            "torch": "2.7",
+            "mjlab": "0.3.1",
+            "rsl_rl": "3.1.0",
+            "adapter": "0.7.0",
+        },
+    }
+
+
+def _execution_contract(
+    tmp_path: Path,
+    clip: dict,
+    *,
+    robot: str = "g1",
+    policy_contract: dict | None = None,
+) -> dict:
+    donor = _write_donor_project(tmp_path / "tier_d_donor")
+    certification = tmp_path / "tier_d_certification.toml"
+    certification.write_text(
+        (donor / "config.toml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return build_tierd_execution_contract(
+        donor_project=donor,
+        certification_config_path=certification,
+        robot=robot,
+        clip=clip,
+        policy_contract=policy_contract or _policy_contract(),
+    )
+
+
+def _canonical_sha256(value: dict) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
 
 
 # ── phase downsampling ───────────────────────────────────────────────────
@@ -241,7 +322,7 @@ def test_generate_tracking_reward_source_raises_on_qpos_too_short():
 def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
     torch = pytest.importorskip("torch")
     src = generate_tracking_residual_reward_source(
-        clip=_make_getup_clip(), clip_id="getup1",
+        clip=_make_getup_clip(), clip_id="getup1", robot="g1",
     )
     # The immutable prior is deliberately compact enough for complete-module
     # editor responses, even on robots with many joints.
@@ -312,7 +393,7 @@ def test_tracking_first_locomotion_prior_wraps_repeatable_gait():
         "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
     }
     src = generate_tracking_residual_reward_source(
-        clip=clip, clip_id="translation-gait")
+        clip=clip, clip_id="translation-gait", robot="g1")
     ns: dict = {}
     exec(compile(src, "looping_tracking", "exec"), ns)  # noqa: S102
 
@@ -339,7 +420,7 @@ def test_tracking_first_validator_allows_hooks_but_freezes_composition():
     )
 
     parent_source = generate_tracking_residual_reward_source(
-        clip=_make_getup_clip(), clip_id="getup1",
+        clip=_make_getup_clip(), clip_id="getup1", robot="g1",
     )
     parent_ns: dict = {}
     exec(compile(parent_source, "parent_tracking", "exec"), parent_ns)  # noqa: S102
@@ -915,6 +996,21 @@ def test_build_track_project_rejects_clip_without_joint_pos(tmp_path: Path):
             project_dir=tmp_path / "work")
 
 
+def test_build_tierd_execution_contract_rejects_donor_task_mismatch(
+    tmp_path: Path,
+) -> None:
+    donor = _write_donor_project(tmp_path / "donor")
+
+    with pytest.raises(TrackError, match="donor config task id does not match"):
+        build_tierd_execution_contract(
+            donor_project=donor,
+            certification_config_path=donor / "config.toml",
+            robot="g1",
+            clip=_make_getup_clip(),
+            policy_contract=_policy_contract(task_id="Mjlab-Other-Task"),
+        )
+
+
 # ── provenance update: K->D and infeasible paths ─────────────────────────
 def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     root = tmp_path / "lib"
@@ -930,7 +1026,9 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     rollout_path.write_bytes(rollout_bytes)
     prov = update_provenance_tier_d(
         robot="g1", clip_id="getup1", errors=errs, iterations=2,
-        rollout_path=rollout_path, root=root)
+        rollout_path=rollout_path,
+        execution_contract=_execution_contract(tmp_path, clip),
+        root=root)
 
     assert prov["tier"] == "D"
     assert prov["tierD"]["iterations"] == 2
@@ -940,6 +1038,8 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     # sha256 and a copy of the clip's content_sha256 at tracking time.
     assert prov["tierD"]["rollout_sha256"] == library.content_sha256(rollout_bytes)
     assert prov["tierD"]["clip_content_sha256"] == content_sha  # _register_clip's real hash
+    assert len(prov["tierD"]["execution_contract_sha256"]) == 64
+    assert len(prov["tierD"]["execution_boundary_sha256"]) == 64
 
     # Persisted to disk, index rebuilt.
     reloaded = library.read_provenance("g1", "getup1", root=root)
@@ -966,10 +1066,38 @@ def test_update_provenance_tier_d_feasible_missing_rollout_file_omits_hash(
     rollout_path = tmp_path / "never_written.npz"
     prov = update_provenance_tier_d(
         robot="g1", clip_id="getup1", errors=errs, iterations=2,
-        rollout_path=rollout_path, root=root)
+        rollout_path=rollout_path,
+        execution_contract=_execution_contract(tmp_path, clip),
+        root=root)
 
     assert prov["tier"] == "D"
     assert "rollout_sha256" not in prov["tierD"]
+
+
+def test_update_provenance_tier_d_feasible_requires_execution_contract(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    errs = TrackingErrors(
+        mean_joint_err_rad=0.1,
+        max_joint_err_rad=0.2,
+        root_z_rmse_m=0.05,
+        duration_coverage=1.0,
+        common_joint_names=["left_hip_pitch_joint"],
+        n_common_joints=1,
+    )
+
+    with pytest.raises(TrackError, match="requires an execution contract"):
+        update_provenance_tier_d(
+            robot="g1",
+            clip_id="getup1",
+            errors=errs,
+            iterations=2,
+            root=root,
+        )
+    assert library.read_provenance("g1", "getup1", root=root)["tier"] == "K"
 
 
 def test_update_provenance_tier_d_infeasible_keeps_tier_k(tmp_path: Path):
@@ -1117,7 +1245,12 @@ def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
     assert errs.feasible  # sanity: fixture stats are within threshold
     return update_provenance_tier_d(
         robot=robot, clip_id=clip_id, errors=errs, iterations=2,
-        rollout_path=rollout_path, root=root)
+        rollout_path=rollout_path,
+        execution_contract=_execution_contract(
+            tmp_path, clip, robot=robot,
+            policy_contract=_policy_contract(),
+        ),
+        root=root)
 
 
 def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Path):
@@ -1134,7 +1267,277 @@ def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Pa
     assert cert.root_z_rmse_m == pytest.approx(0.02)
     assert cert.rollout_sha256 == library.content_sha256(_ROLLOUT_BYTES)
     assert cert.clip_content_sha256 == prov["content_sha256"]
+    assert cert.execution_contract_sha256 == prov["tierD"][
+        "execution_contract_sha256"
+    ]
+    assert cert.execution_boundary_sha256 == prov["tierD"][
+        "execution_boundary_sha256"
+    ]
+    assert len(cert.certificate_sha256) == 64
     assert cert.rollout_path.is_file()
+
+
+def test_require_tierd_admission_rejects_stale_certificate_pin(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    admitted = require_tierd_admission("g1", "getup1", root=root)
+    provenance = library.read_provenance("g1", "getup1", root=root)
+    provenance["tierD"]["tracked_at"] = "2026-08-17T00:00:00Z"
+    library.write_provenance("g1", "getup1", provenance, root=root)
+
+    with pytest.raises(TierDAdmissionError, match="certificate sha256"):
+        require_tierd_admission(
+            "g1",
+            "getup1",
+            expected_clip_sha256=admitted.clip_content_sha256,
+            expected_certificate_sha256=admitted.certificate_sha256,
+            root=root,
+        )
+
+
+def test_require_tierd_admission_rejects_stale_execution_contract_pin(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+
+    with pytest.raises(TierDAdmissionError, match="execution contract sha256"):
+        require_tierd_admission(
+            "g1",
+            "getup1",
+            expected_execution_contract_sha256="0" * 64,
+            root=root,
+        )
+    with pytest.raises(TierDAdmissionError, match="execution boundary sha256"):
+        require_tierd_admission(
+            "g1",
+            "getup1",
+            expected_execution_boundary_sha256="0" * 64,
+            root=root,
+        )
+
+
+def test_verify_tierd_certificate_legacy_record_without_execution_evidence_denied(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    _mutate_provenance(
+        root,
+        "g1",
+        "getup1",
+        lambda p: [
+            p["tierD"].pop(key)
+            for key in (
+                "execution_contract",
+                "execution_contract_sha256",
+                "execution_boundary_sha256",
+            )
+        ],
+    )
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+
+    assert cert is None
+    assert "execution contract is missing" in reason
+
+
+def test_verify_tierd_certificate_tampered_execution_contract_digest_denied(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    _mutate_provenance(
+        root,
+        "g1",
+        "getup1",
+        lambda p: p["tierD"]["execution_contract"]["donor"].update(
+            {"config_sha256": "f" * 64}
+        ),
+    )
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+
+    assert cert is None
+    assert "execution contract sha256 mismatch" in reason
+
+
+def test_verify_tierd_certificate_reference_cadence_receipt_cannot_go_stale(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+
+    def mutate(provenance: dict) -> None:
+        tier_d = provenance["tierD"]
+        contract = tier_d["execution_contract"]
+        reference = contract["reference"]
+        reference["fps"] = 25.0
+        reference["playback_duration_s"] = (
+            reference["frame_count"] / reference["fps"]
+        )
+        unsigned = dict(contract)
+        unsigned.pop("contract_sha256", None)
+        contract["contract_sha256"] = _canonical_sha256(unsigned)
+        tier_d["execution_contract_sha256"] = contract["contract_sha256"]
+
+    _mutate_provenance(root, "g1", "getup1", mutate)
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+
+    assert cert is None
+    assert "clip fps/cadence differs" in reason
+
+
+def test_tierd_target_accepts_changed_policy_details_on_same_execution_boundary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    cert = require_tierd_admission("g1", "getup1", root=root)
+    target = _policy_contract()
+    target["policy"]["actor"]["hidden_dims"] = [512, 256, 128]
+    target["optimizer"] = {"learning_rate": 1e-4}
+
+    assert compare_tierd_target_contract(
+        cert.execution_contract,
+        target,
+        target_robot="g1",
+    ) == []
+    assert require_tierd_target_compatibility(
+        cert,
+        tmp_path / "unused-because-contract-injected",
+        target_robot="g1",
+        target_policy_contract=target,
+    ) is cert
+
+
+def test_tierd_target_rejects_mismatched_donor_task(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    cert = require_tierd_admission("g1", "getup1", root=root)
+    target = _policy_contract(task_id="Mjlab-Other-Task")
+
+    with pytest.raises(TierDAdmissionError, match="identity.task_id differs"):
+        require_tierd_target_compatibility(
+            cert,
+            tmp_path / "target",
+            target_robot="g1",
+            target_policy_contract=target,
+        )
+
+
+def test_tierd_target_requires_explicit_target_robot(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    cert = require_tierd_admission("g1", "getup1", root=root)
+
+    with pytest.raises(TierDAdmissionError, match="target robot identity is required"):
+        require_tierd_target_compatibility(
+            cert,
+            tmp_path / "target",
+            target_robot="",
+            target_policy_contract=_policy_contract(),
+        )
+
+
+def test_tierd_target_rejects_mismatched_control_cadence(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    cert = require_tierd_admission("g1", "getup1", root=root)
+    target = _policy_contract(sim_timestep_s=0.005, decimation=2)
+
+    reasons = compare_tierd_target_contract(
+        cert.execution_contract,
+        target,
+        target_robot="g1",
+    )
+
+    assert any("timing.decimation differs" in reason for reason in reasons)
+    assert any("timing.control_dt_s differs" in reason for reason in reasons)
+
+
+def test_tierd_target_rejects_robot_interface_and_software_drift(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    cert = require_tierd_admission("g1", "getup1", root=root)
+    target = _policy_contract(robot_joints=["right_hip_pitch_joint", "other"])
+    target["versions"]["mjlab"] = "0.4.0"
+
+    reasons = compare_tierd_target_contract(
+        cert.execution_contract,
+        target,
+        target_robot="h1",
+    )
+
+    assert any(reason.startswith("robot differs") for reason in reasons)
+    assert any("joints.ordered_names differs" in reason for reason in reasons)
+    assert any("versions.mjlab differs" in reason for reason in reasons)
+
+
+def test_require_stage_tierd_admission_needs_exact_robot_clip_and_certificate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    admitted = require_tierd_admission("g1", "getup1", root=root)
+    stage = SimpleNamespace(
+        name="rise",
+        reference_clip_id="getup1",
+        reference_tier="D",
+        reference_robot="g1",
+        reference_clip_sha256=admitted.clip_content_sha256,
+        reference_certificate_sha256=admitted.certificate_sha256,
+        reference_execution_contract_sha256=(
+            admitted.execution_contract_sha256
+        ),
+        reference_execution_boundary_sha256=(
+            admitted.execution_boundary_sha256
+        ),
+    )
+
+    assert require_stage_tierd_admission(
+        stage, expected_robot="g1", root=root,
+    ) == admitted
+    stage.reference_execution_boundary_sha256 = "0" * 64
+    with pytest.raises(TierDAdmissionError, match="execution boundary sha256"):
+        require_stage_tierd_admission(
+            stage, expected_robot="g1", root=root,
+        )
+    stage.reference_execution_boundary_sha256 = admitted.execution_boundary_sha256
+    stage.reference_robot = "go1"
+    with pytest.raises(TierDAdmissionError, match="active training robot"):
+        require_stage_tierd_admission(
+            stage, expected_robot="g1", root=root,
+        )
+
+
+def test_require_stage_tierd_admission_rejects_legacy_missing_execution_pins(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    admitted = require_tierd_admission("g1", "getup1", root=root)
+    legacy_stage = SimpleNamespace(
+        name="rise",
+        reference_clip_id="getup1",
+        reference_tier="D",
+        reference_robot="g1",
+        reference_clip_sha256=admitted.clip_content_sha256,
+        reference_certificate_sha256=admitted.certificate_sha256,
+    )
+
+    with pytest.raises(
+        TierDAdmissionError,
+        match="reference_execution_contract_sha256",
+    ):
+        require_stage_tierd_admission(
+            legacy_stage, expected_robot="g1", root=root,
+        )
 
 
 def test_verify_tierd_certificate_frozen_dataclass(tmp_path: Path):
@@ -1306,7 +1709,7 @@ def test_verify_tierd_certificate_tamper_missing_rollout_sha_denied(tmp_path: Pa
     the best-effort hashing in `update_provenance_tier_d` failed) must
     deny cleanly rather than silently trusting an unhashed artifact."""
     root = tmp_path / "lib"
-    prov = _certify_valid_tier_d(tmp_path, root)
+    _certify_valid_tier_d(tmp_path, root)
     _mutate_provenance(root, "g1", "getup1", lambda p: p["tierD"].pop("rollout_sha256"))
 
     cert, reason = verify_tierd_certificate("g1", "getup1", root=root)

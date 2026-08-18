@@ -85,6 +85,15 @@ def load_stage_reference_clip(
     if not clip_id:
         return None
 
+    pinned_robot = getattr(stage, "reference_robot", None)
+    if pinned_robot:
+        if robot and robot != pinned_robot:
+            raise ValueError(
+                f"stage reference robot pin {pinned_robot!r} does not match "
+                f"the active training robot {robot!r}"
+            )
+        robot = str(pinned_robot)
+
     from sculptor.reference import load_clip
     from sculptor.refs import library
 
@@ -124,7 +133,10 @@ def _load_stage_reference(
     if not clip_id:
         return None, None
     try:
-        robot = _robot_slug(robot_hint)
+        robot = str(
+            getattr(stage, "reference_robot", None)
+            or _robot_slug(robot_hint)
+        )
         loaded = load_stage_reference_clip(stage, robot)
         if loaded is None:  # pragma: no cover — clip_id truthy just above
             return None, None

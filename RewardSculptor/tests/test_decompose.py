@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -974,6 +975,38 @@ def _mk_clip_for_signature():
     return make_procedural_jump_clip()
 
 
+def _target_attachment_kwargs(tmp_path: Path, monkeypatch) -> dict:
+    """Install a target-specific Tier-D boundary for decompose unit tests."""
+
+    def _admit(robot: str, clip_id: str):
+        assert robot == "g1"
+        return SimpleNamespace(
+            robot=robot,
+            clip_id=clip_id,
+            clip_content_sha256="1" * 64,
+            certificate_sha256="2" * 64,
+            execution_contract_sha256="3" * 64,
+            execution_boundary_sha256="4" * 64,
+        )
+
+    def _target(cert, target_project, *, target_robot, target_policy_contract):
+        assert target_project == tmp_path / "target-project"
+        assert target_robot == "g1"
+        assert target_policy_contract == {"fixture": "policy-contract"}
+        return cert
+
+    monkeypatch.setattr("sculptor.refs.track.require_tierd_admission", _admit)
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_tierd_target_compatibility",
+        _target,
+    )
+    return {
+        "target_project": tmp_path / "target-project",
+        "target_robot": "g1",
+        "target_policy_contract": {"fixture": "policy-contract"},
+    }
+
+
 def test_attach_references_true_picks_top_match_above_threshold(
     tmp_path, monkeypatch,
 ):
@@ -1000,11 +1033,66 @@ def test_attach_references_true_picks_top_match_above_threshold(
     mission = decompose_task(
         "Stand on one leg and kick", _default_contract(),
         kg_store=None, client=client, attach_references=True,
+        **_target_attachment_kwargs(tmp_path, monkeypatch),
     )
     for stage in mission.stages:
         assert stage.reference_clip_id == "getup_high_conf"
         assert stage.reference_tier == "D"
         assert stage.reference_match_confidence == pytest.approx(0.92)
+        assert stage.reference_execution_contract_sha256 == "3" * 64
+        assert stage.reference_execution_boundary_sha256 == "4" * 64
+
+
+def test_attach_references_without_target_stays_candidate_only(
+    tmp_path, monkeypatch,
+):
+    """A confident/certified retrieval is not executable without a target."""
+    _touch_index(tmp_path, monkeypatch)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="candidate_only", match_confidence=0.99)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_tierd_admission",
+        lambda *_a, **_kw: pytest.fail("candidate-only must not seek admission"),
+    )
+    mission = decompose_task(
+        "Stand on one leg and kick",
+        _default_contract(),
+        client=_StubClient(_good_decomp_model()),
+        attach_references=True,
+    )
+    assert all(stage.reference_clip_id is None for stage in mission.stages)
+
+
+def test_attach_references_rejects_target_incompatible_tierd_candidate(
+    tmp_path, monkeypatch,
+):
+    """Tier-D on another execution boundary remains only a candidate."""
+    _touch_index(tmp_path, monkeypatch)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="other_boundary", match_confidence=0.99)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+    target_kwargs = _target_attachment_kwargs(tmp_path, monkeypatch)
+
+    def _reject(*_args, **_kwargs):
+        raise ValueError("identity.task_id differs")
+
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_tierd_target_compatibility",
+        _reject,
+    )
+    mission = decompose_task(
+        "Stand on one leg and kick",
+        _default_contract(),
+        client=_StubClient(_good_decomp_model()),
+        attach_references=True,
+        **target_kwargs,
+    )
+    assert all(stage.reference_clip_id is None for stage in mission.stages)
 
 
 def test_attach_references_true_leaves_none_below_threshold(
@@ -1030,6 +1118,7 @@ def test_attach_references_true_leaves_none_below_threshold(
     mission = decompose_task(
         "Stand on one leg and kick", _default_contract(),
         kg_store=None, client=client, attach_references=True,
+        **_target_attachment_kwargs(tmp_path, monkeypatch),
     )
     for stage in mission.stages:
         assert stage.reference_clip_id is None
@@ -1080,6 +1169,7 @@ def test_attach_references_selects_and_persists_span(tmp_path, monkeypatch):
     mission = decompose_task(
         "Stand on one leg and kick", _default_contract(),
         kg_store=None, client=client, attach_references=True,
+        **_target_attachment_kwargs(tmp_path, monkeypatch),
     )
     # _good_decomp_model has 3 stages, every one gets the same top match.
     assert len(span_calls) == 3
@@ -1127,6 +1217,7 @@ def test_attach_references_span_declined_leaves_fields_none(tmp_path, monkeypatc
     mission = decompose_task(
         "Stand on one leg and kick", _default_contract(),
         kg_store=None, client=client, attach_references=True,
+        **_target_attachment_kwargs(tmp_path, monkeypatch),
     )
     for stage in mission.stages:
         assert stage.reference_clip_id == "getup_high_conf"
@@ -1161,6 +1252,7 @@ def test_attach_references_span_infra_failure_leaves_method_none(
     mission = decompose_task(
         "Stand on one leg and kick", _default_contract(),
         kg_store=None, client=client, attach_references=True,
+        **_target_attachment_kwargs(tmp_path, monkeypatch),
     )
     for stage in mission.stages:
         assert stage.reference_clip_id == "getup_high_conf"

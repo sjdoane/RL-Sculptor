@@ -1294,7 +1294,12 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
     verify_tierd_certificate — with no explicit tier ever passed by
     mission_metrics.py."""
     from sculptor.refs import library
-    from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
+    from sculptor.reference import load_clip
+    from sculptor.refs.track import (
+        TrackingErrors,
+        build_tierd_execution_contract,
+        update_provenance_tier_d,
+    )
 
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
@@ -1309,9 +1314,54 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
     errs = TrackingErrors(
         mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
         duration_coverage=1.0, common_joint_names=[], n_common_joints=0)
+    clip_path = (
+        library.clip_dir("g1", "getup_demo_clip", root=root)
+        / library.CLIP_FILENAME
+    )
+    clip = load_clip(clip_path)
+    joints = [str(name) for name in clip["joint_names"]]
+    donor = root / "tier_d_donor"
+    donor.mkdir(parents=True, exist_ok=True)
+    donor_config = donor / "config.toml"
+    donor_config.write_text(
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { task_id = "Mjlab-Velocity-Flat-Unitree-G1" }\n',
+        encoding="utf-8",
+    )
+    execution_contract = build_tierd_execution_contract(
+        donor_project=donor,
+        certification_config_path=donor_config,
+        robot="g1",
+        clip=clip,
+        policy_contract={
+            "identity": {
+                "adapter_class": "sculptor.adapters.mjlab.MjlabAdapter",
+                "task_id": "Mjlab-Velocity-Flat-Unitree-G1",
+            },
+            "joints": {"ordered_names": joints},
+            "actions": {
+                "ordered_names": joints,
+                "term_names": ["joint_position"],
+                "shape": [len(joints)],
+            },
+            "timing": {
+                "sim_timestep_s": 0.005,
+                "decimation": 4,
+                "control_dt_s": 0.02,
+            },
+            "versions": {
+                "torch": "2.7",
+                "mjlab": "0.3.1",
+                "rsl_rl": "3.1.0",
+                "adapter": "0.7.0",
+            },
+        },
+    )
     update_provenance_tier_d(
         robot="g1", clip_id="getup_demo_clip", errors=errs, iterations=1,
-        rollout_path=rollout_path, root=root)
+        rollout_path=rollout_path,
+        execution_contract=execution_contract,
+        root=root)
 
     def fake_gen(goal, out_dir, **kw):
         out_dir = Path(out_dir)

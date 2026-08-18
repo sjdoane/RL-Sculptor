@@ -1614,8 +1614,10 @@ def _build_user_prompt(
             if name in parent_modes["windows"])
         modes_block = (
             "# PER_MODE_STRUCTURE (FROZEN)\n"
-            "This reward is split into OGMP modes whose windows come from the "
-            "seams of a composed reference motion:\n"
+            "This reward is split into OGMP-inspired phase windows derived "
+            "from the seams of a fixed composed reference motion. This is a "
+            "time-windowed reward scaffold, not the paper's closed-loop "
+            "oracle or mode-conditioned policy:\n"
             f"{rows}\n"
             "`MODE_ORDER`, `MODE_WINDOWS_S`, `_mode_masks`, `_MODE_FNS`, "
             "`_MODE_FNS_BATCHED` and both `compute_reward*` dispatchers are "

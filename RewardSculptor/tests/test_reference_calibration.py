@@ -28,7 +28,11 @@ from sculptor.eval.metric_calibration import (
 )
 from sculptor.reference import save_clip
 from sculptor.refs import library
-from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
+from sculptor.refs.track import (
+    TrackingErrors,
+    build_tierd_execution_contract,
+    update_provenance_tier_d,
+)
 
 # ── fixtures ────────────────────────────────────────────────────────────
 
@@ -51,6 +55,48 @@ def _rising_clip() -> dict:
         "joint_pos": jp,
         "joint_names": ["j0", "j1"],
     }
+
+
+def _execution_contract(root: Path, clip: dict, robot: str) -> dict:
+    donor = root / "tier_d_donor"
+    donor.mkdir(parents=True, exist_ok=True)
+    config = donor / "config.toml"
+    config.write_text(
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { task_id = "Mjlab-Velocity-Flat-Unitree-G1" }\n',
+        encoding="utf-8",
+    )
+    joints = list(clip["joint_names"])
+    policy_contract = {
+        "identity": {
+            "adapter_class": "sculptor.adapters.mjlab.MjlabAdapter",
+            "task_id": "Mjlab-Velocity-Flat-Unitree-G1",
+        },
+        "joints": {"ordered_names": joints},
+        "actions": {
+            "ordered_names": joints,
+            "term_names": ["joint_position"],
+            "shape": [len(joints)],
+        },
+        "timing": {
+            "sim_timestep_s": 0.005,
+            "decimation": 4,
+            "control_dt_s": 0.02,
+        },
+        "versions": {
+            "torch": "2.7",
+            "mjlab": "0.3.1",
+            "rsl_rl": "3.1.0",
+            "adapter": "0.7.0",
+        },
+    }
+    return build_tierd_execution_contract(
+        donor_project=donor,
+        certification_config_path=config,
+        robot=robot,
+        clip=clip,
+        policy_contract=policy_contract,
+    )
 
 
 def _seed_real_tierd_cert(
@@ -84,7 +130,9 @@ def _seed_real_tierd_cert(
     assert errs.feasible  # sanity: fixture stats are within threshold
     update_provenance_tier_d(
         robot=robot, clip_id=clip_id, errors=errs, iterations=1,
-        rollout_path=rollout_path, root=root)
+        rollout_path=rollout_path,
+        execution_contract=_execution_contract(root, clip, robot),
+        root=root)
 
 
 #: An honest metric: final-decile mean root height, normalized. Monotone in

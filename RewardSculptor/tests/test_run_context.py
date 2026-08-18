@@ -78,6 +78,30 @@ def test_capture_deterministic_modulo_volatile(tmp_path: Path) -> None:
     assert _strip_volatile(a) == _strip_volatile(b)
 
 
+def test_dirty_capture_hashes_patch_and_untracked_bytes_deterministically(
+    tmp_path: Path,
+) -> None:
+    proj = _write_minimal_project(tmp_path)
+    config = proj / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8") + "\n# local experiment\n",
+        encoding="utf-8",
+    )
+    untracked = proj / "research-note.bin"
+    untracked.write_bytes(b"candidate-a\x00")
+
+    first = capture_run_context(proj)["project_git"]
+    second = capture_run_context(proj)["project_git"]
+    assert first["dirty"] is True
+    assert len(first["diff_sha256"]) == 64
+    assert first["diff_sha256"] == second["diff_sha256"]
+    assert first["untracked_count"] == 1
+
+    untracked.write_bytes(b"candidate-b\x00")
+    changed = capture_run_context(proj)["project_git"]
+    assert changed["diff_sha256"] != first["diff_sha256"]
+
+
 def test_prompt_hashes_present_and_stable(tmp_path: Path) -> None:
     proj = _write_minimal_project(tmp_path)
     a = capture_run_context(proj)["prompts"]

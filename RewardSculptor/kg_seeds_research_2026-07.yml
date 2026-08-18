@@ -10,6 +10,23 @@
 # Extract: sculpt kg extract --all   (LLM + PDF cost — run deliberately)
 
 papers:
+  # ── Multi-mode reference policies (Lokesh review, reread 2026-08)
+  - arxiv_id: "2403.04205"
+    title: "OGMP: Oracle Guided Multi-mode Policies for Agile and Versatile Robot Control"
+    rationale: "Primary OGMP source. Grounds the distinction between a true online receding-horizon oracle with rho-bounded exploration and RewardSculptor's current fixed, episode-time phase-window scaffold; prevents the UI and reward authoring layer from overstating paper alignment."
+    tags: ["ogmp", "multi-mode-policy", "receding-horizon-oracle", "rho-bounded-exploration"]
+    # Anchors match the evidence-bearing extracted entities, not just paper-title
+    # vocabulary: the OGMP extraction calls these task-vital modes and a
+    # receding-horizon oracle.
+    expected_concepts: ["oracle", "rho", "vital modes", "receding-horizon"]
+  - arxiv_id: "2410.01030"
+    title: "Preferenced Oracle Guided Multi-mode Policies for Dynamic Bipedal Loco-Manipulation"
+    rationale: "OGMP follow-up for preference-conditioned loco-manipulation. Grounds future mode/task conditioning and preference variation while making clear that a static composed clip plus per-window reward terms is not yet a learned multi-mode controller."
+    tags: ["ogmp", "preference-conditioned", "loco-manipulation", "hybrid-automaton"]
+    # The extracted hybrid-automaton technique represents guards as discrete
+    # mode jumps driven by environment feedback.
+    expected_concepts: ["preference", "hybrid automaton", "mode jumps", "bipedal"]
+
   # ── LLM reward design: 2024-2026 successors of the Eureka line
   - arxiv_id: "2410.14660"
     title: "CARD: Coder-Agnostic Reward Design with Trajectory Preference Evaluation"

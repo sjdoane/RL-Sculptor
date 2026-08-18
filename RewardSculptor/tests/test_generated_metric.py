@@ -2,6 +2,7 @@
 validation gates. GPU-free; metrics are written to temp .py files."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -584,6 +585,10 @@ def test_calibrate_4array_metric_now_passes(tmp_path):
 
 def test_compute_and_resolve_generated_metric(tmp_path):
     p = _write(tmp_path, "good.py", GOOD)
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "id": "generated-weave-stop",
+        "version": "v7",
+    }), encoding="utf-8")
     # synthetic rollout dir: forward-travelling, upright.
     rollout = tmp_path / "rollout"
     rollout.mkdir()
@@ -600,6 +605,10 @@ def test_compute_and_resolve_generated_metric(tmp_path):
     # fitness fn scores iter_dir/rollout.
     fit = make_generated_fitness_fn(p)
     assert fit(tmp_path) == pytest.approx(out["spec_score"])
+    assert fit.metric_id == "generated-weave-stop"
+    assert fit.metric_version == "v7"
+    assert fit.metric_source == "generated"
+    assert fit.metric_sha256 == hashlib.sha256(p.read_bytes()).hexdigest()
     # resolver dispatches a .py path to the generated fitness fn.
     assert resolve_fitness_fn(str(p))(tmp_path) == pytest.approx(out["spec_score"])
     # missing rollout → honest 0.0, never raises.

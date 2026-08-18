@@ -22,6 +22,8 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,15 +35,31 @@ def _fake_run_with_cleanup_factory(captured: dict):
     """Return a `_run_with_cleanup` stub that records the cmd and returns
     a well-formed CompletedProcess-lookalike so `MjlabAdapter.train`'s
     post-checks (ckpt exists, metrics parseable) can pass."""
-    class _FakeCompleted:
-        returncode = 0
-        stdout = '{"status": "ok"}'
-        stderr = ""
-
     def fake_run(cmd, env=None, timeout=None):  # noqa
         captured["cmd"] = cmd
         captured["env"] = env
-        return _FakeCompleted()
+        stdout = '{"status": "ok"}'
+        if "--load-pretrained-policy" in cmd:
+            source = Path(cmd[cmd.index("--load-pretrained-policy") + 1]).resolve()
+            mode = cmd[cmd.index("--pretrained-load-role") + 1]
+            payload = {
+                "type": "warm_start_loaded",
+                "source": str(source),
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "load_cfg_keys": (
+                    ["actor"] if mode == "actor_only" else ["actor", "critic"]
+                ),
+            }
+            stdout += "\n[SCULPT-EVENT] " + json.dumps(payload)
+
+        class _FakeCompleted:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, output: str) -> None:
+                self.stdout = output
+
+        return _FakeCompleted(stdout)
 
     return fake_run
 
@@ -132,6 +150,75 @@ def test_mjlab_train_raises_on_missing_init_policy(tmp_path: Path):
                 reward_module_path=None, output_dir=out, steps=10, seed=0,
                 init_policy_path=missing,
             )
+
+
+def test_warm_start_receipt_requires_exact_source_digest_and_role(
+    tmp_path: Path,
+) -> None:
+    from sculptor.adapters.mjlab import _require_warm_start_loaded
+
+    source = tmp_path / "checkpoint.pt"
+    source.write_bytes(b"exact-policy")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload = {
+        "type": "warm_start_loaded",
+        "source": str(source.resolve()),
+        "source_sha256": digest,
+        "load_cfg_keys": ["actor"],
+    }
+    receipt = _require_warm_start_loaded(
+        "noise\n[SCULPT-EVENT] " + json.dumps(payload),
+        expected_source=source,
+        expected_sha256=digest,
+        expected_mode="actor_only",
+    )
+    assert receipt == payload
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "exactly one"),
+        ("duplicate", "exactly one"),
+        ("source", "source path mismatch"),
+        ("digest", "source digest mismatch"),
+        ("role", "role mismatch"),
+    ],
+)
+def test_warm_start_receipt_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    from sculptor.adapters.mjlab import _require_warm_start_loaded
+
+    source = tmp_path / "checkpoint.pt"
+    source.write_bytes(b"exact-policy")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload = {
+        "type": "warm_start_loaded",
+        "source": str(source.resolve()),
+        "source_sha256": digest,
+        "load_cfg_keys": ["actor", "critic"],
+    }
+    lines: list[str] = []
+    if mutation != "missing":
+        if mutation == "source":
+            payload["source"] = str(tmp_path / "other.pt")
+        elif mutation == "digest":
+            payload["source_sha256"] = "0" * 64
+        elif mutation == "role":
+            payload["load_cfg_keys"] = ["actor"]
+        lines.append("[SCULPT-EVENT] " + json.dumps(payload))
+        if mutation == "duplicate":
+            lines.append("[SCULPT-EVENT] " + json.dumps(payload))
+    with pytest.raises(RuntimeError, match=message):
+        _require_warm_start_loaded(
+            "\n".join(lines),
+            expected_source=source,
+            expected_sha256=digest,
+            expected_mode="actor_critic",
+        )
 
 
 # ── 2. _train_or_resume introspection + event emission ───────────────

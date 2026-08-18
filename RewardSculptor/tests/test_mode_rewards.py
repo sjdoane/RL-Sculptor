@@ -33,7 +33,16 @@ from sculptor.mode_rewards import (
     task_brief,
     validate_mode_reward_source,
 )
-from sculptor.modes import Guard, Mode, ModeError, ModeGraph, Transition
+from sculptor.modes import (
+    PER_ENV_EPISODE_ELAPSED_S,
+    Guard,
+    Mode,
+    ModeError,
+    ModeExecutionManifest,
+    ModeGraph,
+    Transition,
+    mode_graph_sha256,
+)
 
 
 def _graph(names=("approach", "launch", "land"), fps=30.0, span=30) -> ModeGraph:
@@ -91,7 +100,7 @@ def test_only_the_active_mode_is_paid(tmp_path):
     # Author each mode with a distinguishable constant.
     for i, name in enumerate(("approach", "launch", "land"), start=1):
         src = src.replace(
-            f"    del state, action, next_state, info\n    return 0.0, {{}}\n",
+            "    del state, action, next_state, info\n    return 0.0, {}\n",
             f"    del state, action, next_state, info\n"
             f"    return {float(i)}, {{'k': {float(i)}}}\n", 1)
     mod = _load(src, tmp_path)
@@ -238,6 +247,23 @@ def test_a_valid_scaffold_validates_clean():
     assert validate_mode_reward_source(generate_mode_reward_scaffold(g), g) == []
 
 
+def test_a_certified_clip_cannot_be_silently_retimed():
+    """Tier-D cadence is part of the certified artifact identity.
+
+    A caller may add an explicit terminal hold after the clip, but changing the
+    clip's declared time scale would turn the certificate into evidence for a
+    different motion.
+    """
+    graph = _graph()
+    source = generate_mode_reward_scaffold(graph).replace(
+        '"clip_time_scale": 1.0,',
+        '"clip_time_scale": 2.0,',
+        1,
+    )
+    errors = validate_mode_reward_source(source, graph)
+    assert any("retimes a certified reference" in error for error in errors)
+
+
 def test_a_scaffold_stale_against_a_renamed_mode_is_caught():
     """The silent dead end: the graph gained a mode after the scaffold was
     written, so that mode's terms could never be paid."""
@@ -266,6 +292,53 @@ def test_an_invalid_graph_is_refused_rather_than_scaffolded():
                     transitions=(), fps=30.0)
     with pytest.raises(ModeError):
         generate_mode_reward_scaffold(bad)
+
+
+def test_a_predicate_guard_is_refused_until_the_reward_has_a_stateful_executor():
+    """The schema can describe this graph; the elapsed-time reward cannot run it.
+
+    Accepting it would be worse than a missing feature: the predicate would be
+    serialized, then silently ignored while training switched on the clock.
+    """
+    graph = ModeGraph(
+        modes=(Mode("a", (0, 30)), Mode("b", (30, 60))),
+        transitions=(Transition(
+            "a", "b", Guard("predicate", expression="height > 0.5")),),
+        fps=30.0,
+    )
+    with pytest.raises(ModeError, match="state-dependent guards"):
+        generate_mode_reward_scaffold(graph)
+
+
+@pytest.mark.parametrize("transitions", [
+    # Branch: both targets are reachable, but elapsed time has no branch choice.
+    (Transition("a", "b", Guard("phase", at_phase=1.0)),
+     Transition("a", "c", Guard("phase", at_phase=1.0))),
+    # Linear reachability in a different order is still not declaration-order
+    # window execution.
+    (Transition("a", "c", Guard("phase", at_phase=1.0)),
+     Transition("c", "b", Guard("phase", at_phase=1.0))),
+])
+def test_a_branch_or_nonadjacent_graph_is_refused(transitions):
+    graph = ModeGraph(
+        modes=(Mode("a", (0, 30)), Mode("b", (30, 60)),
+               Mode("c", (60, 90))),
+        transitions=transitions,
+        fps=30.0,
+    )
+    with pytest.raises(ModeError, match="ordered, adjacent transition"):
+        generate_mode_reward_scaffold(graph)
+
+
+def test_an_early_phase_guard_is_refused_instead_of_silently_handed_over_late():
+    graph = ModeGraph(
+        modes=(Mode("a", (0, 30)), Mode("b", (30, 60))),
+        transitions=(Transition(
+            "a", "b", Guard("phase", at_phase=0.5)),),
+        fps=30.0,
+    )
+    with pytest.raises(ModeError, match=r"window boundary \(phase 1\.0\)"):
+        generate_mode_reward_scaffold(graph)
 
 
 # ── the authoring prompt ────────────────────────────────────────────────
@@ -311,6 +384,19 @@ def test_reward_spec_publishes_the_windows_for_the_metric_layer(tmp_path):
     mod = _load(generate_mode_reward_scaffold(_graph()), tmp_path)
     assert mod.REWARD_SPEC["mode_windows_s"]["launch"] == [1.0, 2.0]
     assert mod.MODE_ORDER == ["approach", "launch", "land"]
+
+
+def test_reward_spec_publishes_one_content_addressed_execution_manifest(tmp_path):
+    graph = _graph()
+    mod = _load(generate_mode_reward_scaffold(
+        graph, horizon_s=12.0), tmp_path, name="manifest")
+    manifest = ModeExecutionManifest.from_dict(
+        mod.REWARD_SPEC["mode_execution_manifest"])
+
+    assert manifest.mode_order == tuple(mod.MODE_ORDER)
+    assert manifest.window_map == mod.MODE_WINDOWS_S
+    assert manifest.time_basis == PER_ENV_EPISODE_ELAPSED_S
+    assert manifest.graph_sha256 == mode_graph_sha256(graph)
 
 
 # ── the real path: composed clip -> automaton -> scaffold ───────────────
@@ -1067,13 +1153,11 @@ def test_grafting_carries_a_helper_bound_by_tuple_unpacking(tmp_path):
     assert mod._LAUNCH_HI == 0.75 and mod._LAUNCH_LO == 0.25
 
 
-# ── episode-horizon scaling ────────────────────────────────────────────
-# A per-mode reward's windows are CLIP seconds (`frame / clip_fps`). Nothing in
-# that number knows the episode length, and on an authored world the two
-# disagree: platform-ascent-showcase gated a 20 s episode with a 6.92 s
-# composite, so `active_mode` clamped 75% of every episode into the terminal
-# mode — which pays stillness — and the entry window demanded 1.60 m/s against
-# a 1.0 m/s command cap. The policy stood still for three sculpt iterations.
+# ── certified cadence and episode holds ───────────────────────────────
+# A Tier-D certificate covers clip bytes at one cadence. The episode horizon
+# may add a terminal hold, but it cannot retime those bytes while retaining the
+# same identity/certificate. A retimed motion must be materialized and replay-
+# certified as a new reference.
 
 
 def test_no_horizon_keeps_clip_time_byte_for_byte():
@@ -1085,41 +1169,56 @@ def test_no_horizon_keeps_clip_time_byte_for_byte():
                                              horizon_s=None))
 
 
-def test_windows_stretch_to_span_the_episode(tmp_path):
-    """The whole point: after scaling no time is left over for the
-    terminal-mode clamp to swallow."""
+def test_horizon_preserves_certified_clip_cadence_and_declares_hold(tmp_path):
+    """Episode budget must not silently retime a Tier-D-certified motion."""
     g = _graph()                      # 3 modes x 30 frames @ 30 fps = 3.0 s
     mod = _load(generate_mode_reward_scaffold(
         g, behavior_goal="x", horizon_s=12.0), tmp_path, name="scaled")
-    assert mod.MODE_WINDOWS_S["approach"] == (0.0, 4.0)
-    assert mod.MODE_WINDOWS_S["land"][1] == pytest.approx(12.0)
-    assert mod.REWARD_SPEC["clip_time_scale"] == pytest.approx(4.0)
+    assert mod.MODE_WINDOWS_S["approach"] == (0.0, 1.0)
+    assert mod.MODE_WINDOWS_S["land"] == pytest.approx((2.0, 12.0))
+    assert mod.REWARD_SPEC["clip_time_scale"] == pytest.approx(1.0)
     assert mod.REWARD_SPEC["episode_horizon_s"] == 12.0
+    assert mod.REWARD_SPEC["terminal_hold_s"] == pytest.approx(9.0)
+    manifest = mod.REWARD_SPEC["mode_execution_manifest"]
+    assert manifest["schema_version"] == 2
+    assert manifest["certified_clip_duration_s"] == pytest.approx(3.0)
+    assert manifest["terminal_hold_s"] == pytest.approx(9.0)
+    assert manifest["windows_s"]["land"] == pytest.approx([2.0, 12.0])
+    assert mod.REWARD_SPEC["schedule_policy"] == (
+        "certified_clip_cadence_then_terminal_hold"
+    )
 
 
-def test_scaling_moves_the_gate_not_just_the_literal(tmp_path):
-    """Execute it. At t=3.5 s the unscaled automaton is past its last window
-    and clamps to the terminal mode; the scaled one is still in the first."""
+def test_terminal_hold_executes_the_terminal_mode(tmp_path):
+    """Execute the declared post-motion hold, rather than inferring it."""
     g = _graph()
     clipt = _load(generate_mode_reward_scaffold(g, behavior_goal="x"),
                   tmp_path, name="clipt")
-    scaled = _load(generate_mode_reward_scaffold(g, behavior_goal="x",
-                                                 horizon_s=12.0),
-                   tmp_path, name="scaledt")
+    held = _load(generate_mode_reward_scaffold(g, behavior_goal="x",
+                                               horizon_s=12.0),
+                 tmp_path, name="heldt")
     assert clipt.active_mode(_info(3.5)) == "land"
-    assert scaled.active_mode(_info(3.5)) == "approach"
+    assert held.active_mode(_info(3.5)) == "land"
 
 
-def test_tracking_duration_scales_with_the_windows(tmp_path):
-    """`REFERENCE_DURATION_S` and the windows must share one clock. Stretch
-    only the gate and the backbone tracks a different instant than the mode
-    being paid."""
+def test_tracking_duration_remains_certified_while_terminal_mode_holds(tmp_path):
+    """The tracker freezes at the certified end while the manifest scores hold."""
     mod = _load(generate_mode_reward_scaffold(
         _graph(), behavior_goal="x", clip=_tracking_clip(n=90, fps=30.0),
         horizon_s=12.0), tmp_path, name="dur")
-    assert mod.REFERENCE_DURATION_S == pytest.approx(12.0)
-    assert mod.MODE_WINDOWS_S["land"][1] == pytest.approx(
-        mod.REFERENCE_DURATION_S)
+    assert mod.REFERENCE_DURATION_S == pytest.approx(3.0)
+    assert mod.MODE_WINDOWS_S["land"][1] == pytest.approx(12.0)
+    manifest = mod.REWARD_SPEC["mode_execution_manifest"]
+    assert manifest["certified_clip_duration_s"] == pytest.approx(
+        mod.REFERENCE_DURATION_S
+    )
+
+
+def test_horizon_shorter_than_certified_motion_fails_closed():
+    with pytest.raises(ModeError, match="shorter than the certified motion"):
+        generate_mode_reward_scaffold(
+            _graph(), behavior_goal="x", horizon_s=2.5
+        )
 
 
 def test_degenerate_horizons_fall_back_to_clip_time():
@@ -1131,9 +1230,8 @@ def test_degenerate_horizons_fall_back_to_clip_time():
             g, behavior_goal="x", horizon_s=bad) == base
 
 
-def test_a_horizon_fitted_scaffold_still_validates_against_its_graph():
-    """Fitting to an episode is not staleness. The windows no longer equal the
-    graph's clip seconds, and the check has to know the difference."""
+def test_a_horizon_held_scaffold_still_validates_against_its_graph():
+    """The explicit hold does not alter the graph's certified windows."""
     g = _graph()
     src = generate_mode_reward_scaffold(g, behavior_goal="x", horizon_s=12.0)
     assert validate_mode_reward_source(src, g) == []
@@ -1199,6 +1297,17 @@ def test_default_weight_leaves_pure_imitation_scaffolds_untouched():
     assert generate_mode_reward_scaffold(
         g, behavior_goal="x", clip=clip, tracking_weight=1.0
     ) == generate_mode_reward_scaffold(g, behavior_goal="x", clip=clip)
+
+
+def test_reward_spec_reports_whether_tracking_is_actually_present(tmp_path):
+    tracked = _load(generate_mode_reward_scaffold(
+        _graph(), behavior_goal="x", clip=_tracking_clip()),
+        tmp_path, name="tracked_spec")
+    task_only = _load(generate_mode_reward_scaffold(
+        _graph(), behavior_goal="x"), tmp_path, name="task_only_spec")
+
+    assert tracked.REWARD_SPEC["tracking_enabled"] is True
+    assert task_only.REWARD_SPEC["tracking_enabled"] is False
 
 
 # ── mission brief ───────────────────────────────────────────────────────

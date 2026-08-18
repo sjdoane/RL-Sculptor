@@ -1,14 +1,16 @@
-"""sculptor/modes.py — stages as OGMP modes with explicit transition guards.
+"""sculptor/modes.py — an OGMP-inspired phase graph over a fixed reference.
 
-The lab review's framework (docs/RESEARCH_DIRECTION.md §4; OGMP, arXiv
-2403.04205) formalizes a multi-phase behavior as a **hybrid automaton**: a set
-of *modes*, each bundling one sub-behavior, connected by *transitions* whose
-*guards* say when control hands over. The reviewer's point was that this repo's
-stage decomposition had rediscovered that structure informally — stages are
-modes, but the handover between them was never written down.
+The distinction in that title is deliberate. Original OGMP (arXiv 2403.04205)
+uses an online, closed-loop, receding-horizon oracle; rho-bounded permissible
+state exploration; task-parameterized modes; and one policy conditioned on a
+learned mode latent, clock, and task feedback. This module implements none of
+those mechanisms. It derives a finite set of **clip-time phase windows** from
+the seams of one composed, open-loop reference. The generated reward dispatches
+by episode time. Transition guards are validated and reportable metadata, not
+the runtime handover authority or a policy observation.
 
-Writing it down is what this module adds, and it buys three things the implicit
-version cannot:
+That smaller abstraction is still useful, and writing it down buys three
+things the previous implicit stage decomposition could not:
 
 1. **Per-mode reward scope.** A term authored for "launch" should not be paid
    during "land". A mode owns a phase window, so a reward can be gated to it
@@ -29,17 +31,22 @@ between two segments is exactly the transition between them — so
 `modes_from_composition` reads a hybrid automaton straight out of a clip that
 already exists, rather than asking an LLM to invent one.
 
-Scope, stated honestly: this module defines and validates the structure and
-derives it from a composition. It does **not** author per-mode reward code or
-run the metric gauntlet per mode — those consume this schema and are separate
-work (see HANDOFF §9). Guards here are *phase* predicates (time/progress
-through the reference), which is what a composed reference can support;
-state-predicate guards are a superset this schema leaves room for via
-`guard.kind`.
+Scope, stated honestly: this module defines, validates, and derives the phase
+graph. ``sculptor.mode_rewards`` consumes it to generate a time-windowed reward
+module. Production rollouts persist digest-bound, diagnostic-only per-window
+evidence through ``sculptor.eval.mode_metrics``; the generated/validated/
+calibrated per-mode objective gauntlet remains an explicit research workflow,
+not a fitness or selection authority. Predicate guards are an
+extension point carried to the isolated criterion evaluator; the generated
+training reward does not execute them. Any UI/API using this schema must expose
+those capability limits rather than calling the result paper-faithful OGMP.
 """
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -50,6 +57,13 @@ from typing import Any, Mapping, Optional
 GUARD_KINDS = ("phase", "predicate")
 
 MODES_SCHEMA_VERSION = 1
+MODE_EXECUTION_SCHEMA_VERSION = 2
+LEGACY_MODE_EXECUTION_SCHEMA_VERSION = 1
+
+#: The generated reward reads ``episode_length * step_dt`` independently for
+#: each vectorized environment.  Naming that clock in the manifest keeps an
+#: evaluator from silently interpreting the same numeric windows as clip time.
+PER_ENV_EPISODE_ELAPSED_S = "per_env_episode_elapsed_s"
 
 
 class ModeError(ValueError):
@@ -146,6 +160,105 @@ class ModeGraph:
             "transitions": [t.to_dict() for t in self.transitions],
             "source": dict(self.source),
         }
+
+
+@dataclass(frozen=True)
+class ModeExecutionManifest:
+    """The exact phase schedule a generated reward executes.
+
+    A :class:`ModeGraph` owns reference-frame ranges at the reference's
+    certified cadence.  Those ranges are never silently stretched to consume a
+    longer episode: unused budget is represented as an explicit terminal-hold
+    mode.  This immutable record is the join between authoring and execution:
+    exact emitted windows, their order and clock, plus a digest of the graph
+    they came from.  Evaluation therefore scores the same schedule training
+    executed instead of re-deriving or retiming it.
+
+    ``windows_s`` is a tuple rather than a mutable mapping so a caller cannot
+    change the evaluation schedule after validating it.  Version 2 also names
+    the certified clip duration and the post-clip terminal hold separately.
+    That distinction is load-bearing: extending only the terminal window is a
+    hold, while stretching every window is an uncertified retiming.
+
+    ``to_dict`` exposes the ergonomic mapping stored in ``REWARD_SPEC``.
+    """
+
+    mode_order: tuple[str, ...]
+    windows_s: tuple[tuple[str, float, float], ...]
+    time_basis: str
+    graph_sha256: str
+    certified_clip_duration_s: Optional[float] = None
+    terminal_hold_s: float = 0.0
+    schema_version: int = MODE_EXECUTION_SCHEMA_VERSION
+
+    @property
+    def window_map(self) -> dict[str, tuple[float, float]]:
+        return {name: (lo, hi) for name, lo, hi in self.windows_s}
+
+    def to_dict(self) -> dict[str, Any]:
+        value = {
+            "schema_version": self.schema_version,
+            "mode_order": list(self.mode_order),
+            "windows_s": {
+                name: [lo, hi] for name, lo, hi in self.windows_s
+            },
+            "time_basis": self.time_basis,
+            "graph_sha256": self.graph_sha256,
+        }
+        # Preserve the normalized byte identity of schema-1 manifests. They
+        # remain readable as zero-hold legacy schedules, but every newly built
+        # manifest is schema 2 and records the distinction explicitly.
+        if self.schema_version >= 2:
+            value["certified_clip_duration_s"] = (
+                self.certified_clip_duration_s
+            )
+            value["terminal_hold_s"] = self.terminal_hold_s
+        return value
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ModeExecutionManifest":
+        """Parse the data-only form stored in a generated reward.
+
+        Parsing is deliberately strict.  A partial/legacy object must not look
+        like an authoritative schedule; callers can explicitly build a raw
+        graph-time manifest instead.
+        """
+        try:
+            order = tuple(str(name) for name in value["mode_order"])
+            raw_windows = value["windows_s"]
+            if not isinstance(raw_windows, Mapping):
+                raise TypeError("windows_s must be a mapping")
+            if set(raw_windows) != set(order):
+                raise ValueError(
+                    "windows_s keys must exactly match mode_order: "
+                    f"got {sorted(str(k) for k in raw_windows)!r}, "
+                    f"expected {sorted(order)!r}"
+                )
+            windows = tuple(
+                (name, float(raw_windows[name][0]), float(raw_windows[name][1]))
+                for name in order
+            )
+            schema_version = int(value["schema_version"])
+            certified_duration = None
+            terminal_hold = 0.0
+            if schema_version >= 2:
+                certified_duration = float(
+                    value["certified_clip_duration_s"]
+                )
+                terminal_hold = float(value["terminal_hold_s"])
+            return cls(
+                mode_order=order,
+                windows_s=windows,
+                time_basis=str(value["time_basis"]),
+                graph_sha256=str(value["graph_sha256"]),
+                certified_clip_duration_s=certified_duration,
+                terminal_hold_s=terminal_hold,
+                schema_version=schema_version,
+            )
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ModeError(
+                f"invalid mode execution manifest: {type(exc).__name__}: {exc}"
+            ) from exc
 
 
 def validate_mode_graph(graph: ModeGraph) -> list[str]:
@@ -331,3 +444,246 @@ def mode_phase_windows(graph: ModeGraph) -> dict[str, tuple[float, float]]:
                  round(m.frame_range[1] / graph.fps, 4))
         for m in graph.modes
     }
+
+
+def mode_graph_sha256(graph: ModeGraph) -> str:
+    """Content digest of the complete, data-only mode graph.
+
+    Sorting mapping keys makes the digest independent of insertion order while
+    retaining mode/transition list order, which is semantically significant.
+    Refusing non-JSON source metadata is safer than stringifying it into a hash
+    that another process cannot reproduce.
+    """
+    try:
+        payload = json.dumps(
+            graph.to_dict(), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ModeError(
+            f"mode graph cannot be content-addressed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def build_mode_execution_manifest(
+    graph: ModeGraph,
+    *,
+    windows_s: Optional[Mapping[str, tuple[float, float]]] = None,
+    terminal_hold_s: float = 0.0,
+    time_basis: str = PER_ENV_EPISODE_ELAPSED_S,
+) -> ModeExecutionManifest:
+    """Build and validate the exact schedule a reward/evaluator will execute."""
+    order = tuple(mode.name for mode in graph.modes)
+    raw_windows = mode_phase_windows(graph)
+    try:
+        terminal_hold_s = float(terminal_hold_s)
+    except (TypeError, ValueError) as exc:
+        raise ModeError(
+            "cannot build mode execution manifest: terminal_hold_s must be "
+            "a finite non-negative number"
+        ) from exc
+    if not math.isfinite(terminal_hold_s) or terminal_hold_s < 0.0:
+        raise ModeError(
+            "cannot build mode execution manifest: terminal_hold_s must be "
+            f"finite and >= 0, got {terminal_hold_s!r}"
+        )
+    resolved = dict(windows_s or raw_windows)
+    if windows_s is None and order and terminal_hold_s > 0.0:
+        terminal_name = order[-1]
+        lo, hi = resolved[terminal_name]
+        resolved[terminal_name] = (lo, hi + terminal_hold_s)
+    if set(resolved) != set(order):
+        raise ModeError(
+            "cannot build mode execution manifest: windows_s keys must exactly "
+            f"match mode order; got {sorted(str(k) for k in resolved)!r}, "
+            f"expected {sorted(order)!r}"
+        )
+    try:
+        rows = tuple(
+            (name, float(resolved[name][0]), float(resolved[name][1]))
+            for name in order
+        )
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ModeError(
+            f"cannot build mode execution manifest: {type(exc).__name__}: {exc}"
+        ) from exc
+    manifest = ModeExecutionManifest(
+        mode_order=order,
+        windows_s=rows,
+        time_basis=str(time_basis),
+        graph_sha256=mode_graph_sha256(graph),
+        certified_clip_duration_s=max(
+            (float(hi) for _lo, hi in raw_windows.values()), default=0.0
+        ),
+        terminal_hold_s=terminal_hold_s,
+    )
+    errors = validate_mode_execution_manifest(manifest, graph)
+    if errors:
+        raise ModeError(
+            "invalid mode execution manifest:\n  - " + "\n  - ".join(errors)
+        )
+    return manifest
+
+
+def validate_mode_execution_manifest(
+    manifest: ModeExecutionManifest, graph: ModeGraph,
+) -> list[str]:
+    """Every mismatch between an execution schedule and its claimed graph."""
+    errors = validate_mode_graph(graph)
+    if errors:
+        return errors
+    if manifest.schema_version not in {
+        LEGACY_MODE_EXECUTION_SCHEMA_VERSION,
+        MODE_EXECUTION_SCHEMA_VERSION,
+    }:
+        errors.append(
+            f"execution manifest schema {manifest.schema_version} is unsupported; "
+            f"expected {LEGACY_MODE_EXECUTION_SCHEMA_VERSION} or "
+            f"{MODE_EXECUTION_SCHEMA_VERSION}"
+        )
+    if manifest.time_basis != PER_ENV_EPISODE_ELAPSED_S:
+        errors.append(
+            f"execution manifest time_basis {manifest.time_basis!r} is unsupported; "
+            f"expected {PER_ENV_EPISODE_ELAPSED_S!r}"
+        )
+
+    expected_order = tuple(mode.name for mode in graph.modes)
+    if manifest.mode_order != expected_order:
+        errors.append(
+            f"execution manifest mode_order {list(manifest.mode_order)!r} does "
+            f"not match graph order {list(expected_order)!r}"
+        )
+    row_names = tuple(name for name, _lo, _hi in manifest.windows_s)
+    if row_names != manifest.mode_order:
+        errors.append(
+            f"execution manifest windows are ordered {list(row_names)!r}, not "
+            f"{list(manifest.mode_order)!r}"
+        )
+    for name, lo, hi in manifest.windows_s:
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            errors.append(
+                f"execution manifest window for {name!r} must be finite, got "
+                f"({lo!r}, {hi!r})"
+            )
+        elif hi <= lo:
+            errors.append(
+                f"execution manifest window for {name!r} must be non-empty, got "
+                f"({lo!r}, {hi!r})"
+            )
+    raw_windows = mode_phase_windows(graph)
+    emitted = manifest.window_map
+    terminal_name = expected_order[-1]
+    raw_duration = max(
+        (float(hi) for _lo, hi in raw_windows.values()), default=0.0
+    )
+    if manifest.schema_version >= 2:
+        if (
+            manifest.certified_clip_duration_s is None
+            or not math.isfinite(manifest.certified_clip_duration_s)
+            or not math.isclose(
+                manifest.certified_clip_duration_s,
+                raw_duration,
+                abs_tol=1e-3,
+            )
+        ):
+            errors.append(
+                "execution manifest certified_clip_duration_s does not match "
+                f"the graph: expected {raw_duration:g}, got "
+                f"{manifest.certified_clip_duration_s!r}"
+            )
+        if (
+            not math.isfinite(manifest.terminal_hold_s)
+            or manifest.terminal_hold_s < 0.0
+        ):
+            errors.append(
+                "execution manifest terminal_hold_s must be finite and >= 0, "
+                f"got {manifest.terminal_hold_s!r}"
+            )
+    else:
+        # A v1 manifest did not have a field capable of distinguishing a hold
+        # from a retiming. Treat it as an exact certified-cadence/zero-hold
+        # schedule. New rewards always write v2.
+        if manifest.terminal_hold_s != 0.0:
+            errors.append("schema-1 execution manifests cannot declare a hold")
+
+    for name, (raw_lo, raw_hi) in raw_windows.items():
+        emitted_lo, emitted_hi = emitted.get(name, (float("nan"),) * 2)
+        expected_hi = raw_hi
+        if name == terminal_name and manifest.schema_version >= 2:
+            expected_hi = raw_hi + manifest.terminal_hold_s
+        if (
+            not math.isclose(emitted_lo, raw_lo, abs_tol=1e-3)
+            or not math.isclose(emitted_hi, expected_hi, abs_tol=1e-3)
+        ):
+            expectation = (
+                f"certified-cadence window ({raw_lo:g}, {raw_hi:g})"
+                if name != terminal_name or manifest.schema_version < 2
+                else "certified terminal window "
+                f"({raw_lo:g}, {raw_hi:g}) plus explicit "
+                f"{manifest.terminal_hold_s:g}s hold"
+            )
+            errors.append(
+                f"execution manifest window for {name!r} is "
+                f"({emitted_lo:g}, {emitted_hi:g}), not the {expectation}; "
+                "materialize and "
+                "re-certify a retimed reference instead"
+            )
+    expected_digest = mode_graph_sha256(graph)
+    if manifest.graph_sha256 != expected_digest:
+        errors.append(
+            "execution manifest graph_sha256 does not match this graph: "
+            f"expected {expected_digest}, got {manifest.graph_sha256}"
+        )
+    return errors
+
+
+def validate_phase_window_execution_graph(graph: ModeGraph) -> list[str]:
+    """Can the current elapsed-time reward execute this graph *exactly*?
+
+    The schema intentionally represents richer automata for future controllers,
+    but today's generated reward has no stateful transition executor: it moves
+    through contiguous windows in declaration order.  Reject every graph whose
+    transition semantics would otherwise be silently ignored.
+    """
+    errors = validate_mode_graph(graph)
+    if errors:
+        return errors
+
+    expected_edges = [
+        (graph.modes[i].name, graph.modes[i + 1].name)
+        for i in range(len(graph.modes) - 1)
+    ]
+    actual_edges = [(t.from_mode, t.to_mode) for t in graph.transitions]
+    if actual_edges != expected_edges:
+        errors.append(
+            "elapsed-time mode rewards require exactly one ordered, adjacent "
+            f"transition per boundary: expected {expected_edges!r}, got "
+            f"{actual_edges!r}"
+        )
+
+    for index, transition in enumerate(graph.transitions):
+        if transition.guard.kind != "phase":
+            errors.append(
+                f"transition[{index}] {transition.from_mode!r}->"
+                f"{transition.to_mode!r} uses {transition.guard.kind!r}; the "
+                "elapsed-time reward cannot execute state-dependent guards"
+            )
+        elif transition.guard.at_phase is None or not math.isclose(
+            float(transition.guard.at_phase), 1.0, rel_tol=0.0, abs_tol=1e-12,
+        ):
+            errors.append(
+                f"transition[{index}] {transition.from_mode!r}->"
+                f"{transition.to_mode!r} fires at phase "
+                f"{transition.guard.at_phase!r}; the elapsed-time reward hands "
+                "over only at the emitted window boundary (phase 1.0)"
+            )
+
+    for earlier, later in zip(graph.modes, graph.modes[1:]):
+        if int(earlier.frame_range[1]) != int(later.frame_range[0]):
+            errors.append(
+                f"mode windows must be contiguous for elapsed-time execution: "
+                f"{earlier.name!r} ends at frame {earlier.frame_range[1]} but "
+                f"{later.name!r} starts at frame {later.frame_range[0]}"
+            )
+    return errors

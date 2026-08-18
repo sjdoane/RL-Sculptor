@@ -314,6 +314,7 @@ class SculptorKG:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        self._transaction_depth = 0
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate()
         self._conn.commit()
@@ -359,12 +360,40 @@ class SculptorKG:
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
+        if self._transaction_depth > 0:
+            yield self._conn
+            return
         try:
             yield self._conn
             self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
+
+    @contextmanager
+    def transaction(self) -> Iterator["SculptorKG"]:
+        """Atomically group normal ``add_node``/``add_edge`` operations.
+
+        Store methods historically committed each write independently.  This
+        public boundary keeps that behavior for ordinary callers while letting
+        multi-edge scientific attestations publish all-or-nothing.  Nested
+        transactions join the outer unit instead of committing early.
+        """
+        outermost = self._transaction_depth == 0
+        if outermost:
+            self._conn.execute("BEGIN IMMEDIATE")
+        self._transaction_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._transaction_depth -= 1
+            if outermost:
+                self._conn.rollback()
+            raise
+        else:
+            self._transaction_depth -= 1
+            if outermost:
+                self._conn.commit()
 
     # ── nodes ───────────────────────────────────────────────────────────────
     def add_node(self, node: Any, *, upsert: bool = True) -> str:

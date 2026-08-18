@@ -11,18 +11,34 @@ must never have.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pytest
+from typer.testing import CliRunner
 
+from sculptor.cli import app
 from sculptor.export import (
+    DEPLOYMENT_BUNDLE_KIND,
     ExportError,
     export_policy_bundle,
+    export_reference_starting_skill_bundle,
+    export_starting_skill_bundle,
     list_exportable_iters,
 )
+from sculptor.reference import save_clip
+from sculptor.refs import library as reference_library
+from sculptor.skill_bundle import (
+    BUNDLE_KIND,
+    ImportTarget,
+    SkillBundleError,
+    StartingSkillBundleImporter,
+)
+from sculptor.skill_library import SkillLibrary
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GO1_CKPT = FIXTURES / "go1_smoke_checkpoint.pt"
@@ -75,6 +91,41 @@ def _make_project(
         if with_iter_env:
             (it / "env_spec.json").write_text(json.dumps(env_spec))
     return project
+
+
+def _make_library_reference(
+    root: Path,
+    *,
+    robot: str = "g1",
+    clip_id: str = "parkour_seed",
+) -> tuple[Path, Path, dict]:
+    clip_dir = reference_library.clip_dir(robot, clip_id, root=root)
+    clip_path = clip_dir / reference_library.CLIP_FILENAME
+    n_frames = 30
+    time = np.arange(n_frames, dtype=np.float64) / 30.0
+    save_clip(clip_path, {
+        "root_pos_z": np.full(n_frames, 0.78),
+        "root_pos_xy": np.stack((0.3 * time, np.zeros_like(time)), axis=1),
+        "fps": 30.0,
+        "joint_pos": np.zeros((n_frames, 2)),
+        "joint_names": ["j0", "j1"],
+        "meta": {"source": "test_export.reference"},
+    })
+    provenance = reference_library.make_provenance(
+        clip_id=clip_id,
+        robot=robot,
+        source={"kind": "unit-test", "dataset": "synthetic"},
+        license="CC0-1.0",
+        attribution="RewardSculptor test fixture",
+        content_sha256_=hashlib.sha256(clip_path.read_bytes()).hexdigest(),
+        fps_source=30.0,
+        labels=["parkour", "complex-motion"],
+        text="A complex G1 parkour seed",
+    )
+    provenance_path = reference_library.write_provenance(
+        robot, clip_id, provenance, root=root,
+    )
+    return clip_path, provenance_path, provenance
 
 
 # ── discovery ──────────────────────────────────────────────────────────────
@@ -143,6 +194,294 @@ def test_export_bundle_contents_and_manifest(tmp_path):
     assert net["output"] == "mean_action"
     # every listed file carries a sha256
     assert all(len(f["sha256"]) == 64 for f in manifest["files"])
+
+
+def test_portable_starting_skill_is_data_only_and_importable(tmp_path):
+    project = _make_project(tmp_path)
+    deployment = export_policy_bundle(project)
+    portable = export_starting_skill_bundle(
+        project, robot_slug="go1",
+    )
+
+    assert deployment.manifest["kind"] == DEPLOYMENT_BUNDLE_KIND
+    assert portable.bundle_path.suffix == ".rskill"
+    assert portable.manifest["kind"] == BUNDLE_KIND
+    with zipfile.ZipFile(portable.bundle_path) as archive:
+        names = set(archive.namelist())
+        manifest = json.loads(archive.read("manifest.json"))
+    assert names == {"manifest.json", "policy/weights.safetensors"}
+    assert manifest["checkpoint"]["included"] is False
+    assert {
+        "checkpoint.pt", "policy_ts.pt", "policy.onnx", "inference.py",
+        "DEPLOY.md", "config.toml", "env_spec.json",
+    }.isdisjoint(names)
+
+    contract = manifest["compatibility_contract"]
+    identity = contract["identity"]
+    with pytest.raises(
+        SkillBundleError,
+        match="unsupported portable bundle member|deployment ZIPs are not portable",
+    ):
+        StartingSkillBundleImporter(
+            SkillLibrary(tmp_path / "deployment-rejection-library")
+        ).import_archive(
+            deployment.bundle_path,
+            target=ImportTarget(
+                adapter_class=identity["adapter_class"],
+                task_id=identity["task_id"],
+                robot_slug="go1",
+                compatibility_contract=contract,
+            ),
+        )
+
+    imported = StartingSkillBundleImporter(
+        SkillLibrary(tmp_path / "portable-library")
+    ).import_archive(
+        portable.bundle_path,
+        target=ImportTarget(
+            adapter_class=identity["adapter_class"],
+            task_id=identity["task_id"],
+            robot_slug="go1",
+            compatibility_contract=contract,
+        ),
+    )
+    assert imported.record.policy_roles[0] == "actor"
+    assert imported.record.original_checkpoint_sha256 == (
+        deployment.manifest["checkpoint"]["sha256"]
+    )
+
+
+def test_portable_export_requires_rskill_extension(tmp_path):
+    project = _make_project(tmp_path)
+    with pytest.raises(ExportError, match="must end in .rskill"):
+        export_starting_skill_bundle(
+            project, out_path=tmp_path / "not-portable.zip", robot_slug="go1",
+        )
+
+
+def test_portable_export_derives_and_cross_checks_project_robot(tmp_path):
+    project = _make_project(tmp_path)
+    (project / "metadata.json").write_text(json.dumps({
+        "robot_source": {"kind": "library", "library_slug": "go1"},
+    }))
+
+    result = export_starting_skill_bundle(project)
+    assert result.manifest["starting_skill"]["robot_slug"] == "go1"
+    assert result.manifest["deployment"]["robot_slug"] == "go1"
+    with pytest.raises(ExportError, match="conflicts with project metadata"):
+        export_starting_skill_bundle(project, robot_slug="g1")
+
+
+def test_reference_starting_skill_round_trips_through_importer(
+    tmp_path, monkeypatch,
+):
+    source_root = tmp_path / "source-references"
+    clip_path, provenance_path, _ = _make_library_reference(source_root)
+    out = tmp_path / "exports" / "g1-parkour.rskill"
+
+    exported = export_reference_starting_skill_bundle(
+        robot_slug="g1",
+        clip_id="parkour_seed",
+        out_path=out,
+        name="G1 parkour exploration seed",
+        references_root=source_root,
+    )
+
+    assert exported.bundle_path == out.resolve()
+    assert exported.manifest["starting_skill"] == {
+        "name": "G1 parkour exploration seed",
+        "robot_slug": "g1",
+    }
+    assert exported.manifest["reference"]["content_sha256"] == hashlib.sha256(
+        clip_path.read_bytes()
+    ).hexdigest()
+    assert exported.manifest["reference"]["provenance_sha256"] == hashlib.sha256(
+        provenance_path.read_bytes()
+    ).hexdigest()
+    with zipfile.ZipFile(out) as archive:
+        assert set(archive.namelist()) == {
+            "manifest.json",
+            "motion/clip.npz",
+            "motion/provenance.json",
+        }
+        manifest = json.loads(archive.read("manifest.json"))
+        for descriptor in manifest["files"]:
+            payload = archive.read(descriptor["path"])
+            assert descriptor["bytes"] == len(payload)
+            assert descriptor["sha256"] == hashlib.sha256(payload).hexdigest()
+
+    imported_root = tmp_path / "imported-references"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(imported_root))
+    imported = StartingSkillBundleImporter(
+        SkillLibrary(tmp_path / "starting-skill-library")
+    ).import_archive(
+        out,
+        target=ImportTarget(
+            adapter_class="target.Adapter",
+            task_id="Target-Task",
+            robot_slug="g1",
+            compatibility_contract=None,
+        ),
+    )
+    assert imported.record.policy_roles == []
+    assert imported.record.initialization_modes == ["reference_only"]
+    assert imported.record.reference_robot == "g1"
+    assert imported.record.reference_clip_id == "parkour_seed"
+    assert imported.receipt["authorization"]["status"] == "candidate"
+    assert imported.receipt["authorization"]["training_authorized"] is False
+    assert (
+        imported_root / "g1" / "parkour_seed" / "clip.npz"
+    ).read_bytes() == clip_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("robot", "clip_id", "message"),
+    [
+        ("../g1", "parkour_seed", "safe stable library identifier"),
+        ("g1", "../parkour_seed", "invalid reference clip identity"),
+        ("g1/other", "parkour_seed", "safe stable library identifier"),
+    ],
+)
+def test_reference_export_rejects_hostile_library_identity(
+    tmp_path, robot, clip_id, message,
+):
+    with pytest.raises(ExportError, match=message):
+        export_reference_starting_skill_bundle(
+            robot_slug=robot,
+            clip_id=clip_id,
+            out_path=tmp_path / "skill.rskill",
+            references_root=tmp_path / "references",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("robot", "h1", "provenance robot does not match"),
+        ("clip_id", "different_clip", "provenance clip_id does not match"),
+        ("robot", None, "missing required field: robot"),
+        ("clip_id", None, "missing required field: clip_id"),
+    ],
+)
+def test_reference_export_requires_exact_provenance_identity(
+    tmp_path, field, value, message,
+):
+    source_root = tmp_path / "references"
+    _, provenance_path, provenance = _make_library_reference(source_root)
+    if value is None:
+        provenance.pop(field)
+    else:
+        provenance[field] = value
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ExportError, match=message):
+        export_reference_starting_skill_bundle(
+            robot_slug="g1",
+            clip_id="parkour_seed",
+            out_path=tmp_path / "skill.rskill",
+            references_root=source_root,
+        )
+
+
+def test_reference_export_rejects_missing_and_duplicate_provenance(
+    tmp_path,
+):
+    source_root = tmp_path / "references"
+    _, provenance_path, _ = _make_library_reference(source_root)
+    provenance_path.unlink()
+    with pytest.raises(ExportError, match="provenance is missing"):
+        export_reference_starting_skill_bundle(
+            robot_slug="g1",
+            clip_id="parkour_seed",
+            out_path=tmp_path / "missing.rskill",
+            references_root=source_root,
+        )
+
+    _, provenance_path, _ = _make_library_reference(source_root)
+    raw = provenance_path.read_text(encoding="utf-8")
+    raw = raw.replace(
+        '"robot": "g1"', '"robot": "g1", "robot": "g1"', 1,
+    )
+    provenance_path.write_text(raw, encoding="utf-8")
+    with pytest.raises(ExportError, match="duplicate key 'robot'"):
+        export_reference_starting_skill_bundle(
+            robot_slug="g1",
+            clip_id="parkour_seed",
+            out_path=tmp_path / "duplicate.rskill",
+            references_root=source_root,
+        )
+
+
+def test_reference_export_rejects_clip_digest_drift_and_missing_bytes(
+    tmp_path,
+):
+    source_root = tmp_path / "references"
+    clip_path, _, _ = _make_library_reference(source_root)
+    clip_path.write_bytes(clip_path.read_bytes() + b"drift")
+    with pytest.raises(ExportError, match="digest does not match provenance"):
+        export_reference_starting_skill_bundle(
+            robot_slug="g1",
+            clip_id="parkour_seed",
+            out_path=tmp_path / "drift.rskill",
+            references_root=source_root,
+        )
+
+    clip_path.unlink()
+    with pytest.raises(ExportError, match="clip bytes are missing"):
+        export_reference_starting_skill_bundle(
+            robot_slug="g1",
+            clip_id="parkour_seed",
+            out_path=tmp_path / "missing.rskill",
+            references_root=source_root,
+        )
+
+
+def test_reference_export_is_atomic_when_archive_write_fails(
+    tmp_path, monkeypatch,
+):
+    import sculptor.export as export_module
+
+    source_root = tmp_path / "references"
+    _make_library_reference(source_root)
+    out = tmp_path / "existing.rskill"
+    out.write_bytes(b"previous complete export")
+
+    def fail_on_clip(*args, **kwargs):
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(export_module, "_write_zip_member_verified", fail_on_clip)
+    with pytest.raises(OSError, match="simulated write failure"):
+        export_reference_starting_skill_bundle(
+            robot_slug="g1",
+            clip_id="parkour_seed",
+            out_path=out,
+            references_root=source_root,
+        )
+    assert out.read_bytes() == b"previous complete export"
+    assert list(tmp_path.glob(".existing.rskill.*.tmp")) == []
+
+
+def test_refs_export_skill_cli_uses_exact_identity_and_clear_candidate_copy(
+    tmp_path, monkeypatch,
+):
+    source_root = tmp_path / "references"
+    _make_library_reference(source_root)
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(source_root))
+    out = tmp_path / "cli" / "parkour.rskill"
+
+    result = CliRunner().invoke(app, [
+        "refs", "export-skill",
+        "--robot", "g1",
+        "--clip", "parkour_seed",
+        "--out", str(out),
+        "--name", "Research parkour seed",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert out.is_file()
+    assert "pinned g1/parkour_seed" in result.output
+    assert "candidate only" in result.output
+    assert "Tier-D admission remains required" in result.output
 
 
 def test_deployment_contract_and_inference_script(tmp_path):

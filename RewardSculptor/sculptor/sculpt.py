@@ -463,8 +463,18 @@ def _promote_iteration_selection(
 _MODE_REWARD_MARKERS = ("MODE_ORDER", "MODE_WINDOWS_S")
 
 
-def _promoted_mode_reward_clip(rewards_dir: Path) -> Optional[str]:
-    """The clip the newest promoted reward already tracks per mode, if any.
+def _promoted_mode_reward(
+    rewards_dir: Path,
+) -> Optional[tuple[int, Path, dict[str, Any]]]:
+    """Resolve the phase reward that ``current.py`` actually promotes.
+
+    A reward version is not promoted merely because it has the largest
+    integer suffix.  Keep-best and explicit recovery are allowed to point
+    ``current.py`` at an older version, so using the directory maximum here
+    can bind a run to source that will not execute.  An absent or
+    unrecognisable ``current.py`` therefore means "no promoted mode reward";
+    this provenance-sensitive path deliberately has no latest-version
+    fallback.
 
     `promote_mode_reward` and `_prepare_reference_guided_run` are two separate
     reward installers and both finish by repointing `current.py`. Promoting an
@@ -478,22 +488,31 @@ def _promoted_mode_reward_clip(rewards_dir: Path) -> Optional[str]:
     and the scaffold records its clip in `REWARD_SPEC["reference_clip_id"]`
     precisely so this question is answerable from the source text.
     """
-    try:
-        _n, latest = _find_latest_reward_version(rewards_dir)
-    except FileNotFoundError:
+    target = _current_reward_target(rewards_dir)
+    if target is None:
         return None
-    if latest is None or not Path(latest).is_file():
+    match = re.fullmatch(r"v(\d+)", target.stem)
+    if match is None:
         return None
     try:
-        source = Path(latest).read_text(encoding="utf-8")
+        source = target.read_text(encoding="utf-8")
     except OSError:
         return None
     if not all(marker in source for marker in _MODE_REWARD_MARKERS):
         return None
     from sculptor.mode_rewards import reward_spec_from_source
 
-    value = reward_spec_from_source(source).get("reference_clip_id")
-    return value if isinstance(value, str) and value else None
+    spec = reward_spec_from_source(source)
+    value = spec.get("reference_clip_id")
+    if not isinstance(value, str) or not value:
+        return None
+    return int(match.group(1)), target.resolve(), spec
+
+
+def _promoted_mode_reward_spec(rewards_dir: Path) -> Optional[dict[str, Any]]:
+    """Data-only spec for the reward that ``current.py`` actually selects."""
+    resolved = _promoted_mode_reward(rewards_dir)
+    return resolved[2] if resolved is not None else None
 
 
 def _prepare_reference_guided_run(
@@ -549,13 +568,71 @@ def _prepare_reference_guided_run(
     # that also discarded the authored work, so bind what is promoted instead
     # of replacing it. The selection is still re-promoted so the pinned tuple
     # names the reward that actually trains.
-    promoted_clip = _promoted_mode_reward_clip(rewards_dir)
+    promoted_reward = _promoted_mode_reward(rewards_dir)
+    promoted_spec = promoted_reward[2] if promoted_reward else None
+    promoted_clip = (
+        promoted_spec.get("reference_clip_id") if promoted_spec else None
+    )
     if promoted_clip is not None and promoted_clip == clip_id:
-        latest_n, latest_path = _find_latest_reward_version(rewards_dir)
+        from sculptor.mode_rewards import (
+            MODE_BINDING_CONTEXT_REFS,
+            mode_reward_binding_errors,
+        )
+        from sculptor.modes import modes_from_composition
+
+        context_refs = {
+            kind: ref.sha256
+            for kind, ref in selection.refs.items()
+            if kind in MODE_BINDING_CONTEXT_REFS
+            and isinstance(ref.sha256, str)
+        }
+        assert promoted_reward is not None
+        promoted_n, promoted_path, _ = promoted_reward
+        selected_reward_ref = selection.refs.get("reward")
+        if selected_reward_ref is None:
+            raise ValueError(
+                "promoted phase reward cannot be reused because the pinned "
+                "selection has no reward ref"
+            )
+        selected_reward_path = Path(selected_reward_ref.path)
+        if not selected_reward_path.is_absolute():
+            selected_reward_path = project / selected_reward_path
+        selected_reward_path = selected_reward_path.resolve()
+        selected_reward_sha = str(selected_reward_ref.sha256 or "")
+        promoted_reward_sha = file_sha256(promoted_path)
+        if (
+            selected_reward_path != promoted_path
+            or selected_reward_sha != promoted_reward_sha
+        ):
+            raise ValueError(
+                "promoted phase reward cannot be reused because current.py "
+                "and the pinned selection reward ref disagree; restore or "
+                "promote one exact reward tuple before launch"
+            )
+        # The reward is not allowed to attest its own graph. Derive the graph
+        # again from the exact clip bytes resolved above, then validate both
+        # the manifest schedule and its binding against that independent
+        # object before any adapter can allocate a training process.
+        canonical_graph = modes_from_composition(_clip, clip_id=clip_id)
+        binding_errors = mode_reward_binding_errors(
+            promoted_spec,
+            clip_id=clip_id,
+            robot=robot,
+            clip_sha256=clip_sha256,
+            context_refs=context_refs,
+            graph=canonical_graph,
+        )
+        if binding_errors:
+            raise ValueError(
+                "promoted phase reward cannot be reused because its exact "
+                "mode binding is stale or incomplete; regenerate and "
+                "re-author it before launch:\n  - "
+                + "\n  - ".join(binding_errors)
+            )
         tuple_hash, pinned = _promote_iteration_selection(
             adapter,
             project,
-            reward_path=Path(latest_path),
+            reward_path=promoted_path,
             env_spec_version=(selection.refs["env_spec"].version
                               if selection.refs.get("env_spec") else "v0"),
             base_selection=selection_path,
@@ -570,9 +647,9 @@ def _prepare_reference_guided_run(
             "phase_mode": "per_mode",
             "phase_duration_s": None,
             "task_residual_authored": True,
-            "reward_version": f"v{latest_n}",
-            "reward_path": str(Path(latest_path).resolve()),
-            "reward_sha256": file_sha256(Path(latest_path)),
+            "reward_version": f"v{promoted_n}",
+            "reward_path": str(promoted_path),
+            "reward_sha256": promoted_reward_sha,
             "selection_path": (str(pinned.resolve()) if pinned
                                else str(selection_path)),
             "tuple_hash": tuple_hash or selection.tuple_hash,
@@ -1288,7 +1365,9 @@ def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
     init_policy_path: Optional[Path] = None,
+    init_policy_mode: str = "actor_critic",
     warm_start_explicit: bool = False,
+    pre_train_event: Optional[dict[str, Any]] = None,
 ):
     """Skip `adapter.train` when `iter_dir/checkpoint.pt` is already on
     disk and loads successfully — the expensive phase (≥ 22 min for
@@ -1406,6 +1485,8 @@ def _train_or_resume(
         )
         if has_explicit or has_var_kwarg:
             train_kwargs["init_policy_path"] = init_policy_path
+            if "init_policy_mode" in sig.parameters or has_var_kwarg:
+                train_kwargs["init_policy_mode"] = init_policy_mode
         else:
             _emit_event({
                 "type": "warm_start_skipped",
@@ -1414,6 +1495,8 @@ def _train_or_resume(
                 "source": str(init_policy_path),
                 "adapter": type(adapter).__name__,
             })
+    if pre_train_event is not None:
+        _emit_event(dict(pre_train_event))
     return adapter.train(**train_kwargs)
 
 
@@ -1475,6 +1558,319 @@ def _rollout_or_resume(
         n_episodes=n_episodes,
         **extra,
     )
+
+
+def _persist_mode_diagnostics(
+    *,
+    project: Path,
+    iter_index: int,
+    iter_dir: Path,
+    rollout_dir: Path,
+    reward_path: Path,
+    selection_path: Path | None,
+) -> dict[str, Any] | None:
+    """Persist exact, diagnostic-only phase evidence for a mode reward.
+
+    Flat rewards take the no-op path. Once a promoted reward declares mode
+    windows, however, missing/stale graph, manifest, reference, selection, or
+    rollout evidence is a hard integrity error: continuing would attach a
+    plausible-looking ``mode_metrics.json`` to semantics the run did not use.
+    The resulting record is never read by fitness or selection.
+    """
+    reward_path = Path(reward_path).resolve()
+    source = reward_path.read_text(encoding="utf-8")
+    if not all(marker in source for marker in _MODE_REWARD_MARKERS):
+        return None
+
+    from sculptor.eval.mode_metrics import build_mode_diagnostics
+    from sculptor.mode_rewards import (
+        MODE_BINDING_CONTEXT_REFS,
+        mode_reward_binding_errors,
+        reward_spec_from_source,
+    )
+    from sculptor.modes import mode_graph_sha256, modes_from_composition
+    from sculptor.reference_run import load_exact_reference_motion
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    spec = reward_spec_from_source(source)
+    manifest = spec.get("mode_execution_manifest")
+    binding = spec.get("mode_binding")
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            "promoted phase reward is missing mode_execution_manifest; "
+            "refusing to create mode diagnostics"
+        )
+    if not isinstance(binding, dict):
+        raise ValueError(
+            "promoted phase reward is missing mode_binding; refusing to "
+            "create mode diagnostics"
+        )
+    clip_id = str(spec.get("reference_clip_id") or "")
+    robot = str(spec.get("reference_robot") or binding.get("robot") or "")
+    if not clip_id or not robot:
+        raise ValueError(
+            "promoted phase reward does not identify its exact reference "
+            "clip and robot"
+        )
+    if binding.get("clip_id") != clip_id or binding.get("robot") != robot:
+        raise ValueError(
+            "promoted phase reward reference identity disagrees with its "
+            "mode_binding"
+        )
+
+    clip, _reference_provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot=robot,
+    )
+    graph = modes_from_composition(clip, clip_id=clip_id)
+
+    if selection_path is None:
+        raise ValueError(
+            "phase diagnostics require the immutable artifact selection used "
+            "by rollout"
+        )
+    selection_path = Path(selection_path).resolve()
+    selection = WorldArtifactStore(project).read_selection(selection_path)
+    if selection is None:
+        raise ValueError(
+            f"phase diagnostics selection is missing: {selection_path}"
+        )
+    selected_reward = selection.refs.get("reward")
+    reward_sha256 = file_sha256(reward_path)
+    if selected_reward is None or selected_reward.sha256 != reward_sha256:
+        raise ValueError(
+            "phase diagnostics reward does not match the pinned artifact tuple"
+        )
+    context_refs = {
+        kind: ref.sha256
+        for kind, ref in selection.refs.items()
+        if kind in MODE_BINDING_CONTEXT_REFS
+    }
+    binding_errors = mode_reward_binding_errors(
+        spec,
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha256,
+        context_refs=context_refs,
+        graph_sha256=mode_graph_sha256(graph),
+        graph=graph,
+    )
+    if binding_errors:
+        raise ValueError(
+            "phase diagnostics cannot attest a stale mode binding:\n  - "
+            + "\n  - ".join(binding_errors)
+        )
+
+    tuple_snapshot = iter_dir / "artifact_tuple.json"
+    if not tuple_snapshot.is_file():
+        raise ValueError(
+            "phase diagnostics require iter artifact_tuple.json"
+        )
+    try:
+        snapshot_data = json.loads(
+            tuple_snapshot.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"iter artifact_tuple.json is unreadable: {exc}"
+        ) from exc
+    selected_data = selection.to_dict()
+    if (
+        not isinstance(snapshot_data, dict)
+        or snapshot_data.get("tuple_hash") != selection.tuple_hash
+        or snapshot_data.get("refs") != selected_data.get("refs")
+    ):
+        raise ValueError(
+            "iter artifact_tuple.json does not name the same immutable refs "
+            "as the pinned selection"
+        )
+
+    trajectory_path = rollout_dir / "trajectory.npz"
+    behavior_path = rollout_dir / "behavior.json"
+    if not trajectory_path.is_file() or not behavior_path.is_file():
+        raise ValueError(
+            "official phase diagnostics require trajectory.npz and "
+            "behavior.json"
+        )
+    try:
+        behavior = json.loads(behavior_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"rollout behavior.json is unreadable: {exc}") from exc
+    if not isinstance(behavior, dict):
+        raise ValueError("rollout behavior.json must contain an object")
+
+    import numpy as np
+
+    with np.load(trajectory_path, allow_pickle=False) as archive:
+        if "first_episode_valid_mask" not in archive.files:
+            raise ValueError(
+                "trajectory is missing first_episode_valid_mask"
+            )
+        valid_mask = np.asarray(archive["first_episode_valid_mask"])
+        if valid_mask.ndim != 2:
+            raise ValueError(
+                "first_episode_valid_mask must have shape (T, E)"
+            )
+        rollout_frames = int(valid_mask.shape[0])
+        arrays: dict[str, np.ndarray] = {}
+        for name in archive.files:
+            array = np.asarray(archive[name])
+            if array.ndim >= 1 and int(array.shape[0]) == rollout_frames:
+                arrays[name] = array
+
+    record = build_mode_diagnostics(
+        graph,
+        execution_manifest=manifest,
+        mode_binding=binding,
+        arrays=arrays,
+        behavior=behavior,
+        provenance={
+            "iter": int(iter_index),
+            "reward_path": str(reward_path),
+            "reward_sha256": reward_sha256,
+            "trajectory_path": str(trajectory_path.resolve()),
+            "trajectory_sha256": file_sha256(trajectory_path),
+            "behavior_path": str(behavior_path.resolve()),
+            "behavior_sha256": file_sha256(behavior_path),
+            "reference_clip_id": clip_id,
+            "reference_robot": robot,
+            "reference_clip_sha256": clip_sha256,
+            "artifact_tuple_path": str(tuple_snapshot.resolve()),
+            "artifact_tuple_sha256": file_sha256(tuple_snapshot),
+            "artifact_tuple_hash": selection.tuple_hash,
+        },
+    )
+    output = iter_dir / "mode_metrics.json"
+    temporary = iter_dir / ".mode_metrics.json.tmp"
+    temporary.write_text(
+        json.dumps(record, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    _emit_event({
+        "type": "mode_diagnostics_recorded",
+        "iter": int(iter_index),
+        "path": str(output.resolve()),
+        "diagnostic_digest": record["diagnostic_digest"],
+        "graph_sha256": record["graph_sha256"],
+        "execution_manifest_digest": record["execution_manifest_digest"],
+        "authority": "diagnostic_only",
+    })
+    return record
+
+
+def _validated_mode_execution_admission(
+    *,
+    project: Path,
+    reward_path: Path,
+    selection_path: Path | None,
+) -> dict[str, Any] | None:
+    """Re-derive and pin the exact mode executor just before adapter.train.
+
+    Flat rewards intentionally return ``None``. A source that declares mode
+    gating must prove its immutable reward, reference, graph, schedule, and
+    authored context against the iteration's just-pinned selection.
+    """
+    reward_path = Path(reward_path).resolve(strict=True)
+    if re.fullmatch(r"v[0-9]+\.py", reward_path.name) is None:
+        raise ValueError(
+            "mode execution admission requires an immutable v<n>.py reward"
+        )
+    source = reward_path.read_text(encoding="utf-8")
+    if not all(marker in source for marker in _MODE_REWARD_MARKERS):
+        return None
+    if selection_path is None:
+        raise ValueError(
+            "mode execution admission requires the immutable artifact tuple"
+        )
+
+    from sculptor.mode_rewards import (
+        MODE_BINDING_CONTEXT_REFS,
+        mode_execution_manifest_digest,
+        mode_reward_binding_errors,
+        reward_spec_from_source,
+    )
+    from sculptor.modes import mode_graph_sha256, modes_from_composition
+    from sculptor.reference_run import load_exact_reference_motion
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    spec = reward_spec_from_source(source)
+    manifest = spec.get("mode_execution_manifest")
+    binding = spec.get("mode_binding")
+    if not isinstance(manifest, dict) or not isinstance(binding, dict):
+        raise ValueError(
+            "mode execution admission requires exact manifest and binding"
+        )
+    clip_id = str(spec.get("reference_clip_id") or "")
+    robot = str(spec.get("reference_robot") or binding.get("robot") or "")
+    if (
+        not clip_id
+        or not robot
+        or binding.get("clip_id") != clip_id
+        or binding.get("robot") != robot
+    ):
+        raise ValueError(
+            "mode execution admission has no consistent robot/clip identity"
+        )
+
+    clip, _provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot=robot,
+    )
+    graph = modes_from_composition(clip, clip_id=clip_id)
+    graph_sha256 = mode_graph_sha256(graph)
+
+    selection_path = Path(selection_path).resolve(strict=True)
+    selection = WorldArtifactStore(project).read_selection(selection_path)
+    if selection is None:
+        raise ValueError(
+            "mode execution admission cannot read the pinned selection"
+        )
+    reward_sha256 = file_sha256(reward_path)
+    selected_reward = selection.refs.get("reward")
+    if selected_reward is None:
+        raise ValueError("pinned selection has no reward ref")
+    selected_reward_path = Path(selected_reward.path)
+    if not selected_reward_path.is_absolute():
+        selected_reward_path = Path(project) / selected_reward_path
+    if (
+        selected_reward_path.resolve() != reward_path
+        or selected_reward.sha256 != reward_sha256
+    ):
+        raise ValueError(
+            "mode execution reward differs from the pinned artifact tuple"
+        )
+    context_refs = {
+        kind: ref.sha256
+        for kind, ref in selection.refs.items()
+        if kind in MODE_BINDING_CONTEXT_REFS
+    }
+    errors = mode_reward_binding_errors(
+        spec,
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha256,
+        context_refs=context_refs,
+        graph_sha256=graph_sha256,
+        graph=graph,
+    )
+    if errors:
+        raise ValueError(
+            "mode execution admission rejected stale authority:\n  - "
+            + "\n  - ".join(errors)
+        )
+    return {
+        "type": "mode_execution_admitted",
+        "source": "sculpt_run_worker",
+        "reward_path": str(reward_path),
+        "reward_sha256": reward_sha256,
+        "robot": robot,
+        "clip_id": clip_id,
+        "clip_sha256": clip_sha256,
+        "graph_sha256": graph_sha256,
+        "execution_manifest_digest": mode_execution_manifest_digest(manifest),
+        "context_refs": context_refs,
+        "selection": selection_path.name,
+        "tuple_hash": selection.tuple_hash,
+    }
 
 
 def _collect_hack_replays(adapter, runs_dir: Path, iter_index: int,
@@ -1644,6 +2040,7 @@ def _run_one_iter(
     kg_store,
     seed: int,
     init_policy_path: Optional[Path] = None,
+    init_policy_mode: str = "actor_critic",
     warm_start_explicit: bool = False,
     fitness_fn: Optional[Callable[[Path], float]] = None,
     prior_fitness: Optional[dict] = None,
@@ -1839,6 +2236,16 @@ def _run_one_iter(
             "selection": world_selection_path.name,
         })
 
+    mode_execution_event = (
+        _validated_mode_execution_admission(
+            project=project,
+            reward_path=Path(reward_path_trained),
+            selection_path=world_selection_path,
+        )
+        if not dry_run
+        else None
+    )
+
     # §2026-07-04: report the version that actually TRAINS this iter
     # (current.py's target / the revert base), not the disk maximum —
     # the two diverge at run boundaries after best-selection.
@@ -1876,7 +2283,9 @@ def _run_one_iter(
         steps=steps,
         seed=seed,
         init_policy_path=init_policy_path,
+        init_policy_mode=init_policy_mode,
         warm_start_explicit=warm_start_explicit,
+        pre_train_event=mode_execution_event,
     )
     train_s = time.time() - t0
 
@@ -1910,6 +2319,19 @@ def _run_one_iter(
         render_width=iter_cfg.get("render_width"),
         render_height=iter_cfg.get("render_height"),
         render_env_index=iter_cfg.get("render_env_index"),
+    )
+
+    # A promoted phase reward is not fully integrated until its official
+    # rollout is joined back to the exact graph/schedule it trained under.
+    # This record is diagnostic evidence only; no value from it enters
+    # fitness, keep-best, early-stop, or reward-edit authority.
+    _persist_mode_diagnostics(
+        project=project,
+        iter_index=iter_index,
+        iter_dir=iter_dir,
+        rollout_dir=rollout_dir,
+        reward_path=Path(reward_path_trained),
+        selection_path=world_selection_path,
     )
 
     # §Ship 33: objective task fitness on this rollout (ground truth,
@@ -2177,6 +2599,12 @@ def _run_one_iter(
                 "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
                                      if len(fitness_per_seed) > 1 else None),
                 "components": fitness_components,
+                "metric": {
+                    "id": getattr(fitness_fn, "metric_id", None),
+                    "version": getattr(fitness_fn, "metric_version", None),
+                    "source": getattr(fitness_fn, "metric_source", None),
+                    "sha256": getattr(fitness_fn, "metric_sha256", None),
+                },
                 "source": "live",
                 "recorded_at": _utc_now_iso(),
             }
@@ -2767,6 +3195,7 @@ def sculpt_run(
     early_stop_enabled: Optional[bool] = None,
     early_stop_patience: Optional[int] = None,
     init_policy_path: Optional[Path | str] = None,
+    init_policy_mode: str = "actor_critic",
     per_iter_callback: Optional[Callable[["IterOutcome"], Optional[str]]] = None,
     fitness_fn: Optional[Callable[[Path], float]] = None,
     fitness_patience: int = 2,
@@ -2781,6 +3210,7 @@ def sculpt_run(
     feedback_poll_interval: float = 2.0,
     reference_clip_id: Optional[str] = None,
     reference_robot: Optional[str] = None,
+    expected_active_reference_reward_sha256: Optional[str] = None,
 ) -> SculptRunResult:
     """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
     artifacts are persisted. Returning `None` keeps the loop running;
@@ -2835,6 +3265,10 @@ def sculpt_run(
     # mis-validate as cwd (which may or may not be a file). Treat
     # empty / whitespace-only strings as None explicitly.
     init_ckpt: Optional[Path] = None
+    if init_policy_mode not in ("actor_only", "actor_critic"):
+        raise ValueError(
+            "init_policy_mode must be 'actor_only' or 'actor_critic'"
+        )
     if init_policy_path is not None:
         raw = str(init_policy_path).strip()
         if raw:
@@ -2968,12 +3402,68 @@ def sculpt_run(
         from sculptor.kg.store import SculptorKG
         kg_store = SculptorKG()
 
+    from sculptor.reference_authority import (
+        ActiveReferenceAuthorityError,
+        resolve_active_reference_authority,
+    )
+
+    try:
+        active_reference_authority = resolve_active_reference_authority(
+            rewards_dir,
+        )
+    except ActiveReferenceAuthorityError as exc:
+        raise ValueError(
+            f"active reward reference authority is invalid: {exc}"
+        ) from exc
+    if expected_active_reference_reward_sha256 is not None:
+        if (
+            active_reference_authority is None
+            or active_reference_authority.reward_sha256
+            != expected_active_reference_reward_sha256
+        ):
+            raise ValueError(
+                "active reference reward changed after launch admission"
+            )
+    if active_reference_authority is not None:
+        active_pair = (
+            active_reference_authority.reference_clip_id,
+            active_reference_authority.reference_robot,
+        )
+        requested_pair = (reference_clip_id, reference_robot)
+        if any(requested_pair) and requested_pair != active_pair:
+            raise ValueError(
+                "requested reference motion disagrees with the exact "
+                "reference embedded in the active reward"
+            )
+        reference_clip_id, reference_robot = active_pair
+        _emit_event({
+            "type": "active_reference_reward_attested",
+            "source": "sculpt_run_boundary",
+            **active_reference_authority.to_dict(),
+        })
+
     if bool(reference_clip_id) != bool(reference_robot):
         raise ValueError(
             "reference_clip_id and reference_robot must be supplied together"
         )
     reference_motion_context: Optional[dict[str, Any]] = None
     if reference_clip_id and reference_robot:
+        if not dry_run:
+            # Direct CLI/programmatic calls bypass the UI's queue admission.
+            # Re-derive Tier D here, immediately before reference-guided
+            # training setup, so no caller can promote a tier string or stale
+            # path into dynamics authority.
+            target_robot, certificate = _admit_reference_motion_for_target(
+                project=project,
+                reference_robot=reference_robot,
+                reference_clip_id=reference_clip_id,
+            )
+            _emit_event(_reference_feasibility_admission_event(
+                certificate=certificate,
+                reference_robot=reference_robot,
+                target_robot=target_robot,
+                reference_clip_id=reference_clip_id,
+            ))
         reference_motion_context = _prepare_reference_guided_run(
             adapter=adapter,
             project=project,
@@ -3131,6 +3621,7 @@ def sculpt_run(
                 no_kg=no_kg, dry_run=dry_run, kg_store=kg_store,
                 seed=base_seed + i,
                 init_policy_path=(init_ckpt if i == start_iter else None),
+                init_policy_mode=init_policy_mode,
                 warm_start_explicit=(warm_start_explicit and i == start_iter),
                 fitness_fn=fitness_fn,
                 prior_fitness=(
@@ -5551,47 +6042,72 @@ def _parent_env_component_terms(mission, stage) -> set[str]:
         return set()
 
 
-#: Reference-library robot slugs the on-disk library is keyed by
-#: (`sculptor.refs.library.clip_dir(robot, clip_id)`). Mirrors
-#: `mission_metrics._ROBOT_SLUGS` — kept as a small local copy rather
-#: than an import since `mission_metrics.py` is a metric-generation
-#: module or this one has no other dependency on, and the mapping is a
-#: single-source-of-truth-worthy but tiny (3-entry) constant.
-_STAGE_REFERENCE_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+def _project_robot_library_slug(project_root: Path) -> str:
+    """Compatibility wrapper for the shared policy/reference namespace."""
+    from sculptor.project_robot import resolve_project_reference_robot
+
+    return resolve_project_reference_robot(project_root)
+
+
+def _admit_reference_motion_for_target(
+    *,
+    project: Path,
+    reference_robot: str,
+    reference_clip_id: str,
+) -> tuple[str, Any]:
+    """Verify one direct-run reference against the live project boundary."""
+    from sculptor.refs.track import (
+        TierDAdmissionError,
+        require_tierd_admission,
+        require_tierd_target_compatibility,
+    )
+
+    target_robot = _project_robot_library_slug(project)
+    if reference_robot != target_robot:
+        raise TierDAdmissionError(
+            f"selected reference robot {reference_robot!r} does not match "
+            f"project robot {target_robot!r}"
+        )
+    certificate = require_tierd_target_compatibility(
+        require_tierd_admission(reference_robot, reference_clip_id),
+        project,
+        target_robot=target_robot,
+    )
+    return target_robot, certificate
+
+
+def _reference_feasibility_admission_event(
+    *,
+    certificate: Any,
+    reference_robot: str,
+    target_robot: str,
+    reference_clip_id: str,
+) -> dict[str, Any]:
+    """Build the complete worker evidence event for a live reference."""
+    return {
+        "type": "reference_feasibility_admitted",
+        "source": "sculpt_run_worker",
+        "reference_robot": reference_robot,
+        "target_robot": target_robot,
+        "reference_clip_id": reference_clip_id,
+        "clip_sha256": certificate.clip_content_sha256,
+        "rollout_sha256": certificate.rollout_sha256,
+        "certificate_sha256": certificate.certificate_sha256,
+        "execution_contract_sha256": certificate.execution_contract_sha256,
+        "execution_boundary_sha256": certificate.execution_boundary_sha256,
+    }
 
 
 def _stage_reference_robot_slug(*, stage_dir: Path, project_root: Path) -> str:
-    """Resolve the bare robot slug (`"g1"`, `"go1"`, ...) the reference
-    library keys clips by, from the stage's (or the project's, as a
-    fallback for a not-yet-scaffolded stage) `[adapter].config.task_id`
-    — the same adapter/task_id-shaped string used everywhere else
-    (`"Mjlab-Velocity-Flat-Unitree-G1"`). Unknown/unreadable/absent
-    always falls back to `"g1"` (the only populated library robot as of
-    §R1_BUILD_SPEC — mirrors `sculptor.refs`'s own `robot: str = "g1"`
-    default throughout)."""
-    task_id = ""
-    for config_path in (stage_dir / "config.toml", project_root / "config.toml"):
-        if not config_path.is_file():
-            continue
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:  # pragma: no cover
-                import tomli as tomllib  # type: ignore[no-redef]
-            with config_path.open("rb") as f:
-                cfg = tomllib.load(f)
-            task_id = str(
-                ((cfg.get("adapter") or {}).get("config") or {})
-                .get("task_id", "") or "")
-        except Exception:  # noqa: BLE001 — best-effort resolution only
-            task_id = ""
-        if task_id:
-            break
-    hint = task_id.lower()
-    for slug in _STAGE_REFERENCE_ROBOT_SLUGS:
-        if slug in hint:
-            return slug
-    return "g1"
+    """Resolve the exact robot namespace for one mission stage.
+
+    ``stage_dir`` remains in the call signature for compatibility with the
+    stage orchestration code, but a copied task id is not a robot identity and
+    may not override project metadata. There is intentionally no populated-
+    library or ``g1`` fallback.
+    """
+    del stage_dir
+    return _project_robot_library_slug(project_root)
 
 
 def _resolve_stage_rsi_clip(
@@ -5722,6 +6238,54 @@ def _run_one_stage(
     )
 
     stage_dir = mission.stage_dir(stage.name)
+
+    def _readmit_stage_reference(boundary: str) -> None:
+        from sculptor.refs.track import (
+            require_stage_tierd_admission,
+            require_tierd_target_compatibility,
+        )
+
+        if not getattr(stage, "reference_clip_id", None):
+            return
+        project_root = mission_dir.parent.parent
+        active_robot = _stage_reference_robot_slug(
+            stage_dir=stage_dir,
+            project_root=project_root,
+        )
+        certificate = require_stage_tierd_admission(
+            stage, expected_robot=active_robot,
+        )
+        if certificate is not None:
+            certificate = require_tierd_target_compatibility(
+                certificate,
+                project_root,
+                target_robot=active_robot,
+            )
+            emit({
+                "type": "stage_reference_admitted",
+                "stage_name": stage.name,
+                "boundary": boundary,
+                "reference_robot": certificate.robot,
+                "reference_clip_id": certificate.clip_id,
+                "clip_sha256": certificate.clip_content_sha256,
+                "certificate_sha256": certificate.certificate_sha256,
+                "execution_contract_sha256": (
+                    certificate.execution_contract_sha256
+                ),
+                "execution_boundary_sha256": (
+                    certificate.execution_boundary_sha256
+                ),
+            })
+
+    try:
+        _readmit_stage_reference("stage_worker_entry")
+    except ValueError as exc:
+        return _fail_stage(
+            stage,
+            "reference_admission_failed",
+            str(exc),
+            emit,
+        )
     # §Ship 20 Goal #2: compute the effective max iterations BEFORE
     # emitting stage_started so the UI can render `iters X/effectiveY`
     # accurately when the user passed `iterations_override`. Without
@@ -5796,11 +6360,20 @@ def _run_one_stage(
     # before — Ship 16 behavior preserved.
     skill_ckpt: Optional[Path] = None
     if skill_library_handle is not None and stage.init_skill_id:
-        skill_ckpt = skill_library_handle.maybe_load_for_stage(stage, emit)
+        try:
+            skill_ckpt = skill_library_handle.maybe_load_for_stage(stage, emit)
+        except Exception as exc:  # explicit skill selection is authoritative
+            return _fail_stage(
+                stage,
+                "skill_warm_start_admission_failed",
+                f"{type(exc).__name__}: {exc}",
+                emit,
+            )
 
     if skill_ckpt is not None:
         warm_start_path: Optional[Path] = skill_ckpt
         warm_start_source = "skill_library"
+        warm_start_mode = "actor_only"
         warm_start_source_id: Optional[str] = stage.init_skill_id
         if parent_ckpt is not None:
             emit({
@@ -5813,10 +6386,12 @@ def _run_one_stage(
     elif parent_ckpt is not None:
         warm_start_path = parent_ckpt
         warm_start_source = "parent_stage"
+        warm_start_mode = "actor_critic"
         warm_start_source_id = stage.parent_stage
     else:
         warm_start_path = None
         warm_start_source = "none"
+        warm_start_mode = "actor_critic"
         warm_start_source_id = None
 
     emit({
@@ -5826,6 +6401,7 @@ def _run_one_stage(
         "source": warm_start_source,
         "source_id": warm_start_source_id,
         "checkpoint": str(warm_start_path) if warm_start_path else None,
+        "initialization_mode": warm_start_mode,
     })
 
     # 2. Scaffold stage dir idempotently. `stage_dir` was resolved
@@ -6524,6 +7100,7 @@ def _run_one_stage(
                     tracking_source = generate_tracking_residual_reward_source(
                         clip=tracking_clip,
                         clip_id=loaded_clip_id,
+                        robot=sig_robot,
                         version="v0",
                     )
                     latest_reward_file.write_text(
@@ -6653,6 +7230,7 @@ def _run_one_stage(
     extensions_used = 0
     sculpt_result: Any = None
     try:
+        _readmit_stage_reference("before_initial_training")
         sculpt_result = sculpt_run(
             config_path=stage_dir / "config.toml",
             behavior_goal=stage.goal_text,
@@ -6668,6 +7246,7 @@ def _run_one_stage(
             render_height=render_height,
             rollout_episodes=rollout_episodes,
             init_policy_path=warm_start_path,
+            init_policy_mode=warm_start_mode,
             per_iter_callback=per_iter_cb,
             fitness_fn=fitness_fn,
             fitness_target=fitness_target,
@@ -6769,6 +7348,7 @@ def _run_one_stage(
             "reason": "metric_still_improving",
         })
         try:
+            _readmit_stage_reference("before_extension_training")
             sculpt_result = sculpt_run(
                 config_path=stage_dir / "config.toml",
                 behavior_goal=stage.goal_text,

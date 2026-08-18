@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,6 +129,17 @@ ORIENTATION_ERR_WEIGHT = 4.0
 #: produced a spurious "25 Hz" here.
 DEFAULT_CONTROL_HZ = _timing.MJLAB_G1_VELOCITY.control_hz
 
+# Immutable Tier-D execution evidence.  A dynamics-feasibility certificate is
+# not just a good rollout: it is a claim about exact motion bytes executing
+# through one embodiment, task, simulator/control cadence, and software stack.
+# Keep the schema small and explicit so target admission can compare the
+# physical boundary without accidentally requiring identical PPO
+# hyperparameters from the donor project.
+TIER_D_EXECUTION_CONTRACT_SCHEMA = 1
+TIER_D_CERTIFICATE_SCHEMA = "reward-sculptor-tier-d-certificate-v2"
+TIER_D_REFERENCE_CADENCE = "nearest-frame-control-phase-clock-v1"
+_TIER_D_VERSION_KEYS = ("torch", "mjlab", "rsl_rl", "adapter")
+
 DEFAULT_ITERATIONS = 3
 DEFAULT_STEPS_PER_ITERATION = 2000
 DEFAULT_N_EPISODES = 2
@@ -162,6 +174,422 @@ class TrackError(RuntimeError):
     """Raised for setup failures (bad donor config, clip missing common
     joints with the robot, etc.) — never for a feasibility verdict itself,
     which is always a normal (non-exception) result."""
+
+
+def _canonical_sha256(value: Any) -> str:
+    """SHA-256 of one JSON value under the repository's canonical encoding."""
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path, *, label: str) -> str:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise TrackError(f"cannot read {label} at {path}: {exc}") from exc
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _policy_execution_boundary(
+    *, robot: str, policy_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Project the complete warm-start contract onto Tier-D's physical seam.
+
+    The full policy-contract digest is retained separately as provenance.  It
+    is intentionally *not* part of this boundary: a legitimate transfer may
+    change observations, network widths, or PPO settings while executing the
+    same robot/task/action interface at the same cadence.  The fields below
+    are the exact structural and simulator facts that the dynamics evidence
+    actually covers.
+    """
+    if not isinstance(policy_contract, dict):
+        raise TrackError("donor project policy contract is unavailable")
+
+    identity = policy_contract.get("identity")
+    joints = policy_contract.get("joints")
+    actions = policy_contract.get("actions")
+    timing = policy_contract.get("timing")
+    versions = policy_contract.get("versions")
+    if not all(isinstance(block, dict) for block in (
+        identity, joints, actions, timing, versions,
+    )):
+        raise TrackError(
+            "donor policy contract is missing identity/joints/actions/timing/versions"
+        )
+
+    adapter_class = identity.get("adapter_class")
+    task_id = identity.get("task_id")
+    ordered_joints = joints.get("ordered_names")
+    ordered_actions = actions.get("ordered_names")
+    action_terms = actions.get("term_names")
+    action_shape = actions.get("shape")
+    if not isinstance(adapter_class, str) or not adapter_class:
+        raise TrackError("donor policy contract has no adapter class")
+    if not isinstance(task_id, str) or not task_id:
+        raise TrackError("donor policy contract has no task id")
+    for label, value in (
+        ("ordered joints", ordered_joints),
+        ("ordered actions", ordered_actions),
+        ("action terms", action_terms),
+        ("action shape", action_shape),
+    ):
+        if not isinstance(value, list) or not value:
+            raise TrackError(f"donor policy contract has no {label}")
+    if not all(isinstance(name, str) and name for name in ordered_joints):
+        raise TrackError("donor policy contract ordered joints are invalid")
+    if not all(isinstance(name, str) and name for name in ordered_actions):
+        raise TrackError("donor policy contract ordered actions are invalid")
+    if not all(isinstance(name, str) and name for name in action_terms):
+        raise TrackError("donor policy contract action terms are invalid")
+    if not all(
+        isinstance(size, int) and not isinstance(size, bool) and size > 0
+        for size in action_shape
+    ):
+        raise TrackError("donor policy contract action shape is invalid")
+
+    try:
+        sim_timestep_s = float(timing["sim_timestep_s"])
+        decimation = int(timing["decimation"])
+        control_dt_s = float(timing["control_dt_s"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TrackError("donor policy contract timing is incomplete") from exc
+    if (
+        not math.isfinite(sim_timestep_s)
+        or not math.isfinite(control_dt_s)
+        or sim_timestep_s <= 0.0
+        or decimation < 1
+        or control_dt_s <= 0.0
+    ):
+        raise TrackError("donor policy contract timing must be positive")
+    expected_control_dt = sim_timestep_s * decimation
+    if abs(control_dt_s - expected_control_dt) > 1e-9:
+        raise TrackError(
+            "donor policy contract control_dt_s does not equal "
+            "sim_timestep_s * decimation"
+        )
+
+    clean_versions: dict[str, str] = {}
+    for key in _TIER_D_VERSION_KEYS:
+        value = versions.get(key)
+        if not isinstance(value, str) or not value:
+            raise TrackError(
+                f"donor policy contract software version {key!r} is unknown"
+            )
+        clean_versions[key] = value
+
+    if not isinstance(robot, str) or not robot:
+        raise TrackError("Tier-D robot identity is empty")
+    return {
+        "robot": robot,
+        "identity": {
+            "adapter_class": adapter_class,
+            "task_id": task_id,
+        },
+        "joints": {"ordered_names": list(ordered_joints)},
+        "actions": {
+            "ordered_names": list(ordered_actions),
+            "term_names": list(action_terms),
+            "shape": list(action_shape),
+        },
+        "timing": {
+            "sim_timestep_s": sim_timestep_s,
+            "decimation": decimation,
+            "control_dt_s": control_dt_s,
+            "control_hz": 1.0 / control_dt_s,
+        },
+        "versions": clean_versions,
+    }
+
+
+def build_tierd_execution_contract(
+    *,
+    donor_project: Path,
+    certification_config_path: Path,
+    robot: str,
+    clip: dict[str, Any],
+    n_phase_targets: int = N_PHASE_TARGETS,
+    policy_contract: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Build the immutable execution evidence attached to a Tier-D result.
+
+    ``policy_contract`` is injectable for offline validation/tests.  Normal
+    tracking builds it from the donor project using the same canonical helper
+    as warm-start admission.  Both the donor config bytes and the generated
+    certification config bytes are retained: the former is source evidence,
+    while the latter proves what the adapter actually consumed.
+    """
+    if policy_contract is None:
+        try:
+            from sculptor.policy_contract import build_project_policy_contract
+
+            policy_contract = build_project_policy_contract(Path(donor_project))
+        except Exception as exc:  # noqa: BLE001 - normalized to setup failure
+            raise TrackError(
+                f"cannot build donor policy contract: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    boundary = _policy_execution_boundary(
+        robot=robot, policy_contract=policy_contract,
+    )
+    for label, adapter_cfg in (
+        (
+            "donor",
+            _read_adapter_config_file(Path(donor_project) / "config.toml"),
+        ),
+        (
+            "generated certification",
+            _read_adapter_config_file(Path(certification_config_path)),
+        ),
+    ):
+        config_identity = boundary["identity"]
+        task_id = str(
+            adapter_cfg.get("config", {}).get("task_id")
+            or adapter_cfg.get("config", {}).get("env_id")
+            or ""
+        )
+        if adapter_cfg.get("class") != config_identity["adapter_class"]:
+            raise TrackError(
+                f"{label} config adapter class does not match the donor "
+                "policy contract"
+            )
+        if task_id != config_identity["task_id"]:
+            raise TrackError(
+                f"{label} config task id does not match the donor policy contract"
+            )
+    joint_names = clip.get("joint_names")
+    joint_pos = clip.get("joint_pos")
+    if not isinstance(joint_names, (list, tuple)) or not joint_names:
+        raise TrackError("Tier-D reference has no ordered joint names")
+    reference_joints = [str(name) for name in joint_names]
+    if reference_joints != boundary["joints"]["ordered_names"]:
+        raise TrackError(
+            "Tier-D reference ordered joints do not exactly match the donor "
+            "policy contract"
+        )
+    array = np.asarray(joint_pos)
+    if array.ndim != 2 or array.shape[0] < 1:
+        raise TrackError("Tier-D reference joint_pos must have shape (T, J)")
+    if array.shape[1] != len(reference_joints):
+        raise TrackError(
+            "Tier-D reference joint_pos width does not match ordered joints"
+        )
+    try:
+        fps = float(clip["fps"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TrackError("Tier-D reference fps is missing/invalid") from exc
+    if fps <= 0.0:
+        raise TrackError("Tier-D reference fps must be positive")
+    if not isinstance(n_phase_targets, int) or n_phase_targets < 1:
+        raise TrackError("Tier-D phase target count must be a positive integer")
+
+    frame_count = int(array.shape[0])
+    playback_duration_s = frame_count / fps
+    base: dict[str, Any] = {
+        "schema": TIER_D_EXECUTION_CONTRACT_SCHEMA,
+        "donor": {
+            "config_sha256": _file_sha256(
+                Path(donor_project) / "config.toml", label="donor config.toml",
+            ),
+            "certification_config_sha256": _file_sha256(
+                Path(certification_config_path),
+                label="generated certification config.toml",
+            ),
+            "policy_contract_sha256": _canonical_sha256(policy_contract),
+        },
+        "execution_boundary": boundary,
+        "reference": {
+            "fps": fps,
+            "frame_count": frame_count,
+            "playback_duration_s": playback_duration_s,
+            "ordered_joints": reference_joints,
+            "phase_target_count": n_phase_targets,
+            "cadence": {
+                "schema": TIER_D_REFERENCE_CADENCE,
+                "frame_selection": "round(phase * (frame_count - 1))",
+                "phase_interval": "[0,1)",
+                "clock": "environment_control_step_dt",
+            },
+        },
+    }
+    base["execution_boundary_sha256"] = _canonical_sha256(boundary)
+    base["contract_sha256"] = _canonical_sha256(base)
+    issues = validate_tierd_execution_contract(base)
+    if issues:
+        raise TrackError("invalid Tier-D execution contract: " + "; ".join(issues))
+    return base
+
+
+def validate_tierd_execution_contract(contract: Any) -> list[str]:
+    """Validate one stored execution receipt without trusting its digests."""
+    if not isinstance(contract, dict):
+        return ["execution contract is missing"]
+    issues: list[str] = []
+    if contract.get("schema") != TIER_D_EXECUTION_CONTRACT_SCHEMA:
+        issues.append("execution contract schema is unsupported")
+
+    boundary = contract.get("execution_boundary")
+    donor = contract.get("donor")
+    reference = contract.get("reference")
+    if not isinstance(boundary, dict):
+        issues.append("execution boundary is missing")
+    if not isinstance(donor, dict):
+        issues.append("donor evidence is missing")
+    if not isinstance(reference, dict):
+        issues.append("reference cadence evidence is missing")
+    if issues:
+        return issues
+
+    try:
+        rebuilt_boundary = _policy_execution_boundary(
+            robot=boundary.get("robot"),
+            policy_contract={
+                "identity": boundary.get("identity"),
+                "joints": boundary.get("joints"),
+                "actions": boundary.get("actions"),
+                "timing": boundary.get("timing"),
+                "versions": boundary.get("versions"),
+            },
+        )
+    except TrackError as exc:
+        issues.append(str(exc))
+        rebuilt_boundary = None
+    if rebuilt_boundary is not None and rebuilt_boundary != boundary:
+        issues.append("execution boundary contains non-canonical fields or values")
+
+    for key in (
+        "config_sha256", "certification_config_sha256", "policy_contract_sha256",
+    ):
+        if not _is_sha256(donor.get(key)):
+            issues.append(f"donor.{key} is missing/invalid")
+
+    cadence = reference.get("cadence")
+    try:
+        fps = float(reference["fps"])
+        frame_count = int(reference["frame_count"])
+        duration_s = float(reference["playback_duration_s"])
+        phase_target_count = int(reference["phase_target_count"])
+    except (KeyError, TypeError, ValueError):
+        issues.append("reference fps/frame count/duration/phase targets are invalid")
+    else:
+        if fps <= 0.0 or frame_count < 1 or duration_s <= 0.0:
+            issues.append("reference fps/frame count/duration must be positive")
+        elif abs(duration_s - (frame_count / fps)) > 1e-9:
+            issues.append("reference playback duration does not match frame_count/fps")
+        if phase_target_count < 1:
+            issues.append("reference phase target count must be positive")
+        try:
+            control_hz = float(
+                boundary.get("timing", {}).get("control_hz", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            control_hz = 0.0
+            issues.append("execution boundary control cadence is invalid")
+        if control_hz < fps / 2.0:
+            issues.append("reference fps exceeds the certified control cadence")
+        if duration_s > 0.0 and phase_target_count > round(duration_s * control_hz):
+            issues.append("reference phase targets exceed available control steps")
+    expected_cadence = {
+        "schema": TIER_D_REFERENCE_CADENCE,
+        "frame_selection": "round(phase * (frame_count - 1))",
+        "phase_interval": "[0,1)",
+        "clock": "environment_control_step_dt",
+    }
+    if not isinstance(cadence, dict) or cadence != expected_cadence:
+        issues.append("reference cadence schema is missing/unsupported")
+    ordered_reference_joints = reference.get("ordered_joints")
+    if ordered_reference_joints != boundary.get("joints", {}).get("ordered_names"):
+        issues.append("reference ordered joints differ from the execution boundary")
+
+    recorded_boundary_sha = contract.get("execution_boundary_sha256")
+    try:
+        actual_boundary_sha = _canonical_sha256(boundary)
+    except (TypeError, ValueError):
+        actual_boundary_sha = ""
+        issues.append("execution boundary is not canonical JSON")
+    if not _is_sha256(recorded_boundary_sha):
+        issues.append("execution boundary sha256 is missing/invalid")
+    elif recorded_boundary_sha != actual_boundary_sha:
+        issues.append("execution boundary sha256 mismatch")
+
+    recorded_contract_sha = contract.get("contract_sha256")
+    unsigned_contract = dict(contract)
+    unsigned_contract.pop("contract_sha256", None)
+    try:
+        actual_contract_sha = _canonical_sha256(unsigned_contract)
+    except (TypeError, ValueError):
+        actual_contract_sha = ""
+        issues.append("execution contract is not canonical JSON")
+    if not _is_sha256(recorded_contract_sha):
+        issues.append("execution contract sha256 is missing/invalid")
+    elif recorded_contract_sha != actual_contract_sha:
+        issues.append("execution contract sha256 mismatch")
+    return issues
+
+
+def compare_tierd_target_contract(
+    execution_contract: Any,
+    target_policy_contract: Any,
+    *,
+    target_robot: str,
+) -> list[str]:
+    """Compare certified dynamics evidence to a proposed target project.
+
+    Donor config and full policy-contract digests remain evidence, not an
+    equality constraint.  This comparison deliberately admits different
+    optimization/network settings while requiring the same robot, task,
+    ordered joint/action interface, simulator cadence, and software versions.
+    """
+    issues = validate_tierd_execution_contract(execution_contract)
+    if issues:
+        return [f"certified {issue}" for issue in issues]
+    try:
+        target = _policy_execution_boundary(
+            robot=target_robot, policy_contract=target_policy_contract,
+        )
+    except TrackError as exc:
+        return [f"target {exc}"]
+    source = execution_contract["execution_boundary"]
+    reasons: list[str] = []
+    paths = (
+        ("robot",),
+        ("identity", "adapter_class"),
+        ("identity", "task_id"),
+        ("joints", "ordered_names"),
+        ("actions", "ordered_names"),
+        ("actions", "term_names"),
+        ("actions", "shape"),
+        ("timing", "sim_timestep_s"),
+        ("timing", "decimation"),
+        ("timing", "control_dt_s"),
+        ("versions", "torch"),
+        ("versions", "mjlab"),
+        ("versions", "rsl_rl"),
+        ("versions", "adapter"),
+    )
+    for path in paths:
+        left: Any = source
+        right: Any = target
+        for key in path:
+            left = left.get(key) if isinstance(left, dict) else None
+            right = right.get(key) if isinstance(right, dict) else None
+        if left != right:
+            reasons.append(
+                f"{'.'.join(path)} differs (certified {left!r}, target {right!r})"
+            )
+    return reasons
 
 
 # ── phase-target downsampling ───────────────────────────────────────────
@@ -535,6 +963,7 @@ def generate_tracking_residual_reward_source(
     *,
     clip: dict[str, Any],
     clip_id: str,
+    robot: str,
     version: str = "v0",
     n_phase_targets: int = REFERENCE_REWARD_PHASE_TARGETS,
     residual_max: float = 0.25,
@@ -551,6 +980,8 @@ def generate_tracking_residual_reward_source(
     """
     from sculptor.refs.convert import clip_to_arrays
 
+    if not isinstance(robot, str) or not robot:
+        raise TrackError("tracking reward requires an exact robot namespace")
     arrays, meta = clip_to_arrays(clip, n_envs=1)
     if "joint_pos" not in arrays or not meta.get("joint_names"):
         raise TrackError(
@@ -648,9 +1079,11 @@ REWARD_SPEC: dict = {{
     # task's `pose`/`upright`/gait terms compete with the very motion being
     # certified (measured: 28% of the reference's joint amplitude reproduced).
     "reference_tracking": True,
+    "reference_robot": {robot!r},
     "composition": {{
         "type": "reference_tracking_residual",
         "reference_clip_id": {clip_id!r},
+        "reference_robot": {robot!r},
         "reference_target_sha256": {target_hash!r},
         "tracking_weight": 1.0,
         "residual_max": {float(residual_max)!r},
@@ -1148,6 +1581,29 @@ def compute_tracking_errors(
 
 
 # ── donor-config templating ─────────────────────────────────────────────
+def _read_adapter_config_file(config_path: Path) -> dict[str, Any]:
+    """Read one adapter table without instantiating runtime code."""
+    try:
+        import tomllib  # py311+
+    except ModuleNotFoundError:  # pragma: no cover - py310 fallback
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    config_path = Path(config_path)
+    if not config_path.is_file():
+        raise TrackError(f"adapter config does not exist: {config_path}")
+    with config_path.open("rb") as f:
+        cfg = tomllib.load(f)
+    adapter_cfg = cfg.get("adapter")
+    if not adapter_cfg or "class" not in adapter_cfg:
+        raise TrackError(
+            f"{config_path}: missing [adapter] section or [adapter].class"
+        )
+    return {
+        "class": adapter_cfg["class"],
+        "config": adapter_cfg.get("config", {}) or {},
+    }
+
+
 def read_donor_adapter_config(donor_project: Path) -> dict[str, Any]:
     """Read `[adapter]` (class + config) out of a donor project's
     `config.toml`. Raises `TrackError` with an actionable message if the
@@ -1241,6 +1697,7 @@ def build_track_project(
     n_episodes: int = DEFAULT_N_EPISODES,
     n_phase_targets: int = N_PHASE_TARGETS,
     control_hz: float = DEFAULT_CONTROL_HZ,
+    sim_timing: Optional[_timing.SimTiming] = None,
 ) -> TrackPlan:
     """Build the throwaway sculpt project directory (config.toml +
     rewards/current.py + env/ RSI+eval-reset), WITHOUT training. Used by
@@ -1256,6 +1713,14 @@ def build_track_project(
 
     adapter_cfg = read_donor_adapter_config(donor_project)
     config_path = write_project_config_toml(project_dir, adapter_cfg)
+    if sim_timing is None:
+        task_id = str(adapter_cfg.get("config", {}).get("task_id") or "")
+        sim_timing = _timing.timing_for_task(task_id)
+    effective_control_hz = (
+        sim_timing.control_hz if sim_timing is not None else float(control_hz)
+    )
+    if effective_control_hz <= 0.0:
+        raise TrackError("tracking project control rate must be positive")
 
     # The phase clock must advance with WALL TIME, not with the training
     # budget. This used to read `int(steps_per_iteration)`, but per this
@@ -1268,7 +1733,7 @@ def build_track_project(
     fps = float(clip.get("fps") or 0.0) or 30.0
     n_frames = int(np.asarray(clip["root_pos_z"]).shape[0])
     duration_s = n_frames / fps if fps > 0 else 0.0
-    episode_len_steps = max(1, int(round(duration_s * float(control_hz))))
+    episode_len_steps = max(1, int(round(duration_s * effective_control_hz)))
     target_joint_pos = downsample_phase_targets(
         np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase_targets)
     target_root_z = downsample_phase_targets(
@@ -1298,11 +1763,15 @@ def build_track_project(
     # cannot visit all its targets, or a reference with content above Nyquist,
     # should be visible before the GPU time is spent rather than inferred from
     # a flat learning curve afterwards.
-    timing_findings = _timing.validate_timing(
-        _timing.MJLAB_G1_VELOCITY,
-        reference_fps=fps,
-        reference_duration_s=duration_s,
-        n_phase_targets=n_phase_targets)
+    timing_findings = (
+        _timing.validate_timing(
+            sim_timing,
+            reference_fps=fps,
+            reference_duration_s=duration_s,
+            n_phase_targets=n_phase_targets,
+        )
+        if sim_timing is not None else []
+    )
     for finding in timing_findings:
         print(f"[track] timing: {finding}", file=sys.stderr, flush=True)
 
@@ -1353,6 +1822,7 @@ def update_provenance_tier_d(
     errors: TrackingErrors,
     iterations: int,
     rollout_path: Optional[Path] = None,
+    execution_contract: Optional[dict[str, Any]] = None,
     root: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Read -> mutate -> write the clip's provenance with the Tier-D
@@ -1378,6 +1848,27 @@ def update_provenance_tier_d(
     as an unverifiable (not fatally-erroring) certificate."""
     from sculptor.refs import library
 
+    # A feasible rollout without exact execution evidence is still useful
+    # diagnostic output, but it is not a Tier-D certificate.  Fail before
+    # mutating provenance rather than letting an unscoped "D" claim escape.
+    if execution_contract is None and errors.feasible:
+        raise TrackError(
+            "feasible Tier-D provenance requires an execution contract"
+        )
+    if execution_contract is not None:
+        issues = validate_tierd_execution_contract(execution_contract)
+        if issues:
+            raise TrackError(
+                "cannot record invalid Tier-D execution contract: "
+                + "; ".join(issues)
+            )
+        certified_robot = execution_contract["execution_boundary"]["robot"]
+        if certified_robot != robot:
+            raise TrackError(
+                f"execution contract robot {certified_robot!r} does not match "
+                f"provenance robot {robot!r}"
+            )
+
     prov = library.read_provenance(robot, clip_id, root=root)
     tier_d_block: dict[str, Any] = {
         "tracked_at": library._utc_now_iso(),
@@ -1385,6 +1876,14 @@ def update_provenance_tier_d(
         "errors": errors.to_dict(),
         "clip_content_sha256": prov.get("content_sha256"),
     }
+    if execution_contract is not None:
+        tier_d_block["execution_contract"] = execution_contract
+        tier_d_block["execution_contract_sha256"] = execution_contract[
+            "contract_sha256"
+        ]
+        tier_d_block["execution_boundary_sha256"] = execution_contract[
+            "execution_boundary_sha256"
+        ]
     if errors.feasible:
         prov["tier"] = "D"
         if rollout_path is not None:
@@ -1455,18 +1954,64 @@ def track_clip(
         clip_d = library.clip_dir(robot, clip_id, root=library_root)
         project_dir = clip_d / "tierD_work"
 
+    policy_contract: Optional[dict[str, Any]] = None
+    sim_timing: Optional[_timing.SimTiming] = None
+    if not dry_run:
+        try:
+            from sculptor.policy_contract import build_project_policy_contract
+
+            policy_contract = build_project_policy_contract(Path(donor_project))
+            boundary = _policy_execution_boundary(
+                robot=robot, policy_contract=policy_contract,
+            )
+            timing = boundary["timing"]
+            sim_timing = _timing.SimTiming(
+                physics_dt=float(timing["sim_timestep_s"]),
+                decimation=int(timing["decimation"]),
+            )
+        except Exception as exc:  # noqa: BLE001 - normalized setup failure
+            if isinstance(exc, TrackError):
+                raise
+            raise TrackError(
+                "cannot capture donor execution boundary before tracking: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
     _log(f"[track] building throwaway project at {project_dir}")
     plan = build_track_project(
         clip=clip, clip_id=clip_id, robot=robot, donor_project=donor_project,
         project_dir=project_dir, iterations=iterations,
-        steps_per_iteration=steps_per_iteration, n_episodes=n_episodes)
+        steps_per_iteration=steps_per_iteration, n_episodes=n_episodes,
+        sim_timing=sim_timing,
+    )
 
     if dry_run:
         prov = library.read_provenance(robot, clip_id, root=library_root)
         return TrackResult(plan=plan, errors=None, provenance=prov, dry_run=True)
 
+    assert policy_contract is not None  # established before project construction
+    execution_contract = build_tierd_execution_contract(
+        donor_project=donor_project,
+        certification_config_path=plan.config_path,
+        robot=robot,
+        clip=clip,
+        n_phase_targets=plan.n_phase_targets,
+        policy_contract=policy_contract,
+    )
+
     _log(f"[track] loading adapter from {plan.config_path}")
     adapter = load_adapter(plan.config_path)
+    consumed_config_sha = _file_sha256(
+        plan.config_path, label="generated certification config.toml",
+    )
+    recorded_config_sha = execution_contract["donor"][
+        "certification_config_sha256"
+    ]
+    if consumed_config_sha != recorded_config_sha:
+        raise TrackError(
+            "generated certification config changed while the adapter was "
+            "being loaded; refusing a stale Tier-D execution receipt"
+        )
 
     import inspect
 
@@ -1543,6 +2088,7 @@ def track_clip(
     prov = update_provenance_tier_d(
         robot=robot, clip_id=clip_id, errors=errors,
         iterations=plan.iterations, rollout_path=rollout_dest,
+        execution_contract=execution_contract,
         root=library_root)
 
     return TrackResult(plan=plan, errors=errors, provenance=prov, dry_run=False)
@@ -1587,6 +2133,40 @@ class TierDCertificate:
     rollout_path: Path
     rollout_sha256: str
     clip_content_sha256: str
+    execution_contract: dict[str, Any] = field(repr=False)
+    execution_contract_sha256: str = ""
+    execution_boundary_sha256: str = ""
+    # Canonical digest of the exact robot/clip identity plus the complete
+    # tierD certificate block that passed verification.  This is a receipt for
+    # immutable admission state, not a substitute for re-reading the clip and
+    # rollout bytes at every execution boundary.
+    certificate_sha256: str = ""
+
+
+class TierDAdmissionError(ValueError):
+    """Raised when a reference cannot satisfy an exact Tier-D admission."""
+
+
+def _tierd_certificate_sha256(
+    robot: str,
+    clip_id: str,
+    tier_d: dict[str, Any],
+) -> str:
+    """Stable content identity for one verified Tier-D certificate block."""
+    payload = {
+        "schema": TIER_D_CERTIFICATE_SCHEMA,
+        "robot": robot,
+        "clip_id": clip_id,
+        "tierD": tier_d,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def verify_tierd_certificate(
@@ -1674,6 +2254,30 @@ def verify_tierd_certificate(
     if prov.get("tier") != "D":
         return None, f"{prefix}: provenance.tier is {prov.get('tier')!r}, not 'D'"
 
+    execution_contract = tier_d.get("execution_contract")
+    execution_issues = validate_tierd_execution_contract(execution_contract)
+    if execution_issues:
+        return None, (
+            f"{prefix}: invalid Tier-D execution evidence: "
+            + "; ".join(execution_issues)
+        )
+    execution_contract_sha = execution_contract["contract_sha256"]
+    execution_boundary_sha = execution_contract["execution_boundary_sha256"]
+    if tier_d.get("execution_contract_sha256") != execution_contract_sha:
+        return None, (
+            f"{prefix}: tierD execution contract sha256 receipt is missing/stale"
+        )
+    if tier_d.get("execution_boundary_sha256") != execution_boundary_sha:
+        return None, (
+            f"{prefix}: tierD execution boundary sha256 receipt is missing/stale"
+        )
+    certified_robot = execution_contract["execution_boundary"]["robot"]
+    if certified_robot != robot:
+        return None, (
+            f"{prefix}: execution evidence robot {certified_robot!r} does not "
+            f"match library robot {robot!r}"
+        )
+
     rollout_path_str = tier_d.get("rollout_path")
     if not rollout_path_str:
         return None, f"{prefix}: tierD block has no rollout_path recorded"
@@ -1745,6 +2349,38 @@ def verify_tierd_certificate(
             f"{actual_clip_sha[:12]}…) — the clip file was modified after "
             "certification without re-tracking")
 
+    # The byte hash above already binds the motion artifact.  Re-read its
+    # explicit cadence/interface fields as well so a malformed or stale
+    # execution receipt produces an actionable denial rather than a generic
+    # digest mismatch downstream.
+    try:
+        from sculptor.reference import load_clip
+
+        current_clip = load_clip(clip_path)
+        current_fps = float(current_clip["fps"])
+        current_joints = [str(name) for name in current_clip["joint_names"]]
+        current_joint_pos = np.asarray(current_clip["joint_pos"])
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        return None, (
+            f"{prefix}: cannot read clip cadence/interface evidence: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    reference_evidence = execution_contract["reference"]
+    if current_joints != reference_evidence["ordered_joints"]:
+        return None, (
+            f"{prefix}: current clip ordered joints differ from Tier-D evidence"
+        )
+    if current_joint_pos.ndim != 2 or int(current_joint_pos.shape[0]) != int(
+        reference_evidence["frame_count"]
+    ):
+        return None, (
+            f"{prefix}: current clip frame count differs from Tier-D evidence"
+        )
+    if abs(current_fps - float(reference_evidence["fps"])) > 1e-12:
+        return None, (
+            f"{prefix}: current clip fps/cadence differs from Tier-D evidence"
+        )
+
     cert = TierDCertificate(
         robot=robot,
         clip_id=clip_id,
@@ -1756,5 +2392,189 @@ def verify_tierd_certificate(
         rollout_path=rollout_path,
         rollout_sha256=actual_rollout_sha,
         clip_content_sha256=current_clip_sha,
+        execution_contract=execution_contract,
+        execution_contract_sha256=execution_contract_sha,
+        execution_boundary_sha256=execution_boundary_sha,
+        certificate_sha256=_tierd_certificate_sha256(
+            robot, clip_id, tier_d,
+        ),
     )
     return cert, None
+
+
+def require_tierd_admission(
+    robot: str,
+    clip_id: str,
+    *,
+    expected_clip_sha256: Optional[str] = None,
+    expected_certificate_sha256: Optional[str] = None,
+    expected_rollout_sha256: Optional[str] = None,
+    expected_execution_contract_sha256: Optional[str] = None,
+    expected_execution_boundary_sha256: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> TierDCertificate:
+    """Verify Tier D and, when supplied, match immutable admission pins.
+
+    This is the sole raising admission API for launch paths.  Callers may use
+    :func:`verify_tierd_certificate` for a read-only availability verdict, but
+    mission attachment and every training boundary must come through here so
+    stale bytes cannot silently inherit a prior approval.
+    """
+    certificate, reason = verify_tierd_certificate(robot, clip_id, root=root)
+    if certificate is None:
+        raise TierDAdmissionError(
+            reason or f"{robot}/{clip_id}: no verified Tier-D certificate"
+        )
+
+    expected = {
+        "clip sha256": expected_clip_sha256,
+        "certificate sha256": expected_certificate_sha256,
+        "rollout sha256": expected_rollout_sha256,
+        "execution contract sha256": expected_execution_contract_sha256,
+        "execution boundary sha256": expected_execution_boundary_sha256,
+    }
+    actual = {
+        "clip sha256": certificate.clip_content_sha256,
+        "certificate sha256": certificate.certificate_sha256,
+        "rollout sha256": certificate.rollout_sha256,
+        "execution contract sha256": certificate.execution_contract_sha256,
+        "execution boundary sha256": certificate.execution_boundary_sha256,
+    }
+    for label, pinned in expected.items():
+        if pinned is not None and actual[label] != pinned:
+            raise TierDAdmissionError(
+                f"{robot}/{clip_id}: stale Tier-D admission: pinned {label} "
+                f"{pinned}, current {actual[label]}"
+            )
+    return certificate
+
+
+def require_tierd_target_compatibility(
+    certificate: TierDCertificate,
+    target_project: Path,
+    *,
+    target_robot: str,
+    target_policy_contract: Optional[dict[str, Any]] = None,
+) -> TierDCertificate:
+    """Fail closed unless a target project is inside the certified boundary.
+
+    This helper is intentionally separate from artifact verification so launch
+    adapters can build/request their target contract once and pass it here.
+    Supplying ``target_policy_contract`` is also the CPU-only test seam; normal
+    callers omit it and the canonical project contract is rebuilt from disk.
+    """
+    if not isinstance(target_robot, str) or not target_robot.strip():
+        raise TierDAdmissionError(
+            f"{certificate.robot}/{certificate.clip_id}: target robot identity "
+            "is required for Tier-D compatibility admission"
+        )
+    robot = target_robot.strip()
+    if target_policy_contract is None:
+        try:
+            from sculptor.policy_contract import build_project_policy_contract
+
+            target_policy_contract = build_project_policy_contract(
+                Path(target_project),
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize admission failure
+            raise TierDAdmissionError(
+                f"{certificate.robot}/{certificate.clip_id}: cannot build "
+                f"target execution contract: {type(exc).__name__}: {exc}"
+            ) from exc
+    reasons = compare_tierd_target_contract(
+        certificate.execution_contract,
+        target_policy_contract,
+        target_robot=robot,
+    )
+    if reasons:
+        raise TierDAdmissionError(
+            f"{certificate.robot}/{certificate.clip_id}: target project is "
+            "outside the certified Tier-D execution boundary: "
+            + "; ".join(reasons)
+        )
+    return certificate
+
+
+def require_stage_tierd_admission(
+    stage: Any,
+    *,
+    expected_robot: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> Optional[TierDCertificate]:
+    """Re-admit an attached mission stage against its exact stored pins.
+
+    Unattached stages return ``None``.  An attached legacy/Tier-K/unpinned
+    stage fails closed: it must be detached and attached again after earning a
+    real Tier-D certificate.  This keeps serialization backward compatible
+    without letting legacy display metadata become execution authority.
+    """
+    clip_id = getattr(stage, "reference_clip_id", None)
+    if not clip_id:
+        return None
+    robot = getattr(stage, "reference_robot", None)
+    clip_sha256 = getattr(stage, "reference_clip_sha256", None)
+    certificate_sha256 = getattr(
+        stage, "reference_certificate_sha256", None,
+    )
+    execution_contract_sha256 = getattr(
+        stage, "reference_execution_contract_sha256", None,
+    )
+    execution_boundary_sha256 = getattr(
+        stage, "reference_execution_boundary_sha256", None,
+    )
+    missing = [
+        label for label, value in (
+            ("reference_robot", robot),
+            ("reference_clip_sha256", clip_sha256),
+            ("reference_certificate_sha256", certificate_sha256),
+            ("reference_execution_contract_sha256", execution_contract_sha256),
+            ("reference_execution_boundary_sha256", execution_boundary_sha256),
+        ) if not value
+    ]
+    if missing:
+        raise TierDAdmissionError(
+            f"stage {getattr(stage, 'name', '<unknown>')!r} reference "
+            f"{clip_id!r} has no immutable Tier-D admission pin(s): "
+            + ", ".join(missing)
+        )
+    if getattr(stage, "reference_tier", None) != "D":
+        raise TierDAdmissionError(
+            f"stage {getattr(stage, 'name', '<unknown>')!r} reference "
+            f"{robot}/{clip_id} is not recorded as Tier D"
+        )
+    if expected_robot and str(robot) != expected_robot:
+        raise TierDAdmissionError(
+            f"stage {getattr(stage, 'name', '<unknown>')!r} reference robot "
+            f"pin {robot!r} does not match the active training robot "
+            f"{expected_robot!r}"
+        )
+    return require_tierd_admission(
+        str(robot),
+        str(clip_id),
+        expected_clip_sha256=str(clip_sha256),
+        expected_certificate_sha256=str(certificate_sha256),
+        expected_execution_contract_sha256=str(execution_contract_sha256),
+        expected_execution_boundary_sha256=str(execution_boundary_sha256),
+        root=root,
+    )
+
+
+def require_mission_tierd_admissions(
+    mission: Any,
+    *,
+    expected_robot: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> dict[str, TierDCertificate]:
+    """Re-admit every runnable attached reference in a mission."""
+    admitted: dict[str, TierDCertificate] = {}
+    for stage in getattr(mission, "stages", ()):
+        if getattr(stage, "status", "pending") not in ("pending", "training"):
+            continue
+        certificate = require_stage_tierd_admission(
+            stage,
+            expected_robot=expected_robot,
+            root=root,
+        )
+        if certificate is not None:
+            admitted[str(getattr(stage, "name", ""))] = certificate
+    return admitted
