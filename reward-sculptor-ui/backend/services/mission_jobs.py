@@ -92,6 +92,67 @@ _STAGE_TEE_EVENTS = frozenset({
 })
 
 
+def admit_mission_references_for_target(
+    project_dir: Path,
+    mission: Any,
+) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
+    """Re-admit every runnable reference against the current target.
+
+    A Tier-D certificate proves one donor execution boundary. It does not
+    authorize every project that happens to use the same robot slug. This
+    helper is shared by the HTTP enqueue boundary and the worker boundary so
+    both rebuild the exact project robot and policy contract from disk before
+    comparing each attached reference. A mission with no runnable attached
+    references stays independent of the reference subsystem.
+    """
+    runnable_with_reference = any(
+        getattr(stage, "status", "pending") in ("pending", "training")
+        and bool(getattr(stage, "reference_clip_id", None))
+        for stage in getattr(mission, "stages", ())
+    )
+    if not runnable_with_reference:
+        return None, {}, None
+
+    from backend.services.project_robot import resolve_project_reference_robot
+    from sculptor.policy_contract import (
+        build_project_policy_contract,
+        contract_fingerprint,
+    )
+    from sculptor.refs.track import (
+        TierDAdmissionError,
+        require_mission_tierd_admissions,
+        require_tierd_target_compatibility,
+    )
+
+    try:
+        target_robot = resolve_project_reference_robot(project_dir)
+        target_policy_contract = build_project_policy_contract(project_dir)
+    except Exception as exc:  # noqa: BLE001 - normalize target resolution
+        raise TierDAdmissionError(
+            "cannot resolve the mission target execution boundary: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    admitted = require_mission_tierd_admissions(
+        mission,
+        expected_robot=target_robot,
+    )
+    for certificate in admitted.values():
+        require_tierd_target_compatibility(
+            certificate,
+            project_dir,
+            target_robot=target_robot,
+            target_policy_contract=target_policy_contract,
+        )
+    return target_robot, admitted, {
+        "schema": 1,
+        "target_robot": target_robot,
+        "policy_contract_sha256": contract_fingerprint(
+            target_policy_contract,
+        ),
+    }
+
+
 # ── In-process decompose ─────────────────────────────────────────────
 def run_mission_decompose_job(
     *,
@@ -164,8 +225,39 @@ def run_mission_decompose_job(
 
             kg_store = None if no_kg else SculptorKG()
             try:
+                target_project = None
+                target_robot = None
+                target_policy_contract = None
+                try:
+                    from backend.services.project_robot import (
+                        resolve_project_reference_robot,
+                    )
+                    from sculptor.policy_contract import (
+                        build_project_policy_contract,
+                    )
+
+                    target_robot = resolve_project_reference_robot(project_dir)
+                    target_policy_contract = build_project_policy_contract(
+                        project_dir,
+                    )
+                    target_project = project_dir
+                except Exception as exc:  # noqa: BLE001 - candidate-only
+                    job.emit({
+                        "type": "mission_reference_candidates_only",
+                        "mission_slug": mission_slug,
+                        "reason": (
+                            "target execution boundary unavailable: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    })
                 mission = decompose_task(
-                    goal, reward_contract, kg_store=kg_store,
+                    goal,
+                    reward_contract,
+                    kg_store=kg_store,
+                    robot_hint=target_robot,
+                    target_project=target_project,
+                    target_robot=target_robot,
+                    target_policy_contract=target_policy_contract,
                 )
             finally:
                 if kg_store is not None:
@@ -356,6 +448,7 @@ def run_mission_execute_job(
     mission_slug: str,
     run_kwargs: Optional[dict[str, Any]] = None,
     job_manager: Optional[JobManager] = None,
+    reference_target_receipt: Optional[dict[str, Any]] = None,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Async runner that spawns `sculpt mission-run` as a subprocess
     and streams its `[SCULPT-EVENT]` markers into `job.events`.
@@ -378,6 +471,65 @@ def run_mission_execute_job(
             "project_slug": project_slug,
             "run_kwargs": dict(run_kwargs or {}),
         })
+
+        # Worker-boundary recheck: the request handler's successful admission
+        # is not transferable across the queue delay.  Re-read mission state
+        # and the exact clip/certificate/rollout bytes before creating any
+        # training subprocess.
+        from sculptor.mission import load_mission
+        from sculptor.refs.track import TierDAdmissionError
+
+        md = mission_store.mission_dir(project_dir, mission_slug)
+        try:
+            mission = load_mission(md)
+            target_robot, admitted, current_target_receipt = (
+                admit_mission_references_for_target(
+                    project_dir,
+                    mission,
+                )
+            )
+            if (
+                reference_target_receipt is not None
+                and current_target_receipt != reference_target_receipt
+            ):
+                raise TierDAdmissionError(
+                    "mission target execution contract changed after queue "
+                    f"(pinned {reference_target_receipt}, current "
+                    f"{current_target_receipt})"
+                )
+        except TierDAdmissionError as exc:
+            job.emit({
+                "type": "mission_reference_admission_failed",
+                "mission_slug": mission_slug,
+                "error": str(exc),
+            })
+            raise RuntimeError(
+                f"mission reference admission failed before spawn: {exc}"
+            ) from exc
+        if admitted:
+            job.emit({
+                "type": "mission_references_admitted",
+                "mission_slug": mission_slug,
+                "boundary": "mission_worker_entry",
+                "target_robot": target_robot,
+                "target_receipt": current_target_receipt,
+                "stages": {
+                    stage_name: {
+                        "reference_robot": certificate.robot,
+                        "reference_clip_id": certificate.clip_id,
+                        "clip_sha256": certificate.clip_content_sha256,
+                        "rollout_sha256": certificate.rollout_sha256,
+                        "certificate_sha256": certificate.certificate_sha256,
+                        "execution_contract_sha256": (
+                            certificate.execution_contract_sha256
+                        ),
+                        "execution_boundary_sha256": (
+                            certificate.execution_boundary_sha256
+                        ),
+                    }
+                    for stage_name, certificate in admitted.items()
+                },
+            })
 
         # Build cmd. `sculpt` is a typer entry point; spawn via
         # `python -m sculptor.cli` so we don't depend on PATH having
@@ -403,7 +555,6 @@ def run_mission_execute_job(
         env.update(remote_env(project_dir.parent))
 
         # Per-job log file under the mission dir for durability.
-        md = mission_store.mission_dir(project_dir, mission_slug)
         md.mkdir(parents=True, exist_ok=True)
         log_path = md / f"_execute_{job.job_id}.log"
         job.params["log_file"] = str(log_path)

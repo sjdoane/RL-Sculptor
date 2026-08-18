@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -50,13 +51,21 @@ from backend.services.physical_scene_audit import (
     audit_physical_scene_alignment,
 )
 from backend.services.project_store import ProjectStore
+from backend.services.project_robot import resolve_project_reference_robot
 from backend.services.run_manager import (
     build_iterations_summary,
     control_file_path,
     read_control_file,
+    resolve_starting_skill_target,
     resolve_warm_start_checkpoint,
     run_sculpt_job,
     write_control_file,
+)
+from sculptor.skill_bundle import ImportTarget, compatibility_for
+from sculptor.skill_library import SkillLibrary, SkillLibraryError
+from sculptor.reference_authority import (
+    ActiveReferenceAuthorityError,
+    resolve_active_reference_authority,
 )
 
 # Snake-case-ish segment guard for mission_slug / stage_name before they are
@@ -94,6 +103,14 @@ def _problem(
         content=body,
         media_type="application/problem+json",
     )
+
+
+def _sha256_path(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _find_run(jobs: JobManager, slug: str, run_id: str) -> Optional[Job]:
@@ -517,21 +534,264 @@ def launch_run(
                 type_="/problems/no-api-key",
             )
 
+        if not (body.fitness_metric or "").strip() and not (
+            body.acknowledge_blind_fitness
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "objective fitness is required for live training",
+                detail=(
+                    "choose an objective fitness metric, or explicitly set "
+                    "acknowledge_blind_fitness=true for a deliberate blind "
+                    "ablation"
+                ),
+                type_="/problems/objective-fitness-required",
+            )
+
     project_dir = Path(detail.project_dir)
+    if body.warm_start_iteration is not None and body.starting_skill_id is not None:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "choose one starting policy source",
+            detail=(
+                "warm_start_iteration recovers this project's checkpoint; "
+                "starting_skill_id selects a shared/imported skill. They cannot "
+                "both initialize the same run."
+            ),
+            type_="/problems/starting-skill",
+        )
+    if body.initialization_mode is not None and body.starting_skill_id is None:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "initialization mode has no starting skill",
+            detail="select a starting_skill_id or clear initialization_mode",
+            type_="/problems/starting-skill",
+        )
+    if (
+        body.expected_starting_skill_manifest_digest is not None
+        and body.starting_skill_id is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "starting-skill manifest pin has no skill",
+            detail=(
+                "expected_starting_skill_manifest_digest is only valid with "
+                "starting_skill_id"
+            ),
+            type_="/problems/starting-skill-stale",
+        )
+    if (
+        body.starting_skill_id is not None
+        and body.expected_starting_skill_manifest_digest is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "starting-skill manifest pin is required",
+            detail=(
+                "refresh the starting-point picker and submit the receipt's "
+                "manifest_digest with the selected skill"
+            ),
+            type_="/problems/starting-skill-stale",
+        )
+    if bool(body.reference_clip_id) != bool(body.reference_robot):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference motion is incomplete",
+            detail=(
+                "reference_clip_id and reference_robot must be supplied together"
+            ),
+            type_="/problems/reference-motion",
+        )
+
+    selected_skill = None
+    starting_skill_target_receipt: Optional[dict[str, Any]] = None
+    selected_mode = body.initialization_mode or "actor_only"
+    resolved_reference_clip_id = body.reference_clip_id
+    resolved_reference_robot = body.reference_robot
+    reference_feasibility: Optional[dict[str, Any]] = None
+    try:
+        active_reference = resolve_active_reference_authority(
+            project_dir / "rewards",
+        )
+    except ActiveReferenceAuthorityError as exc:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "active reward reference authority is invalid",
+            detail=str(exc),
+            type_="/problems/active-reference-authority",
+        )
+    active_reference_receipt = (
+        active_reference.to_dict() if active_reference is not None else None
+    )
+    if body.starting_skill_id is not None:
+        try:
+            resolve_project_reference_robot(project_dir)
+        except (OSError, TypeError, ValueError) as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "project robot identity is unresolved",
+                detail=str(exc),
+                type_="/problems/starting-skill-project-contract",
+                code="project_robot_unresolved",
+            )
+        library = SkillLibrary()
+        selected_skill = library.load(body.starting_skill_id)
+        if selected_skill is None:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill is unavailable",
+                detail=f"no skill record {body.starting_skill_id!r}",
+                type_="/problems/starting-skill",
+            )
+        if (
+            selected_skill.manifest_digest
+            != body.expected_starting_skill_manifest_digest
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill changed after selection",
+                detail=(
+                    "the selected skill's immutable manifest digest no longer "
+                    "matches the launch request; refresh the starting-point "
+                    "picker before launching"
+                ),
+                type_="/problems/starting-skill-stale",
+                expected_manifest_digest=(
+                    body.expected_starting_skill_manifest_digest
+                ),
+                actual_manifest_digest=selected_skill.manifest_digest,
+            )
+        try:
+            target_payload, starting_skill_target_receipt = (
+                resolve_starting_skill_target(
+                    project_dir,
+                    require_policy_contract=(selected_mode != "reference_only"),
+                )
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "project policy contract is unavailable",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/starting-skill-project-contract",
+            )
+        target = ImportTarget(
+            adapter_class=target_payload["adapter_class"],
+            task_id=target_payload["task_id"],
+            robot_slug=target_payload["robot_slug"],
+            compatibility_contract=target_payload["compatibility_contract"],
+        )
+        compatibility = compatibility_for(selected_skill, target)
+        if compatibility["reasons"]:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill is incompatible",
+                detail="; ".join(compatibility["reasons"]),
+                type_="/problems/starting-skill-incompatible",
+                compatibility=compatibility,
+            )
+        if selected_mode not in compatibility["allowed_initialization_modes"]:
+            selected_reasons = compatibility.get("mode_reasons", {}).get(
+                selected_mode, [],
+            )
+            reason_suffix = (
+                "; " + "; ".join(str(reason) for reason in selected_reasons)
+                if selected_reasons
+                else ""
+            )
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "initialization mode is not supported",
+                detail=(
+                    f"{selected_mode!r} is unavailable for this skill; choose "
+                    + ", ".join(compatibility["allowed_initialization_modes"])
+                    + reason_suffix
+                ),
+                type_="/problems/starting-skill-mode",
+                compatibility=compatibility,
+            )
+        if selected_mode != "reference_only":
+            try:
+                library.checkpoint_path_for(selected_skill)
+            except SkillLibraryError as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill failed its integrity check",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-integrity",
+                )
+        if (
+            selected_mode == "reference_only"
+            and selected_skill.reference_clip_id
+            and selected_skill.reference_robot
+        ):
+            bundled_pair = (
+                selected_skill.reference_clip_id,
+                selected_skill.reference_robot,
+            )
+            explicit_pair = (body.reference_clip_id, body.reference_robot)
+            if all(explicit_pair) and explicit_pair != bundled_pair:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill and motion selection disagree",
+                    detail=(
+                        "clear the separately selected motion or select the "
+                        "same motion carried by the starting-skill manifest"
+                    ),
+                    type_="/problems/starting-skill-reference",
+                )
+            resolved_reference_clip_id, resolved_reference_robot = bundled_pair
+        elif selected_mode == "reference_only":
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill has no reference motion",
+                detail="reference_only requires a bundled reference clip",
+                type_="/problems/starting-skill-reference",
+            )
+    if active_reference is not None:
+        active_pair = (
+            active_reference.reference_clip_id,
+            active_reference.reference_robot,
+        )
+        selected_pair = (
+            resolved_reference_clip_id,
+            resolved_reference_robot,
+        )
+        if any(selected_pair) and selected_pair != active_pair:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "motion selection disagrees with the active reward",
+                detail=(
+                    "the exact reward selected by rewards/current.py embeds "
+                    f"{active_pair[1]}/{active_pair[0]}; select that motion "
+                    "or promote a reward built for the requested motion"
+                ),
+                type_="/problems/active-reference-authority",
+                active_reference=active_reference_receipt,
+            )
+        resolved_reference_clip_id, resolved_reference_robot = active_pair
     # A promoted authored world is part of the run's scientific input, not a
     # cosmetic preview. Verify the atomic tuple at the last responsible
     # moment so a stale browser or direct API client cannot start training on
     # tampered/drifted artifacts. Legacy projects without a selection keep
     # their existing default-scene behavior.
     selection_path = project_dir / "env" / "selection_current.json"
+    authored_world_receipt: dict[str, Any] | None = None
     if selection_path.is_file():
         try:
-            world_report = world_store.validate(project_dir)
+            world_report = world_store.training_preflight(project_dir)
         except Exception as exc:  # noqa: BLE001 — fail closed before GPU work
             return _problem(
                 status.HTTP_412_PRECONDITION_FAILED,
                 "authored world could not be verified",
                 detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/world-integrity",
+            )
+        if not isinstance(world_report, dict):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world integrity check failed",
+                detail="authored world selection disappeared during preflight",
                 type_="/problems/world-integrity",
             )
         if not bool(world_report.get("ok")):
@@ -542,6 +802,24 @@ def launch_run(
                 detail="; ".join(str(error) for error in errors),
                 type_="/problems/world-integrity",
             )
+        if world_report.get("robot_matches_project") is False:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "training environment targets another robot",
+                detail=(
+                    f"the authored world targets "
+                    f"{world_report.get('world_robot')!r}, but the project "
+                    f"targets {world_report.get('project_robot')!r}; "
+                    "re-author the world for the project robot before launching"
+                ),
+                type_="/problems/world-robot-mismatch",
+            )
+        authored_world_receipt = {
+            "selection_version": world_report.get("selection_version"),
+            "tuple_hash": world_report.get("tuple_hash"),
+            "world_robot": world_report.get("world_robot"),
+            "project_robot": world_report.get("project_robot"),
+        }
     if body.warm_start_iteration is not None:
         try:
             resolve_warm_start_checkpoint(
@@ -554,7 +832,7 @@ def launch_run(
                 detail=f"{type(exc).__name__}: {exc}",
                 type_="/problems/warm-start",
             )
-    if bool(body.reference_clip_id) != bool(body.reference_robot):
+    if bool(resolved_reference_clip_id) != bool(resolved_reference_robot):
         return _problem(
             status.HTTP_412_PRECONDITION_FAILED,
             "reference motion is incomplete",
@@ -564,14 +842,14 @@ def launch_run(
             ),
             type_="/problems/reference-motion",
         )
-    if body.reference_clip_id and body.reference_robot:
+    if resolved_reference_clip_id and resolved_reference_robot:
         # Resolve the exact (embodiment, clip) pair before queuing GPU work.
         # The index is a cache, so provenance + clip bytes remain the
         # authoritative existence check.
         from sculptor.refs import library as reference_library
 
         ref_dir = reference_library.clip_dir(
-            body.reference_robot, body.reference_clip_id,
+            resolved_reference_robot, resolved_reference_clip_id,
         )
         provenance_path = ref_dir / reference_library.PROVENANCE_FILENAME
         clip_path = ref_dir / reference_library.CLIP_FILENAME
@@ -581,7 +859,7 @@ def launch_run(
                 "reference motion is unavailable",
                 detail=(
                     f"no complete reference clip "
-                    f"{body.reference_robot}/{body.reference_clip_id}"
+                    f"{resolved_reference_robot}/{resolved_reference_clip_id}"
                 ),
                 type_="/problems/reference-motion",
             )
@@ -605,7 +883,125 @@ def launch_run(
                 ),
                 type_="/problems/reference-motion",
             )
+        # Lokesh feasibility admission: a reference-backed TRAINING run is
+        # only scientifically meaningful after the exact clip has been
+        # physics-tracked successfully.  Never trust provenance.tier alone;
+        # the verifier re-hashes both clip and rollout artifacts.  Tier-K is
+        # still useful for an explicit inspect-only check, where the worker
+        # re-verifies the immutable reference contract and then returns before
+        # creating a sculpt subprocess.  It never trains, rolls out, or
+        # publishes a checkpoint; that weaker admission is recorded plainly.
+        from sculptor.refs.track import (
+            TierDAdmissionError,
+            require_tierd_admission,
+            require_tierd_target_compatibility,
+        )
+
+        try:
+            target_robot = resolve_project_reference_robot(project_dir)
+        except ValueError as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "project robot identity is unresolved",
+                detail=str(exc),
+                type_="/problems/reference-feasibility",
+            )
+        if resolved_reference_robot != target_robot:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is for a different robot",
+                detail=(
+                    f"selected reference robot {resolved_reference_robot!r} "
+                    f"does not match project robot {target_robot!r}"
+                ),
+                type_="/problems/reference-feasibility",
+            )
+        try:
+            certificate = require_tierd_admission(
+                resolved_reference_robot, resolved_reference_clip_id,
+            )
+            certificate = require_tierd_target_compatibility(
+                certificate,
+                project_dir,
+                target_robot=target_robot,
+            )
+            certificate_reason = None
+        except TierDAdmissionError as exc:
+            certificate = None
+            certificate_reason = str(exc)
+        if certificate is None and not body.dry_run:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is kinematic-only",
+                detail=(
+                    "live reference-backed training requires a verified "
+                    "Tier-D physics-tracking certificate for the exact clip "
+                    f"and rollout: {certificate_reason or 'not certified'}"
+                ),
+                type_="/problems/reference-feasibility",
+                reference_robot=resolved_reference_robot,
+                reference_clip_id=resolved_reference_clip_id,
+                required_tier="D",
+                admitted_tier="K",
+            )
+        if certificate is not None:
+            reference_feasibility = {
+                "status": "tierd_verified",
+                "tier": "D",
+                "clip_sha256": certificate.clip_content_sha256,
+                "rollout_sha256": certificate.rollout_sha256,
+                "certificate_sha256": certificate.certificate_sha256,
+                "execution_contract_sha256": (
+                    certificate.execution_contract_sha256
+                ),
+                "execution_boundary_sha256": (
+                    certificate.execution_boundary_sha256
+                ),
+                "target_robot": target_robot,
+                "tracked_at": certificate.tracked_at,
+            }
+        else:
+            reference_feasibility = {
+                "status": "kinematic_reference_inspection_only",
+                "tier": "K",
+                "clip_sha256": _sha256_path(clip_path),
+                "rollout_sha256": None,
+                "reason": certificate_reason,
+                "scope": "contract_and_reference_resolution",
+                "inspection_only": True,
+                "training_authorized": False,
+                "training_invoked": False,
+                "checkpoint_published": False,
+                "target_robot": target_robot,
+            }
     run_params: dict[str, Any] = body.model_dump()
+    run_params["initialization_mode"] = selected_mode if selected_skill else None
+    run_params["reference_clip_id"] = resolved_reference_clip_id
+    run_params["reference_robot"] = resolved_reference_robot
+    run_params["reference_feasibility"] = reference_feasibility
+    run_params["active_reference_authority"] = active_reference_receipt
+    run_params["starting_skill_target_receipt"] = (
+        starting_skill_target_receipt
+    )
+    # Pin the admitted world tuple separately from the request. The worker
+    # re-attests this receipt immediately before subprocess creation so a
+    # queued run cannot inherit a re-authored or deleted world silently.
+    run_params["authored_world_receipt"] = authored_world_receipt
+    run_params["objective_fitness_receipt"] = {
+        "requested_metric": body.fitness_metric,
+        "objective_requested": bool((body.fitness_metric or "").strip()),
+        "blind_ablation_acknowledged": bool(body.acknowledge_blind_fitness),
+        "dry_run": bool(body.dry_run),
+        "authorization": (
+            "dry_run"
+            if body.dry_run
+            else (
+                "objective_requested"
+                if (body.fitness_metric or "").strip()
+                else "blind_ablation_acknowledged"
+            )
+        ),
+    }
     job = jobs.submit(
         kind="sculpt_run",
         project_slug=slug,
@@ -715,6 +1111,23 @@ def get_run(
     return RunDetail(
         **summary.model_dump(),
         params=params,
+        reference_feasibility=(
+            dict(job.params["reference_feasibility"])
+            if isinstance(job.params.get("reference_feasibility"), dict)
+            else None
+        ),
+        objective_fitness_receipt=(
+            dict(job.params["objective_fitness_receipt"])
+            if isinstance(job.params.get("objective_fitness_receipt"), dict)
+            else None
+        ),
+        starting_skill_target_receipt=(
+            dict(job.params["starting_skill_target_receipt"])
+            if isinstance(
+                job.params.get("starting_skill_target_receipt"), dict,
+            )
+            else None
+        ),
         iterations=iterations,
         stdout_tail=list(job.log_ring),
         total_event_count=len(job.events),

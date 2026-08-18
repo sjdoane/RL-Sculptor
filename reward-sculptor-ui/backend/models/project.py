@@ -88,6 +88,9 @@ class ProjectSummary(BaseModel):
     # dashboard uses).
     adapter_class: Optional[str] = None
     library_slug: Optional[str] = None
+    # Exact namespace for reference clips and portable policy contracts. This
+    # is not inferred from ``library_slug`` or the adapter task id.
+    reference_robot: Optional[str] = None
     num_envs: Optional[int] = None
     device: Optional[str] = None
     primary_metric: Optional[float] = None
@@ -104,6 +107,7 @@ class ProjectDetail(ProjectSummary):
     # after cross-referencing metadata.json's robot_source.
     ready_to_train: bool = True
     library_slug: Optional[str] = None
+    reference_robot: Optional[str] = None
     # M5: true when the user created a project with a coming-soon
     # adapter (Isaac Lab / MJX / RLlib). UI disables the Train button
     # with a tooltip pointing at the adoption guide.

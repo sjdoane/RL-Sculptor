@@ -32,6 +32,15 @@ class RunParams(BaseModel):
     no_kg: bool = False
     dry_run: bool = False
 
+    acknowledge_blind_fitness: bool = False
+    """Explicit authorization for a live run with no objective fitness.
+
+    This is deliberately independent from ``fitness_metric``.  Omitting a
+    metric is an experimental ablation, not an implicit default that a direct
+    API client may trigger accidentally.  Dry runs do not require the
+    acknowledgement because they are explicitly labeled non-live checks.
+    """
+
     # Advanced — Phase 4.
     training_iterations: Optional[
         Annotated[int, Field(ge=100, le=200_000)]
@@ -174,6 +183,26 @@ class RunParams(BaseModel):
     this project's ``runs/iter_N/checkpoint.pt`` or ``checkpoint.zip`` and
     passes it to ``sculpt run --init-policy``.  It never changes the selected
     reward, environment, or objective-metric mode."""
+
+    starting_skill_id: Optional[
+        Annotated[str, Field(pattern=r"^[a-f0-9]{12}$")]
+    ] = None
+    """Content-addressed shared/imported policy selected as the run's
+    starting point. It is resolved and hash-attested again at launch."""
+
+    expected_starting_skill_manifest_digest: Optional[
+        Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    ] = None
+    """Optimistic-concurrency pin returned by the starting-skill receipt.
+    Required with ``starting_skill_id`` so a stale picker cannot silently
+    launch a record whose admitted manifest changed after selection."""
+
+    initialization_mode: Optional[
+        Literal["actor_only", "actor_critic", "full_resume", "reference_only"]
+    ] = None
+    """What state to inherit. Imported bundles currently admit actor-only or
+    actor+critic transfer; full_resume is reserved for exact optimizer/run-state
+    compatible records and is rejected unless the record explicitly allows it."""
 
     reference_clip_id: Optional[
         Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
@@ -327,9 +356,29 @@ class RunSummary(BaseModel):
 
 class RunDetail(RunSummary):
     params: RunParams
+    # Server-resolved feasibility receipt. It is deliberately outside
+    # RunParams so direct API clients cannot self-assert Tier-D authority.
+    reference_feasibility: Optional[dict] = None
+    # Server-derived receipt for the objective-fitness launch decision.  The
+    # request bit remains in ``params`` for exact replay; this receipt records
+    # which authority admitted the run.
+    objective_fitness_receipt: Optional[dict] = None
+    # Server-derived queue/launch attestation for an imported starting skill.
+    # Kept outside RunParams so API clients cannot self-assert compatibility.
+    starting_skill_target_receipt: Optional[dict] = None
     iterations: list[IterEventSummary]
     stdout_tail: list[str]                # last 200 in-memory lines
     total_event_count: int                # events list size
+
+
+class PolicyEvidenceValue(BaseModel):
+    """One objective-evidence value copied from the immutable iteration
+    sidecar. ``key`` is retained so the UI never invents a semantic label or
+    threshold that the metric did not record."""
+
+    key: str
+    value: float
+    kind: Literal["fraction", "count", "frames", "score", "value"]
 
 
 class PolicySummary(BaseModel):
@@ -343,6 +392,27 @@ class PolicySummary(BaseModel):
     primary_metric: Optional[float] = None
     fitness: Optional[float] = None
     reward_version: Optional[str] = None
+    # Objective identity is separate from the score. Older artifacts often
+    # contain a scalar but no immutable metric identity; those fields stay
+    # null rather than letting the UI imply the numbers are comparable.
+    metric_id: Optional[str] = None
+    metric_version: Optional[str] = None
+    metric_source: Optional[str] = None
+    metric_sha256: Optional[str] = None
+    criterion_status: Literal["passed", "failed", "not_recorded"] = (
+        "not_recorded"
+    )
+    evidence_status: Literal["complete", "partial", "unavailable"] = (
+        "unavailable"
+    )
+    route_evidence: Optional[PolicyEvidenceValue] = None
+    contact_evidence: Optional[PolicyEvidenceValue] = None
+    hold_evidence: Optional[PolicyEvidenceValue] = None
+    rollout_available: bool = False
+    # True only for a coherent on-disk selection receipt: top-level selected
+    # index + source and the matching candidate's selected=true marker.
+    selected: bool = False
+    selection_source: Optional[str] = None
 
 
 class RunWSMessage(BaseModel):

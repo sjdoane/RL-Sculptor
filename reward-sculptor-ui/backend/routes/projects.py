@@ -270,6 +270,7 @@ def _finalize_library_scaffold(
     robot_source = {
         "kind": "library",
         "library_slug": entry.slug,
+        "reference_robot": entry.reference_robot,
         "training_support": entry.training_support,
         "category": entry.category,
         "menagerie_package": entry.menagerie_package,

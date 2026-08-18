@@ -17,6 +17,7 @@ pending-stage-with-no-training-dir case (§commit 8b0bfa3 precedent).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -109,7 +110,12 @@ def _seed_library(
     library.rebuild_index(root=root)
 
 
-def _seed_t1_clip(root: Path, *, with_preview: bool = False) -> None:
+def _seed_t1_clip(
+    root: Path,
+    *,
+    with_preview: bool = False,
+    clip_id: str = "fallandgetup1_subject1_t1",
+) -> None:
     """§Problem 2 (2026-07-11): one t1 clip, deliberately given the SAME
     text/labels as `fallandgetup1_subject1` (the g1 clip `_seed_library`
     writes) so a robot-filter bug — e.g. accidentally pooling every
@@ -117,7 +123,6 @@ def _seed_t1_clip(root: Path, *, with_preview: bool = False) -> None:
     would be caught by a query that should hit only one of the two."""
     from sculptor.refs import library
 
-    clip_id = "fallandgetup1_subject1_t1"
     clip_dir = library.clip_dir("t1", clip_id, root=root)
     clip_dir.mkdir(parents=True, exist_ok=True)
     _write_clip_npz(clip_dir)
@@ -127,6 +132,65 @@ def _seed_t1_clip(root: Path, *, with_preview: bool = False) -> None:
         labels=["fall", "and", "get", "up", "subject1"], tier="K")
     if with_preview:
         _write_preview(clip_dir)
+    library.rebuild_index(root=root)
+
+
+def _certify_clip(
+    root: Path, robot: str, clip_id: str, *, project_dir: Path,
+) -> None:
+    """Write a minimal, internally consistent Tier-D test certificate."""
+    from sculptor.refs import library
+    from sculptor.policy_contract import build_project_policy_contract
+    from sculptor.reference import load_clip, save_clip
+    from sculptor.refs.track import build_tierd_execution_contract
+
+    clip_dir = library.clip_dir(robot, clip_id, root=root)
+    policy_contract = build_project_policy_contract(project_dir)
+    clip = load_clip(clip_dir / library.CLIP_FILENAME)
+    ordered_joints = list(policy_contract["joints"]["ordered_names"])
+    frame_count = len(np.asarray(clip["root_pos_z"]))
+    clip["joint_names"] = ordered_joints
+    clip["joint_pos"] = np.zeros(
+        (frame_count, len(ordered_joints)), dtype=np.float32,
+    )
+    save_clip(clip_dir / library.CLIP_FILENAME, clip)
+    clip_sha256 = library.content_sha256(
+        (clip_dir / library.CLIP_FILENAME).read_bytes()
+    )
+    rollout_path = clip_dir / "tierD_rollout.npz"
+    rollout_path.write_bytes(b"verified rollout fixture")
+    rollout_sha256 = library.content_sha256(rollout_path.read_bytes())
+    execution_contract = build_tierd_execution_contract(
+        donor_project=project_dir,
+        certification_config_path=project_dir / "config.toml",
+        robot=robot,
+        clip=load_clip(clip_dir / library.CLIP_FILENAME),
+        policy_contract=policy_contract,
+    )
+    provenance = library.read_provenance(robot, clip_id, root=root)
+    provenance["tier"] = "D"
+    provenance["content_sha256"] = clip_sha256
+    provenance["tierD"] = {
+        "feasible": True,
+        "tracked_at": "2026-07-09T01:00:00Z",
+        "iterations": 5,
+        "errors": {
+            "mean_joint_err_rad": 0.01,
+            "max_joint_err_rad": 0.02,
+            "root_z_rmse_m": 0.01,
+        },
+        "rollout_path": str(rollout_path.resolve()),
+        "rollout_sha256": rollout_sha256,
+        "clip_content_sha256": clip_sha256,
+        "execution_contract": execution_contract,
+        "execution_contract_sha256": execution_contract["contract_sha256"],
+        "execution_boundary_sha256": execution_contract[
+            "execution_boundary_sha256"
+        ],
+    }
+    library.write_provenance(
+        robot, clip_id, provenance, root=root,
+    )
     library.rebuild_index(root=root)
 
 
@@ -141,7 +205,22 @@ def refs_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _make_project(client: TestClient, name: str = "Refs Test") -> str:
     r = client.post("/projects", json={"name": name, "adapter": "gym_sb3"})
     assert r.status_code == 201, r.text
-    return r.json()["slug"]
+    slug = r.json()["slug"]
+    client.app.state.project_store.set_adapter_section(  # type: ignore[attr-defined]
+        slug,
+        "sculptor.adapters.mjlab.MjlabAdapter",
+        {"task_id": "Mjlab-Velocity-Flat-Unitree-G1"},
+    )
+    client.app.state.project_store.write_robot_source(  # type: ignore[attr-defined]
+        slug,
+        {
+            "kind": "library",
+            "library_slug": "g1",
+            "library_name": "g1",
+            "training_support": "ready",
+        },
+    )
+    return slug
 
 
 def _stage_dict(name: str, *, status: str = "pending") -> dict:
@@ -290,19 +369,71 @@ def test_search_t1_clip_found_only_under_t1_robot(
 # ── GET /references/{clip_id} ────────────────────────────────────────
 def test_get_reference_detail(client: TestClient, refs_root: Path) -> None:
     _seed_library(refs_root)
-    r = client.get("/references/fallandgetup1_subject1")
+    r = client.get("/references/fallandgetup1_subject1", params={"robot": "g1"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["index_row"]["clip_id"] == "fallandgetup1_subject1"
     assert body["provenance"]["clip_id"] == "fallandgetup1_subject1"
     assert body["provenance"]["license"] == "CC BY-NC-ND 4.0"
+    assert body["dynamics_admission"]["admitted"] is False
+    assert body["dynamics_admission"]["certificate_digest"] is None
+    assert "tierD" in body["dynamics_admission"]["reason"]
+
+
+def test_reference_artifact_routes_require_robot_identity(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _seed_library(refs_root)
+    for suffix in ("", "/preview", "/file/clip.npz", "/modes"):
+        response = client.get(f"/references/fallandgetup1_subject1{suffix}")
+        assert response.status_code == 422, (suffix, response.text)
+        assert response.json()["detail"][0]["loc"] == ["query", "robot"]
+
+
+def test_get_reference_detail_exposes_reverified_dynamics_receipt(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    from sculptor.refs.track import TierDCertificate
+
+    _seed_library(refs_root)
+    certificate = TierDCertificate(
+        robot="g1",
+        clip_id="fallandgetup1_subject1",
+        tracked_at="2026-08-17T00:00:00Z",
+        iterations=500,
+        mean_joint_err_rad=0.1,
+        max_joint_err_rad=0.3,
+        root_z_rmse_m=0.02,
+        rollout_path=refs_root / "g1" / "fallandgetup1_subject1" / "tierD_rollout.npz",
+        rollout_sha256="1" * 64,
+        clip_content_sha256="2" * 64,
+        execution_contract={"schema": "test-only"},
+        execution_contract_sha256="4" * 64,
+        execution_boundary_sha256="5" * 64,
+        certificate_sha256="3" * 64,
+    )
+    monkeypatch.setattr(
+        "sculptor.refs.track.verify_tierd_certificate",
+        lambda robot, clip_id: (certificate, None),
+    )
+
+    response = client.get(
+        "/references/fallandgetup1_subject1", params={"robot": "g1"}
+    )
+    assert response.status_code == 200, response.text
+    admission = response.json()["dynamics_admission"]
+    assert admission["admitted"] is True
+    assert admission["tier"] == "D"
+    assert admission["clip_sha256"] == "2" * 64
+    assert admission["rollout_sha256"] == "1" * 64
+    assert len(admission["certificate_digest"]) == 64
 
 
 def test_get_reference_detail_404_unknown_clip(
     client: TestClient, refs_root: Path,
 ) -> None:
     _seed_library(refs_root)
-    r = client.get("/references/no-such-clip")
+    r = client.get("/references/no-such-clip", params={"robot": "g1"})
     assert r.status_code == 404
 
 
@@ -313,20 +444,24 @@ def test_get_reference_detail_404_invalid_clip_id_regex(
     # Uppercase + traversal-shaped path segments both fail the
     # `^[a-z0-9][a-z0-9_-]{0,95}$` guard.
     for bad_id in ["Bad-ID", "..", "has space"]:
-        r = client.get(f"/references/{bad_id}")
+        r = client.get(f"/references/{bad_id}", params={"robot": "g1"})
         assert r.status_code == 404, (bad_id, r.text)
 
 
 # ── GET /references/{clip_id}/preview ────────────────────────────────
 def test_preview_404_when_absent(client: TestClient, refs_root: Path) -> None:
     _seed_library(refs_root)  # no previews written
-    r = client.get("/references/fallandgetup1_subject1/preview")
+    r = client.get(
+        "/references/fallandgetup1_subject1/preview", params={"robot": "g1"}
+    )
     assert r.status_code == 404
 
 
 def test_preview_200_when_present(client: TestClient, refs_root: Path) -> None:
     _seed_library(refs_root, with_preview_for={"fallandgetup1_subject1"})
-    r = client.get("/references/fallandgetup1_subject1/preview")
+    r = client.get(
+        "/references/fallandgetup1_subject1/preview", params={"robot": "g1"}
+    )
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "image/png"
 
@@ -334,7 +469,10 @@ def test_preview_200_when_present(client: TestClient, refs_root: Path) -> None:
 # ── GET /references/{clip_id}/file/clip.npz ──────────────────────────
 def test_download_clip_file(client: TestClient, refs_root: Path) -> None:
     _seed_library(refs_root)
-    r = client.get("/references/fallandgetup1_subject1/file/clip.npz")
+    r = client.get(
+        "/references/fallandgetup1_subject1/file/clip.npz",
+        params={"robot": "g1"},
+    )
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "application/octet-stream"
     assert len(r.content) > 0
@@ -344,7 +482,9 @@ def test_download_clip_file_404_unknown_clip(
     client: TestClient, refs_root: Path,
 ) -> None:
     _seed_library(refs_root)
-    r = client.get("/references/no-such-clip/file/clip.npz")
+    r = client.get(
+        "/references/no-such-clip/file/clip.npz", params={"robot": "g1"}
+    )
     assert r.status_code == 404
 
 
@@ -360,30 +500,56 @@ def test_download_clip_file_traversal_rejected(
     assert r.status_code in (404, 307, 308)
 
 
-def test_get_reference_detail_preview_and_download_resolve_t1_clip(
+def test_get_reference_detail_preview_and_download_use_exact_t1_pair(
     client: TestClient, refs_root: Path,
 ) -> None:
-    """The single-clip routes (detail/preview/file) carry no `robot`
-    param at all — robot is resolved by looking the clip_id up in the
-    index (§decision 11's design). A t1 clip_id must resolve through
-    every one of them exactly like a g1 clip_id does."""
+    """Every artifact route resolves the explicit robot/clip identity."""
     _seed_library(refs_root)
     _seed_t1_clip(refs_root, with_preview=True)
     clip_id = "fallandgetup1_subject1_t1"
 
-    r = client.get(f"/references/{clip_id}")
+    r = client.get(f"/references/{clip_id}", params={"robot": "t1"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["index_row"]["robot"] == "t1"
     assert body["provenance"]["robot"] == "t1"
 
-    r2 = client.get(f"/references/{clip_id}/preview")
+    r2 = client.get(f"/references/{clip_id}/preview", params={"robot": "t1"})
     assert r2.status_code == 200, r2.text
     assert r2.headers["content-type"] == "image/png"
 
-    r3 = client.get(f"/references/{clip_id}/file/clip.npz")
+    r3 = client.get(
+        f"/references/{clip_id}/file/clip.npz", params={"robot": "t1"}
+    )
     assert r3.status_code == 200, r3.text
     assert len(r3.content) > 0
+
+
+def test_duplicate_clip_ids_resolve_by_exact_robot_pair(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """A clip ID is never a globally unique artifact identity."""
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root, with_preview_for={clip_id})
+    _seed_t1_clip(refs_root, with_preview=True, clip_id=clip_id)
+
+    for robot in ("g1", "t1"):
+        detail = client.get(
+            f"/references/{clip_id}", params={"robot": robot}
+        )
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["index_row"]["robot"] == robot
+        assert detail.json()["provenance"]["robot"] == robot
+        assert client.get(
+            f"/references/{clip_id}/preview", params={"robot": robot}
+        ).status_code == 200
+        assert client.get(
+            f"/references/{clip_id}/file/clip.npz", params={"robot": robot}
+        ).status_code == 200
+
+    assert client.get(
+        f"/references/{clip_id}", params={"robot": "go1"}
+    ).status_code == 404
 
 
 # ── attach / detach ─────────────────────────────────────────────────
@@ -393,6 +559,9 @@ def test_attach_reference_sets_stage_fields(
     _seed_library(refs_root, with_preview_for={"fallandgetup1_subject1"})
     slug = _make_project(client)
     project_dir = tmp_projects_root / slug
+    _certify_clip(
+        refs_root, "g1", "fallandgetup1_subject1", project_dir=project_dir,
+    )
     _write_mission(project_dir, "m1", [_stage_dict("torso_righting")])
 
     r = client.post(
@@ -402,22 +571,42 @@ def test_attach_reference_sets_stage_fields(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["reference_clip_id"] == "fallandgetup1_subject1"
-    assert body["reference_tier"] == "K"
+    assert body["reference_tier"] == "D"
     assert body["reference_match_confidence"] is None
+    assert body["reference_robot"] == "g1"
+    assert len(body["reference_clip_sha256"]) == 64
+    assert len(body["reference_certificate_sha256"]) == 64
+    assert len(body["reference_execution_contract_sha256"]) == 64
+    assert len(body["reference_execution_boundary_sha256"]) == 64
 
     # Persisted to mission.json.
     mission_json = json.loads((project_dir / ".missions" / "m1" / "mission.json").read_text())
     stage = mission_json["stages"][0]
     assert stage["reference_clip_id"] == "fallandgetup1_subject1"
-    assert stage["reference_tier"] == "K"
+    assert stage["reference_tier"] == "D"
     assert stage["reference_match_confidence"] is None
+    assert stage["reference_robot"] == "g1"
+    assert stage["reference_clip_sha256"] == body["reference_clip_sha256"]
+    assert (
+        stage["reference_certificate_sha256"]
+        == body["reference_certificate_sha256"]
+    )
+    assert (
+        stage["reference_execution_contract_sha256"]
+        == body["reference_execution_contract_sha256"]
+    )
+    assert (
+        stage["reference_execution_boundary_sha256"]
+        == body["reference_execution_boundary_sha256"]
+    )
 
     # And it flows through the mission GET (StageSchema mirror).
     r2 = client.get(f"/projects/{slug}/missions/m1")
     assert r2.status_code == 200, r2.text
     stage2 = r2.json()["stages"][0]
     assert stage2["reference_clip_id"] == "fallandgetup1_subject1"
-    assert stage2["reference_tier"] == "K"
+    assert stage2["reference_tier"] == "D"
+    assert stage2["reference_robot"] == "g1"
 
 
 def test_attach_reference_t1_clip(
@@ -437,14 +626,324 @@ def test_attach_reference_t1_clip(
         f"/projects/{slug}/missions/m1/stages/a/reference",
         json={"clip_id": "fallandgetup1_subject1_t1"},
     )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["reference_clip_id"] == "fallandgetup1_subject1_t1"
-    assert body["reference_tier"] == "K"
+    assert r.status_code == 412, r.text
 
     mission_json = json.loads((project_dir / ".missions" / "m1" / "mission.json").read_text())
     stage = mission_json["stages"][0]
-    assert stage["reference_clip_id"] == "fallandgetup1_subject1_t1"
+    assert stage.get("reference_clip_id") is None
+
+
+def test_attach_reference_rejects_missing_tierd_certificate(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    _seed_library(refs_root)
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+
+    response = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": "fallandgetup1_subject1"},
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/reference-feasibility"
+    stage = json.loads(
+        (project_dir / ".missions" / "m1" / "mission.json").read_text()
+    )["stages"][0]
+    assert stage.get("reference_clip_id") is None
+
+
+@pytest.mark.parametrize("tamper", ["clip_bytes", "rollout_hash"])
+def test_attach_reference_rejects_stale_or_forged_certificate(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    tamper: str,
+) -> None:
+    from sculptor.refs import library
+
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    slug = _make_project(client, name=f"tamper {tamper}")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    clip_dir = library.clip_dir("g1", clip_id, root=refs_root)
+    if tamper == "clip_bytes":
+        (clip_dir / library.CLIP_FILENAME).write_bytes(b"stale clip bytes")
+    else:
+        provenance = library.read_provenance("g1", clip_id, root=refs_root)
+        provenance["tierD"]["rollout_sha256"] = "f" * 64
+        library.write_provenance(
+            "g1", clip_id, provenance, root=refs_root,
+        )
+
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    response = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/reference-feasibility"
+
+
+def test_attach_reference_uses_project_robot_with_duplicate_clip_ids(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    from sculptor.refs import library
+
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    t1_dir = library.clip_dir("t1", clip_id, root=refs_root)
+    t1_dir.mkdir(parents=True, exist_ok=True)
+    _write_clip_npz(t1_dir)
+    _write_provenance(
+        t1_dir,
+        clip_id=clip_id,
+        robot="t1",
+        text="same id, different robot",
+        labels=["duplicate"],
+    )
+    slug = _make_project(client, name="compound identity")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    library.rebuild_index(root=refs_root)
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    response = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reference_robot"] == "g1"
+    stage = json.loads(
+        (project_dir / ".missions" / "m1" / "mission.json").read_text()
+    )["stages"][0]
+    assert stage["reference_robot"] == "g1"
+
+
+def test_mission_run_api_rejects_reference_changed_after_attach(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    from sculptor.refs import library
+
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    slug = _make_project(client, name="stale before enqueue")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    attached = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+    assert attached.status_code == 200, attached.text
+    clip_path = (
+        library.clip_dir("g1", clip_id, root=refs_root)
+        / library.CLIP_FILENAME
+    )
+    clip_path.write_bytes(b"changed after stage attachment")
+
+    response = client.post(f"/projects/{slug}/missions/m1/run", json={})
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/reference-feasibility"
+
+
+def test_mission_run_api_rejects_target_contract_drift_after_attach(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    """A donor certificate cannot authorize a newly different target task."""
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    slug = _make_project(client, name="target drift before enqueue")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    attached = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+    assert attached.status_code == 200, attached.text
+
+    client.app.state.project_store.set_adapter_section(  # type: ignore[attr-defined]
+        slug,
+        "sculptor.adapters.mjlab.MjlabAdapter",
+        {"task_id": "Mjlab-Velocity-Rough-Unitree-G1"},
+    )
+    response = client.post(f"/projects/{slug}/missions/m1/run", json={})
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/reference-feasibility"
+    assert "identity.task_id differs" in response.json()["detail"]
+
+
+def test_mission_run_worker_rechecks_before_subprocess_spawn(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.job_manager import Job
+    from backend.services.mission_jobs import run_mission_execute_job
+    from sculptor.refs import library
+
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    slug = _make_project(client, name="stale before spawn")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    attached = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+    assert attached.status_code == 200, attached.text
+    provenance = library.read_provenance("g1", clip_id, root=refs_root)
+    provenance["tierD"]["tracked_at"] = "forged-after-queue"
+    library.write_provenance("g1", clip_id, provenance, root=refs_root)
+
+    spawned = False
+
+    async def _unexpected_spawn(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("training subprocess must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _unexpected_spawn)
+    runner = run_mission_execute_job(
+        project_dir=project_dir,
+        project_slug=slug,
+        mission_slug="m1",
+    )
+    job = Job(
+        job_id="job-tierd-boundary",
+        kind="mission_execute",
+        project_slug=slug,
+        status="running",
+    )
+
+    with pytest.raises(RuntimeError, match="admission failed before spawn"):
+        asyncio.run(runner(job, asyncio.Event()))
+    assert spawned is False
+    assert any(
+        event["type"] == "mission_reference_admission_failed"
+        for event in job.events
+    )
+
+
+def test_mission_run_worker_rejects_target_contract_drift_before_spawn(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.job_manager import Job
+    from backend.services.mission_jobs import run_mission_execute_job
+
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    slug = _make_project(client, name="target drift before spawn")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    attached = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+    assert attached.status_code == 200, attached.text
+    client.app.state.project_store.set_adapter_section(  # type: ignore[attr-defined]
+        slug,
+        "sculptor.adapters.mjlab.MjlabAdapter",
+        {"task_id": "Mjlab-Velocity-Rough-Unitree-G1"},
+    )
+
+    spawned = False
+
+    async def _unexpected_spawn(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("training subprocess must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _unexpected_spawn)
+    runner = run_mission_execute_job(
+        project_dir=project_dir,
+        project_slug=slug,
+        mission_slug="m1",
+    )
+    job = Job(
+        job_id="job-target-boundary",
+        kind="mission_execute",
+        project_slug=slug,
+        status="running",
+    )
+
+    with pytest.raises(RuntimeError, match="admission failed before spawn"):
+        asyncio.run(runner(job, asyncio.Event()))
+    assert spawned is False
+    failure = next(
+        event for event in job.events
+        if event["type"] == "mission_reference_admission_failed"
+    )
+    assert "identity.task_id differs" in failure["error"]
+
+
+def test_mission_run_worker_rejects_exact_target_receipt_drift(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even compatible target changes cannot inherit the queued receipt."""
+    from backend.services.job_manager import Job
+    from backend.services.mission_jobs import run_mission_execute_job
+
+    clip_id = "fallandgetup1_subject1"
+    _seed_library(refs_root)
+    slug = _make_project(client, name="exact receipt drift")
+    project_dir = tmp_projects_root / slug
+    _certify_clip(refs_root, "g1", clip_id, project_dir=project_dir)
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+    attached = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": clip_id},
+    )
+    assert attached.status_code == 200, attached.text
+
+    spawned = False
+
+    async def _unexpected_spawn(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("training subprocess must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _unexpected_spawn)
+    runner = run_mission_execute_job(
+        project_dir=project_dir,
+        project_slug=slug,
+        mission_slug="m1",
+        reference_target_receipt={
+            "schema": 1,
+            "target_robot": "g1",
+            "policy_contract_sha256": "f" * 64,
+        },
+    )
+    job = Job(
+        job_id="job-exact-target-boundary",
+        kind="mission_execute",
+        project_slug=slug,
+        status="running",
+    )
+
+    with pytest.raises(RuntimeError, match="admission failed before spawn"):
+        asyncio.run(runner(job, asyncio.Event()))
+    assert spawned is False
+    failure = next(
+        event for event in job.events
+        if event["type"] == "mission_reference_admission_failed"
+    )
+    assert "target execution contract changed after queue" in failure["error"]
 
 
 def test_attach_reference_pending_stage_without_training_dir(
@@ -456,6 +955,9 @@ def test_attach_reference_pending_stage_without_training_dir(
     _seed_library(refs_root)
     slug = _make_project(client)
     project_dir = tmp_projects_root / slug
+    _certify_clip(
+        refs_root, "g1", "fallandgetup1_subject1", project_dir=project_dir,
+    )
     _write_mission(project_dir, "m1", [_stage_dict("torso_righting", status="pending")])
     assert not (project_dir / ".missions" / "m1" / "stages" / "torso_righting").exists()
 
@@ -564,6 +1066,9 @@ def test_detach_reference_clears_fields(
     _seed_library(refs_root)
     slug = _make_project(client)
     project_dir = tmp_projects_root / slug
+    _certify_clip(
+        refs_root, "g1", "fallandgetup1_subject1", project_dir=project_dir,
+    )
     _write_mission(project_dir, "m1", [_stage_dict("a")])
 
     r = client.post(
@@ -580,6 +1085,11 @@ def test_detach_reference_clears_fields(
     assert stage["reference_clip_id"] is None
     assert stage["reference_tier"] is None
     assert stage["reference_match_confidence"] is None
+    assert stage["reference_robot"] is None
+    assert stage["reference_clip_sha256"] is None
+    assert stage["reference_certificate_sha256"] is None
+    assert stage["reference_execution_contract_sha256"] is None
+    assert stage["reference_execution_boundary_sha256"] is None
 
 
 def test_detach_reference_409_when_mission_job_active(
@@ -588,6 +1098,9 @@ def test_detach_reference_409_when_mission_job_active(
     _seed_library(refs_root)
     slug = _make_project(client)
     project_dir = tmp_projects_root / slug
+    _certify_clip(
+        refs_root, "g1", "fallandgetup1_subject1", project_dir=project_dir,
+    )
     _write_mission(project_dir, "m1", [_stage_dict("a")])
 
     r = client.post(
@@ -678,7 +1191,9 @@ def test_compose_creates_a_novel_clip_from_two_sources(
 
     # And it is immediately reachable through the normal library surface,
     # so the reference picker / stage attach need no special case.
-    detail = client.get("/references/novel-motion--g1")
+    detail = client.get(
+        "/references/novel-motion--g1", params={"robot": "g1"}
+    )
     assert detail.status_code == 200
     assert detail.json()["provenance"]["source"]["kind"] == "compose"
 
@@ -771,7 +1286,7 @@ def test_compose_surfaces_the_seam_measurement_on_refusal(
     assert "seam discontinuity" in r.json()["detail"]
 
 
-# ── the OGMP mode automaton + its reward scaffold ──────────────────────
+# ── the OGMP-inspired phase scaffold + its reward module ───────────────
 # `ModeTimeline.tsx` already draws the automaton at compose time by mirroring
 # the derivation in TypeScript. These cover the half that cannot be mirrored:
 # turning it into reward code (HANDOFF.md §12).
@@ -810,11 +1325,33 @@ def test_reference_modes_are_derived_from_the_clips_own_provenance(
     """One composed segment is one mode, each seam a transition — a read of
     what `refs.compose` already recorded, not a new derivation."""
     _write_composite(refs_root)
-    r = client.get("/references/novel-jump-kick--g1/modes")
+    r = client.get(
+        "/references/novel-jump-kick--g1/modes", params={"robot": "g1"}
+    )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["fps"] == 120.0
+    # Capability disclosure is part of the API contract. A phase-window
+    # scaffold must never be presented as the paper's closed-loop oracle or
+    # latent-mode-conditioned policy merely because both use the word mode.
+    assert body["capability"] == {
+        "kind": "phase_window_reference_scaffold",
+        "paper_alignment": "ogmp_inspired",
+        "dispatch_authority": "episode_time_window",
+        "reference_generator": "fixed_composed_clip",
+        "runtime_transition_guards": False,
+        "policy_mode_conditioning": False,
+        "rho_bounded_exploration": False,
+        "closed_loop_receding_horizon_oracle": False,
+        "summary": (
+            "Fixed composite-reference windows gate phase-specific reward "
+            "terms. Transition guards are inspectable metadata; they do not "
+            "currently drive the policy or runtime handover."
+        ),
+    }
     assert [m["name"] for m in body["modes"]] == ["approach", "launch", "strike"]
+    assert body["modes"][0]["reward_terms"] == []
+    assert body["modes"][0]["success_predicate"] is None
     assert body["modes"][0]["start_s"] == 0.0
     # `mode_phase_windows` rounds to 4 dp — 0.1 ms, five orders of magnitude
     # finer than the 20 ms control step these windows gate against.
@@ -830,13 +1367,17 @@ def test_a_non_composite_reference_is_422_not_500(
     """The common mistake. The request is well-formed; the clip just is not a
     composite, so there is one mode and no transition to derive."""
     _seed_library(refs_root)
-    r = client.get("/references/walk1_subject2/modes")
+    r = client.get(
+        "/references/walk1_subject2/modes", params={"robot": "g1"}
+    )
     assert r.status_code == 422, r.text
     assert "composition" in r.json()["detail"]
 
 
 def test_modes_for_a_malformed_clip_id_is_404(client: TestClient) -> None:
-    assert client.get("/references/..%2Fetc/modes").status_code in (404, 400)
+    assert client.get(
+        "/references/..%2Fetc/modes", params={"robot": "g1"}
+    ).status_code in (404, 400)
 
 
 def test_scaffolding_a_mode_reward_writes_it_into_the_project(
@@ -846,7 +1387,7 @@ def test_scaffolding_a_mode_reward_writes_it_into_the_project(
     slug = _make_project(client)
     r = client.post(
         f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
-        json={"clip_id": "novel-jump-kick--g1",
+        json={"clip_id": "novel-jump-kick--g1", "robot": "g1",
               "goal": "run in and strike at the apex"})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -862,6 +1403,8 @@ def test_scaffolding_a_mode_reward_writes_it_into_the_project(
     # mode is authored, and nothing tells the policy to follow the reference.
     assert "TARGET_JOINT_POS" in src
     assert body["tracking"] is True
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    assert listing["mode_rewards"][0]["tracking_enabled"] is True
 
 
 def test_scaffolding_without_tracking_omits_the_backbone(
@@ -871,9 +1414,15 @@ def test_scaffolding_without_tracking_omits_the_backbone(
     slug = _make_project(client)
     r = client.post(
         f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
-        json={"clip_id": "novel-jump-kick--g1", "tracking": False})
+        json={
+            "clip_id": "novel-jump-kick--g1",
+            "robot": "g1",
+            "tracking": False,
+        })
     assert r.status_code == 200, r.text
     assert "TARGET_JOINT_POS" not in Path(r.json()["path"]).read_text()
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    assert listing["mode_rewards"][0]["tracking_enabled"] is False
 
 
 def test_scaffolding_twice_is_a_409_unless_overwrite(
@@ -884,7 +1433,7 @@ def test_scaffolding_twice_is_a_409_unless_overwrite(
     _write_composite(refs_root)
     slug = _make_project(client)
     url = f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward"
-    payload = {"clip_id": "novel-jump-kick--g1"}
+    payload = {"clip_id": "novel-jump-kick--g1", "robot": "g1"}
     assert client.post(url, json=payload).status_code == 200
     again = client.post(url, json=payload)
     assert again.status_code == 409, again.text
@@ -903,6 +1452,7 @@ def test_a_filename_cannot_escape_the_rewards_directory(
     for bad in ("../escape.py", "sub/dir.py", "no_extension", ".hidden.py",
                 "/abs/path.py"):
         r = client.post(url, json={"clip_id": "novel-jump-kick--g1",
+                                   "robot": "g1",
                                    "filename": bad})
         assert r.status_code == 422, f"{bad!r} was accepted: {r.text}"
 
@@ -914,7 +1464,7 @@ def test_a_clip_id_mismatch_between_path_and_body_is_refused(
     slug = _make_project(client)
     r = client.post(
         f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
-        json={"clip_id": "something-else--g1"})
+        json={"clip_id": "something-else--g1", "robot": "g1"})
     assert r.status_code == 422, r.text
 
 
@@ -924,7 +1474,7 @@ def test_scaffolding_for_an_unknown_project_is_404(
     _write_composite(refs_root)
     r = client.post(
         "/projects/no-such-project/references/novel-jump-kick--g1/mode-reward",
-        json={"clip_id": "novel-jump-kick--g1"})
+        json={"clip_id": "novel-jump-kick--g1", "robot": "g1"})
     assert r.status_code == 404, r.text
 
 
@@ -935,13 +1485,22 @@ AUTHOR_URL = "/projects/{slug}/references/novel-jump-kick--g1/mode-reward/author
 def _scaffold(client: TestClient, slug: str, overwrite: bool = False) -> dict:
     r = client.post(
         f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
-        json={"clip_id": "novel-jump-kick--g1", "overwrite": overwrite})
+        json={
+            "clip_id": "novel-jump-kick--g1",
+            "robot": "g1",
+            "overwrite": overwrite,
+        })
     assert r.status_code == 200, r.text
     return r.json()
 
 
 def _author_body(**kw) -> dict:
-    return {"clip_id": "novel-jump-kick--g1", "mode": "launch", **kw}
+    return {
+        "clip_id": "novel-jump-kick--g1",
+        "robot": "g1",
+        "mode": "launch",
+        **kw,
+    }
 
 
 def test_authoring_a_mode_fires_a_job_and_chains_the_filename(
@@ -1076,7 +1635,7 @@ def test_authoring_for_a_non_composite_reference_is_422(
     slug = _make_project(client)
     r = client.post(
         f"/projects/{slug}/references/walk1_subject2/mode-reward/author",
-        json={"clip_id": "walk1_subject2", "mode": "whole"})
+        json={"clip_id": "walk1_subject2", "robot": "g1", "mode": "whole"})
     assert r.status_code == 422, r.text
 
 
@@ -1130,7 +1689,8 @@ def _author_all(client: TestClient, slug: str, monkeypatch) -> str:
             return dest
         monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _edit)
         r = client.post(AUTHOR_URL.format(slug=slug),
-                        json={"clip_id": "novel-jump-kick--g1", "mode": mode,
+                        json={"clip_id": "novel-jump-kick--g1",
+                              "robot": "g1", "mode": mode,
                               "filename": name})
         assert r.status_code == 202, r.text
         # Authoring is a background job; the next call reads the file it
@@ -1211,6 +1771,84 @@ def test_a_bare_scaffold_can_be_promoted_deliberately(
     assert [v["version"] for v in client.get(f"/projects/{slug}/rewards").json()] == [1, 0]
 
 
+def test_same_clip_id_with_changed_bytes_is_stale_not_promotable(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """The id is a label, not provenance. Replacing bytes under it must not
+    reuse phase windows/rewards that were reviewed against the old motion."""
+    clip_dir = _write_composite(refs_root)
+    slug = _make_project(client)
+    body = _scaffold(client, slug)
+
+    before = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(
+        item for item in before["mode_rewards"]
+        if item["filename"] == body["filename"]
+    )
+    assert mine["context_current"] is True
+    assert mine["execution_context_digest"] == body["execution_context_digest"]
+
+    # A ZIP reader permits trailing bytes, so the fixture remains readable;
+    # its content identity nonetheless changed.
+    with (clip_dir / "clip.npz").open("ab") as stream:
+        stream.write(b"changed-reference-bytes")
+
+    after = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(
+        item for item in after["mode_rewards"]
+        if item["filename"] == body["filename"]
+    )
+    assert mine["context_current"] is False
+
+    promoted = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": body["filename"], "allow_unauthored": True},
+    )
+    assert promoted.status_code == 409, promoted.text
+    assert "older execution context" in promoted.json()["title"]
+
+
+def test_legacy_mode_reward_without_source_robot_fails_closed(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    """Missing provenance must not be silently interpreted as G1.
+
+    Older phase rewards did not always bind a source robot.  The target
+    project's robot is not evidence about the artifact that produced those
+    phase windows, so such a reward remains inspectable but cannot be
+    promoted until it is regenerated.
+    """
+    from sculptor.mode_rewards import _rewrite_reward_spec
+
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    body = _scaffold(client, slug)
+    reward_path = tmp_projects_root / slug / "rewards" / body["filename"]
+    reward_path.write_text(
+        _rewrite_reward_spec(
+            reward_path.read_text(encoding="utf-8"),
+            {"reference_robot": ""},
+        ),
+        encoding="utf-8",
+    )
+
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(
+        item for item in listing["mode_rewards"]
+        if item["filename"] == body["filename"]
+    )
+    assert mine["reference_robot"] == ""
+    assert mine["context_current"] is False
+    assert "source robot identity is missing" in mine["context_blocker"]
+
+    refused = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": body["filename"], "allow_unauthored": True},
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["title"] == "mode reward source robot is unknown"
+
+
 def test_promoting_a_filename_that_escapes_the_project_is_refused(
     client: TestClient, refs_root: Path,
 ) -> None:
@@ -1276,6 +1914,28 @@ def test_mode_rewards_promoted_names_what_a_run_would_train(
     assert all(m["authored"] for m in promoted["modes"])
 
 
+def test_mode_rewards_resolves_current_pointer_not_highest_version(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    final = _author_all(client, slug, monkeypatch)
+    assert client.post(
+        PROMOTE_URL.format(slug=slug), json={"filename": final}
+    ).status_code == 200
+    rewards = tmp_projects_root / slug / "rewards"
+    # Keep-best can leave later files on disk while current.py selects v1.
+    (rewards / "v4.py").write_bytes((rewards / "v1.py").read_bytes())
+
+    promoted = client.get(f"/projects/{slug}/mode-rewards").json()["promoted"]
+
+    assert promoted is not None
+    assert promoted["version"] == 1
+    assert promoted["filename"] == "v1.py"
+
+
 def test_mode_rewards_promoted_clears_when_a_flat_reward_supersedes_it(
     client: TestClient, refs_root: Path, tmp_projects_root: Path, monkeypatch,
 ) -> None:
@@ -1292,11 +1952,14 @@ def test_mode_rewards_promoted_clears_when_a_flat_reward_supersedes_it(
     final = _author_all(client, slug, monkeypatch)
     client.post(PROMOTE_URL.format(slug=slug), json={"filename": final})
 
-    (tmp_projects_root / slug / "rewards" / "v2.py").write_text(
+    v2 = tmp_projects_root / slug / "rewards" / "v2.py"
+    v2.write_text(
         "REWARD_SPEC = {'version': 'v2'}\n"
         "def compute_reward(state, action, next_state, info):\n"
         "    return 0.0, {}\n",
         encoding="utf-8")
+    from sculptor.edit import _write_current_reexport
+    _write_current_reexport(v2.parent, v2)
 
     body = client.get(f"/projects/{slug}/mode-rewards").json()
 
@@ -1344,12 +2007,10 @@ def test_a_project_with_no_selection_stays_on_clip_time_and_full_tracking(
     assert _tracking_weight(d) == 1.0
 
 
-def test_a_world_project_scales_the_windows_and_demotes_the_clip(
+def test_a_world_project_declares_horizon_and_demotes_the_clip(
     tmp_projects_root: Path,
 ) -> None:
-    """The two measured defects, read off the same selection: a 6.92 s
-    automaton gating a 20 s episode, and a backbone worth 7x every authored
-    mode term put together."""
+    """The horizon and imitation balance come from the same selection."""
     from backend.routes.references import (WORLD_TRACKING_WEIGHT,
                                            _episode_horizon_s,
                                            _tracking_weight)
@@ -1358,6 +2019,37 @@ def test_a_world_project_scales_the_windows_and_demotes_the_clip(
     _write_selection(d)
     assert _episode_horizon_s(d) == 20.0
     assert _tracking_weight(d) == WORLD_TRACKING_WEIGHT
+
+
+def test_changed_task_content_invalidates_same_clip_mode_reward(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    """A selection file can keep the same ref paths while the immutable
+    objects behind them change. The binding hashes the referenced content, not
+    merely the path or clip id."""
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_selection(project_dir, episode_s=20.0)
+    body = _scaffold(client, slug)
+
+    task_path = project_dir / "env" / "task.json"
+    task = json.loads(task_path.read_text(encoding="utf-8"))
+    task["shared"]["termination"]["episode_length_s"] = 12.0
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(
+        item for item in listing["mode_rewards"]
+        if item["filename"] == body["filename"]
+    )
+    assert mine["context_current"] is False
+    refused = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": body["filename"], "allow_unauthored": True},
+    )
+    assert refused.status_code == 409, refused.text
+    assert "clip-id equality alone" in refused.json()["detail"]
 
 
 def test_a_selection_without_a_goal_is_not_a_mission(
@@ -1393,8 +2085,7 @@ def test_the_brief_offers_only_the_channel_a_reward_may_read(
 def test_a_scaffold_on_a_world_project_carries_both_fixes(
     client: TestClient, refs_root: Path, tmp_projects_root: Path,
 ) -> None:
-    """End to end through the route: the file the UI writes must be on the
-    episode's clock AND price the clip as a style prior."""
+    """The route preserves certified cadence and prices the clip as a prior."""
     from backend.routes.references import WORLD_TRACKING_WEIGHT
 
     _write_composite(refs_root)
@@ -1403,9 +2094,22 @@ def test_a_scaffold_on_a_world_project_carries_both_fixes(
     body = _scaffold(client, slug)
 
     src = (tmp_projects_root / slug / "rewards" / body["filename"]).read_text()
+    from sculptor.mode_rewards import reward_spec_from_source
+
+    spec = reward_spec_from_source(src)
     assert f"TRACKING_W = {WORLD_TRACKING_WEIGHT!r}" in src
-    assert '"episode_horizon_s": 20.0' in src
-    assert "REFERENCE_DURATION_S = 20.0" in src
+    assert spec["episode_horizon_s"] == 20.0
+    assert spec["clip_time_scale"] == 1.0
+    assert spec["terminal_hold_s"] == pytest.approx(18.0)
+    assert spec["schedule_policy"] == (
+        "certified_clip_cadence_then_terminal_hold"
+    )
+    assert spec["mode_binding"]["clip_id"] == "novel-jump-kick--g1"
+    assert spec["mode_binding"]["robot"] == "g1"
+    assert len(spec["mode_binding"]["clip_sha256"]) == 64
+    assert len(spec["mode_binding"]["graph_sha256"]) == 64
+    assert len(spec["mode_binding"]["execution_manifest_digest"]) == 64
+    assert "REFERENCE_DURATION_S = 2.0" in src
 
 
 def test_promotion_records_which_file_it_came_from(

@@ -291,8 +291,10 @@ def test_author_blank_robot_defaults_to_project_robot(client: TestClient):
 
 
 def test_author_explicit_robot_mismatch_is_disclosed(client: TestClient):
-    """An explicit robot that differs from the project robot is allowed
-    but disclosed in the draft AND in the promoted selection."""
+    """A mismatched draft may be inspected, but training preflight discloses
+    the exact mismatch so the run route can fail closed."""
+    from backend.services import world_store
+
     slug = _make_project(client)
     _set_project_robot(client, slug, "unitree_go1")
     draft = _author(client, slug)  # pins unitree_g1:base explicitly
@@ -310,6 +312,13 @@ def test_author_explicit_robot_mismatch_is_disclosed(client: TestClient):
     assert summary["robot"] == "unitree_g1:base"
     assert summary["project_capability_id"] == "unitree_go1:base"
     assert summary["robot_matches_project"] is False
+    project_dir = Path(client.get(f"/projects/{slug}").json()["project_dir"])
+    preflight = world_store.training_preflight(project_dir)
+    assert preflight is not None
+    assert preflight["ok"] is True
+    assert preflight["world_robot"] == "unitree_g1:base"
+    assert preflight["project_robot"] == "unitree_go1:base"
+    assert preflight["robot_matches_project"] is False
 
 
 def test_author_without_project_robot_reports_unknown_match(

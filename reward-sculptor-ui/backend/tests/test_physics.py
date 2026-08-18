@@ -873,6 +873,7 @@ def test_mjcf_unavailable_reason_explains_gymnasium_builtin(
     fake = RobotLibrary(entries_by_slug={
         "hopper_gym": RobotEntry(
             slug="hopper_gym",
+            reference_robot="hopper",
             display_name="Hopper (gym)",
             category="Other",
             description="",

@@ -28,6 +28,7 @@ from backend.routes import jobs as jobs_routes
 from backend.routes import kg as kg_routes
 from backend.routes import library as library_routes
 from backend.routes import metrics as metrics_routes
+from backend.routes import mode_evidence as mode_evidence_routes
 from backend.routes import missions as missions_routes
 from backend.routes import physics as physics_routes
 from backend.routes import policies as policies_routes
@@ -38,6 +39,7 @@ from backend.routes import robot as robot_routes
 from backend.routes import reports as reports_routes
 from backend.routes import runs as runs_routes
 from backend.routes import saved as saved_routes
+from backend.routes import starting_skills as starting_skills_routes
 from backend.routes import system as system_routes
 from backend.routes import trash as trash_routes
 from backend.routes import worlds as worlds_routes
@@ -217,8 +219,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(missions_routes.router)
     app.include_router(missions_routes.ws_router)
     app.include_router(metrics_routes.router)
+    app.include_router(mode_evidence_routes.router)
     app.include_router(trash_routes.router)
     app.include_router(saved_routes.router)
+    app.include_router(starting_skills_routes.router)
     app.include_router(references_routes.router)
     app.include_router(worlds_routes.router)
     return app

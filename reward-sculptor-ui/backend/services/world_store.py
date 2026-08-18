@@ -583,12 +583,41 @@ def validate(project_dir: Path) -> dict[str, Any]:
     errors.extend(
         f"TaskSpec: {e}"
         for e in validate_task_spec(bundle["task"], world=bundle["world"]))
+    shared = bundle["world"].get("shared") or {}
+    world_robot = (shared.get("robot") or {}).get("capability_id")
+    project_robot = project_capability_id(project_dir)
     return {
         "ok": not errors,
         "selection_version": selected.selection_version,
         "tuple_hash": selected.tuple_hash,
         "errors": errors,
+        "robot_matches_project": (
+            None if project_robot is None else world_robot == project_robot
+        ),
+        "world_robot": world_robot,
+        "project_robot": project_robot,
     }
+
+
+def training_preflight(project_dir: Path) -> dict[str, Any] | None:
+    """Re-attest the promoted world and its robot before training.
+
+    The authored world is an executable training input, so integrity alone is
+    insufficient: its robot must also be the robot configured by the project.
+    Keep this as the single backend authority used both when the HTTP request
+    is admitted and again by the queued worker immediately before spawn.
+
+    ``None`` means the project has no promoted authored world and therefore
+    retains the existing built-in-scene behavior.
+    """
+    selection_path = Path(project_dir) / "env" / "selection_current.json"
+    if not selection_path.is_file():
+        return None
+
+    # Derive integrity, tuple identity, and robot compatibility from the same
+    # loaded bundle. One snapshot cannot mix hashes from one promotion with
+    # robot metadata from a concurrent promotion.
+    return dict(validate(project_dir))
 
 
 def curriculum(project_dir: Path) -> dict[str, Any]:

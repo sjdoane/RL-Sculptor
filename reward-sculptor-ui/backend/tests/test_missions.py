@@ -62,6 +62,8 @@ def _seed_mission_on_disk(
             "started_at": None,
             "finished_at": None,
             "redecomposition_attempts": 0,
+            "reference_execution_contract_sha256": "a" * 64,
+            "reference_execution_boundary_sha256": "b" * 64,
         })
     payload = {
         "schema_version": 1,
@@ -155,6 +157,12 @@ def test_get_mission_detail_returns_stages(
     assert len(body["stages"]) == 3
     assert body["stages"][0]["name"] == "stage_0"
     assert body["stages"][1]["parent_stage"] == "stage_0"
+    assert body["stages"][0]["reference_execution_contract_sha256"] == (
+        "a" * 64
+    )
+    assert body["stages"][0]["reference_execution_boundary_sha256"] == (
+        "b" * 64
+    )
     assert body["lifecycle"] == "ready"
 
 
@@ -492,7 +500,7 @@ def test_decompose_job_passes_n_candidates_to_generate_stage_metrics(
     captured: dict[str, object] = {}
 
     # Stub decompose_task so it writes a minimal 1-stage mission + returns.
-    def _fake_decompose_task(goal, reward_contract, *, kg_store=None):
+    def _fake_decompose_task(goal, reward_contract, *, kg_store=None, **_kwargs):
         from sculptor.mission import Mission, Stage
         return Mission(
             goal=goal,

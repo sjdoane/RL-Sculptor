@@ -21,6 +21,7 @@ import json
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -39,6 +40,112 @@ def _make_project_with_library(
     )
     assert r.status_code == 200
     return slug
+
+
+def _configure_g1_project(client: TestClient, slug: str) -> Path:
+    store = client.app.state.project_store
+    store.set_adapter_section(
+        slug,
+        "sculptor.adapters.mjlab.MjlabAdapter",
+        {
+            "task_id": "Mjlab-Velocity-Flat-Unitree-G1",
+            "num_envs": 16,
+            "device": "cpu",
+        },
+    )
+    store.write_robot_source(slug, {
+        "kind": "library",
+        "library_slug": "g1",
+        "library_name": "g1",
+        "training_support": "ready",
+    })
+    detail = store.get(slug)
+    assert detail is not None
+    return Path(detail.project_dir)
+
+
+def _register_feasibility_reference(
+    tmp_path: Path,
+    *,
+    robot: str,
+    clip_id: str,
+    tier_d: bool,
+    project_dir: Path | None = None,
+) -> tuple[str, str | None]:
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+
+    n = 20
+    fps = 30.0
+    t = np.arange(n, dtype=np.float64) / fps
+    ordered_joints = ["hip"]
+    policy_contract = None
+    if project_dir is not None:
+        from sculptor.policy_contract import build_project_policy_contract
+
+        policy_contract = build_project_policy_contract(project_dir)
+        ordered_joints = list(policy_contract["joints"]["ordered_names"])
+    source = save_clip(tmp_path / f"{clip_id}.npz", {
+        "root_pos_z": np.full(n, 0.8),
+        "root_pos_xy": np.stack([0.1 * t, np.zeros_like(t)], axis=1),
+        "fps": fps,
+        "joint_pos": np.zeros((n, len(ordered_joints))),
+        "joint_names": ordered_joints,
+        "meta": {"source": "unit-test:reference-feasibility"},
+    })
+    clip_dir = library.clip_dir(robot, clip_id)
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    clip_bytes = source.read_bytes()
+    (clip_dir / library.CLIP_FILENAME).write_bytes(clip_bytes)
+    provenance = library.make_provenance(
+        clip_id=clip_id,
+        robot=robot,
+        source={"kind": "unit-test"},
+        license="CC0",
+        attribution="unit test",
+        content_sha256_=hashlib.sha256(clip_bytes).hexdigest(),
+        fps_source=fps,
+        text="feasibility test motion",
+    )
+    library.write_provenance(robot, clip_id, provenance)
+    library.rebuild_index()
+    rollout_sha = None
+    if tier_d:
+        from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
+
+        rollout = clip_dir / "tierD_rollout.npz"
+        rollout.write_bytes(b"physics-tracked-rollout")
+        errors = TrackingErrors(
+            mean_joint_err_rad=0.05,
+            max_joint_err_rad=0.08,
+            root_z_rmse_m=0.02,
+            duration_coverage=1.0,
+            common_joint_names=ordered_joints,
+            n_common_joints=len(ordered_joints),
+        )
+        assert errors.feasible
+        execution_contract = None
+        if project_dir is not None and policy_contract is not None:
+            from sculptor.reference import load_clip
+            from sculptor.refs.track import build_tierd_execution_contract
+
+            execution_contract = build_tierd_execution_contract(
+                donor_project=project_dir,
+                certification_config_path=project_dir / "config.toml",
+                robot=robot,
+                clip=load_clip(source),
+                policy_contract=policy_contract,
+            )
+        update_provenance_tier_d(
+            robot=robot,
+            clip_id=clip_id,
+            errors=errors,
+            iterations=2,
+            rollout_path=rollout,
+            execution_contract=execution_contract,
+        )
+        rollout_sha = hashlib.sha256(rollout.read_bytes()).hexdigest()
+    return hashlib.sha256(clip_bytes).hexdigest(), rollout_sha
 
 
 # ── fake sculpt job factory ──────────────────────────────────────────
@@ -151,7 +258,12 @@ def test_launch_run_returns_summary(
     slug = _make_project_with_library(client, "RunLaunch")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "run forward", "iterations": 2, "dry_run": False},
+        json={
+            "behavior_goal": "run forward",
+            "iterations": 2,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     assert r.status_code == 202, r.text
     summary = r.json()
@@ -189,6 +301,7 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
         json={
             "behavior_goal": "walk with this style while weaving",
             "iterations": 1,
+            "acknowledge_blind_fitness": True,
             "reference_clip_id": "walk_cycle",
         },
     )
@@ -200,6 +313,7 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
         json={
             "behavior_goal": "walk with this style while weaving",
             "iterations": 1,
+            "acknowledge_blind_fitness": True,
             "reference_clip_id": "walk_cycle",
             "reference_robot": "demo",
         },
@@ -226,6 +340,7 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
         json={
             "behavior_goal": "walk with this style while weaving",
             "iterations": 1,
+            "acknowledge_blind_fitness": True,
             "reference_clip_id": "walk_cycle",
             "reference_robot": "demo",
         },
@@ -238,7 +353,7 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
     plain = client.post(
         f"/projects/{slug}/runs",
         json={"behavior_goal": "walk with this style while weaving",
-              "iterations": 1},
+              "iterations": 1, "acknowledge_blind_fitness": True},
     )
     assert plain.status_code == 202, plain.text
 
@@ -273,6 +388,7 @@ def test_launch_run_with_reference_motion_succeeds_once_a_world_is_promoted(
         json={
             "behavior_goal": "walk with this style while weaving",
             "iterations": 1,
+            "acknowledge_blind_fitness": True,
             "reference_clip_id": "walk_cycle",
             "reference_robot": "demo",
         },
@@ -280,6 +396,306 @@ def test_launch_run_with_reference_motion_succeeds_once_a_world_is_promoted(
     assert launched.status_code in (202, 412), launched.text
     if launched.status_code == 412:
         assert launched.json()["type"] == "/problems/world-integrity"
+
+
+def test_tier_k_reference_is_dry_run_only_and_receipt_says_kinematic(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import world_store
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    slug = _make_project_with_library(client, "TierKAdmission")
+    project_dir = _configure_g1_project(client, slug)
+    clip_sha, _ = _register_feasibility_reference(
+        tmp_path,
+        robot="g1",
+        clip_id="kinematic_seed",
+        tier_d=False,
+        project_dir=project_dir,
+    )
+    selection = project_dir / "env" / "selection_current.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _p: {
+            "ok": True,
+            "selection_version": 1,
+            "tuple_hash": "c" * 64,
+            "errors": [],
+            "robot_matches_project": True,
+            "world_robot": "unitree_g1:base",
+            "project_robot": "unitree_g1:base",
+        },
+    )
+
+    live = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "adapt this kinematic seed",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+            "reference_clip_id": "kinematic_seed",
+            "reference_robot": "g1",
+        },
+    )
+    assert live.status_code == 412, live.text
+    assert live.json()["type"] == "/problems/reference-feasibility"
+    assert live.json()["required_tier"] == "D"
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+    smoke = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "smoke test this kinematic seed",
+            "iterations": 1,
+            "dry_run": True,
+            "reference_clip_id": "kinematic_seed",
+            "reference_robot": "g1",
+        },
+    )
+    assert smoke.status_code == 202, smoke.text
+    run = client.get(
+        f"/projects/{slug}/runs/{smoke.json()['run_id']}"
+    ).json()
+    attestation = run["reference_feasibility"]
+    assert attestation["status"] == "kinematic_reference_inspection_only"
+    assert attestation["scope"] == "contract_and_reference_resolution"
+    assert attestation["inspection_only"] is True
+    assert attestation["training_invoked"] is False
+    assert attestation["checkpoint_published"] is False
+    assert attestation["clip_sha256"] == clip_sha
+    assert attestation["rollout_sha256"] is None
+
+
+def test_tier_d_reference_receipt_pins_exact_clip_and_rollout_digests(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import world_store
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    slug = _make_project_with_library(client, "TierDAdmission")
+    project_dir = _configure_g1_project(client, slug)
+    clip_sha, rollout_sha = _register_feasibility_reference(
+        tmp_path,
+        robot="g1",
+        clip_id="dynamic_seed",
+        tier_d=True,
+        project_dir=project_dir,
+    )
+    selection = project_dir / "env" / "selection_current.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _p: {
+            "ok": True,
+            "selection_version": 1,
+            "tuple_hash": "c" * 64,
+            "errors": [],
+            "robot_matches_project": True,
+            "world_robot": "unitree_g1:base",
+            "project_robot": "unitree_g1:base",
+        },
+    )
+
+    launched = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "evolve this dynamically feasible motion",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+            "reference_clip_id": "dynamic_seed",
+            "reference_robot": "g1",
+        },
+    )
+    assert launched.status_code == 202, launched.text
+    run = client.get(
+        f"/projects/{slug}/runs/{launched.json()['run_id']}"
+    ).json()
+    attestation = run["reference_feasibility"]
+    assert attestation["status"] == "tierd_verified"
+    assert attestation["tier"] == "D"
+    assert attestation["clip_sha256"] == clip_sha
+    assert attestation["rollout_sha256"] == rollout_sha
+
+
+def test_active_reference_reward_cannot_bypass_tierd_when_picker_is_empty(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The executing reward, rather than picker state, owns admission."""
+    from backend.services import world_store
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    slug = _make_project_with_library(client, "ActiveReferenceAuthority")
+    project_dir = _configure_g1_project(client, slug)
+    _register_feasibility_reference(
+        tmp_path,
+        robot="g1",
+        clip_id="parkour_seed",
+        tier_d=True,
+        project_dir=project_dir,
+    )
+    selection = project_dir / "env" / "selection_current.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _p: {
+            "ok": True,
+            "selection_version": 1,
+            "tuple_hash": "c" * 64,
+            "errors": [],
+            "robot_matches_project": True,
+            "world_robot": "unitree_g1:base",
+            "project_robot": "unitree_g1:base",
+        },
+    )
+
+    rewards = project_dir / "rewards"
+    reward = rewards / "v41.py"
+    reward.write_text(
+        "REWARD_SPEC = {"
+        "'reference_tracking': True,"
+        "'reference_robot': 'g1',"
+        "'composition': {"
+        "'type': 'reference_tracking_residual',"
+        "'reference_clip_id': 'parkour_seed',"
+        "'reference_robot': 'g1',"
+        f"'reference_target_sha256': {'a' * 64!r}"
+        "}}\n",
+        encoding="utf-8",
+    )
+    (rewards / "current.py").write_text(
+        "from pathlib import Path\n"
+        "_HERE = Path(__file__).resolve().parent\n"
+        "_LATEST = _HERE / 'v41.py'\n",
+        encoding="utf-8",
+    )
+
+    launched = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "evolve the already promoted parkour motion",
+            "iterations": 1,
+            "acknowledge_blind_fitness": True,
+        },
+    )
+
+    assert launched.status_code == 202, launched.text
+    job = client.app.state.job_manager.get(launched.json()["run_id"])
+    assert job is not None
+    assert job.params["reference_clip_id"] == "parkour_seed"
+    assert job.params["reference_robot"] == "g1"
+    receipt = job.params["active_reference_authority"]
+    assert receipt["reward_sha256"] == hashlib.sha256(
+        reward.read_bytes()
+    ).hexdigest()
+    assert job.params["reference_feasibility"]["status"] == "tierd_verified"
+
+
+def test_active_reference_reward_rejects_a_different_picker_motion(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "ActiveReferenceMismatch")
+    project_dir = _configure_g1_project(client, slug)
+    rewards = project_dir / "rewards"
+    (rewards / "v8.py").write_text(
+        "REWARD_SPEC = {"
+        "'reference_robot': 'g1',"
+        "'composition': {"
+        "'type': 'reference_tracking_residual',"
+        "'reference_clip_id': 'jump',"
+        "'reference_robot': 'g1',"
+        f"'reference_target_sha256': {'b' * 64!r}"
+        "}}\n",
+        encoding="utf-8",
+    )
+    (rewards / "current.py").write_text(
+        "from pathlib import Path\n"
+        "_HERE = Path(__file__).resolve().parent\n"
+        "_LATEST = _HERE / 'v8.py'\n",
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "use a different motion",
+            "iterations": 1,
+            "acknowledge_blind_fitness": True,
+            "reference_clip_id": "flip",
+            "reference_robot": "g1",
+        },
+    )
+
+    assert response.status_code == 412
+    assert response.json()["type"] == "/problems/active-reference-authority"
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+
+def test_legacy_reference_reward_without_robot_is_not_trainable(
+    client: TestClient,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "LegacyReferenceAuthority")
+    project_dir = _configure_g1_project(client, slug)
+    rewards = project_dir / "rewards"
+    (rewards / "v3.py").write_text(
+        "REWARD_SPEC = {"
+        "'composition': {"
+        "'type': 'reference_tracking_residual',"
+        "'reference_clip_id': 'legacy',"
+        f"'reference_target_sha256': {'c' * 64!r}"
+        "}}\n",
+        encoding="utf-8",
+    )
+    (rewards / "current.py").write_text(
+        "from pathlib import Path\n"
+        "_HERE = Path(__file__).resolve().parent\n"
+        "_LATEST = _HERE / 'v3.py'\n",
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "do not guess the old robot namespace",
+            "iterations": 1,
+            "acknowledge_blind_fitness": True,
+        },
+    )
+
+    assert response.status_code == 412
+    assert response.json()["type"] == "/problems/active-reference-authority"
+    assert "reference_robot" in response.json()["detail"]
 
 
 def test_get_run_preserves_advanced_launch_params(
@@ -342,7 +758,12 @@ def test_cannot_launch_two_concurrent_runs(
     )
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "run forward", "iterations": 2, "dry_run": False},
+        json={
+            "behavior_goal": "run forward",
+            "iterations": 2,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     assert r.status_code == 409
     assert r.json()["type"] == "/problems/job-busy"
@@ -355,10 +776,71 @@ def test_live_run_blocked_without_api_key(
     slug = _make_project_with_library(client, "RunNoKey")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "run forward", "iterations": 2, "dry_run": False},
+        json={
+            "behavior_goal": "run forward",
+            "iterations": 2,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     assert r.status_code == 412
     assert r.json()["type"] == "/problems/no-api-key"
+
+
+def test_live_run_without_objective_requires_explicit_blind_acknowledgement(
+    client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch,
+) -> None:
+    """Direct API clients cannot accidentally launch the blind loop."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "BlindObjectiveGuard")
+
+    rejected = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "run forward without an objective",
+            "iterations": 1,
+            "dry_run": False,
+        },
+    )
+
+    assert rejected.status_code == 412, rejected.text
+    assert rejected.json()["type"] == "/problems/objective-fitness-required"
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+
+def test_blind_acknowledgement_is_persisted_with_server_receipt(
+    client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "BlindObjectiveReceipt")
+
+    launched = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "measure a deliberate blind ablation",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
+    )
+    assert launched.status_code == 202, launched.text
+
+    run_id = launched.json()["run_id"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        detail = client.get(f"/projects/{slug}/runs/{run_id}").json()
+        if detail["status"] == "completed":
+            break
+        time.sleep(0.05)
+
+    assert detail["params"]["acknowledge_blind_fitness"] is True
+    receipt = detail["objective_fitness_receipt"]
+    assert receipt["requested_metric"] is None
+    assert receipt["objective_requested"] is False
+    assert receipt["blind_ablation_acknowledged"] is True
+    assert receipt["authorization"] == "blind_ablation_acknowledged"
 
 
 def test_dry_run_does_not_require_api_key(
@@ -398,7 +880,12 @@ def test_kill_run_transitions_to_stopped(
     slug = _make_project_with_library(client, "RunKill")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "run forward", "iterations": 2, "dry_run": False},
+        json={
+            "behavior_goal": "run forward",
+            "iterations": 2,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     run_id = r.json()["run_id"]
 
@@ -425,7 +912,12 @@ def test_ws_replays_events_after_completion(
     slug = _make_project_with_library(client, "RunWs")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "run forward", "iterations": 2, "dry_run": False},
+        json={
+            "behavior_goal": "run forward",
+            "iterations": 2,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     run_id = r.json()["run_id"]
 
@@ -774,6 +1266,74 @@ def test_run_sculpt_job_forwards_explicit_warm_start_with_hash(
     assert job.params["warm_start_iteration"] == 22
 
 
+def test_worker_blocks_active_reference_reward_drift_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+    from sculptor.reference_authority import resolve_active_reference_authority
+
+    project_dir = tmp_path / "active-reference-drift"
+    rewards = project_dir / "rewards"
+    rewards.mkdir(parents=True)
+    reward = rewards / "v5.py"
+    reward.write_text(
+        "REWARD_SPEC = {"
+        "'reference_robot': 'g1',"
+        "'composition': {"
+        "'type': 'reference_tracking_residual',"
+        "'reference_clip_id': 'parkour',"
+        "'reference_robot': 'g1',"
+        f"'reference_target_sha256': {'d' * 64!r}"
+        "}}\n",
+        encoding="utf-8",
+    )
+    (rewards / "current.py").write_text(
+        "from pathlib import Path\n"
+        "_HERE = Path(__file__).resolve().parent\n"
+        "_LATEST = _HERE / 'v5.py'\n",
+        encoding="utf-8",
+    )
+    admitted = resolve_active_reference_authority(rewards)
+    assert admitted is not None
+    reward.write_text(
+        reward.read_text(encoding="utf-8").replace("parkour", "drifted"),
+        encoding="utf-8",
+    )
+
+    async def _must_not_spawn(*_args, **_kwargs):
+        pytest.fail("subprocess must not start after authority drift")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _must_not_spawn)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "evolve the admitted motion",
+            "iterations": 1,
+            "reference_clip_id": "parkour",
+            "reference_robot": "g1",
+            "active_reference_authority": admitted.to_dict(),
+        },
+    )
+    job = Job(
+        job_id="t_active_reference_drift",
+        kind="sculpt_run",
+        project_slug="active-reference-drift",
+        status="running",
+    )
+    job._cancel = asyncio.Event()
+
+    with pytest.raises(RuntimeError, match="active reference reward changed"):
+        asyncio.run(runner(job, job._cancel))
+
+    event = next(
+        item for item in job.events
+        if item.get("type") == "active_reference_authority_failed"
+    )
+    assert event["expected"]["reward_sha256"] == admitted.reward_sha256
+    assert event["actual"]["reward_sha256"] != admitted.reward_sha256
+
+
 def test_launch_rejects_missing_warm_start_before_job_submission(
     client: TestClient, fake_sculpt,
 ) -> None:
@@ -890,7 +1450,7 @@ def test_run_sculpt_job_forwards_hardware_overrides_as_cli_flags(
     assert cmd[cmd.index("--device") + 1] == "cuda:0"
 
 
-def test_run_sculpt_job_forwards_reference_pair_as_cli_flags(
+def test_tier_k_inspection_never_spawns_training_or_publishes_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from backend.services import run_manager
@@ -898,14 +1458,16 @@ def test_run_sculpt_job_forwards_reference_pair_as_cli_flags(
 
     project_dir = tmp_path / "reference-flags"
     project_dir.mkdir()
-    captured: dict = {}
-
-    class _Sentinel(Exception):
-        pass
+    subprocess_called = False
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    clip_sha, _ = _register_feasibility_reference(
+        tmp_path, robot="g1", clip_id="walk_cycle", tier_d=False,
+    )
 
     async def _fake_exec(*args, **kwargs):
-        captured["cmd"] = list(args)
-        raise _Sentinel()
+        nonlocal subprocess_called
+        subprocess_called = True
+        raise AssertionError("Tier-K inspection must not create a subprocess")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
     runner = run_manager.run_sculpt_job(
@@ -913,8 +1475,16 @@ def test_run_sculpt_job_forwards_reference_pair_as_cli_flags(
         run_params={
             "behavior_goal": "preserve this gait while weaving",
             "iterations": 1,
+            "dry_run": True,
             "reference_clip_id": "walk_cycle",
             "reference_robot": "g1",
+            "reference_feasibility": {
+                "status": "kinematic_reference_inspection_only",
+                "tier": "K",
+                "clip_sha256": clip_sha,
+                "rollout_sha256": None,
+                "scope": "contract_and_reference_resolution",
+            },
         },
     )
     job = Job(
@@ -922,12 +1492,78 @@ def test_run_sculpt_job_forwards_reference_pair_as_cli_flags(
         project_slug="reference-flags", status="running",
     )
     job._cancel = asyncio.Event()
-    with pytest.raises(_Sentinel):
-        asyncio.run(runner(job, job._cancel))
+    result = asyncio.run(runner(job, job._cancel))
 
-    cmd = captured["cmd"]
-    assert cmd[cmd.index("--reference-clip") + 1] == "walk_cycle"
-    assert cmd[cmd.index("--reference-robot") + 1] == "g1"
+    assert subprocess_called is False
+    assert result["inspection_only"] is True
+    assert result["training_invoked"] is False
+    assert result["rollout_invoked"] is False
+    assert result["checkpoint_published"] is False
+    assert not list(project_dir.rglob("checkpoint.pt"))
+    assert not list(project_dir.rglob("checkpoint.zip"))
+    admitted = next(
+        event for event in job.events
+        if event["type"] == "reference_feasibility_admitted"
+    )
+    assert admitted["kinematic_only"] is True
+    assert admitted["training_authorized"] is False
+    assert admitted["training_invoked"] is False
+    assert admitted["checkpoint_published"] is False
+    assert admitted["clip_sha256"] == clip_sha
+    assert admitted["rollout_sha256"] is None
+    completed = next(
+        event for event in job.events
+        if event["type"] == "reference_inspection_completed"
+    )
+    assert completed["scope"] == "contract_and_reference_resolution"
+
+
+def test_run_worker_rejects_reference_digest_drift_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+    from sculptor.refs import library
+
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    clip_sha, _ = _register_feasibility_reference(
+        tmp_path, robot="g1", clip_id="drift_seed", tier_d=False,
+    )
+    clip_path = library.clip_dir("g1", "drift_seed") / library.CLIP_FILENAME
+    clip_path.write_bytes(clip_path.read_bytes() + b"queue-time-drift")
+    project_dir = tmp_path / "reference-drift"
+    project_dir.mkdir()
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "smoke test a pinned reference",
+            "iterations": 1,
+            "dry_run": True,
+            "reference_clip_id": "drift_seed",
+            "reference_robot": "g1",
+            "reference_feasibility": {
+                "status": "kinematic_reference_inspection_only",
+                "tier": "K",
+                "clip_sha256": clip_sha,
+                "rollout_sha256": None,
+                "scope": "contract_and_reference_resolution",
+            },
+        },
+    )
+    job = Job(
+        job_id="reference_drift",
+        kind="sculpt_run",
+        project_slug="reference-drift",
+        status="running",
+    )
+    cancel = asyncio.Event()
+
+    with pytest.raises(RuntimeError, match="changed after admission"):
+        asyncio.run(runner(job, cancel))
+    assert any(
+        event["type"] == "reference_feasibility_integrity_failed"
+        for event in job.events
+    )
 
 
 def test_launch_rejects_tampered_authored_world_before_job_submission(
@@ -959,6 +1595,110 @@ def test_launch_rejects_tampered_authored_world_before_job_submission(
     assert client.app.state.job_manager.list(  # type: ignore[attr-defined]
         kind="sculpt_run", project_slug=slug,
     ) == []
+
+
+def test_launch_rejects_authored_world_for_another_robot(
+    client: TestClient, fake_sculpt, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import world_store
+
+    slug = _make_project_with_library(client, "WorldRobotMismatch")
+    project = client.get(f"/projects/{slug}").json()
+    selection = Path(project["project_dir"]) / "env" / "selection_current.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _project: {
+            "ok": True,
+            "selection_version": 4,
+            "tuple_hash": "a" * 64,
+            "errors": [],
+            "robot_matches_project": False,
+            "world_robot": "unitree_g1:base",
+            "project_robot": "hopper:base",
+        },
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "traverse the authored obstacle course",
+            "iterations": 1,
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/world-robot-mismatch"
+    assert response.json()["title"] == (
+        "training environment targets another robot"
+    )
+    assert "re-author" in response.json()["detail"]
+    assert client.app.state.job_manager.list(  # type: ignore[attr-defined]
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+
+def test_run_worker_rejects_world_robot_drift_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager, world_store
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "world-robot-drift"
+    project_dir.mkdir()
+    expected_receipt = {
+        "selection_version": 4,
+        "tuple_hash": "a" * 64,
+        "world_robot": "unitree_g1:base",
+        "project_robot": "unitree_g1:base",
+    }
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _project: {
+            "ok": True,
+            "selection_version": 5,
+            "tuple_hash": "b" * 64,
+            "errors": [],
+            "robot_matches_project": False,
+            "world_robot": "go1:base",
+            "project_robot": "unitree_g1:base",
+        },
+    )
+
+    async def _must_not_spawn(*_args, **_kwargs):
+        raise AssertionError("subprocess must not start for a mismatched world")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _must_not_spawn)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "continue across the course",
+            "iterations": 1,
+            "dry_run": True,
+            "authored_world_receipt": expected_receipt,
+        },
+    )
+    job = Job(
+        job_id="world_robot_drift",
+        kind="sculpt_run",
+        project_slug="world-robot-drift",
+        status="running",
+    )
+
+    with pytest.raises(RuntimeError, match="targets another robot"):
+        asyncio.run(runner(job, asyncio.Event()))
+
+    failure = next(
+        event for event in job.events
+        if event.get("type") == "authored_world_revalidation_failed"
+    )
+    assert failure["reason"] == "robot_mismatch"
+    assert failure["world_robot"] == "go1:base"
+    assert "pid" not in job.params
 
 
 def test_run_sculpt_job_omits_steps_per_iter_flag_when_not_set(
@@ -1494,7 +2234,8 @@ def test_run_sculpt_job_launch_gen_rejected_runs_blind(
     runner = run_manager.run_sculpt_job(
         project_dir=project_dir,
         run_params={"behavior_goal": "do a spin", "iterations": 1,
-                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe",
+                    "acknowledge_blind_fitness": False},
     )
     job = Job(job_id="t_lgr", kind="sculpt_run", project_slug="lg-reject", status="running")
     job._cancel = asyncio.Event()
@@ -1506,6 +2247,15 @@ def test_run_sculpt_job_launch_gen_rejected_runs_blind(
     assert rejected[0]["reasons"], rejected[0]
     assert rejected[0]["can_retry"] is True, rejected[0]
     assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
+    assert job.params["blind_fitness_runtime_acknowledged"] is True
+    assert job.params["blind_fitness_runtime_acknowledgement_source"] == (
+        "metric_generation_decision"
+    )
+    acknowledged = [
+        e for e in job.events if e.get("type") == "blind_fitness_acknowledged"
+    ]
+    assert len(acknowledged) == 1
+    assert acknowledged[0]["source"] == "metric_generation_decision"
 
 
 def test_run_sculpt_job_launch_gen_retry_then_accept(
@@ -1969,7 +2719,12 @@ def test_realism_audit_surfaced_in_iter_detail(
     slug = _make_project_with_library(client, "RunRealism")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "test realism", "iterations": 1, "dry_run": False},
+        json={
+            "behavior_goal": "test realism",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     run_id = r.json()["run_id"]
 
@@ -2057,7 +2812,12 @@ def test_physics_edit_suggestion_surfaced_in_iter_detail(
     slug = _make_project_with_library(client, "RunPhysSug")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "test phys sugg", "iterations": 1, "dry_run": False},
+        json={
+            "behavior_goal": "test phys sugg",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     run_id = r.json()["run_id"]
 
@@ -2084,7 +2844,12 @@ def test_physics_edit_suggestion_none_without_event(
     slug = _make_project_with_library(client, "RunNoPhysSug")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "test baseline", "iterations": 1, "dry_run": False},
+        json={
+            "behavior_goal": "test baseline",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     run_id = r.json()["run_id"]
     deadline = time.time() + 10
@@ -2134,7 +2899,12 @@ def test_iter_detail_has_realism_audit_none_when_no_event(
     slug = _make_project_with_library(client, "RunNoRealism")
     r = client.post(
         f"/projects/{slug}/runs",
-        json={"behavior_goal": "test baseline", "iterations": 1, "dry_run": False},
+        json={
+            "behavior_goal": "test baseline",
+            "iterations": 1,
+            "dry_run": False,
+            "acknowledge_blind_fitness": True,
+        },
     )
     run_id = r.json()["run_id"]
 
@@ -2308,7 +3078,8 @@ def test_control_endpoint_merges_mode_resume_and_stop(
     r = client.post(
         f"/projects/{slug}/runs",
         json={"behavior_goal": "kick forward", "iterations": 3,
-              "start_mode": "manual"},
+              "start_mode": "manual",
+              "acknowledge_blind_fitness": True},
     )
     assert r.status_code == 202, r.text
     run_id = r.json()["run_id"]

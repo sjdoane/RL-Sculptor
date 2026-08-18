@@ -67,6 +67,7 @@ Source = Literal["menagerie", "mjlab_builtin", "gymnasium_builtin"]
 
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_]{1,62}[a-z0-9]$")
+_REFERENCE_ROBOT_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _URL_RE = re.compile(r"^https?://[^\s]+$")
 
 
@@ -87,6 +88,9 @@ class Reference:
 @dataclass
 class RobotEntry:
     slug: str
+    # Namespace used by reference artifacts and portable policy contracts.
+    # It is intentionally explicit rather than inferred from ``slug``.
+    reference_robot: str
     display_name: str
     category: str
     description: str
@@ -350,6 +354,14 @@ def _validate_entry_dict(raw: dict, idx: int) -> RobotEntry:
         raise _err("display_name is required")
 
     description = raw.get("description", "") or ""
+    reference_robot = raw.get("reference_robot")
+    if (
+        not isinstance(reference_robot, str)
+        or _REFERENCE_ROBOT_RE.fullmatch(reference_robot) is None
+    ):
+        raise _err(
+            "reference_robot is required and must be a lowercase robot namespace"
+        )
     menagerie_package = raw.get("menagerie_package")
     if menagerie_package is not None and not isinstance(menagerie_package, str):
         raise _err(f"menagerie_package must be a string or null, got {type(menagerie_package).__name__}")
@@ -387,6 +399,7 @@ def _validate_entry_dict(raw: dict, idx: int) -> RobotEntry:
 
     return RobotEntry(
         slug=slug,
+        reference_robot=reference_robot,
         display_name=display_name,
         category=category,
         description=description,

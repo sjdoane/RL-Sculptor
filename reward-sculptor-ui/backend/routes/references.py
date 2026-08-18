@@ -96,17 +96,22 @@ def _valid_clip_id(clip_id: str) -> bool:
     return bool(_CLIP_ID_RE.fullmatch(clip_id))
 
 
-def _find_index_row(clip_id: str) -> Optional[dict[str, Any]]:
+def _find_index_row(
+    clip_id: str,
+    robot: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Look up one clip's slim index row by id (v1 = g1 only, but this
     scans every robot dir the index happens to carry rather than
     hard-coding "g1" — a future multi-robot library needs no route
     change)."""
     from sculptor.refs import library
 
-    for row in library.read_index():
-        if row.get("clip_id") == clip_id:
-            return row
-    return None
+    matches = [
+        row for row in library.read_index()
+        if row.get("clip_id") == clip_id
+        and (robot is None or row.get("robot") == robot)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _clip_dir_for(clip_id: str, robot: str) -> Path:
@@ -253,34 +258,21 @@ def browse_references(
 
 
 def _project_reference_robot(project_dir: Path) -> str:
-    """The library namespace this project's clips must come from.
+    """Return the project's explicit robot-library namespace or ``""``.
 
-    Mirrors `sculptor.sculpt._stage_reference_robot_slug`, which is what
-    actually resolves the clip at training time — deliberately the same
-    task_id-shaped string ("Mjlab-Velocity-Flat-Unitree-G1"). Returns "" when
-    it cannot tell, so an unknown adapter never blocks an attach.
+    Task-name substring inference used to disagree with the runtime boundary
+    and silently default legacy projects toward G1. The metadata sidecar is the
+    one identity authority shared with run admission; callers fail closed when
+    it is absent or malformed.
     """
     try:
-        from sculptor.sculpt import _STAGE_REFERENCE_ROBOT_SLUGS
-    except Exception:  # noqa: BLE001 — never block an attach on an import
+        from backend.services.project_robot import (
+            resolve_project_reference_robot,
+        )
+
+        return resolve_project_reference_robot(project_dir)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return ""
-    config_path = project_dir / "config.toml"
-    if not config_path.is_file():
-        return ""
-    try:
-        import tomllib
-        with config_path.open("rb") as f:
-            cfg = tomllib.load(f)
-        task_id = str(
-            ((cfg.get("adapter") or {}).get("config") or {})
-            .get("task_id", "") or "")
-    except Exception:  # noqa: BLE001 — best-effort resolution only
-        return ""
-    hint = task_id.lower()
-    for candidate in _STAGE_REFERENCE_ROBOT_SLUGS:
-        if candidate in hint:
-            return candidate
-    return ""
 
 
 def _normalize(s: str) -> str:
@@ -326,7 +318,7 @@ class ComposeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     clip_id: str
-    robot: str = "g1"
+    robot: str
     segments: list[ComposeSegment]
     text: str = ""
     labels: list[str] = []
@@ -367,7 +359,7 @@ def compose_reference_clip(body: ComposeRequest) -> Any:
             return _problem(
                 status.HTTP_400_BAD_REQUEST, "invalid source clip_id",
                 detail=f"{seg.clip_id!r} must match {_CLIP_ID_RE.pattern}")
-    if _find_index_row(body.clip_id) is not None:
+    if _find_index_row(body.clip_id, body.robot) is not None:
         return _problem(
             status.HTTP_409_CONFLICT, "clip_id already exists",
             detail=f"{body.clip_id!r} is already in the library")
@@ -413,18 +405,21 @@ def compose_reference_clip(body: ComposeRequest) -> Any:
     "/references/{clip_id}",
     responses={404: {"model": ProblemDetail}},
 )
-def get_reference_detail(clip_id: str) -> Any:
+def get_reference_detail(
+    clip_id: str,
+    robot: str = Query(..., min_length=1),
+) -> Any:
     if not _valid_clip_id(clip_id):
         return _problem(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
             detail=f"malformed clip_id {clip_id!r}",
             type_="/problems/not-found")
 
-    row = _find_index_row(clip_id)
+    row = _find_index_row(clip_id, robot)
     if row is None:
         return _problem(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
-            detail=f"no reference clip {clip_id!r}",
+            detail=f"no reference clip ({robot!r}, {clip_id!r})",
             type_="/problems/not-found")
 
     from sculptor.refs import library
@@ -435,7 +430,46 @@ def get_reference_detail(clip_id: str) -> Any:
     except (OSError, ValueError):
         provenance = None
 
-    return {"index_row": row, "provenance": provenance}
+    # A top-level ``tier: D`` string is not admission evidence.  Re-run the
+    # certificate verifier against the current clip and rollout bytes whenever
+    # the UI asks whether this motion is suitable for a real training plan.
+    # The digest below is a compact receipt over the verified facts, not a
+    # replacement for the underlying content hashes.
+    from sculptor.refs.track import verify_tierd_certificate
+
+    certificate, denial_reason = verify_tierd_certificate(row["robot"], clip_id)
+    if certificate is None:
+        dynamics_admission = {
+            "admitted": False,
+            "tier": str(row.get("tier") or "K"),
+            "certificate_digest": None,
+            "clip_sha256": (
+                provenance.get("content_sha256")
+                if isinstance(provenance, dict) else None
+            ),
+            "rollout_sha256": None,
+            "reason": denial_reason or "no verified dynamics certificate",
+        }
+    else:
+        dynamics_admission = {
+            "admitted": True,
+            "tier": "D",
+            "certificate_digest": certificate.certificate_sha256,
+            "clip_sha256": certificate.clip_content_sha256,
+            "rollout_sha256": certificate.rollout_sha256,
+            "reason": None,
+            "tracking_errors": {
+                "mean_joint_err_rad": certificate.mean_joint_err_rad,
+                "max_joint_err_rad": certificate.max_joint_err_rad,
+                "root_z_rmse_m": certificate.root_z_rmse_m,
+            },
+        }
+
+    return {
+        "index_row": row,
+        "provenance": provenance,
+        "dynamics_admission": dynamics_admission,
+    }
 
 
 # ── GET /references/{clip_id}/preview ────────────────────────────────
@@ -444,7 +478,10 @@ def get_reference_detail(clip_id: str) -> Any:
     response_class=FileResponse,
     responses={404: {"model": ProblemDetail}},
 )
-def get_reference_preview(clip_id: str) -> Any:
+def get_reference_preview(
+    clip_id: str,
+    robot: str = Query(..., min_length=1),
+) -> Any:
     from sculptor.refs import library
 
     if not _valid_clip_id(clip_id):
@@ -453,11 +490,11 @@ def get_reference_preview(clip_id: str) -> Any:
             detail=f"malformed clip_id {clip_id!r}",
             type_="/problems/not-found")
 
-    row = _find_index_row(clip_id)
+    row = _find_index_row(clip_id, robot)
     if row is None:
         return _problem(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
-            detail=f"no reference clip {clip_id!r}",
+            detail=f"no reference clip ({robot!r}, {clip_id!r})",
             type_="/problems/not-found")
 
     preview_path = _clip_dir_for(clip_id, row["robot"]) / library.PREVIEW_FILENAME
@@ -476,7 +513,10 @@ def get_reference_preview(clip_id: str) -> Any:
     response_class=FileResponse,
     responses={404: {"model": ProblemDetail}},
 )
-def get_reference_clip_file(clip_id: str) -> Any:
+def get_reference_clip_file(
+    clip_id: str,
+    robot: str = Query(..., min_length=1),
+) -> Any:
     from sculptor.refs import library
 
     if not _valid_clip_id(clip_id):
@@ -485,11 +525,11 @@ def get_reference_clip_file(clip_id: str) -> Any:
             detail=f"malformed clip_id {clip_id!r}",
             type_="/problems/not-found")
 
-    row = _find_index_row(clip_id)
+    row = _find_index_row(clip_id, robot)
     if row is None:
         return _problem(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
-            detail=f"no reference clip {clip_id!r}",
+            detail=f"no reference clip ({robot!r}, {clip_id!r})",
             type_="/problems/not-found")
 
     clip_dir = _clip_dir_for(clip_id, row["robot"])
@@ -590,7 +630,11 @@ def _active_job_conflict(
 
 @router.post(
     "/projects/{slug}/missions/{mission_slug}/stages/{stage}/reference",
-    responses={404: {"model": ProblemDetail}, 409: {"model": ProblemDetail}},
+    responses={
+        404: {"model": ProblemDetail},
+        409: {"model": ProblemDetail},
+        412: {"model": ProblemDetail},
+    },
 )
 def attach_stage_reference(
     slug: str,
@@ -615,11 +659,36 @@ def attach_stage_reference(
             detail=f"malformed clip_id {body.clip_id!r}",
             type_="/problems/not-found")
 
-    row = _find_index_row(body.clip_id)
+    project_robot = _project_reference_robot(project_dir)
+    if not project_robot:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "project robot is not resolved",
+            detail=(
+                "Select a robot-specific training environment before "
+                "attaching a reference motion."
+            ),
+            type_="/problems/reference-feasibility",
+        )
+    row = _find_index_row(body.clip_id, project_robot)
     if row is None:
+        other = _find_index_row(body.clip_id)
+        if other is not None:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference clip is for a different robot",
+                detail=(
+                    f"{body.clip_id!r} is not available for project robot "
+                    f"{project_robot!r}; choose the exact robot-specific "
+                    "reference artifact."
+                ),
+                type_="/problems/reference-feasibility",
+            )
         return _problem(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
-            detail=f"no reference clip {body.clip_id!r}",
+            detail=(
+                f"no reference clip ({project_robot!r}, {body.clip_id!r})"
+            ),
             type_="/problems/not-found")
 
     # A Stage stores a clip id with no embodiment beside it, and at training
@@ -629,7 +698,6 @@ def attach_stage_reference(
     # in the stage card, and then fail hours later with
     # `reference_tracking_seed_failed` — unrecoverable without hand-editing
     # mission.json, because the mismatch is not representable in the state.
-    project_robot = _project_reference_robot(project_dir)
     clip_robot = str(row.get("robot") or "")
     if project_robot and clip_robot and clip_robot != project_robot:
         return _problem(
@@ -651,6 +719,30 @@ def attach_stage_reference(
     if err is not None:
         return err
 
+    from sculptor.refs.track import (
+        TierDAdmissionError,
+        require_tierd_admission,
+        require_tierd_target_compatibility,
+    )
+
+    try:
+        certificate = require_tierd_admission(project_robot, body.clip_id)
+        certificate = require_tierd_target_compatibility(
+            certificate,
+            project_dir,
+            target_robot=project_robot,
+        )
+    except TierDAdmissionError as exc:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference is not admitted for mission training",
+            detail=(
+                f"{project_robot}/{body.clip_id} has no current verified "
+                f"Tier-D certificate: {exc}"
+            ),
+            type_="/problems/reference-feasibility",
+        )
+
     from sculptor.mission import load_mission, save_mission
 
     md = mission_store.mission_dir(project_dir, mission_slug)
@@ -658,19 +750,37 @@ def attach_stage_reference(
     for s in mission.stages:
         if s.name == stage:
             s.reference_clip_id = body.clip_id
-            s.reference_tier = row.get("tier")
+            s.reference_tier = "D"
             # §decision 11: "match_confidence (null for manual attach)"
             # — this endpoint is a direct attach-by-clip_id, never fed a
             # search-result's match_confidence, so it is always None.
             s.reference_match_confidence = None
+            s.reference_robot = project_robot
+            s.reference_clip_sha256 = certificate.clip_content_sha256
+            s.reference_certificate_sha256 = certificate.certificate_sha256
+            s.reference_execution_contract_sha256 = (
+                certificate.execution_contract_sha256
+            )
+            s.reference_execution_boundary_sha256 = (
+                certificate.execution_boundary_sha256
+            )
             break
     save_mission(mission, md)
 
     return {
         "stage": stage,
         "reference_clip_id": body.clip_id,
-        "reference_tier": row.get("tier"),
+        "reference_tier": "D",
         "reference_match_confidence": None,
+        "reference_robot": project_robot,
+        "reference_clip_sha256": certificate.clip_content_sha256,
+        "reference_certificate_sha256": certificate.certificate_sha256,
+        "reference_execution_contract_sha256": (
+            certificate.execution_contract_sha256
+        ),
+        "reference_execution_boundary_sha256": (
+            certificate.execution_boundary_sha256
+        ),
     }
 
 
@@ -715,6 +825,15 @@ def detach_stage_reference(
             s.reference_clip_id = None
             s.reference_tier = None
             s.reference_match_confidence = None
+            s.reference_robot = None
+            s.reference_clip_sha256 = None
+            s.reference_certificate_sha256 = None
+            s.reference_execution_contract_sha256 = None
+            s.reference_execution_boundary_sha256 = None
+            s.reference_span_start_s = None
+            s.reference_span_end_s = None
+            s.reference_span_confidence = None
+            s.reference_span_method = None
             break
     save_mission(mission, md)
 
@@ -732,7 +851,7 @@ class ModeRewardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     clip_id: str
-    robot: str = "g1"
+    robot: str
     goal: str = ""
     #: Include the reference-tracking backbone. Default on: without it every
     #: mode is a stub paying zero, so the module is not trainable until every
@@ -794,15 +913,13 @@ def _mission_brief(task: dict, world: dict, catalog: dict) -> str:
 
 
 def _episode_horizon_s(project_dir: Path) -> Optional[float]:
-    """The episode the mode automaton has to cover, or None if unknowable.
+    """The execution budget for an explicit terminal hold, if knowable.
 
-    A per-mode reward's windows are raw CLIP seconds. When the project has an
-    authored world those are the wrong clock: on platform-ascent-showcase a
-    6.92 s composite gated a 20 s episode, so `active_mode` clamped 75% of
-    every episode into the terminal mode (which pays stillness) and the entry
-    window demanded a speed above the runtime's own command cap. Three sculpt
-    iterations later the robot had never left the ground. See
-    `sculptor.mode_rewards.scale_windows`.
+    A Tier-D certificate covers the reference at its exact cadence, so this
+    value never stretches or fits the clip windows. If the project episode is
+    longer, the generated execution manifest extends only the terminal mode
+    and records both certified clip duration and hold duration. A shorter
+    horizon is rejected rather than silently truncating certified motion.
 
     Read from the promoted selection's task ref rather than the compiler's
     `traversal_window_s`: that value is derived at runtime and never persisted
@@ -820,6 +937,163 @@ def _episode_horizon_s(project_dir: Path) -> Optional[float]:
     except (ValueError, TypeError, AttributeError):
         return None
     return horizon if horizon > 0.0 else None
+
+
+def _mode_context(
+    project_dir: Path,
+    *,
+    clip_id: str,
+    robot: str,
+    tracking_weight: float,
+) -> tuple[str, dict[str, Any]]:
+    """Content identity of everything that fixes phase-window semantics.
+
+    A clip id alone is not a reuse key. The same reference paired with a new
+    task/world selection can have a different terminal hold, tracking
+    balance, and therefore a different execution manifest. Hash the reference bytes plus
+    the promoted selection and every immutable object it names. This gives
+    authoring, promotion, and launch one generic answer to "is this still the
+    artifact I reviewed?" without teaching the key about a particular robot or
+    task.
+    """
+    reference_path = _clip_dir_for(clip_id, robot) / "clip.npz"
+    reference_sha = (
+        hashlib.sha256(reference_path.read_bytes()).hexdigest()
+        if reference_path.is_file() else ""
+    )
+
+    selection_path = project_dir / "env" / "selection_current.json"
+    selection_hasher = hashlib.sha256()
+    selection_valid = False
+    try:
+        raw = selection_path.read_bytes()
+        selection_hasher.update(b"selection_current.json\0" + raw)
+        selection = json.loads(raw)
+        refs = selection.get("refs") if isinstance(selection, dict) else None
+        root = project_dir.resolve()
+        for kind in sorted((refs or {}).keys()):
+            rel = (((refs or {}).get(kind) or {}).get("path"))
+            if not isinstance(rel, str) or not rel:
+                continue
+            target = (project_dir / rel).resolve()
+            if not target.is_relative_to(root) or not target.is_file():
+                raise ValueError(f"unsafe or missing selection ref {rel!r}")
+            selection_hasher.update(kind.encode("utf-8") + b"\0")
+            selection_hasher.update(target.read_bytes())
+        selection_valid = True
+    except (OSError, ValueError, TypeError, AttributeError):
+        # No authored selection is a legitimate pure-imitation context. It is
+        # represented explicitly, not confused with an unreadable reference.
+        selection_hasher.update(b"no-promoted-selection")
+
+    payload = {
+        "schema": "phase-window-context-v1",
+        "clip_id": clip_id,
+        "robot": robot,
+        "reference_sha256": reference_sha,
+        "selection_content_sha256": selection_hasher.hexdigest(),
+        "selection_present": selection_valid,
+        "episode_horizon_s": _episode_horizon_s(project_dir),
+        "tracking_weight": round(float(tracking_weight), 12),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")
+    ).hexdigest()
+    return digest, payload
+
+
+def _mode_binding_context_refs(project_dir: Path) -> dict[str, str]:
+    """Current non-reward artifact digests, normalized by the core contract."""
+    from sculptor.mode_rewards import MODE_BINDING_CONTEXT_REFS
+
+    context_refs: dict[str, str] = {}
+    try:
+        selection = json.loads(
+            (project_dir / "env" / "selection_current.json")
+            .read_text(encoding="utf-8")
+        )
+        refs = selection.get("refs") if isinstance(selection, dict) else {}
+        for kind in MODE_BINDING_CONTEXT_REFS:
+            value = ((refs or {}).get(kind) or {}).get("sha256")
+            if isinstance(value, str) and value:
+                context_refs[kind] = value
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return context_refs
+
+
+def _mode_binding(
+    project_dir: Path,
+    *,
+    clip_id: str,
+    robot: str,
+    graph: Any,
+    execution_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Structured non-circular reuse key persisted in ``REWARD_SPEC``.
+
+    The reward ref itself is excluded because the binding lives inside that
+    reward. All environment-side refs are already content-addressed by the
+    atomic selection, so comparing this object at launch catches a same-name
+    clip replacement, robot change, graph drift, or a re-authored task/world.
+    """
+    clip_path = _clip_dir_for(clip_id, robot) / "clip.npz"
+    clip_sha = (
+        hashlib.sha256(clip_path.read_bytes()).hexdigest()
+        if clip_path.is_file() else ""
+    )
+    from sculptor.modes import mode_graph_sha256
+    from sculptor.mode_rewards import build_mode_reward_binding
+
+    graph_digest = mode_graph_sha256(graph)
+    return build_mode_reward_binding(
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha,
+        graph_sha256=graph_digest,
+        context_refs=_mode_binding_context_refs(project_dir),
+        execution_manifest=execution_manifest,
+    )
+
+
+def _manifest_digest(spec: dict[str, Any]) -> str:
+    manifest = spec.get("mode_execution_manifest")
+    if not isinstance(manifest, dict):
+        return ""
+    try:
+        from sculptor.mode_rewards import mode_execution_manifest_digest
+        from sculptor.modes import ModeError
+
+        return mode_execution_manifest_digest(manifest)
+    except (TypeError, ValueError, ModeError):
+        return ""
+
+
+def _mode_binding_is_current(
+    project_dir: Path,
+    *,
+    clip_id: str,
+    robot: str,
+    spec: dict[str, Any],
+) -> bool:
+    stored = spec.get("mode_binding")
+    if not isinstance(stored, dict):
+        return False
+    loaded, err = _load_mode_graph(clip_id, robot)
+    if err is not None or loaded is None:
+        return False
+    _clip, graph = loaded
+    manifest = spec.get("mode_execution_manifest")
+    if not isinstance(manifest, dict):
+        return False
+    return stored == _mode_binding(
+        project_dir,
+        clip_id=clip_id,
+        robot=robot,
+        graph=graph,
+        execution_manifest=manifest,
+    )
 
 
 def _load_mode_graph(clip_id: str, robot: str):
@@ -860,8 +1134,18 @@ def _load_mode_graph(clip_id: str, robot: str):
     "/references/{clip_id}/modes",
     responses={404: {"model": ProblemDetail}, 422: {"model": ProblemDetail}},
 )
-def get_reference_modes(clip_id: str, robot: str = Query("g1")) -> Any:
-    """The hybrid automaton derived from a composite's own provenance."""
+def get_reference_modes(
+    clip_id: str,
+    robot: str = Query(..., min_length=1),
+) -> Any:
+    """The phase-window scaffold derived from a composite's provenance.
+
+    This endpoint deliberately publishes the execution contract as data.  The
+    current implementation is OGMP-inspired, but it is not the paper's online
+    receding-horizon oracle, rho-bounded exploration, or latent-mode-conditioned
+    policy.  Consumers must not infer those capabilities from the word
+    ``mode`` or from the presence of transition metadata.
+    """
     from sculptor.mode_rewards import mode_windows_s
 
     loaded, err = _load_mode_graph(clip_id, robot)
@@ -872,12 +1156,30 @@ def get_reference_modes(clip_id: str, robot: str = Query("g1")) -> Any:
     return {
         "clip_id": clip_id,
         "fps": graph.fps,
+        "capability": {
+            "kind": "phase_window_reference_scaffold",
+            "paper_alignment": "ogmp_inspired",
+            "dispatch_authority": "episode_time_window",
+            "reference_generator": "fixed_composed_clip",
+            "runtime_transition_guards": False,
+            "policy_mode_conditioning": False,
+            "rho_bounded_exploration": False,
+            "closed_loop_receding_horizon_oracle": False,
+            "summary": (
+                "Fixed composite-reference windows gate phase-specific reward "
+                "terms. Transition guards are inspectable metadata; they do "
+                "not currently drive the policy or runtime handover."
+            ),
+        },
         "modes": [
             {"name": m.name,
              "frame_range": list(m.frame_range),
              "start_s": windows[m.name][0],
              "end_s": windows[m.name][1],
-             "source_clip_id": m.source_clip_id}
+             "source_clip_id": m.source_clip_id,
+             "reference_clip_id": m.reference_clip_id,
+             "reward_terms": list(m.reward_terms),
+             "success_predicate": m.success_predicate}
             for m in graph.modes
         ],
         "transitions": [
@@ -904,6 +1206,56 @@ def _reward_dest(project_dir: Path, filename: str) -> Optional[Path]:
     if name.startswith(".") or ".." in name:
         return None
     return project_dir / "rewards" / name
+
+
+def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
+    """Resolve the exact ``v<n>.py`` selected by ``current.py``.
+
+    Version maxima are not execution truth: keep-best may intentionally point
+    at an older file.  This parser accepts both re-export formats used by the
+    CLI and UI writers and fails closed for hand-edited or missing pointers.
+    """
+    current = rewards_dir / "current.py"
+    if not current.is_file():
+        return None
+    try:
+        source = current.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r"/\s*(['\"])(v\d+\.py)\1", source)
+    if match is None:
+        return None
+    target = rewards_dir / match.group(2)
+    return target.resolve() if target.is_file() else None
+
+
+def _selection_reward_agreement(
+    project_dir: Path, reward_path: Path,
+) -> tuple[bool, str]:
+    """Whether the immutable world tuple pins the same reward bytes."""
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    selection = WorldArtifactStore(project_dir).read_selection(
+        project_dir / "env" / "selection_current.json"
+    )
+    if selection is None:
+        return False, "the project has no authoritative selection"
+    ref = selection.refs.get("reward")
+    if ref is None:
+        return False, "the authoritative selection has no reward ref"
+    selected = Path(ref.path)
+    if not selected.is_absolute():
+        selected = project_dir / selected
+    selected = selected.resolve()
+    target = reward_path.resolve()
+    if selected != target:
+        return False, (
+            f"selection pins {selected.name}, while current.py selects "
+            f"{target.name}"
+        )
+    if str(ref.sha256 or "") != file_sha256(target):
+        return False, "the selection reward digest does not match current.py"
+    return True, ""
 
 
 def _chain_name(stem: str, mode_name: str) -> str:
@@ -956,11 +1308,56 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
         if not authored:
             continue
         windows = _mode_windows_from_source(source)
+        from sculptor.mode_rewards import reward_spec_from_source
+        spec = reward_spec_from_source(source)
         clip_id = _spec_str_from_source(source, "reference_clip_id")
+        reference_robot = _spec_str_from_source(source, "reference_robot")
+        stored_context = _spec_str_from_source(
+            source, "execution_context_digest")
+        try:
+            tracking_weight = float(spec.get("tracking_weight", 1.0))
+        except (TypeError, ValueError):
+            tracking_weight = 1.0
+        if reference_robot:
+            current_context, _ = _mode_context(
+                project_dir,
+                clip_id=clip_id,
+                robot=reference_robot,
+                tracking_weight=tracking_weight,
+            )
+            binding_current = _mode_binding_is_current(
+                project_dir,
+                clip_id=clip_id,
+                robot=reference_robot,
+                spec=spec,
+            )
+        else:
+            # A legacy phase reward without source-robot identity cannot be
+            # proven compatible with this project. Never substitute the
+            # target robot: that would turn missing provenance into a false
+            # same-robot claim.
+            current_context = ""
+            binding_current = False
         out.append({
             "filename": path.name,
             "path": str(path),
             "clip_id": clip_id,
+            "reference_robot": reference_robot,
+            "execution_context_digest": stored_context,
+            "context_blocker": (
+                None if reference_robot
+                else "source robot identity is missing; regenerate this mode reward"
+            ),
+            # Missing is stale, never "probably current". Older files can be
+            # inspected, but must be explicitly regenerated before promotion.
+            "context_current": bool(
+                stored_context
+                and stored_context == current_context
+                and binding_current
+            ),
+            "tracking_enabled": bool(
+                spec.get("tracking_enabled", "def _tracking(" in source)
+            ),
             "mtime": path.stat().st_mtime,
             # Matched against the promoted version's `source_sha256` to answer
             # "is what trains still what I authored?". A filename comparison
@@ -984,24 +1381,71 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
     # promoted side here is what lets the Behavior flow say "4 modes will
     # train" rather than "4 modes exist on disk somewhere".
     promoted: dict[str, Any] | None = None
-    best_n = -1
-    best_path: Path | None = None
-    for path in rewards_dir.glob("v*.py"):
-        m = re.fullmatch(r"v(\d+)", path.stem)
-        if m and int(m.group(1)) > best_n:
-            best_n, best_path = int(m.group(1)), path
-    if best_path is not None:
+    current_path = _current_reward_target(rewards_dir)
+    current_match = (
+        re.fullmatch(r"v(\d+)", current_path.stem)
+        if current_path is not None else None
+    )
+    if current_path is not None and current_match is not None:
+        current_n = int(current_match.group(1))
         try:
-            source = best_path.read_text(encoding="utf-8")
+            source = current_path.read_text(encoding="utf-8")
         except OSError:
             source = ""
         authored = authored_modes(source) if source else {}
         if authored:
             windows = _mode_windows_from_source(source)
+            from sculptor.mode_rewards import reward_spec_from_source
+            spec = reward_spec_from_source(source)
+            promoted_clip = _spec_str_from_source(
+                source, "reference_clip_id")
+            promoted_robot = _spec_str_from_source(source, "reference_robot")
+            stored_context = _spec_str_from_source(
+                source, "execution_context_digest")
+            try:
+                tracking_weight = float(spec.get("tracking_weight", 1.0))
+            except (TypeError, ValueError):
+                tracking_weight = 1.0
+            if promoted_robot:
+                current_context, _ = _mode_context(
+                    project_dir,
+                    clip_id=promoted_clip,
+                    robot=promoted_robot,
+                    tracking_weight=tracking_weight,
+                )
+                binding_current = _mode_binding_is_current(
+                    project_dir,
+                    clip_id=promoted_clip,
+                    robot=promoted_robot,
+                    spec=spec,
+                )
+            else:
+                current_context = ""
+                binding_current = False
+            selection_current, selection_blocker = (
+                _selection_reward_agreement(project_dir, current_path)
+            )
             promoted = {
-                "version": best_n,
-                "filename": best_path.name,
-                "clip_id": _spec_str_from_source(source, "reference_clip_id"),
+                "version": current_n,
+                "filename": current_path.name,
+                "clip_id": promoted_clip,
+                "reference_robot": promoted_robot,
+                "execution_context_digest": stored_context,
+                "context_blocker": (
+                    None if promoted_robot
+                    else "source robot identity is missing; regenerate this mode reward"
+                ),
+                "context_current": bool(
+                    stored_context
+                    and stored_context == current_context
+                    and binding_current
+                    and selection_current
+                ),
+                "selection_current": selection_current,
+                "promotion_blocker": selection_blocker or None,
+                "tracking_enabled": bool(
+                    spec.get("tracking_enabled", "def _tracking(" in source)
+                ),
                 # "" for a version promoted before this was recorded, which
                 # reads as "matches nothing" — the safe direction: the UI
                 # offers to promote again rather than claiming a stale reward
@@ -1112,12 +1556,46 @@ def scaffold_mode_reward(
                    "authored mode bodies. Pass overwrite=true to replace it.",
             type_="/problems/conflict")
 
+    tracking_weight = _tracking_weight(project_dir)
+    context_digest, context = _mode_context(
+        project_dir,
+        clip_id=clip_id,
+        robot=body.robot,
+        tracking_weight=tracking_weight,
+    )
     try:
         source = generate_mode_reward_scaffold(
             graph, behavior_goal=body.goal, clip_id=clip_id,
             clip=clip if body.tracking else None,
             horizon_s=_episode_horizon_s(project_dir),
-            tracking_weight=_tracking_weight(project_dir))
+            tracking_weight=tracking_weight)
+        # Binding is immutable provenance, not a comment. Promotion and launch
+        # can now distinguish "same clip id" from "same reviewed execution
+        # context" after a world/task/reference edit.
+        from sculptor.mode_rewards import (
+            _rewrite_reward_spec,
+            reward_spec_from_source,
+        )
+        generated_spec = reward_spec_from_source(source)
+        execution_manifest = generated_spec.get("mode_execution_manifest")
+        if not isinstance(execution_manifest, dict) or not _manifest_digest(
+            generated_spec
+        ):
+            raise ModeError(
+                "generated phase reward is missing its execution manifest"
+            )
+        source = _rewrite_reward_spec(source, {
+            "reference_robot": body.robot,
+            "execution_context_digest": context_digest,
+            "execution_context": context,
+            "mode_binding": _mode_binding(
+                project_dir,
+                clip_id=clip_id,
+                robot=body.robot,
+                graph=graph,
+                execution_manifest=execution_manifest,
+            ),
+        })
     except ModeError as e:
         return _problem(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1134,15 +1612,15 @@ def scaffold_mode_reward(
     dest.write_text(source, encoding="utf-8")
 
     authored = authored_modes(source)
-    # The MODULE's windows, not the graph's. They differ once the scaffold has
-    # been fitted to an episode horizon, and these are the ones each mode's
-    # terms are actually paid over — reporting clip seconds here told the user
-    # the fit had not happened when it had.
+    # The MODULE's execution windows, not only the graph's certified windows.
+    # They differ solely when an explicit terminal hold extends the final
+    # mode; no certified clip phase is fitted or retimed.
     windows = _mode_windows_from_source(source) or mode_windows_s(graph)
     return {
         "path": str(dest),
         "filename": dest.name,
         "clip_id": clip_id,
+        "execution_context_digest": context_digest,
         "tracking": bool(body.tracking),
         "modes": [
             {"name": name,
@@ -1161,7 +1639,7 @@ class ModeAuthorRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     clip_id: str
-    robot: str = "g1"
+    robot: str
     #: Which mode to author. One per request: the scaffold's gating is already
     #: correct, so the only thing a model can get wrong is one window's terms.
     mode: str
@@ -1350,6 +1828,71 @@ def promote_mode_reward_route(
             detail=f"{src.name} does not exist in this project's rewards/",
             type_="/problems/not-found")
 
+    source = src.read_text(encoding="utf-8")
+    from sculptor.mode_rewards import reward_spec_from_source
+    spec = reward_spec_from_source(source)
+    stored_context = spec.get("execution_context_digest")
+    reference_robot = spec.get("reference_robot")
+    if not isinstance(reference_robot, str) or not reference_robot.strip():
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode reward source robot is unknown",
+            detail=(
+                "This phase reward predates exact source-robot provenance. "
+                "Regenerate it against the intended reference and robot; the "
+                "project target robot cannot substitute for missing source "
+                "identity."
+            ),
+            type_="/problems/stale-artifact",
+        )
+    reference_robot = reference_robot.strip()
+    try:
+        tracking_weight = float(spec.get("tracking_weight", 1.0))
+    except (TypeError, ValueError):
+        tracking_weight = 1.0
+    current_context, current_context_fields = _mode_context(
+        project_dir,
+        clip_id=clip_id,
+        robot=str(reference_robot),
+        tracking_weight=tracking_weight,
+    )
+    if not isinstance(stored_context, str) or stored_context != current_context:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode reward belongs to an older execution context",
+            detail=(
+                "The reference bytes, robot, task/world selection, episode "
+                "horizon, or tracking balance changed after this phase reward "
+                "was scaffolded. Regenerate it before promotion; clip-id "
+                "equality alone is not sufficient provenance. Current context "
+                f"is {current_context[:12]} ({current_context_fields})."
+            ),
+            type_="/problems/stale-artifact",
+        )
+    if not _mode_binding_is_current(
+        project_dir,
+        clip_id=clip_id,
+        robot=str(reference_robot),
+        spec=spec,
+    ):
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode reward binding is stale or incomplete",
+            detail=(
+                "The phase reward must bind the exact reference bytes, robot, "
+                "mode graph, emitted execution schedule, and non-reward world "
+                "artifacts. Regenerate it before promotion; a matching clip "
+                "name or phase list is not sufficient provenance."
+            ),
+            type_="/problems/stale-artifact",
+        )
+
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    world_store = WorldArtifactStore(project_dir)
+    selection_path = project_dir / "env" / "selection_current.json"
+    selection = world_store.read_selection(selection_path)
+
     contract = None
     try:
         from sculptor.adapters.base import load_adapter
@@ -1357,6 +1900,10 @@ def promote_mode_reward_route(
     except Exception:  # noqa: BLE001 — probe is a bonus, absence is not fatal
         contract = None
 
+    current_path = project_dir / "rewards" / "current.py"
+    previous_current = (
+        current_path.read_bytes() if current_path.is_file() else None
+    )
     try:
         out = promote_mode_reward(
             src, contract=contract, allow_unauthored=body.allow_unauthored)
@@ -1365,7 +1912,42 @@ def promote_mode_reward_route(
             status.HTTP_409_CONFLICT, "reward not promotable", detail=str(e),
             type_="/problems/state-conflict")
 
+    promoted_path = Path(out["path"]).resolve()
+    promoted_selection = None
+    if selection is not None:
+        try:
+            refs = dict(selection.refs)
+            refs["reward"] = ArtifactRef.from_path(
+                "reward", promoted_path.stem, promoted_path, base=project_dir
+            )
+            promoted_selection = world_store.promote(
+                refs, evaluation_lineage=selection.evaluation_lineage
+            )
+        except Exception as exc:  # noqa: BLE001 - restore prior commit point
+            if previous_current is None:
+                current_path.unlink(missing_ok=True)
+            else:
+                current_path.write_bytes(previous_current)
+            promoted_path.unlink(missing_ok=True)
+            return _problem(
+                status.HTTP_409_CONFLICT,
+                "reward tuple promotion failed",
+                detail=(
+                    "The reward file passed validation, but its immutable "
+                    f"world/task tuple could not be committed: {exc}"
+                ),
+                type_="/problems/state-conflict",
+            )
+
     return {"version": out["version"], "filename": out["filename"],
             "path": out["path"], "clip_id": clip_id,
             "unauthored": out["unauthored"],
-            "source_filename": out["source_filename"]}
+            "source_filename": out["source_filename"],
+            "selection_version": (
+                promoted_selection.selection_version
+                if promoted_selection is not None else None
+            ),
+            "tuple_hash": (
+                promoted_selection.tuple_hash
+                if promoted_selection is not None else None
+            )}

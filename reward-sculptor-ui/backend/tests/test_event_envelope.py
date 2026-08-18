@@ -86,3 +86,26 @@ def test_every_line_is_still_logged_and_non_event_lines_pass_through(tmp_path):
     typed = [e for e in job.events if e["type"] != "log_line"]
     assert [e["type"] for e in typed] == ["run_started"]
     assert (tmp_path / "run.log").read_text().splitlines()[0] == "plain progress line"
+
+
+def test_parsed_event_is_forwarded_to_observation_boundary(tmp_path):
+    job = _FakeJob()
+    observed: list[dict] = []
+    asyncio.run(_stream_stdout(
+        job=job,
+        proc=_FakeProc([
+            EVENT_TAG + " " + json.dumps({
+                "type": "warm_start_loaded",
+                "source": "/project/runs/iter_0/checkpoint.pt",
+                "source_sha8": "12345678",
+                "load_cfg_keys": ["actor"],
+            }) + "\n",
+        ]),
+        log_path=tmp_path / "run.log",
+        on_event=observed.append,
+    ))
+
+    assert len(observed) == 1
+    assert observed[0]["type"] == "warm_start_loaded"
+    assert observed[0]["origin"] == "stdout"
+    assert observed[0]["source"].endswith("checkpoint.pt")

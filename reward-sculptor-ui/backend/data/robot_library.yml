@@ -9,6 +9,9 @@
 #   "gymnasium_compatible" (legacy gym_sb3 path).
 # - `is_smoke_test_target`: true for Cartpole only; UI category filter
 #   hides "Other" by default so Cartpole doesn't clutter the browser.
+# - `reference_robot`: exact namespace used by reference clips and portable
+#   policy contracts. Required for every entry; never inferred from `slug` or
+#   a task id. It may differ from the catalog asset slug (unitree_g1 -> g1).
 # - `references`: verified URLs only. preview_only entries ship with
 #   `references: []` unless a canonical paper + repo was hand-verified
 #   during research.
@@ -16,6 +19,7 @@
 robots:
   # ── mjlab_ready (6 robots, 14 tasks) ──────────────────────────────────────
   - slug: cartpole_mjlab
+    reference_robot: cartpole_mjlab
     display_name: "Cartpole (toy)"
     category: Other
     description: "Classical cart-pole stabilization toy task; ships inside mjlab for smoke testing."
@@ -34,6 +38,7 @@ robots:
     thumbnail_path: robots/cartpole_mjlab.webp
 
   - slug: unitree_go1
+    reference_robot: go1
     display_name: "Unitree Go1"
     category: Quadruped
     description: "Unitree Go1 quadruped (~12 kg, 12 actuated joints). Canonical sim-to-real legged locomotion platform."
@@ -67,6 +72,7 @@ robots:
     thumbnail_path: robots/unitree_go1.webp
 
   - slug: anybotics_anymal_c
+    reference_robot: anybotics_anymal_c
     display_name: "ANYmal C"
     category: Quadruped
     description: "ANYbotics ANYmal C quadruped (~50 kg, 12 DoF). Canonical proprioceptive-locomotion research platform."
@@ -91,6 +97,7 @@ robots:
     thumbnail_path: robots/anybotics_anymal_c.webp
 
   - slug: unitree_g1
+    reference_robot: g1
     display_name: "Unitree G1"
     category: Humanoid
     description: "Unitree G1 humanoid (~35 kg, 23 actuated joints). Primary humanoid RL target on the sculptor."
@@ -130,6 +137,7 @@ robots:
     thumbnail_path: robots/unitree_g1.webp
 
   - slug: booster_t1
+    reference_robot: booster_t1
     display_name: "Booster T1"
     category: Humanoid
     description: "Booster Robotics T1 humanoid (23 DoF). Accompanied by the Booster Gym RL framework."
@@ -151,6 +159,7 @@ robots:
     thumbnail_path: robots/booster_t1.webp
 
   - slug: i2rt_yam
+    reference_robot: i2rt_yam
     display_name: "Yam arm (I2RT)"
     category: Arm
     description: "I2RT YAM 6-DoF manipulator. Used for mjlab's Lift-Cube manipulation tasks."
@@ -177,6 +186,7 @@ robots:
 
   # ── gymnasium_compatible (5 legacy robots) ────────────────────────────────
   - slug: hopper
+    reference_robot: hopper
     display_name: "Hopper"
     category: Other
     description: "MuJoCo Gymnasium single-legged hopper benchmark."
@@ -192,6 +202,7 @@ robots:
     thumbnail_path: robots/hopper.webp
 
   - slug: ant
+    reference_robot: ant
     display_name: "Ant"
     category: Quadruped
     description: "MuJoCo Gymnasium 4-legged ant benchmark."
@@ -207,6 +218,7 @@ robots:
     thumbnail_path: robots/ant.webp
 
   - slug: walker2d
+    reference_robot: walker2d
     display_name: "Walker2d"
     category: Other
     description: "MuJoCo Gymnasium 2D bipedal walker."
@@ -222,6 +234,7 @@ robots:
     thumbnail_path: robots/walker2d.webp
 
   - slug: halfcheetah
+    reference_robot: halfcheetah
     display_name: "HalfCheetah"
     category: Quadruped
     description: "MuJoCo Gymnasium planar quadruped benchmark."
@@ -237,6 +250,7 @@ robots:
     thumbnail_path: robots/halfcheetah.webp
 
   - slug: humanoid
+    reference_robot: humanoid
     display_name: "Humanoid (Gymnasium)"
     category: Humanoid
     description: "MuJoCo Gymnasium humanoid benchmark."
@@ -254,6 +268,7 @@ robots:
   # ── preview_only (Menagerie; not yet wired to an mjlab task) ──────────────
   # Arms
   - slug: agilex_piper
+    reference_robot: agilex_piper
     display_name: "AgileX PiPER"
     category: Arm
     description: "AgileX PiPER 6-DoF manipulator."
@@ -266,6 +281,7 @@ robots:
     thumbnail_path: robots/agilex_piper.webp
 
   - slug: arx_l5
+    reference_robot: arx_l5
     display_name: "ARX L5"
     category: Arm
     description: "ARX Robotics L5 6-DoF manipulator."
@@ -278,6 +294,7 @@ robots:
     thumbnail_path: robots/arx_l5.webp
 
   - slug: dynamixel_2r
+    reference_robot: dynamixel_2r
     display_name: "Dynamixel 2R"
     category: Arm
     description: "Research test-rig: 2-revolute-joint arm driven by Dynamixel servos."
@@ -290,6 +307,7 @@ robots:
     thumbnail_path: robots/dynamixel_2r.webp
 
   - slug: franka_emika_panda
+    reference_robot: franka_emika_panda
     display_name: "Franka Emika Panda"
     category: Arm
     description: "Franka Emika Panda 7-DoF manipulator."
@@ -302,6 +320,7 @@ robots:
     thumbnail_path: robots/franka_emika_panda.webp
 
   - slug: franka_fr3
+    reference_robot: franka_fr3
     display_name: "Franka FR3"
     category: Arm
     description: "Franka Robotics FR3 7-DoF manipulator."
@@ -314,6 +333,7 @@ robots:
     thumbnail_path: robots/franka_fr3.webp
 
   - slug: franka_fr3_v2
+    reference_robot: franka_fr3_v2
     display_name: "Franka FR3 (v2)"
     category: Arm
     description: "Franka Robotics FR3 7-DoF manipulator — v2 model refinement."
@@ -326,6 +346,7 @@ robots:
     thumbnail_path: robots/franka_fr3_v2.webp
 
   - slug: kinova_gen3
+    reference_robot: kinova_gen3
     display_name: "Kinova Gen3"
     category: Arm
     description: "Kinova Gen3 7-DoF manipulator."
@@ -338,6 +359,7 @@ robots:
     thumbnail_path: robots/kinova_gen3.webp
 
   - slug: kuka_iiwa_14
+    reference_robot: kuka_iiwa_14
     display_name: "KUKA LBR iiwa 14"
     category: Arm
     description: "KUKA LBR iiwa 14 7-DoF manipulator."
@@ -350,6 +372,7 @@ robots:
     thumbnail_path: robots/kuka_iiwa_14.webp
 
   - slug: low_cost_robot_arm
+    reference_robot: low_cost_robot_arm
     display_name: "Low-Cost Robot Arm"
     category: Arm
     description: "Open-source low-cost 5-DoF robot arm (Alexander Koch et al.)."
@@ -362,6 +385,7 @@ robots:
     thumbnail_path: robots/low_cost_robot_arm.webp
 
   - slug: rethink_robotics_sawyer
+    reference_robot: rethink_robotics_sawyer
     display_name: "Rethink Robotics Sawyer"
     category: Arm
     description: "Rethink Robotics Sawyer 7-DoF manipulator."
@@ -374,6 +398,7 @@ robots:
     thumbnail_path: robots/rethink_robotics_sawyer.webp
 
   - slug: robotstudio_so101
+    reference_robot: robotstudio_so101
     display_name: "The Robot Studio SO-101"
     category: Arm
     description: "The Robot Studio SO-101 5-DoF open-source arm."
@@ -386,6 +411,7 @@ robots:
     thumbnail_path: robots/robotstudio_so101.webp
 
   - slug: trs_so_arm100
+    reference_robot: trs_so_arm100
     display_name: "SO-ARM 100"
     category: Arm
     description: "Standard Open Arm-100 5-DoF open-source arm."
@@ -398,6 +424,7 @@ robots:
     thumbnail_path: robots/trs_so_arm100.webp
 
   - slug: trossen_vx300s
+    reference_robot: trossen_vx300s
     display_name: "ViperX 300 6-DoF"
     category: Arm
     description: "Trossen Robotics ViperX 300 6-DoF manipulator."
@@ -410,6 +437,7 @@ robots:
     thumbnail_path: robots/trossen_vx300s.webp
 
   - slug: trossen_wx250s
+    reference_robot: trossen_wx250s
     display_name: "WidowX 250 6-DoF"
     category: Arm
     description: "Trossen Robotics WidowX 250 6-DoF manipulator."
@@ -422,6 +450,7 @@ robots:
     thumbnail_path: robots/trossen_wx250s.webp
 
   - slug: ufactory_xarm7
+    reference_robot: ufactory_xarm7
     display_name: "UFactory xArm7"
     category: Arm
     description: "UFactory xArm 7-DoF manipulator."
@@ -434,6 +463,7 @@ robots:
     thumbnail_path: robots/ufactory_xarm7.webp
 
   - slug: unitree_z1
+    reference_robot: unitree_z1
     display_name: "Unitree Z1"
     category: Arm
     description: "Unitree Z1 6-DoF manipulator (mountable on quadrupeds)."
@@ -446,6 +476,7 @@ robots:
     thumbnail_path: robots/unitree_z1.webp
 
   - slug: universal_robots_ur10e
+    reference_robot: universal_robots_ur10e
     display_name: "Universal Robots UR10e"
     category: Arm
     description: "Universal Robots UR10e collaborative 6-DoF manipulator."
@@ -458,6 +489,7 @@ robots:
     thumbnail_path: robots/universal_robots_ur10e.webp
 
   - slug: universal_robots_ur5e
+    reference_robot: universal_robots_ur5e
     display_name: "Universal Robots UR5e"
     category: Arm
     description: "Universal Robots UR5e collaborative 6-DoF manipulator."
@@ -470,6 +502,7 @@ robots:
     thumbnail_path: robots/universal_robots_ur5e.webp
 
   - slug: openarm_v1
+    reference_robot: openarm_v1
     display_name: "OpenArm v1"
     category: Arm
     description: "OpenArm v1 community-developed open-source manipulator."
@@ -483,6 +516,7 @@ robots:
 
   # Drones
   - slug: bitcraze_crazyflie_2
+    reference_robot: bitcraze_crazyflie_2
     display_name: "Bitcraze Crazyflie 2"
     category: Drone
     description: "Bitcraze Crazyflie 2 nano-quadcopter research platform."
@@ -495,6 +529,7 @@ robots:
     thumbnail_path: robots/bitcraze_crazyflie_2.webp
 
   - slug: skydio_x2
+    reference_robot: skydio_x2
     display_name: "Skydio X2"
     category: Drone
     description: "Skydio X2 autonomous quadcopter."
@@ -508,6 +543,7 @@ robots:
 
   # Grippers & hands
   - slug: leap_hand
+    reference_robot: leap_hand
     display_name: "LEAP Hand"
     category: Gripper_Hand
     description: "LEAP Hand dexterous manipulation testbed (CMU)."
@@ -520,6 +556,7 @@ robots:
     thumbnail_path: robots/leap_hand.webp
 
   - slug: robotiq_2f85
+    reference_robot: robotiq_2f85
     display_name: "Robotiq 2F-85"
     category: Gripper_Hand
     description: "Robotiq 2F-85 2-finger parallel gripper."
@@ -532,6 +569,7 @@ robots:
     thumbnail_path: robots/robotiq_2f85.webp
 
   - slug: robotiq_2f85_v4
+    reference_robot: robotiq_2f85_v4
     display_name: "Robotiq 2F-85 (v4)"
     category: Gripper_Hand
     description: "Robotiq 2F-85 2-finger parallel gripper — v4 model refinement."
@@ -544,6 +582,7 @@ robots:
     thumbnail_path: robots/robotiq_2f85_v4.webp
 
   - slug: shadow_dexee
+    reference_robot: shadow_dexee
     display_name: "Shadow DEX-EE"
     category: Gripper_Hand
     description: "Shadow Robot Company DEX-EE dexterous hand."
@@ -556,6 +595,7 @@ robots:
     thumbnail_path: robots/shadow_dexee.webp
 
   - slug: shadow_hand
+    reference_robot: shadow_hand
     display_name: "Shadow Hand E3M5"
     category: Gripper_Hand
     description: "Shadow Robot Company Hand E3M5 — 24-DoF anthropomorphic dexterous hand."
@@ -568,6 +608,7 @@ robots:
     thumbnail_path: robots/shadow_hand.webp
 
   - slug: tetheria_aero_hand_open
+    reference_robot: tetheria_aero_hand_open
     display_name: "Tetheria Aero Hand (open)"
     category: Gripper_Hand
     description: "Tetheria Aero Hand in open configuration — research gripper."
@@ -580,6 +621,7 @@ robots:
     thumbnail_path: robots/tetheria_aero_hand_open.webp
 
   - slug: ability_hand
+    reference_robot: ability_hand
     display_name: "Psyonic Ability Hand"
     category: Gripper_Hand
     description: "Psyonic Ability Hand — 6-DoF anthropomorphic prosthetic hand."
@@ -592,6 +634,7 @@ robots:
     thumbnail_path: robots/ability_hand.webp
 
   - slug: wonik_allegro
+    reference_robot: wonik_allegro
     display_name: "Wonik Allegro Hand V3"
     category: Gripper_Hand
     description: "Wonik Robotics Allegro Hand V3 — 16-DoF 4-fingered dexterous hand."
@@ -605,6 +648,7 @@ robots:
 
   # Humanoids
   - slug: apptronik_apollo
+    reference_robot: apptronik_apollo
     display_name: "Apptronik Apollo"
     category: Humanoid
     description: "Apptronik Apollo general-purpose humanoid."
@@ -617,6 +661,7 @@ robots:
     thumbnail_path: robots/apptronik_apollo.webp
 
   - slug: fourier_n1
+    reference_robot: fourier_n1
     display_name: "Fourier N1"
     category: Humanoid
     description: "Fourier Intelligence N1 humanoid."
@@ -629,6 +674,7 @@ robots:
     thumbnail_path: robots/fourier_n1.webp
 
   - slug: pal_talos
+    reference_robot: pal_talos
     display_name: "PAL TALOS"
     category: Humanoid
     description: "PAL Robotics TALOS — full-size humanoid research platform."
@@ -641,6 +687,7 @@ robots:
     thumbnail_path: robots/pal_talos.webp
 
   - slug: pndbotics_adam_lite
+    reference_robot: pndbotics_adam_lite
     display_name: "PNDbotics Adam Lite"
     category: Humanoid
     description: "PNDbotics Adam Lite humanoid."
@@ -653,6 +700,7 @@ robots:
     thumbnail_path: robots/pndbotics_adam_lite.webp
 
   - slug: robotis_op3
+    reference_robot: robotis_op3
     display_name: "Robotis OP3"
     category: Humanoid
     description: "Robotis OP3 small-scale bipedal humanoid."
@@ -665,6 +713,7 @@ robots:
     thumbnail_path: robots/robotis_op3.webp
 
   - slug: toddlerbot_2xc
+    reference_robot: toddlerbot_2xc
     display_name: "ToddlerBot 2XC"
     category: Humanoid
     description: "Stanford ToddlerBot 2XC — affordable bipedal humanoid."
@@ -677,6 +726,7 @@ robots:
     thumbnail_path: robots/toddlerbot_2xc.webp
 
   - slug: toddlerbot_2xm
+    reference_robot: toddlerbot_2xm
     display_name: "ToddlerBot 2XM"
     category: Humanoid
     description: "Stanford ToddlerBot 2XM — affordable bipedal humanoid (M variant)."
@@ -689,6 +739,7 @@ robots:
     thumbnail_path: robots/toddlerbot_2xm.webp
 
   - slug: unitree_h1
+    reference_robot: unitree_h1
     display_name: "Unitree H1"
     category: Humanoid
     description: "Unitree H1 full-size humanoid (19 DoF)."
@@ -701,6 +752,7 @@ robots:
     thumbnail_path: robots/unitree_h1.webp
 
   - slug: unitree_h1_2
+    reference_robot: unitree_h1_2
     display_name: "Unitree H1.2"
     category: Humanoid
     description: "Unitree H1.2 full-size humanoid (successor to H1)."
@@ -713,6 +765,7 @@ robots:
     thumbnail_path: robots/unitree_h1_2.webp
 
   - slug: elf2_humanoid
+    reference_robot: elf2_humanoid
     display_name: "Elf2 Humanoid"
     category: Humanoid
     description: "Elf2 humanoid research platform."
@@ -725,6 +778,7 @@ robots:
     thumbnail_path: robots/elf2_humanoid.webp
 
   - slug: jvrc_humanoid
+    reference_robot: jvrc_humanoid
     display_name: "JVRC Humanoid"
     category: Humanoid
     description: "JVRC (Japan Virtual Robotics Challenge) humanoid."
@@ -737,6 +791,7 @@ robots:
     thumbnail_path: robots/jvrc_humanoid.webp
 
   - slug: mujoco_humanoid_builtin
+    reference_robot: mujoco_humanoid_builtin
     display_name: "MuJoCo Humanoid (classic)"
     category: Humanoid
     description: "MuJoCo's canonical 22-DoF humanoid — built-in tutorial model."
@@ -749,6 +804,7 @@ robots:
     thumbnail_path: robots/mujoco_humanoid_builtin.webp
 
   - slug: rainy_rby1
+    reference_robot: rainy_rby1
     display_name: "Rainbow Robotics RB-Y1"
     category: Humanoid
     description: "Rainbow Robotics RB-Y1 wheeled humanoid."
@@ -762,6 +818,7 @@ robots:
 
   # Mobile manipulators
   - slug: hello_robot_stretch
+    reference_robot: hello_robot_stretch
     display_name: "Hello Robot Stretch 2"
     category: Mobile_Manipulator
     description: "Hello Robot Stretch 2 — mobile home-assistant robot."
@@ -774,6 +831,7 @@ robots:
     thumbnail_path: robots/hello_robot_stretch.webp
 
   - slug: hello_robot_stretch_3
+    reference_robot: hello_robot_stretch_3
     display_name: "Hello Robot Stretch 3"
     category: Mobile_Manipulator
     description: "Hello Robot Stretch 3 — successor mobile manipulator."
@@ -786,6 +844,7 @@ robots:
     thumbnail_path: robots/hello_robot_stretch_3.webp
 
   - slug: pal_tiago_dual
+    reference_robot: pal_tiago_dual
     display_name: "PAL TIAGo++"
     category: Mobile_Manipulator
     description: "PAL Robotics TIAGo++ dual-arm mobile manipulator."
@@ -798,6 +857,7 @@ robots:
     thumbnail_path: robots/pal_tiago_dual.webp
 
   - slug: robot_soccer_kit
+    reference_robot: robot_soccer_kit
     display_name: "Robot Soccer Kit"
     category: Mobile_Manipulator
     description: "Rhoban Robot Soccer Kit — omnidirectional mobile base for robot soccer."
@@ -811,6 +871,7 @@ robots:
 
   # Quadrupeds (preview only; Go1/ANYmal-C listed above as mjlab_ready)
   - slug: agility_cassie
+    reference_robot: agility_cassie
     display_name: "Agility Cassie"
     category: Quadruped
     description: "Agility Robotics Cassie bipedal legged robot."
@@ -823,6 +884,7 @@ robots:
     thumbnail_path: robots/agility_cassie.webp
 
   - slug: anybotics_anymal_b
+    reference_robot: anybotics_anymal_b
     display_name: "ANYmal B"
     category: Quadruped
     description: "ANYbotics ANYmal B — predecessor to ANYmal C."
@@ -835,6 +897,7 @@ robots:
     thumbnail_path: robots/anybotics_anymal_b.webp
 
   - slug: boston_dynamics_spot
+    reference_robot: boston_dynamics_spot
     display_name: "Boston Dynamics Spot"
     category: Quadruped
     description: "Boston Dynamics Spot — commercial quadruped."
@@ -847,6 +910,7 @@ robots:
     thumbnail_path: robots/boston_dynamics_spot.webp
 
   - slug: unitree_a1
+    reference_robot: unitree_a1
     display_name: "Unitree A1"
     category: Quadruped
     description: "Unitree A1 quadruped — predecessor to Go1."
@@ -859,6 +923,7 @@ robots:
     thumbnail_path: robots/unitree_a1.webp
 
   - slug: unitree_aliengo
+    reference_robot: unitree_aliengo
     display_name: "Unitree Aliengo"
     category: Quadruped
     description: "Unitree Aliengo quadruped — larger than A1, smaller than AlienGo."
@@ -871,6 +936,7 @@ robots:
     thumbnail_path: robots/unitree_aliengo.webp
 
   - slug: unitree_go2
+    reference_robot: unitree_go2
     display_name: "Unitree Go2"
     category: Quadruped
     description: "Unitree Go2 quadruped — successor to Go1. Note: no mjlab task registered yet; preview-only."

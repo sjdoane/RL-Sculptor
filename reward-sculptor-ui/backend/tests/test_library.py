@@ -45,6 +45,29 @@ def test_library_slugs_unique_and_well_formed() -> None:
         assert _SLUG_RE.match(slug), f"malformed slug {slug!r}"
 
 
+def test_catalog_declares_reference_namespaces_without_slug_inference() -> None:
+    from backend.services.robot_library import load_library
+    from sculptor.project_robot import (
+        LEGACY_REFERENCE_ROBOT_BY_LIBRARY_SLUG,
+    )
+
+    path = (
+        Path(__file__).resolve().parents[1] / "data" / "robot_library.yml"
+    )
+    lib = load_library(path)
+    assert lib.entries_by_slug["unitree_g1"].reference_robot == "g1"
+    assert lib.entries_by_slug["unitree_go1"].reference_robot == "go1"
+    assert lib.entries_by_slug["booster_t1"].reference_robot == "booster_t1"
+    # Every pre-field catalog entry has an explicit migration mapping. New
+    # entries must still declare their namespace in YAML; this assertion keeps
+    # the current legacy snapshot and catalog from silently drifting apart.
+    assert all(
+        LEGACY_REFERENCE_ROBOT_BY_LIBRARY_SLUG.get(slug)
+        == entry.reference_robot
+        for slug, entry in lib.entries_by_slug.items()
+    )
+
+
 def test_library_categories_cover_mjlab_ready() -> None:
     """Every mjlab-ready entry lives in one of the enumerated categories."""
     from backend.services.robot_library import CATEGORIES, load_library
@@ -86,10 +109,10 @@ def test_library_loader_rejects_duplicate_slugs(tmp_path: Path) -> None:
     bad = tmp_path / "bad.yml"
     bad.write_text(
         "robots:\n"
-        "  - slug: foo\n    display_name: Foo\n    category: Other\n"
+        "  - slug: foo\n    reference_robot: foo\n    display_name: Foo\n    category: Other\n"
         "    source: menagerie\n    training_support: preview_only\n"
         "    thumbnail_path: robots/foo.webp\n"
-        "  - slug: foo\n    display_name: Foo Dup\n    category: Other\n"
+        "  - slug: foo\n    reference_robot: foo\n    display_name: Foo Dup\n    category: Other\n"
         "    source: menagerie\n    training_support: preview_only\n"
         "    thumbnail_path: robots/foo.webp\n",
         encoding="utf-8",
@@ -104,7 +127,7 @@ def test_library_loader_rejects_bad_url(tmp_path: Path) -> None:
     bad = tmp_path / "bad.yml"
     bad.write_text(
         "robots:\n"
-        "  - slug: foo\n    display_name: Foo\n    category: Other\n"
+        "  - slug: foo\n    reference_robot: foo\n    display_name: Foo\n    category: Other\n"
         "    source: menagerie\n    training_support: preview_only\n"
         "    thumbnail_path: robots/foo.webp\n"
         "    references:\n"
@@ -224,6 +247,7 @@ def test_get_library_robot_detail(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["slug"] == "unitree_g1"
+    assert body["reference_robot"] == "g1"
     assert body["category"] == "Humanoid"
     assert len(body["references"]) >= 3
 
@@ -274,6 +298,7 @@ def test_create_project_with_library_slug_mjlab_ready(
     assert body["adapter_class"] == "sculptor.adapters.mjlab.MjlabAdapter"
     assert body["adapter_config"]["task_id"] == "Mjlab-Velocity-Flat-Unitree-G1"
     assert body["library_slug"] == "unitree_g1"
+    assert body["reference_robot"] == "g1"
     assert body["ready_to_train"] is True
 
     # kg_seeds.yml populated with arxiv paper references.
@@ -304,6 +329,7 @@ def test_create_project_with_library_slug_hopper_gym(
     body = r.json()
     assert body["adapter_class"] == "sculptor.adapters.gym_sb3.GymSB3Adapter"
     assert body["library_slug"] == "hopper"
+    assert body["reference_robot"] == "hopper"
     assert body["ready_to_train"] is True
 
 
@@ -322,6 +348,7 @@ def test_create_project_with_library_slug_preview_only(
     body = r.json()
     assert body["adapter_class"] == "sculptor.adapters.gym_sb3.GymSB3Adapter"
     assert body["library_slug"] == "franka_fr3"
+    assert body["reference_robot"] == "franka_fr3"
     assert body["ready_to_train"] is False
 
 

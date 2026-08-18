@@ -72,7 +72,7 @@ def _tracking_clip() -> dict:
 
 def test_manual_tracking_guard_allows_residual_hooks_only() -> None:
     parent_source = generate_tracking_residual_reward_source(
-        clip=_tracking_clip(), clip_id="clip-a",
+        clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",
     )
     child_source = parent_source.replace(
         "    return 0.0\n\n\ndef compute_reward",
@@ -88,7 +88,7 @@ def test_manual_tracking_guard_allows_residual_hooks_only() -> None:
 
 def test_manual_tracking_guard_rejects_composition_drift() -> None:
     parent_source = generate_tracking_residual_reward_source(
-        clip=_tracking_clip(), clip_id="clip-a",
+        clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",
     )
     child_source = parent_source.replace("_TRACKING_WEIGHT = 1.0", "_TRACKING_WEIGHT = 0.1")
     parent_spec, _ = _extract_reward_spec(parent_source)

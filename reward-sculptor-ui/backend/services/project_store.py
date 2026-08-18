@@ -209,6 +209,7 @@ class ProjectStore:
         status = _compute_status(project_dir, metadata, n_iters)
 
         library_slug = None
+        reference_robot = None
         ready_to_train = True
         adapter_unavailable = False
         robot_source = metadata.get("robot_source") or {}
@@ -222,6 +223,18 @@ class ProjectStore:
             if robot_source.get("adapter_unavailable"):
                 adapter_unavailable = True
                 ready_to_train = False
+
+        try:
+            from backend.services.project_robot import (
+                resolve_project_reference_robot,
+            )
+
+            reference_robot = resolve_project_reference_robot(project_dir)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # Detail reads remain available for incomplete/legacy projects;
+            # launch and attach boundaries use the same resolver and fail
+            # closed when this field is unresolved or contradictory.
+            reference_robot = None
 
         migration_warning = _compute_migration_warning(adapter_class)
 
@@ -238,6 +251,7 @@ class ProjectStore:
             adapter_config=adapter_config,
             ready_to_train=ready_to_train,
             library_slug=library_slug,
+            reference_robot=reference_robot,
             adapter_unavailable=adapter_unavailable,
             migration_warning=migration_warning,
         )
@@ -265,6 +279,7 @@ class ProjectStore:
                     # the parsed config; surface the card-facing bits.
                     adapter_class=detail.adapter_class,
                     library_slug=detail.library_slug,
+                    reference_robot=detail.reference_robot,
                     num_envs=num_envs if isinstance(num_envs, int) else None,
                     device=device if isinstance(device, str) else None,
                 )

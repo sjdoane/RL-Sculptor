@@ -27,6 +27,7 @@ class LibraryRobotResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     slug: str
+    reference_robot: str
     display_name: str
     category: str
     description: str = ""

@@ -204,6 +204,8 @@ def set_library_robot(
             {
                 "kind": "library",
                 "library_name": body.robot_name,
+                "library_slug": body.robot_name,
+                "reference_robot": body.robot_name,
                 "env_id": env_id,
                 "model_file": None,
                 "original_filename": None,

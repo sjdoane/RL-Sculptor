@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -179,6 +178,15 @@ def _stages_to_schema(stages: list) -> list[StageSchema]:
             reference_tier=getattr(s, "reference_tier", None),
             reference_match_confidence=getattr(
                 s, "reference_match_confidence", None),
+            reference_robot=getattr(s, "reference_robot", None),
+            reference_clip_sha256=getattr(
+                s, "reference_clip_sha256", None),
+            reference_certificate_sha256=getattr(
+                s, "reference_certificate_sha256", None),
+            reference_execution_contract_sha256=getattr(
+                s, "reference_execution_contract_sha256", None),
+            reference_execution_boundary_sha256=getattr(
+                s, "reference_execution_boundary_sha256", None),
             # §D24 F1: mirrors Stage.reference_span_start_s/_end_s/
             # _confidence/_method, same drill as reference_clip_id above.
             reference_span_start_s=getattr(s, "reference_span_start_s", None),

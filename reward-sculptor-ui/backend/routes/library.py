@@ -40,6 +40,7 @@ _THUMBNAIL_ROOT = (
 def _entry_to_response(entry: RobotEntry) -> LibraryRobotResponse:
     return LibraryRobotResponse(
         slug=entry.slug,
+        reference_robot=entry.reference_robot,
         display_name=entry.display_name,
         category=entry.category,
         description=entry.description,

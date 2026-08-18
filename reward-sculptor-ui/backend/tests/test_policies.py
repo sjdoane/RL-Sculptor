@@ -32,6 +32,7 @@ def _make_project(client: TestClient) -> str:
 def _plant_iter(
     project_dir: Path, i: int, *, metric: float = 10.0,
     reward_version: str = "v0", fitness: float | None = None,
+    fitness_doc: dict | None = None, rollout: bool = False,
 ) -> None:
     it = project_dir / "runs" / f"iter_{i}"
     it.mkdir(parents=True, exist_ok=True)
@@ -45,8 +46,13 @@ def _plant_iter(
         json.dumps({"version": reward_version}))
     (it / "metrics.json").write_text(
         json.dumps({"metrics": {"mean_return": metric}}))
-    if fitness is not None:
+    if fitness_doc is not None:
+        (it / "fitness.json").write_text(json.dumps(fitness_doc))
+    elif fitness is not None:
         (it / "fitness.json").write_text(json.dumps({"fitness": fitness}))
+    if rollout:
+        (it / "rollout").mkdir()
+        (it / "rollout" / "rollout.mp4").write_bytes(b"immutable-rollout")
 
 
 def test_list_policies_empty(client: TestClient, tmp_projects_root: Path):
@@ -77,6 +83,78 @@ def test_list_policies_returns_disk_iters(
     assert rows[1]["fitness"] == pytest.approx(0.37)
     assert rows[0]["checkpoint"] == "checkpoint.pt"
     assert rows[0]["checkpoint_bytes"] > 0
+
+
+def test_policy_listing_uses_evidenced_selection_not_newest(
+    client: TestClient, tmp_projects_root: Path,
+):
+    slug = _make_project(client)
+    pdir = tmp_projects_root / slug
+    _plant_iter(
+        pdir,
+        4,
+        fitness_doc={
+            "fitness": 0.94,
+            "metric": {
+                "id": "weave-stop",
+                "version": "v3",
+                "source": "generated",
+                "sha256": "c" * 64,
+            },
+            "components": {
+                "order_ok_frac": 1.0,
+                "contact_evidence_ok": 1.0,
+                "contact_frac": 0.0,
+                "ch_hold": 1.0,
+            },
+        },
+        rollout=True,
+    )
+    _plant_iter(
+        pdir,
+        5,
+        fitness_doc={
+            "fitness": 0.98,
+            "components": {
+                "order_ok_frac": 0.0,
+                "contact_evidence_ok": 1.0,
+                "contact_frac": 0.0,
+                "ch_hold": 0.0,
+            },
+        },
+    )
+    (pdir / "reports").mkdir(exist_ok=True)
+    (pdir / "reports" / "selection.json").write_text(json.dumps({
+        "selected_iter_index": 4,
+        "selection_source": "objective_criterion",
+        "candidates": [
+            {"iter_index": 4, "selected": True, "criterion_pass": True},
+            {"iter_index": 5, "selected": False, "criterion_pass": False},
+        ],
+    }))
+
+    response = client.get(f"/projects/{slug}/policies")
+    assert response.status_code == 200, response.text
+    rows = {row["iter_index"]: row for row in response.json()}
+
+    assert rows[4]["selected"] is True
+    assert rows[4]["selection_source"] == "objective_criterion"
+    assert rows[4]["criterion_status"] == "passed"
+    assert rows[4]["metric_id"] == "weave-stop"
+    assert rows[4]["metric_version"] == "v3"
+    assert rows[4]["metric_sha256"] == "c" * 64
+    assert rows[4]["evidence_status"] == "complete"
+    assert rows[4]["route_evidence"] == {
+        "key": "order_ok_frac", "value": 1.0, "kind": "fraction",
+    }
+    assert rows[4]["contact_evidence"]["key"] == "contact_frac"
+    assert rows[4]["hold_evidence"]["key"] == "ch_hold"
+    assert rows[4]["rollout_available"] is True
+
+    assert rows[5]["selected"] is False
+    assert rows[5]["selection_source"] is None
+    assert rows[5]["criterion_status"] == "failed"
+    assert rows[5]["rollout_available"] is False
 
 
 def test_export_downloads_zip_bundle(
