@@ -176,11 +176,13 @@ def _build_eval_reset_block(eval_reset: dict[str, Any]) -> str:
 
 
 MODEL_ID = model_for("metric_gen")
-#: §truncation fix: adaptive THINKING shares this budget with the code output, and a
-#: hard metric's think can use 5-8k tokens — at the old 8000 cap that truncated the
-#: code (a confusing downstream "missing compute_spec"). 16000 leaves ample room for
-#: thinking AND a complete metric (observed ~7.3-7.5k total per generation).
-MAX_TOKENS = 16000
+#: Adaptive THINKING shares this budget with the code output.  World-grounded,
+#: compound objectives can legitimately need more than the old 16k ceiling before
+#: emitting any code, so keep enough headroom for both phases.  ``medium`` effort
+#: prevents best-of-N from spending the entire budget re-deriving the validator while
+#: preserving enough reasoning for an honest conjunctive metric.
+MAX_TOKENS = 32000
+GENERATION_EFFORT = "medium"
 #: §reviewer-truncation fix: the review call had the SAME class of bug MAX_TOKENS
 #: fixed for generation — adaptive THINKING shares the budget with the structured
 #: JSON verdict, and at the old 4000 cap a reviewer whose thinking ran long emitted a
@@ -446,6 +448,7 @@ def _sample_source(client: Any, system_prompt: str, user_content: str,
         max_tokens=MAX_TOKENS,
         temperature=1.0,
         thinking={"type": "adaptive"},
+        output_config={"effort": GENERATION_EFFORT},
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )

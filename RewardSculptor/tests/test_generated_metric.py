@@ -1081,10 +1081,20 @@ def test_sample_source_raises_on_max_tokens_truncation():
         content = [type("B", (), {"type": "text",
                    "text": "```python\ndef compute_spec(a, b, m): return {'spec_score': 0.0}\n```"})()]
 
+    seen = {}
+
+    class _MessagesOk:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return _Ok()
+
     class _ClientOk:
-        messages = type("M", (), {"create": lambda self, **kw: _Ok()})()
+        messages = _MessagesOk()
 
     assert "def compute_spec" in _sample_source(_ClientOk(), "sys", "user", model="m")
+    assert seen["max_tokens"] == 32000
+    assert seen["thinking"] == {"type": "adaptive"}
+    assert seen["output_config"] == {"effort": "medium"}
 
 
 def test_graded_discrimination_ranks_and_is_deterministic():
