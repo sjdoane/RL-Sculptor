@@ -572,6 +572,31 @@ def compute_spec(arrays, behavior, meta):
     assert "smoothing, capping" in hold_reason
 
 
+def test_catalog_literal_access_allows_guards_but_rejects_aliases() -> None:
+    from sculptor.eval.metric_validate import _catalog_array_access_violations
+
+    guarded = '''\
+def compute_spec(arrays, behavior, meta):
+    if arrays is None:
+        return {"spec_score": 0.0}
+    if not isinstance(arrays, dict):
+        return {"spec_score": 0.0}
+    root = arrays.get("root_link_pos_w")
+    return {"spec_score": 0.0 if root is None else 1.0}
+'''
+    aliased = '''\
+def compute_spec(arrays, behavior, meta):
+    local_arrays = arrays
+    root = local_arrays.get("root_link_pos_w")
+    return {"spec_score": 0.0 if root is None else 1.0}
+'''
+
+    assert _catalog_array_access_violations(guarded) == []
+    violations = _catalog_array_access_violations(aliased)
+    assert len(violations) == 1
+    assert "line 2" in violations[0]
+
+
 def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_path):
     catalog = _catalog()
     metric_path = _write_metric(tmp_path, GOOD_OBJECT_METRIC)

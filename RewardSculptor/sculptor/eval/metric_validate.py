@@ -524,7 +524,9 @@ def _catalog_array_access_violations(source: str) -> list[str]:
     Exact allowlisting and observable partitioning require every generated
     metric access to be statically attributable to one declared name.  Aliases,
     iteration, and computed keys would make that proof impossible even though
-    the runtime still drops undeclared NPZ members.
+    the runtime still drops undeclared NPZ members.  Pure null/type guards do
+    not access a key and are safe to allow; rejecting them forces otherwise
+    correct generated metrics to remove ordinary defensive checks.
     """
     try:
         tree = ast.parse(source)
@@ -550,6 +552,32 @@ def _catalog_array_access_violations(source: str) -> list[str]:
                     and call.args and isinstance(call.args[0], ast.Constant)
                     and isinstance(call.args[0].value, str)):
                 continue
+        # ``if arrays is None`` / ``if arrays is not None`` only guards the
+        # contract object.  No catalog member can be reached through it.
+        if (isinstance(parent, ast.Compare) and len(parent.ops) == 1
+                and isinstance(parent.ops[0], (ast.Is, ast.IsNot))
+                and len(parent.comparators) == 1
+                and (
+                    (parent.left is node
+                     and isinstance(parent.comparators[0], ast.Constant)
+                     and parent.comparators[0].value is None)
+                    or (parent.comparators[0] is node
+                        and isinstance(parent.left, ast.Constant)
+                        and parent.left.value is None)
+                )):
+            continue
+        # ``isinstance(arrays, dict)`` is likewise a type guard, not an alias
+        # or dynamic lookup.  Keep the accepted type literal deliberately
+        # narrow so arbitrary calls still fail closed.
+        if (isinstance(parent, ast.Call)
+                and isinstance(parent.func, ast.Name)
+                and parent.func.id == "isinstance"
+                and len(parent.args) == 2
+                and parent.args[0] is node
+                and isinstance(parent.args[1], ast.Name)
+                and parent.args[1].id == "dict"
+                and not parent.keywords):
+            continue
         violations.append(
             f"line {getattr(node, 'lineno', '?')}: arrays must be accessed "
             "only with a literal declared key")
