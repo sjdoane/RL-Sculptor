@@ -1,12 +1,98 @@
 # HANDOFF — start here
 
-**You are picking up the RL-Sculptor project. When the user says "read handoff", read this whole file, then begin Task 1 in §4. Work autonomously through the big tasks in order; after you have implemented enough of a task (Task 1, and ideally Task 2), STOP and run the End-to-End Live UI Verification in §6 — drive the whole app through the browser, screenshot every page, confirm it matches expectations and looks good, then report with the screenshots before continuing.**
+**Current authority:** read `AGENTS.md`, then this newest section, then
+`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. The old numbered task queue below
+is historical context, not an instruction to restart already-completed work.
+Historical GPU heartbeat messages are also not launch authority.
 
 Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 - `RewardSculptor/` — the core Python library + `sculpt` CLI (the train→rollout→diagnose→edit loop, the paper knowledge graph, the objective-metric trust pipeline, adapters for MJLab/MuJoCo + Isaac). Run things with `uv run …` from inside `RewardSculptor/`.
 - `reward-sculptor-ui/` — FastAPI backend + React/Vite frontend that wraps the library (project lifecycle, robot picker, reward editor, KG browser, world builder, live run streaming, reports).
 
 Current git branch: `ship-20-ux-revamp` (do NOT work on `main`). Keep committing to this branch.
+
+## 0. Current work — research starting points and honest OGMP integration (2026-08-17)
+
+The active implementation adds a researcher-facing starting-point workflow
+with three independent inputs: compatible policy weights, an immutable
+reference motion, and the project's already-promoted world. Portable
+`.rskill` uploads are bounded data-only archives. Safetensors policy tensors
+are checked against the exact adapter/task/robot/joint/action/observation/
+network contract and converted into a server-owned checkpoint. Motion-only
+uploads register a candidate; they do **not** authorize training until the
+exact Tier-D physics certificate is reverified against the target project's
+robot, task, ordered interface, simulator cadence, and software boundary.
+Uploaded controller/world declarations are verified, digested, and discarded;
+the UI must never imply they were staged or activated.
+
+Run launch now pins and rechecks the target contract after queueing, before
+subprocess creation. Policy lineage is earned only after the runner emits an
+exact successful load event. The knowledge graph distinguishes uploaded
+safetensors from the derived native policy, records conversion evidence, uses
+deterministic dirty-tree software identity, and permits `TRACKS` only with
+worker-observed Tier-D evidence. Reference, reward, world, mode graph, and
+execution-manifest identities remain separate.
+
+The OGMP UI is intentionally labeled **OGMP-inspired**. Implemented behavior
+is a validated linear phase-window automaton with an immutable execution
+manifest, explicit terminal-hold budget, per-mode reward scope, and offline
+per-mode/transition diagnostics. It does not claim queried/receding-horizon
+oracles, rho-bounded exploration, learned mode latents, predicate branching,
+or preference conditioning. Training and evaluation must consume the same
+certified cadence; retiming creates a new artifact and requires recertification.
+
+The implementation is now end-to-end rather than a UI-only selector:
+
+- New Run offers an explicit **From scratch / Project checkpoint / Imported
+  skill** decision, never silently choosing the newest checkpoint. Policy and
+  motion remain independently selectable, and the active project world never
+  changes as an upload side effect.
+- Portable `.rskill` publication is transactional and process-locked. Strict
+  JSON, bounded ZIP members, safetensors/NPZ contracts, reference registration,
+  server-owned weight conversion, receipts, and KG facts either all publish or
+  all roll back.
+- Mission skill publication retains exact reward, world, reference,
+  certificate, rollout, execution-contract, and boundary evidence. Every
+  checkpoint resolution re-admits the same Tier-D chain. Only a policy
+  checkpoint is reusable; source controller/world declarations remain inert.
+- Immediately before a real adapter train call, the worker emits a
+  content-addressed `ModeExecutionArtifact` and the KG records
+  `TrainingRun -[USES_MODE_EXECUTION]-> ModeExecutionArtifact`. The backend
+  independently re-derives and rechecks reward, clip, graph, manifest,
+  selection, and Tier-D identities before accepting that fact.
+- The production mode panel can record an immutable exact-context readiness
+  receipt. Its current state is deliberately `observe_only`: no generated,
+  validated, calibrated per-mode objective set is attached to training, so the
+  receipt grants no fitness or selection authority.
+- The research seed catalog has explicit source SHA, rationale, tags, and
+  concept anchors. Exact `sculpt kg extract --arxiv <id>` selection removes
+  title ambiguity; the current 19-source seed catalog passes its coverage
+  audit, including OGMP `2403.04205` and Preferenced OGMP `2410.01030`.
+
+Live browser QA covered New Run, all three starting-point paths, the imported
+receipt, desktop/mobile layout, and the Knowledge tab. It found and fixed two
+defects: mobile import content could overflow, and inspecting a legacy receipt
+without the new authorization block crashed the whole interface. Legacy
+receipts now remain inspectable, fail closed, and require re-import.
+
+Final CPU/UI verification for this slice:
+
+- core: **2,820 passed, 1 optional-JAX skip** (`pytest tests -q`);
+- backend: **709 passed** (`pytest backend/tests -q`);
+- frontend: **24 passed**, TypeScript typecheck passed, and the production
+  build completed across 2,773 modules;
+- core/backend `compileall`, `git diff --check`, and F/E9 Ruff checks over the
+  new authority modules and current skill/mode paths passed. The pre-existing
+  repository-wide Ruff backlog remains outside this slice; do not represent
+  the whole historical tree as lint-clean;
+- a fresh browser tab rechecked the three starting-point choices, selected a
+  legacy blocked receipt without crashing, confirmed its primary action stayed
+  disabled, verified both OGMP papers in Knowledge, and produced no error-level
+  console entries.
+
+Do not launch a GPU training job for this work. These checks prove the
+contracts, API, UI, and CPU orchestration; they do not constitute a new G1
+physics rollout, hardware claim, or physical-showcase acceptance proof.
 
 ---
 

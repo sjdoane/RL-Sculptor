@@ -15,7 +15,7 @@ It was chosen because no part of it can be faked:
 | What it forces | Why it's the interesting case |
 |---|---|
 | **A motion no clip contains** | The library has running, one-leg jumps, beam balance and turns — never in one recording. The reference has to be *composed* from four solved clips. That is the whole research direction: solve a novel motion out of pre-existing solved data. |
-| **Four distinct phases** | approach / bound / balance / settle become four OGMP modes with phase-guarded transitions, and four separately-authored reward functions. A single posture term cannot cover all four. |
+| **Four distinct phases** | approach / bound / balance / settle become four OGMP-inspired fixed phase windows with separately-authored reward functions. A single posture term cannot cover all four. This is not OGMP's online oracle or predicate-driven mode executor. |
 | **A course wider than mjlab's env grid** | The compiled course spans **5.02 × 1.20 m** against mjlab's 2.0 m default `env_spacing`. Every authored world before the fix had its 1024 parallel copies overlapping three deep. You will watch the reconciler print the correction. |
 | **Platforms at three heights** | Tops at **0.231 / 0.305 / 0.380 m**. Route-RSI resets have to place the robot *on* the surface it picked, not at flat-ground height. That bug put the G1 shin-deep in solid box. |
 | **Train-only randomization** | The author emits two variations — middle platform height `U(0.18, 0.41) m`, second gap length `U(0.31, 0.57) m` — applied to training and never to evaluation. |
@@ -131,7 +131,11 @@ guessed:
 | `balance` | 2.12 – 4.92 s | `balance_on_beam03_poses_100_jpos` |
 | `settle` | 4.92 – 6.92 s | `leftturn04_poses_100_jpos` |
 
-Transitions between them are `phase` guards at `at_phase: 1.0`.
+The graph records diagnostic transitions at the immutable composition seam
+times. Runtime dispatch is fixed elapsed time: it does not evaluate transition
+predicates, retime the clip, or query OGMP's receding-horizon oracle. The UI
+uses **OGMP-inspired** deliberately so this showcase cannot overstate the
+paper alignment.
 
 1. **Scaffold reward** — instant, no LLM. Writes the dispatch and the
    four windows, leaves four `_mode_*` bodies as stubs.

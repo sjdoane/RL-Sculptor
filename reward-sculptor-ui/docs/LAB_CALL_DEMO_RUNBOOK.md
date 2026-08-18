@@ -1,7 +1,87 @@
 # RewardSculptor research-lab demo runbook
 
-This runbook is current as of 2026-07-24. The workflow is entirely in the UI
+This runbook is current as of 2026-08-17. The workflow is entirely in the UI
 after starting the local app.
+
+> **Active scope:** the current handoff is the CPU/UI research starting-point,
+> mode-authority, and knowledge-lineage implementation. There is no active GPU
+> worker and nothing in the historical physical-proof log below authorizes a
+> new launch. Use `HANDOFF.md` and `AGENTS.md` for current authority.
+
+## Research starting points
+
+**New run → Starting point** is now the single policy-initialization surface:
+
+- **From scratch** creates new actor and critic networks.
+- **Project checkpoint** transfers actor and critic from a completed local
+  iteration into a fresh optimizer/run.
+- **Imported skill** accepts only a strict data-only `.rskill` and shows an
+  admission receipt before it can be selected. The normal RewardSculptor
+  `.zip` is a separate trusted deployment package and cannot be uploaded.
+
+Policy and motion are separate choices. After choosing a starting policy,
+choose or remove **Starting motion** independently. The active project world
+is also independent: an uploaded bundle never changes it. Controller/world
+members in an imported bundle are provenance evidence only unless a separate
+reviewed promotion flow explicitly activates them.
+
+For an imported skill, check all three receipt cells before launch:
+
+1. **Starting policy** names the exact roles that will load. Prefer
+   **Actor only** for adaptation; use **Actor + critic** only when the source
+   and downstream objectives are close enough to justify value transfer.
+2. **Starting motion** names the exact robot/clip pair and whether it is
+   attached. A Tier-K clip is a kinematic candidate and is limited to an
+   inspect-only contract/reference check: no trainer, rollout, or checkpoint
+   is created. Rehearsal/overnight training requires the stored
+   Tier-D tracking certificate to re-verify against the current clip and
+   rollout bytes **and** the target project's robot, task, ordered
+   joint/action interface, simulator cadence, and software boundary.
+3. **Training environment** must name the project's validated active world.
+   A source-world digest in the bundle is not an active world.
+
+Open **Validation and provenance details** and retain the manifest digest,
+checkpoint/reference SHA-256 values, exact adapter/task/robot contract, and
+trust decision with the run evidence. The worker rechecks these values at
+launch. A changed record or artifact fails before training rather than falling
+back silently.
+
+Raw `.pt`, pickle, TorchScript, uploaded Python controllers, links, nested
+archives, and unbounded archives are rejected. Portable imports use validated
+safetensors and reconstruct a server-owned checkpoint; they are policy
+transfers, not full optimizer resumes.
+
+Create a portable transfer with
+`sculpt export --portable --robot <slug> --config <project>/config.toml`.
+Use `sculpt export --config ...` without `--portable` only for the trusted
+deployment ZIP containing the raw checkpoint, inference code, and deployment
+formats.
+
+### Mode evidence and paper scope
+
+For a composed motion, the Rewards panel names the implemented capability as a
+fixed phase-window scaffold. It preserves certified clip cadence and an
+explicit terminal hold; it does not claim runtime guard handover, a
+mode-conditioned policy, rho-bounded exploration, or a receding-horizon
+oracle. **Record readiness receipt** writes a content-addressed receipt for the
+exact clip, robot, reward, selection, graph, and execution manifest. Until a
+generated, validated, and calibrated metric exists for every phase, that
+receipt must say **observe only** and cannot steer selection or certify
+success.
+
+The Knowledge tab should return both extracted sources when searching for
+`Oracle Guided`: arXiv `2403.04205` and `2410.01030`. Missing either source, a
+failed seed-coverage audit, or a graph/manifest digest mismatch is a blocker,
+not a cosmetic warning.
+
+The 2026-08-17 CPU/UI verification baseline is core 2,820 passed (one
+optional-JAX skip), backend 709 passed, frontend 24 passed plus typecheck and
+production build, with a clean fresh-browser console. This is pipeline and
+interface evidence only. It does not replace a new simulator rollout or the
+physical acceptance conjunction later in this runbook.
+
+The full researcher contract and a G1 parkour-evolution experiment are in
+[`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`](../../docs/STARTING_POINT_RESEARCH_WORKFLOW.md).
 
 > **Evidence correction:** iter 13 is not valid physical slalom evidence.
 > Its policy followed a route expressed in the robot's local environment

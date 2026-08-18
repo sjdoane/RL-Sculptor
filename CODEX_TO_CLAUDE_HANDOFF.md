@@ -2,6 +2,22 @@
 > On "read handoff", read `HANDOFF.md` and begin its Task 1. This file below is
 > older, task-specific history kept for reference only.
 
+## Current 2026-08-17 handoff
+
+The active rules are `AGENTS.md`; the current implementation state is
+`HANDOFF.md` §0; the complete researcher and artifact contract is
+`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. The current slice is the secure
+portable starting-point workflow, target-bound Tier-D admission, exact runtime
+load/lineage evidence, honest OGMP-inspired UI, and deterministic KG identity.
+Treat policy, motion, and world as independent inputs. A registered motion is
+not training-authorized until its target-specific Tier-D boundary passes.
+Controller/world declarations from an upload are inert evidence, not staged
+runtime components. No GPU launch is part of this handoff. Final verification
+is green: core 2,820 passed (one optional-JAX skip), backend 709 passed,
+frontend 24 passed plus typecheck/build, scoped F/E9 and compile checks passed,
+and a fresh browser pass found no console errors. See `HANDOFF.md` §0 for the
+exact honest boundary and browser findings.
+
 ---
 
 # Latest handoff — mission success-criterion process isolation (2026-07-19)

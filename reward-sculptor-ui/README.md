@@ -96,6 +96,15 @@ footgun. Override with `RS_ALLOW_CLOUD_SYNC=true`.
   filesystem events over WebSocket, virtualized log view, per-iter
   timeline, live primary-metric chart, 2-second rollout clips pushed as
   each iteration completes.
+- **Portable starting points** — independently choose a project checkpoint,
+  content-attested safetensors policy, and reference motion. `.rskill` uploads
+  are quarantined and contract-checked; live reference training requires an
+  exact Tier-D certificate, while Tier-K is limited to an inspect-only
+  contract/reference check that cannot publish a policy. See the
+  [research workflow](../docs/STARTING_POINT_RESEARCH_WORKFLOW.md).
+- **Mode-aware rewards** — author fixed phase-window reward terms against a
+  canonical motion graph, promote an exact context-bound execution manifest,
+  and inspect all-lane diagnostic-only per-mode evidence after rollout.
 - **Reward editor** — Monaco-backed view of every `v<n>.py`, clone the
   latest into an editable draft, save as a new `human`-authored version
   with server-side AST validation + KG-referenced arxiv IDs.
