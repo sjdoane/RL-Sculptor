@@ -908,6 +908,7 @@ def generate_objective_metric(
         selected_candidate: Optional[int] = None
         ranked_valid: list[dict[str, Any]] = []
         passed = False
+        cumulative_validation_reasons: list[str] = []
 
         if n_candidates and n_candidates > 1:
             # §best-of-N: sample N candidates and select the most-discriminating valid one.
@@ -935,15 +936,24 @@ def generate_objective_metric(
                 _emit({"stage": "generating", "attempt": attempt + 1, "max": n_attempts,
                        "message": f"Generating candidate metric "
                                   f"(attempt {attempt + 1}/{n_attempts})…"})
-                user = base_user
-                # Feed back ANY prior failure's reasons (an earlier attempt OR, when
-                # best-of-N fell through, its aggregated candidate failures). Equivalent
-                # to `attempt > 0` for single-shot (validation is None at attempt 0).
+                # Preserve the whole repair contract across retries.  Feeding back
+                # only the immediately previous result lets a later candidate
+                # regress on an earlier gate as soon as that gate disappears from
+                # the latest reason list (for example, reintroducing a smoothed
+                # continuity proxy after fixing a catalog access).
                 if validation is not None and not validation.get("ok"):
+                    for reason in validation.get("reasons") or []:
+                        if reason not in cumulative_validation_reasons:
+                            cumulative_validation_reasons.append(reason)
+                user = base_user
+                # Feed back every failure observed so far (an earlier attempt OR,
+                # when best-of-N fell through, its aggregated candidate failures).
+                if cumulative_validation_reasons:
                     user = (
                         base_user
-                        + "\n\nThe previous attempt FAILED these validation gates:\n"
-                        + json.dumps(validation.get("reasons") or [], indent=2)
+                        + "\n\nPrior attempts FAILED these validation gates "
+                          "(cumulative; fix ALL of them):\n"
+                        + json.dumps(cumulative_validation_reasons, indent=2)
                         + "\nFix ALL of them. Output ONLY the corrected module."
                     )
                 try:

@@ -2897,11 +2897,19 @@ def validate_generated_metric(
             )
             gates["continuous_hold_interruption"] = continuous_ok
             if not continuous_ok:
+                requested_hold_steps = _requested_terminal_hold_steps(
+                    behavior_goal)
+                hold_contract = (
+                    f"at least {requested_hold_steps} consecutive raw-frame samples"
+                    if requested_hold_steps > 0
+                    else "the requested consecutive raw-frame duration"
+                )
                 reasons.append(
                     "[continuous-hold] a physically interrupted terminal "
                     f"dwell scored {interrupted_score:.3f}; an explicitly "
-                    "continuous duration must fail its completion gate, not "
-                    "pass through a mean or quiet-sample fraction "
+                    f"continuous duration requires {hold_contract}; smoothing, "
+                    "capping, or a mean/quiet-sample fraction must not bridge "
+                    "a violating frame "
                     f"(required <= {continuous_ceiling:.3f})"
                 )
 

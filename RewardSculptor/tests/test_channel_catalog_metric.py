@@ -541,10 +541,12 @@ def compute_spec(arrays, behavior, meta):
     dt = float(behavior.get("step_dt", 0.02) or 0.02)
     speed = np.linalg.norm(
         np.diff(root, axis=0)[..., :2], axis=-1) / dt
-    quiet_fraction = np.mean(speed[-100:] < 0.12, axis=0)
+    padded = np.pad(speed, ((2, 2), (0, 0)), mode="edge")
+    smoothed_speed = sum(padded[i:i + speed.shape[0]] for i in range(5)) / 5.0
+    quiet_fraction = np.mean(smoothed_speed[-90:] < 0.12, axis=0)
     dx = root[-1, :, 0] - root[0, :, 0]
     completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
-    physical = (dx > 0.5) & (quiet_fraction > 0.9)
+    physical = (dx > 0.5) & (quiet_fraction > 0.99)
     return {{"spec_score": float(np.mean(physical & completed))}}
 '''
     path = _write_metric(tmp_path, source, "fraction_hold.py")
@@ -554,7 +556,7 @@ def compute_spec(arrays, behavior, meta):
         path,
         behavior_goal=(
             "Run through the ordered slalom, enter the finish, then remain "
-            "upright and still continuously for at least 2 seconds"
+            "upright and still for 100 uninterrupted frames"
         ),
         channel_catalog=catalog,
     )
@@ -562,7 +564,12 @@ def compute_spec(arrays, behavior, meta):
     assert not result["ok"]
     assert not result["gates"]["continuous_hold_interruption"]
     assert result["archetype_scores"]["catalog_interrupted_hold"] > 0.9
-    assert any("[continuous-hold]" in reason for reason in result["reasons"])
+    hold_reason = next(
+        reason for reason in result["reasons"]
+        if "[continuous-hold]" in reason
+    )
+    assert "at least 100 consecutive raw-frame samples" in hold_reason
+    assert "smoothing, capping" in hold_reason
 
 
 def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_path):

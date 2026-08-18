@@ -291,3 +291,9 @@ cannot pass is an automatic self-rejection.
   continuity: sparse violations can satisfy those summaries while breaking
   every genuine hold. The validator includes a competent terminal state with
   sparse one-frame interruptions specifically to reject this shortcut.
+- Evaluate every continuity predicate on UNSMOOTHED per-frame signals. Smoothing,
+  filtering, merging gaps, dilation, or debounce may support a graded diagnostic,
+  but must never bridge a violating frame inside the completion gate.
+- A stated frame count is exact. NEVER cap, scale, shorten, or replace it to fit
+  the available episode tail. If fewer qualifying frames remain, the completion
+  gate fails.

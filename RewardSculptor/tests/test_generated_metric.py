@@ -718,6 +718,45 @@ def test_generate_objective_metric_rejects_bad_and_retries(tmp_path):
     assert client.messages.creates == 3  # retried up to the cap on failure
 
 
+def test_metric_prompt_requires_raw_exact_continuity() -> None:
+    from sculptor.prompts import load_prompt
+
+    prompt = load_prompt("gen_objective_metric")
+    assert "UNSMOOTHED per-frame signals" in prompt
+    assert "must never bridge a violating frame" in prompt
+    assert "A stated frame count is exact" in prompt
+    assert "NEVER cap, scale, shorten" in prompt
+
+
+def test_validation_retry_feedback_is_cumulative(tmp_path, monkeypatch) -> None:
+    import sculptor.eval.metric_gen as metric_gen
+
+    validation_results = iter([
+        {"ok": False, "reasons": ["[continuous-hold] preserve this failure"]},
+        {"ok": False, "reasons": ["[channel-catalog] fix this too"]},
+        {"ok": False, "reasons": ["[nondegeneracy] final failure"]},
+    ])
+
+    monkeypatch.setattr(
+        metric_gen,
+        "validate_generated_metric",
+        lambda *args, **kwargs: next(validation_results),
+    )
+    client = _CycleClient(GOOD, GOOD, GOOD)
+    record = metric_gen.generate_objective_metric(
+        "hold 100 uninterrupted frames",
+        tmp_path / "cumulative-feedback",
+        client=client,
+        max_attempts=3,
+        review=False,
+    )
+
+    assert not record["accepted"]
+    assert "[continuous-hold] preserve this failure" in client.messages.users[1]
+    assert "[continuous-hold] preserve this failure" in client.messages.users[2]
+    assert "[channel-catalog] fix this too" in client.messages.users[2]
+
+
 def test_generate_objective_metric_review_can_veto(tmp_path):
     from sculptor.eval.metric_gen import generate_objective_metric
     # validation passes but the reviewer rejects → not accepted.
