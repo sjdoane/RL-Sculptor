@@ -9,12 +9,15 @@ import {
   authorModeReward,
   browseReferences,
   getJob,
+  getModeEvidence,
   getReferenceModes,
   listModeRewards,
   promoteModeReward,
+  recordModeEvidenceReceipt,
   scaffoldModeReward,
   type ModeRewardFile,
   type ModeRewardResult,
+  type ModeEvidenceStatus,
   type PromotedModeReward,
   type ReferenceModeGraph,
 } from "@/lib/api";
@@ -23,7 +26,7 @@ import type { RefIndexRow } from "@/lib/types";
 /**
  * Per-mode reward authoring for a composed reference.
  *
- * A composite's phases ARE its OGMP modes, and this is where each one gets
+ * A composite's segments become OGMP-inspired reward phases, and this is where each one gets
  * its own reward terms. The division of labour is the point: the phase clock,
  * the windows and the dispatch that pays a mode only inside its own window
  * are GENERATED from the automaton — both Tier-D failures in this repo were
@@ -39,7 +42,7 @@ import type { RefIndexRow } from "@/lib/types";
 export function ModeRewardPanel({
   slug,
   clipId: initialClipId,
-  robot = "g1",
+  robot,
   goal = "",
 }: {
   slug: string;
@@ -47,7 +50,7 @@ export function ModeRewardPanel({
    *  the normal case — per-mode authoring is what you do BEFORE there is a
    *  tracking reward — so the panel can also find a composite itself. */
   clipId?: string;
-  robot?: string;
+  robot: string;
   goal?: string;
 }) {
   const [clipId, setClipId] = useState<string>(initialClipId ?? "");
@@ -77,6 +80,9 @@ export function ModeRewardPanel({
   // endpoint — see the checkbox below for what turning it off costs.
   const [tracking, setTracking] = useState(true);
   const [confirmPartial, setConfirmPartial] = useState(false);
+  const [evidence, setEvidence] = useState<ModeEvidenceStatus | null>(null);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
+  const [evidenceBusy, setEvidenceBusy] = useState(false);
   const qc = useQueryClient();
   const saveDraft = useSaveBehaviorDraft(slug);
 
@@ -105,21 +111,24 @@ export function ModeRewardPanel({
     async ({ adopt = false }: { adopt?: boolean } = {}) => {
       const { mode_rewards: files, promoted: p } = await listModeRewards(slug);
       setPromoted(p);
-      const mine = files.find((f) => f.clip_id === clipId);
+      const mine = files.find(
+        (f) => f.clip_id === clipId && f.reference_robot === robot,
+      );
       setDigest(mine?.digest ?? "");
       if (adopt && mine) {
         setReward({
           path: mine.path,
           filename: mine.filename,
           clip_id: mine.clip_id,
-          tracking: true,
+          tracking: mine.tracking_enabled,
           modes: mine.modes,
           unauthored: mine.unauthored,
         });
+        setTracking(mine.tracking_enabled);
         setResumed(true);
       }
     },
-    [clipId, slug],
+    [clipId, robot, slug],
   );
 
   useEffect(() => {
@@ -155,6 +164,32 @@ export function ModeRewardPanel({
       live = false;
     };
   }, [clipId, refresh, robot, slug]);
+
+  useEffect(() => {
+    if (!clipId) return;
+    let live = true;
+    setEvidence(null);
+    setEvidenceError(null);
+    getModeEvidence(slug, clipId, robot)
+      .then((value) => live && setEvidence(value))
+      .catch((e) => {
+        if (!live) return;
+        setEvidenceError(
+          e instanceof ApiError ? e.message : "Could not attest mode evidence",
+        );
+      });
+    return () => {
+      live = false;
+    };
+  }, [
+    clipId,
+    promoted?.context_current,
+    promoted?.execution_context_digest,
+    promoted?.selection_current,
+    promoted?.source_sha256,
+    robot,
+    slug,
+  ]);
 
   async function runSearch() {
     setSearching(true);
@@ -249,9 +284,10 @@ export function ModeRewardPanel({
             </>
           ) : (
             <>
-              A composed reference's phases ARE its OGMP modes. Pick one and
-              each phase gets its own reward terms, paid only inside its own
-              window.
+              A composed reference can be split into time-windowed reward
+              phases. Pick one and each phase gets its own terms, paid only
+              inside its own window. This is OGMP-inspired; it is not yet a
+              closed-loop oracle or a mode-conditioned policy.
             </>
           )}
         </div>
@@ -277,16 +313,11 @@ export function ModeRewardPanel({
   // promotion is a file copy and the cost of the other error is training a
   // reward the user believes they replaced.
   const promotedIsCurrent =
-    promoted !== null && digest !== "" && promoted.source_sha256 === digest;
-  // How far the automaton reaches on each clock. The graph is clip seconds;
-  // the scaffold's windows are the episode it was fitted to.
-  const clipSpan = Math.max(
-    0,
-    ...(graph?.modes ?? []).map((m) => m.frame_range[1] / (graph?.fps || 1)),
-  );
-  const episodeSpan = Math.max(0, ...(reward?.modes ?? []).map((m) => m.end_s));
-  const stretched = clipSpan > 0 && episodeSpan / clipSpan > 1.01;
-
+    promoted !== null
+    && promoted.clip_id === clipId
+    && promoted.reference_robot === robot
+    && promoted.context_current !== false && digest !== "" &&
+    promoted.source_sha256 === digest;
   async function onScaffold(overwrite = false) {
     setBusy("scaffold");
     setError(null);
@@ -319,12 +350,16 @@ export function ModeRewardPanel({
         const files = await listModeRewards(slug)
           .then((r) => r.mode_rewards)
           .catch(() => [] as ModeRewardFile[]);
-        const mine = files.find((f) => f.clip_id === clipId);
+        const mine = files.find(
+          (f) => f.clip_id === clipId && f.reference_robot === robot,
+        );
         if (mine) {
           setReward({
             path: mine.path, filename: mine.filename, clip_id: mine.clip_id,
-            tracking: true, modes: mine.modes, unauthored: mine.unauthored,
+            tracking: mine.tracking_enabled,
+            modes: mine.modes, unauthored: mine.unauthored,
           });
+          setTracking(mine.tracking_enabled);
           setResumed(true);
           setLog((l) => [...l, `found existing ${mine.filename} — resumed`]);
           return;
@@ -427,6 +462,18 @@ export function ModeRewardPanel({
     }
   }
 
+  async function onRecordEvidence() {
+    setEvidenceBusy(true);
+    setEvidenceError(null);
+    try {
+      setEvidence(await recordModeEvidenceReceipt(slug, clipId, robot));
+    } catch (e) {
+      setEvidenceError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setEvidenceBusy(false);
+    }
+  }
+
   return (
     <div className="rs-card" style={{ padding: 14 }}>
       <div className="rs-flex rs-gap-8" style={{ marginBottom: 4 }}>
@@ -441,9 +488,82 @@ export function ModeRewardPanel({
         )}
       </div>
       <div className="rs-sub" style={{ fontSize: 11, marginBottom: 10 }}>
-        {graph.modes.length} modes at {graph.fps.toFixed(0)} fps. The windows
-        and the dispatch are generated from the automaton; a model writes only
-        one mode's terms per call.
+        {graph.modes.length} reward phases at {graph.fps.toFixed(0)} fps. The
+        fixed-clip windows and episode-time dispatch are generated; a model
+        writes only one phase's terms per call. Guards are inspectable metadata
+        and do not currently drive runtime handover.
+      </div>
+
+      <details
+        style={{
+          marginBottom: 12,
+          padding: "9px 11px",
+          border: "1px solid var(--hairline)",
+          borderRadius: "var(--radius-md)",
+          background: "var(--canvas-soft)",
+          fontSize: 11,
+        }}
+      >
+        <summary style={{ cursor: "pointer", fontWeight: 650 }}>
+          Implemented capability · fixed phase-window scaffold
+        </summary>
+        <div className="rs-sub" style={{ marginTop: 7, lineHeight: 1.5 }}>
+          {graph.capability.summary}
+        </div>
+        <div style={{ display: "grid", gap: 4, marginTop: 8 }}>
+          <span><strong>Active:</strong> fixed composed reference, per-phase rewards, immutable episode-time dispatch.</span>
+          <span><strong>Not active:</strong> runtime guard handover, mode-conditioned policy, ρ-bounded exploration, receding-horizon oracle.</span>
+        </div>
+      </details>
+
+      <div
+        style={{
+          marginBottom: 12,
+          padding: "10px 11px",
+          border: "1px solid var(--hairline)",
+          borderLeft: "3px solid var(--st-amber, #d97706)",
+          borderRadius: "var(--radius-md)",
+          background: "var(--canvas-soft)",
+        }}
+      >
+        <div className="rs-flex rs-gap-8" style={{ alignItems: "flex-start" }}>
+          <Icon name="shield-check" size={15} color="var(--st-amber, #d97706)" />
+          <div className="rs-grow">
+            <div style={{ fontSize: 12, fontWeight: 650 }}>
+              Independent mode evidence · observe only
+            </div>
+            <div className="rs-sub" style={{ fontSize: 10.8, lineHeight: 1.5, marginTop: 3 }}>
+              {evidence ? (
+                <>
+                  No generated, validated, and calibrated objective metric set
+                  is registered for this exact reward context. This does not
+                  count as fitness or selection evidence.
+                  {evidence.recorded && (
+                    <> Receipt <code>{evidence.receipt_sha256.slice(0, 12)}</code>.</>
+                  )}
+                </>
+              ) : evidenceError ? (
+                evidenceError
+              ) : (
+                "Checking the active reward, reference, graph, manifest, and selection…"
+              )}
+            </div>
+          </div>
+          <Btn
+            kind="quiet"
+            size="sm"
+            icon="file-text"
+            disabled={!promotedIsCurrent || evidenceBusy}
+            title={
+              promotedIsCurrent
+                ? "Write an immutable receipt for this exact execution context"
+                : "Promote this exact mode reward before recording evidence"
+            }
+            onClick={onRecordEvidence}
+          >
+            {evidenceBusy ? "Recording…" : "Record readiness receipt"}
+          </Btn>
+        </div>
       </div>
 
       {/* The same timeline the compose dialog showed. It was built once,
@@ -458,18 +578,11 @@ export function ModeRewardPanel({
           fps={graph.fps}
           transitions={graph.transitions}
         />
-        {/* Two different numbers for the same mode, stacked, is the panel's
-            most confusing moment: the timeline above is clip time and the
-            per-mode rows below are the episode the reward is fitted to. When
-            a 6.92 s composite gates a 20 s episode they differ by ~2.9x, and
-            with nothing distinguishing them the fitted windows read as a bug. */}
-        {reward && stretched && (
+        {reward && (
           <div className="rs-sub" style={{ fontSize: 10.5, marginTop: 6 }}>
-            The episode is longer than the clip, so the windows below are
-            stretched {(episodeSpan / clipSpan).toFixed(2)}× to span it — the
-            clip plays across the whole {episodeSpan.toFixed(1)} s rather than
-            finishing early and leaving the rest of every episode in the last
-            mode.
+            These windows preserve the certified clip cadence exactly. If the
+            episode outlasts the clip, the executor holds the terminal mode and
+            final reference frame; it never stretches a certified motion.
           </div>
         )}
       </div>
@@ -590,7 +703,9 @@ export function ModeRewardPanel({
             ) : doneCount < reward.modes.length ? (
               <>
                 {reward.modes.length - doneCount} mode(s) still pay nothing.
-                Promoting now trains the tracking backbone alone.
+                {reward.tracking
+                  ? " Promoting now trains the tracking backbone alone in those modes."
+                  : " Promoting now leaves those modes at zero reward; no tracking backbone is active."}
               </>
             ) : (
               <>

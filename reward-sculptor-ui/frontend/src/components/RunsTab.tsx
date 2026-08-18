@@ -1622,12 +1622,28 @@ function LiveRunDetailPane({
     let chosen = false;
     let ignoredPartial: string | null = null;
     let noise: { before: number; after: number; ceiling: number } | null = null;
+    let skill: {
+      id: string; mode: string; manifestDigest: string | null;
+      checkpointSha256: string | null;
+    } | null = null;
     for (const ev of events.events) {
       const e = ev as {
         type?: string; source?: string; checkpoint?: string;
         std_before?: number; std_after?: number; ceiling?: number;
+        starting_skill_id?: string; initialization_mode?: string;
+        manifest_digest?: string; checkpoint_sha256?: string;
       };
-      if (e.type === "warm_start_checkpoint_resolved") { source = e.checkpoint ?? null; chosen = true; }
+      if (e.type === "starting_skill_resolved" && e.starting_skill_id) {
+        skill = {
+          id: e.starting_skill_id,
+          mode: e.initialization_mode ?? "unknown",
+          manifestDigest: e.manifest_digest ?? null,
+          checkpointSha256: e.checkpoint_sha256 ?? null,
+        };
+        source = `portable skill ${e.starting_skill_id}`;
+        chosen = true;
+      }
+      else if (e.type === "warm_start_checkpoint_resolved") { source = e.checkpoint ?? null; chosen = true; }
       else if (e.type === "resume_warm_start_resolved") { source = asPath(e.source) ?? null; chosen = false; }
       else if (e.type === "partial_train_recovered") { source = e.checkpoint ?? source; chosen = false; }
       else if (e.type === "partial_train_ignored") { ignoredPartial = e.checkpoint ?? null; }
@@ -1638,7 +1654,50 @@ function LiveRunDetailPane({
       }
     }
     if (source === null) return null;
-    return { source, chosen, ignoredPartial, noise };
+    return { source, chosen, ignoredPartial, noise, skill };
+  }, [events.events]);
+
+  const referenceAdmission = useMemo(() => {
+    let receipt: {
+      outcome: "admitted" | "failed"; tier: string; status: string;
+      robot: string | null; clipId: string | null; clipSha256: string | null;
+      rolloutSha256: string | null; trainingAuthorized: boolean;
+      reason: string | null;
+    } | null = null;
+    for (const ev of events.events) {
+      const e = ev as {
+        type?: string; tier?: string; status?: string;
+        reference_robot?: string; reference_clip_id?: string;
+        clip_sha256?: string; rollout_sha256?: string;
+        training_authorized?: boolean; reason?: string; error?: string;
+      };
+      if (e.type === "reference_feasibility_admitted") {
+        receipt = {
+          outcome: "admitted",
+          tier: e.tier ?? "unknown",
+          status: e.status ?? "verified",
+          robot: e.reference_robot ?? null,
+          clipId: e.reference_clip_id ?? null,
+          clipSha256: e.clip_sha256 ?? null,
+          rolloutSha256: e.rollout_sha256 ?? null,
+          trainingAuthorized: e.training_authorized === true,
+          reason: e.reason ?? null,
+        };
+      } else if (e.type === "reference_feasibility_integrity_failed") {
+        receipt = {
+          outcome: "failed",
+          tier: e.tier ?? "unknown",
+          status: "integrity_failed",
+          robot: e.reference_robot ?? null,
+          clipId: e.reference_clip_id ?? null,
+          clipSha256: e.clip_sha256 ?? null,
+          rolloutSha256: e.rollout_sha256 ?? null,
+          trainingAuthorized: false,
+          reason: e.error ?? e.reason ?? "reference feasibility integrity failed",
+        };
+      }
+    }
+    return receipt;
   }, [events.events]);
 
   // The most recent `learning_vitals`, plus where the run's exploration
@@ -1796,6 +1855,7 @@ function LiveRunDetailPane({
           }}
         />
         {startingPolicy && <StartingPolicyCard {...startingPolicy} />}
+        {referenceAdmission && <ReferenceAdmissionCard {...referenceAdmission} />}
         {vitals && <LearningVitalsStrip {...vitals} />}
         {isActive && awaiting && run.data && (
           <FeedbackPanel
@@ -2105,11 +2165,15 @@ function shortCkpt(path: string): string {
 // Where this run's weights came from. Training almost never starts from
 // scratch, and which policy seeded it decides what the run can reach — so it
 // belongs next to the run, not buried in the event log.
-function StartingPolicyCard({ source, chosen, ignoredPartial, noise }: {
+function StartingPolicyCard({ source, chosen, ignoredPartial, noise, skill }: {
   source: string;
   chosen: boolean;
   ignoredPartial: string | null;
   noise: { before: number; after: number; ceiling: number } | null;
+  skill: {
+    id: string; mode: string; manifestDigest: string | null;
+    checkpointSha256: string | null;
+  } | null;
 }) {
   return (
     <div className="rs-card" style={{ margin: "0 16px 12px" }}>
@@ -2127,6 +2191,17 @@ function StartingPolicyCard({ source, chosen, ignoredPartial, noise }: {
           disk. Your choice wins; that partial was not used.
         </div>
       )}
+      {skill && (
+        <div className="rs-sub" style={{ fontSize: 11 }}>
+          Portable skill <code className="mono">{skill.id}</code> Â· {skill.mode.replaceAll("_", " ")}
+          {skill.manifestDigest && (
+            <> Â· manifest <code className="mono">{skill.manifestDigest.slice(0, 12)}â€¦</code></>
+          )}
+          {skill.checkpointSha256 && (
+            <> Â· weights <code className="mono">{skill.checkpointSha256.slice(0, 12)}â€¦</code></>
+          )}
+        </div>
+      )}
       {noise && (
         <div className="rs-sub" style={{ fontSize: 11 }}>
           Carried action-noise std {noise.before.toFixed(2)}, above this task's fresh-init{" "}
@@ -2141,6 +2216,50 @@ function StartingPolicyCard({ source, chosen, ignoredPartial, noise }: {
 
 // §Ship 39 (H1): the inline feedback prompt shown when the loop is paused
 // awaiting the human's observation (manual mode).
+function ReferenceAdmissionCard({
+  outcome, tier, status, robot, clipId, clipSha256, rolloutSha256,
+  trainingAuthorized, reason,
+}: {
+  outcome: "admitted" | "failed";
+  tier: string;
+  status: string;
+  robot: string | null;
+  clipId: string | null;
+  clipSha256: string | null;
+  rolloutSha256: string | null;
+  trainingAuthorized: boolean;
+  reason: string | null;
+}) {
+  const good = outcome === "admitted";
+  return (
+    <div
+      className="rs-card"
+      style={{
+        margin: "0 16px 12px",
+        border: `1px solid ${good ? "var(--st-emerald)" : "var(--st-rose)"}`,
+      }}
+    >
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
+        <Icon name={good ? "shield-check" : "alert-triangle"} size={15} color={good ? "var(--st-emerald)" : "var(--st-rose)"} />
+        <span className="rs-eyebrow">Reference feasibility</span>
+        <span className={`rs-badge ${good ? "emerald" : "rose"}`}>Tier {tier}</span>
+        <span style={{ fontSize: 11.5, fontWeight: 650 }}>
+          {good
+            ? trainingAuthorized ? "live training authorized" : "inspection only · no policy output"
+            : "integrity check failed"}
+        </span>
+      </div>
+      <div className="rs-sub" style={{ fontSize: 11, lineHeight: 1.5 }}>
+        {robot && clipId && <><code className="mono">{robot}/{clipId}</code> Â· </>}
+        {status.replaceAll("_", " ")}
+        {clipSha256 && <> Â· clip <code className="mono">{clipSha256.slice(0, 12)}â€¦</code></>}
+        {rolloutSha256 && <> Â· tracked rollout <code className="mono">{rolloutSha256.slice(0, 12)}â€¦</code></>}
+        {reason && <> Â· {reason}</>}
+      </div>
+    </div>
+  );
+}
+
 function FeedbackPanel({ iterIndex, pending, onSubmit }: { iterIndex: number | null; pending: boolean; onSubmit: (text: string, goAuto: boolean) => void }) {
   const [text, setText] = useState("");
   return (

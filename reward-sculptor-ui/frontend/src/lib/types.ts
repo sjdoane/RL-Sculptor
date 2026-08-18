@@ -25,6 +25,7 @@ export interface ProjectSummary {
   // fields filled by the route from the latest sculpt_run.
   adapter_class?: string | null;
   library_slug?: string | null;
+  reference_robot?: string | null;
   num_envs?: number | null;
   device?: string | null;
   primary_metric?: number | null;
@@ -37,6 +38,7 @@ export interface ProjectDetail extends ProjectSummary {
   adapter_config: Record<string, unknown>;
   ready_to_train?: boolean;
   library_slug?: string | null;
+  reference_robot?: string | null;
   adapter_unavailable?: boolean;
 }
 
@@ -336,6 +338,9 @@ export interface RunParamsPayload {
   iterations: number;
   no_kg?: boolean;
   dry_run?: boolean;
+  /** Explicit research authorization for a live run with no objective
+   * fitness. False/omitted is fail-closed; dry runs do not require it. */
+  acknowledge_blind_fitness?: boolean;
   // M7 Phase 4 — GPU-appropriate overrides. All optional; null means
   // "use the project's config.toml default".
   training_iterations?: number | null;
@@ -383,6 +388,16 @@ export interface RunParamsPayload {
   // Explicit policy-only recovery. The backend resolves this iteration to a
   // non-empty checkpoint inside this project's runs directory.
   warm_start_iteration?: number | null;
+  // A reusable, content-addressed starting skill imported through the
+  // researcher-facing bundle flow. `initialization_mode` is deliberately
+  // explicit: loading an actor is not the same experiment as also loading a
+  // critic, and neither is a full optimizer/iteration resume.
+  starting_skill_id?: string | null;
+  /** Immutable manifest pin from the import/list receipt. Required whenever a
+   * starting_skill_id is selected; the server rechecks it at route and worker
+   * boundaries so a stale picker cannot launch different bytes. */
+  expected_starting_skill_manifest_digest?: string | null;
+  initialization_mode?: StartingSkillInitializationMode | null;
   // Optional pre-existing motion. The exact robot namespace is paired with
   // the clip id so the backend never resolves from a fallback embodiment.
   reference_clip_id?: string | null;
@@ -593,6 +608,29 @@ export interface RunSummary {
 
 export interface RunDetail extends RunSummary {
   params: RunParamsPayload;
+  /** Server-derived Tier-D/Tier-K decision; clients cannot assert it. */
+  reference_feasibility?: Record<string, unknown> | null;
+  /** Server-derived objective request/admission receipt. */
+  objective_fitness_receipt?: {
+    requested_metric?: string | null;
+    objective_requested?: boolean;
+    blind_ablation_acknowledged?: boolean;
+    dry_run?: boolean;
+    effective_metric?: string | null;
+    resolved_metric?: string | null;
+    effective_mode?: "observe" | "steer" | null;
+    blind_at_subprocess_start?: boolean;
+    authorization?: string;
+  } | null;
+  /** Server-derived admission/worker pin for imported starting skills. */
+  starting_skill_target_receipt?: {
+    schema: number;
+    adapter_class: string;
+    task_id: string;
+    robot_slug: string | null;
+    policy_contract_required: boolean;
+    policy_contract_sha256: string | null;
+  } | null;
   iterations: IterEventSummary[];
   stdout_tail: string[];
   total_event_count: number;
@@ -607,6 +645,186 @@ export interface PolicySummary {
   primary_metric: number | null;
   fitness: number | null;
   reward_version: string | null;
+  metric_id: string | null;
+  metric_version: string | null;
+  metric_source: string | null;
+  metric_sha256: string | null;
+  criterion_status: "passed" | "failed" | "not_recorded";
+  evidence_status: "complete" | "partial" | "unavailable";
+  route_evidence: PolicyEvidenceValue | null;
+  contact_evidence: PolicyEvidenceValue | null;
+  hold_evidence: PolicyEvidenceValue | null;
+  rollout_available: boolean;
+  /** Earned only from a coherent immutable selection receipt. */
+  selected: boolean;
+  selection_source: string | null;
+}
+
+export interface PolicyEvidenceValue {
+  key: string;
+  value: number;
+  kind: "fraction" | "count" | "frames" | "score" | "value";
+}
+
+// ── Starting skills (portable policy / motion import) ───────────────
+
+export type StartingSkillInitializationMode =
+  | "actor_only"
+  | "actor_critic"
+  | "reference_only"
+  | "full_resume";
+
+export type StartingSkillCompatibilityStatus =
+  | "full_resume"
+  | "transfer_actor_critic"
+  | "transfer_actor"
+  | "teacher_only"
+  | "reference_only"
+  | "partially_compatible"
+  | "incompatible";
+
+export interface StartingSkillRecord {
+  skill_id: string;
+  alias: string | null;
+  created_at: string;
+  adapter_class: string;
+  task_id: string;
+  robot_slug: string | null;
+  source: string;
+  checkpoint_sha256: string | null;
+  checkpoint_size_bytes: number | null;
+  /** Data format admitted by the server (for example `safetensors` or a
+   * server-reserialized `sanitized_pt`). Optional for older library rows. */
+  checkpoint_format?: string | null;
+  source_format?: string | null;
+  manifest_digest: string | null;
+  identity_digest?: string | null;
+  source_weights_sha256?: string | null;
+  reference_clip_id: string | null;
+  reference_robot: string | null;
+  reference_sha256?: string | null;
+  reference_provenance_sha256?: string | null;
+  world_bundle_sha256?: string | null;
+  controller_sha256?: string | null;
+  compatibility_contract?: Record<string, unknown> | null;
+  compatibility_contract_digest?: string | null;
+  tensor_contract_verified?: boolean;
+  tensor_signature_sha256?: string | null;
+  initialization_modes: StartingSkillInitializationMode[];
+  policy_roles: string[];
+  trust_status: string;
+}
+
+export interface StartingSkillCompatibility {
+  status: StartingSkillCompatibilityStatus;
+  allowed_initialization_modes: StartingSkillInitializationMode[];
+  reasons: string[];
+  /** Stable machine-readable blockers paired with the researcher-facing
+   * reason text. Older receipts may not include this field. */
+  reason_codes?: string[];
+  mode_reasons?: Partial<Record<StartingSkillInitializationMode, string[]>>;
+}
+
+export interface StartingSkillTrustReceipt {
+  status: "sanitized" | "verified_local" | string;
+  detail?: string;
+  source_format?: string | null;
+  checkpoint_format?: string | null;
+  manifest_digest: string | null;
+  checkpoint_sha256: string | null;
+  compatibility_contract_digest?: string | null;
+  tensor_contract_verified?: boolean;
+  tensor_signature_sha256?: string | null;
+}
+
+export interface StartingSkillComponents {
+  policy_roles: string[];
+  reference: {
+    clip_id: string;
+    robot: string;
+    admission?: {
+      status: "registered_candidate" | string;
+      structural_checks: string[];
+      training_authorized: boolean;
+      next_gate: string;
+    };
+  } | null;
+  world: {
+    included: boolean;
+    status: "digest_recorded_bytes_discarded" | "absent" | string;
+    bytes_retained: boolean;
+    activatable: boolean;
+    sha256?: string | null;
+  };
+  controller: {
+    kind: string;
+    status: "digest_recorded_bytes_discarded" | string;
+    bytes_retained: boolean;
+    activatable: boolean;
+    sha256?: string | null;
+  } | null;
+  excluded: string[];
+}
+
+/** Admission receipt returned both by list and import. It is intentionally
+ * richer than the stored skill record so the UI can show researchers exactly
+ * what will load, what was excluded, and why a bundle is incompatible. */
+export interface StartingSkillReceipt {
+  skill: StartingSkillRecord;
+  /** Deprecated structural alias retained for older clients. It is not a
+   * launch authorization; use `selectable` plus the run receipt. */
+  compatible: boolean;
+  selectable: boolean;
+  training_authorized: false;
+  /** Added by schema-v3 imports. Older disk receipts do not contain this
+   * block, so clients must treat absence as blocked rather than crashing or
+   * inferring launch authority. */
+  authorization?: {
+    status: "candidate" | "blocked" | string;
+    receipt_scope: "structural_selectability_only" | string;
+    training_authorized: false;
+    mode_gates: Partial<Record<StartingSkillInitializationMode, string[]>>;
+    detail: string;
+    policy_present: boolean;
+  };
+  compatibility: StartingSkillCompatibility;
+  trust: StartingSkillTrustReceipt;
+  components: StartingSkillComponents;
+  warnings: string[];
+}
+
+export interface StartingSkillsResponse {
+  skills: StartingSkillReceipt[];
+}
+
+export interface StageReferenceAttachmentReceipt {
+  stage: string;
+  reference_clip_id: string;
+  reference_tier: "D";
+  reference_match_confidence: null;
+  reference_robot: string;
+  reference_clip_sha256: string;
+  reference_certificate_sha256: string;
+  reference_execution_contract_sha256: string;
+  reference_execution_boundary_sha256: string;
+}
+
+export type StartingPointKind =
+  | "scratch"
+  | "project_checkpoint"
+  | "shared_skill";
+
+/** Controlled value emitted by StartingPointPickerDialog. Run fields retain
+ * their API names; `kind` and `import_manifest_digest` are UI/provenance
+ * context and must not be copied blindly into the POST body. */
+export interface StartingPointSelection {
+  kind: StartingPointKind;
+  warm_start_iteration: number | null;
+  starting_skill_id: string | null;
+  initialization_mode: StartingSkillInitializationMode | null;
+  reference_clip_id: string | null;
+  reference_robot: string | null;
+  import_manifest_digest: string | null;
 }
 
 /** Every event the WS stream emits. The frontend switches on
@@ -934,6 +1152,7 @@ export interface LibraryPreconfiguredTask {
 
 export interface LibraryRobot {
   slug: string;
+  reference_robot: string;
   display_name: string;
   category: RobotCategory;
   description: string;
@@ -1052,6 +1271,14 @@ export interface StageSchema {
   reference_clip_id?: string | null;
   reference_tier?: string | null;
   reference_match_confidence?: number | null;
+  // Immutable Tier-D admission receipt. Nullable only for legacy mission
+  // reads; attached runnable stages are rejected unless artifact and
+  // execution-boundary pins are all present.
+  reference_robot?: string | null;
+  reference_clip_sha256?: string | null;
+  reference_certificate_sha256?: string | null;
+  reference_execution_contract_sha256?: string | null;
+  reference_execution_boundary_sha256?: string | null;
   // §D24 F1: the goal-aligned sub-span of reference_clip_id, when one
   // was selected (docs/internal/REFERENCE_BUILD_LOG.md D23/D24). All
   // four null together when no span applies (no clip attached, the
@@ -1520,8 +1747,21 @@ export interface ComposeResult {
 
 // GET /references/{clip_id} — provenance.json content + the index row.
 export interface RefDetail {
-  index: RefIndexRow;
-  provenance: Record<string, unknown>;
+  index_row: RefIndexRow;
+  provenance: Record<string, unknown> | null;
+  dynamics_admission: {
+    admitted: boolean;
+    tier: string;
+    certificate_digest: string | null;
+    clip_sha256: string | null;
+    rollout_sha256: string | null;
+    reason: string | null;
+    tracking_errors?: {
+      mean_joint_err_rad: number;
+      max_joint_err_rad: number;
+      root_z_rmse_m: number;
+    };
+  };
 }
 
 // ── Worlds (environment authoring, item 5) ─────────────────────────────

@@ -52,13 +52,13 @@ function indexToRow(r: RefIndexRow): PickerRow {
 /** Small keyframe-strip preview. Hides itself on 404 (no preview.png
  *  for this clip — decision 8 says preview generation must never block
  *  ingest, so absence is an expected, non-error state). */
-function PreviewImage({ clipId }: { clipId: string }) {
+function PreviewImage({ robot, clipId }: { robot: string; clipId: string }) {
   const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [clipId]);
+  useEffect(() => setFailed(false), [robot, clipId]);
   if (failed) return null;
   return (
     <img
-      src={getReferencePreviewUrl(clipId)}
+      src={getReferencePreviewUrl(robot, clipId)}
       alt={`${clipId} keyframe preview`}
       onError={() => setFailed(true)}
       style={{
@@ -123,7 +123,7 @@ export function ReferencePickerDialog({
   stageName,
   currentClipId,
   initialQuery,
-  robot = "g1",
+  robot,
   onPick,
   onClose,
 }: {
@@ -138,10 +138,10 @@ export function ReferencePickerDialog({
    *  noise (0000_motorcycle…) — opening pre-searched on the stage's
    *  own goal surfaces relevant clips immediately. */
   initialQuery?: string;
-  /** Reference-library embodiment namespace. The normal run picker derives
-   *  this from project metadata; mission callers keep the historical g1
-   *  default unless they pass a different robot. */
-  robot?: string;
+  /** Canonical reference-library embodiment namespace resolved from project
+   *  metadata. Every caller must pass it explicitly; catalog slugs and task
+   *  names are not reference namespaces. */
+  robot: string;
   /** Standalone selection mode. When provided, selecting a clip returns it
    *  to the caller instead of mutating a mission stage. */
   onPick?: (selection: { clipId: string; robot: string }) => void;
@@ -265,7 +265,9 @@ export function ReferencePickerDialog({
     <Modal
       icon="video"
       title="Pick a reference clip"
-      subtitle={stageName ? `Stage ${stageName}` : `Motion prior · ${robot}`}
+      subtitle={stageName
+        ? `Stage ${stageName} · ${robot}`
+        : `Motion prior · ${robot}`}
       onClose={onClose}
       footer={
         <>
@@ -510,7 +512,7 @@ export function ReferencePickerDialog({
                 to get its arrays out to inspect or archive them. */}
             <a
               className="rs-sub"
-              href={getReferenceClipUrl(selectedClipId)}
+              href={getReferenceClipUrl(robot, selectedClipId)}
               download={`${selectedClipId}.npz`}
               style={{ fontSize: 10.5, display: "inline-flex", alignItems: "center", gap: 4 }}
             >
@@ -518,7 +520,7 @@ export function ReferencePickerDialog({
               clip.npz
             </a>
           </div>
-          <PreviewImage clipId={selectedClipId} />
+          <PreviewImage robot={robot} clipId={selectedClipId} />
         </div>
       )}
 

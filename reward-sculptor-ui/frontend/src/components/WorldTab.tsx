@@ -18,6 +18,7 @@ import {
   useWorldSelection,
   useWorldValidation,
 } from "@/hooks/useWorlds";
+import { WORLD_ROBOT_MISMATCH_DETAIL } from "@/lib/worldLaunch";
 
 /** "5 elements — 3 platform · 2 gap"; gaps carry no geometry, so call
  *  that out rather than letting the total look inconsistent with the
@@ -109,13 +110,13 @@ export default function WorldTab({
         <div className="rs-banner warn">
           <Icon name="alert-triangle" size={17} />
           <span className="rs-grow">
-            <b>Robot differs from the project.</b> This world was authored
+            <b>Training blocked: robot differs from the project.</b> This world
+            was authored
             for <code className="mono">{s.shared_summary.robot}</code>, but the
             project&apos;s configured robot is{" "}
             <code className="mono">{s.shared_summary.project_capability_id}</code>.
-            Training under this selection uses the authored world&apos;s robot.
-            Re-author (leave the robot field blank to use the project robot)
-            if that is not intended.
+            {" "}{WORLD_ROBOT_MISMATCH_DETAIL} Leave the robot field blank
+            while re-authoring to use the project robot.
           </span>
         </div>
       )}

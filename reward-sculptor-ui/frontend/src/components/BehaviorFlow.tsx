@@ -2,7 +2,7 @@
  * The pipeline as one ordered list, on one screen.
  *
  * The showcase workflow — author a world, compose a novel motion out of
- * solved clips, split it into OGMP modes, author a reward per mode, train —
+ * solved clips, split it into reward phases, author a reward per phase, train —
  * was spread across six tabs and eight modals, three levels deep, with no
  * state carried between them. Nothing said what order to do things in, what
  * was already done, or which artifact the next step would read. The composed
@@ -27,6 +27,7 @@ import { useRewards } from "@/hooks/useRewards";
 import { useHasActiveRun } from "@/hooks/useRuns";
 import { useWorldSelection } from "@/hooks/useWorlds";
 import { listModeRewards } from "@/lib/api";
+import { deriveModeRewardReadiness } from "@/lib/behaviorFlow";
 import { referenceRobotForProject } from "@/lib/referenceRobot";
 import type { ProjectDetail } from "@/lib/types";
 
@@ -99,19 +100,25 @@ export function BehaviorFlow({
   const steps: Step[] = useMemo(() => {
     const hasIters = project.n_iterations_completed > 0;
     const clipId = draft.data?.reference_clip_id ?? "";
+    const clipRobot = draft.data?.reference_robot ?? referenceRobot;
     // Match the chosen clip, or — with no clip chosen — whatever is actually
     // promoted. The old `!clipId || ...` fell through to the FIRST file in an
     // mtime-sorted list, so a project with no motion chosen could show
     // "Choose a reference motion" unchecked and "4/4 authored" checked
     // directly beneath it, for a clip the user had never selected.
     const promotedClip = modeRewards.data?.promoted?.clip_id ?? "";
+    const promotedRobot = modeRewards.data?.promoted?.reference_robot ?? "";
     const matchClip = clipId || promotedClip;
-    const modeFile = matchClip
-      ? modeRewards.data?.mode_rewards.find((f) => f.clip_id === matchClip)
-      : undefined;
-    const authoredCount =
-      modeFile?.modes.filter((m) => m.authored).length ?? 0;
-    const modeCount = modeFile?.modes.length ?? 0;
+    const matchRobot = clipId ? clipRobot : promotedRobot;
+    const modeReadiness = deriveModeRewardReadiness({
+      files: modeRewards.data?.mode_rewards ?? [],
+      promoted: modeRewards.data?.promoted ?? null,
+      clipId: matchClip,
+      robot: matchRobot,
+    });
+    const modeFile = modeReadiness.modeFile ?? undefined;
+    const authoredCount = modeReadiness.authoredCount;
+    const modeCount = modeReadiness.modeCount;
     // Only the version chain proves a reward is what a run will train. A
     // mode_reward_v*.py is NOT a version — that is the whole reason `promote`
     // exists — so "all modes authored" is not the same as "in use".
@@ -126,13 +133,15 @@ export function BehaviorFlow({
     // then puts a green check immediately above a row reading "not promoted
     // yet", which is the exact confusion this card exists to prevent.
     const modesReadyUnpromoted =
-      modeCount > 0 && authoredCount === modeCount
-      && !(promoted && promoted.clip_id === modeFile?.clip_id);
+      modeReadiness.authoredCurrent && !modeReadiness.promotedExact;
     const rewardEvidence = promoted
       ? `v${promoted.version}.py · ${promoted.modes.length} modes`
         + (promoted.unauthored.length
             ? ` · ${promoted.unauthored.length} still a stub`
             : " · all authored")
+        + (modeReadiness.promotionBlocker
+            ? ` · blocked: ${modeReadiness.promotionBlocker}`
+            : " · exact current selection")
       : versionCount
         ? `${versionCount} version${versionCount === 1 ? "" : "s"}`
         : undefined;
@@ -184,21 +193,27 @@ export function BehaviorFlow({
       },
       {
         key: "modes",
-        label: "Author a reward per mode",
-        hint: "A composite's phases ARE its OGMP modes. Each gets its own reward "
-            + "terms, paid only inside its own window.",
-        done: modeCount > 0 && authoredCount === modeCount,
+        label: "Author phase-specific rewards",
+        hint: "A composite's segments become OGMP-inspired time windows. Each "
+            + "gets its own reward terms; runtime currently dispatches by the "
+            + "episode clock, not by a closed-loop mode controller.",
+        done: modeReadiness.authoredCurrent,
         evidence: modeCount
           ? `${authoredCount}/${modeCount} authored · ${modeFile?.filename}`
             // The gap this closes: authoring writes mode_reward_v<n>.py, which
             // is not a version. Fully authored and never promoted looked
             // identical to fully authored and training.
-            + (promoted && promoted.clip_id === modeFile?.clip_id
-                ? ` · promoted as v${promoted.version}.py`
+            + (modeReadiness.promotedExact
+                ? ` · promoted as v${promoted?.version}.py`
                 : " · not promoted yet")
+            + (modeReadiness.modeBlocker
+                ? ` · blocked: ${modeReadiness.modeBlocker}`
+                : " · current context")
           : undefined,
         tab: "rewards",
-        action: modeCount ? "Continue authoring" : "Scaffold modes",
+        action: modeReadiness.modeBlocker
+          ? "Refresh modes"
+          : modeCount ? "Continue authoring" : "Scaffold modes",
         // Both this step and the next one target the Rewards tab, and the
         // panel each of them means is off-screen on arrival. Land on the
         // control, not the tab.
@@ -210,7 +225,9 @@ export function BehaviorFlow({
         label: "Put a reward in the chain",
         hint: "Only v<n>.py counts. Promote the per-mode reward, or let the "
             + "sculptor iterate from the grounded starting reward.",
-        done: !modesReadyUnpromoted && (rewardShaped || !!promoted),
+        done: modeCount > 0
+          ? modeReadiness.promotedExact
+          : rewardShaped,
         evidence: rewardEvidence,
         tab: "rewards",
         action: modesReadyUnpromoted ? "Promote it" : "Open rewards",

@@ -1,0 +1,496 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { expect, test, vi } from "vitest";
+
+import { StartingPointPickerDialog } from "@/components/StartingPointPickerDialog";
+import { listStartingSkills, uploadStartingSkill } from "@/lib/api";
+import type {
+  PolicySummary,
+  StartingPointSelection,
+  StartingSkillReceipt,
+} from "@/lib/types";
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...original,
+    listStartingSkills: vi.fn(),
+    uploadStartingSkill: vi.fn(),
+  };
+});
+
+const receipt: StartingSkillReceipt = {
+  skill: {
+    skill_id: "g1-parkour",
+    alias: "G1 parkour prior",
+    created_at: "2026-08-17T12:00:00Z",
+    adapter_class: "sculptor.adapters.mjlab.MjlabAdapter",
+    task_id: "Mjlab-G1-Parkour",
+    robot_slug: "g1",
+    source: "imported",
+    checkpoint_sha256: "a".repeat(64),
+    checkpoint_size_bytes: 4096,
+    checkpoint_format: "sanitized_pt",
+    source_format: "safetensors",
+    manifest_digest: "b".repeat(64),
+    identity_digest: "c".repeat(64),
+    source_weights_sha256: "d".repeat(64),
+    reference_clip_id: "parkour-reference",
+    reference_robot: "g1",
+    reference_sha256: "e".repeat(64),
+    reference_provenance_sha256: "f".repeat(64),
+    world_bundle_sha256: "1".repeat(64),
+    controller_sha256: "2".repeat(64),
+    compatibility_contract: {
+      observations: { shape: [48] },
+      actions: { shape: [29] },
+      policy: { actor: { hidden_dims: [512, 256] } },
+    },
+    compatibility_contract_digest: "3".repeat(64),
+    tensor_contract_verified: true,
+    tensor_signature_sha256: "4".repeat(64),
+    initialization_modes: ["actor_only", "reference_only"],
+    policy_roles: ["actor"],
+    trust_status: "sanitized",
+  },
+  compatible: true,
+  selectable: true,
+  training_authorized: false,
+  authorization: {
+    status: "candidate",
+    receipt_scope: "structural_selectability_only",
+    training_authorized: false,
+    mode_gates: {
+      actor_only: [
+        "revalidate the current project policy contract at launch",
+        "observe warm_start_loaded with the exact digest and actor role",
+      ],
+      reference_only: [
+        "verify a target-specific Tier-D execution contract and boundary",
+      ],
+    },
+    detail: "Import/list admission makes this starting point selectable; the worker must still earn runtime proof.",
+    policy_present: true,
+  },
+  compatibility: {
+    status: "partially_compatible",
+    allowed_initialization_modes: ["actor_only", "reference_only"],
+    reasons: [],
+    mode_reasons: {
+      actor_critic: ["Critic observation contract differs from this project."],
+      full_resume: ["Optimizer state is not portable."],
+    },
+  },
+  trust: {
+    status: "sanitized",
+    detail: "Safetensors were checked and reserialized by the server.",
+    source_format: "safetensors",
+    checkpoint_format: "sanitized_pt",
+    manifest_digest: "b".repeat(64),
+    checkpoint_sha256: "a".repeat(64),
+    compatibility_contract_digest: "3".repeat(64),
+    tensor_contract_verified: true,
+    tensor_signature_sha256: "4".repeat(64),
+  },
+  components: {
+    policy_roles: ["actor"],
+    reference: {
+      clip_id: "parkour-reference",
+      robot: "g1",
+      admission: {
+        status: "registered_candidate",
+        structural_checks: ["bounded arrays"],
+        training_authorized: false,
+        next_gate: "Run Tier-D feasibility verification.",
+      },
+    },
+    world: {
+      included: true,
+      status: "digest_recorded_bytes_discarded",
+      bytes_retained: false,
+      activatable: false,
+    },
+    controller: {
+      kind: "reference_tracker",
+      status: "digest_recorded_bytes_discarded",
+      bytes_retained: false,
+      activatable: false,
+    },
+    excluded: [
+      "raw checkpoints, pickle, Python, TorchScript, native binaries, and unknown members are rejected before admission",
+    ],
+  },
+  warnings: ["Bundled world digest was recorded but its bytes were not retained."],
+};
+
+const referenceOnlyReceipt: StartingSkillReceipt = {
+  ...receipt,
+  skill: {
+    ...receipt.skill,
+    skill_id: "g1-motion-only",
+    alias: "G1 motion only",
+    checkpoint_sha256: null,
+    checkpoint_size_bytes: null,
+    checkpoint_format: "none",
+    source_format: "npz",
+    initialization_modes: ["reference_only"],
+    policy_roles: [],
+    trust_status: "validated",
+  },
+  compatibility: {
+    status: "reference_only",
+    allowed_initialization_modes: ["reference_only"],
+    reasons: [],
+  },
+  trust: {
+    ...receipt.trust,
+    status: "validated",
+    detail: "Bounded trajectory arrays and provenance were validated.",
+    source_format: "npz",
+    checkpoint_format: "none",
+    checkpoint_sha256: null,
+  },
+  components: {
+    ...receipt.components,
+    policy_roles: [],
+    world: {
+      included: false,
+      status: "absent",
+      bytes_retained: false,
+      activatable: false,
+    },
+    controller: null,
+  },
+  warnings: [],
+};
+
+const scratch: StartingPointSelection = {
+  kind: "scratch",
+  warm_start_iteration: null,
+  starting_skill_id: null,
+  initialization_mode: null,
+  reference_clip_id: null,
+  reference_robot: null,
+  import_manifest_digest: null,
+};
+
+function renderPicker(
+  onChange = vi.fn(),
+  checkpoints: PolicySummary[] = [],
+  projectRobot = "g1",
+) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <StartingPointPickerDialog
+        slug="g1-parkour"
+        projectRobot={projectRobot}
+        projectTaskId="Mjlab-G1-Parkour"
+        checkpoints={checkpoints}
+        value={scratch}
+        onChange={onChange}
+        onClose={vi.fn()}
+      />
+    </QueryClientProvider>,
+  );
+  return onChange;
+}
+
+test("makes policy, motion, world, trust, and initialization semantics explicit", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [receipt] });
+  const user = userEvent.setup();
+  const onChange = renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /G1 parkour prior/i }));
+
+  expect(screen.getByText("Starting policy")).toBeInTheDocument();
+  expect(screen.getByText("Starting motion")).toBeInTheDocument();
+  expect(screen.getByText("Training environment")).toBeInTheDocument();
+  expect(screen.getByText("Controller source")).toBeInTheDocument();
+  expect(screen.getByText(/partially compatible/i)).toBeInTheDocument();
+  expect(screen.getByText(/does not authorize training/i)).toBeInTheDocument();
+  expect(screen.getByText(/warm_start_loaded with the exact digest/i)).toBeInTheDocument();
+  expect(screen.getByText("Source digest only")).toBeInTheDocument();
+  expect(screen.getByText(/content-attested|trusted/i)).toBeInTheDocument();
+  expect(screen.getAllByText(/registered candidate/i)).toHaveLength(2);
+  expect(screen.getByText(/Run Tier-D feasibility verification/i)).toBeInTheDocument();
+  expect(screen.getByText("obs 48 / actions 29 / actor 512 -> 256")).toBeInTheDocument();
+  expect(screen.getByLabelText("Tensor contract verified")).toBeInTheDocument();
+  expect(screen.getByRole("radio", { name: /Actor \+ critic/i })).toBeDisabled();
+  expect(screen.getByRole("radio", { name: /Actor \+ critic/i })).toHaveTextContent(
+    /Critic observation contract differs/i,
+  );
+  expect(screen.getByRole("radio", { name: /Full training resume/i })).toBeDisabled();
+
+  await user.click(screen.getByRole("button", { name: /Use this starting point/i }));
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+    kind: "shared_skill",
+    starting_skill_id: "g1-parkour",
+    initialization_mode: "actor_only",
+    reference_clip_id: null,
+    reference_robot: null,
+    import_manifest_digest: "b".repeat(64),
+  }));
+});
+
+test("fails legacy receipts closed without crashing the picker", async () => {
+  const legacyReceipt: StartingSkillReceipt = {
+    ...receipt,
+    skill: {
+      ...receipt.skill,
+      skill_id: "legacy-g1-prior",
+      alias: "Legacy G1 prior",
+    },
+    selectable: false,
+    authorization: undefined,
+  };
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [legacyReceipt] });
+  const user = userEvent.setup();
+  renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /Legacy G1 prior/i }));
+
+  expect(screen.getByText(/legacy receipt predates launch-authorization evidence/i))
+    .toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Use this starting point/i }))
+    .toBeDisabled();
+});
+
+test.each(["controller.pt", "deployment.zip"])(
+  "rejects non-portable %s artifacts before upload",
+  async (filename) => {
+    vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+    vi.mocked(uploadStartingSkill).mockClear();
+    // Exercise the component's own fail-closed validation. Browsers normally
+    // filter this extension via `accept`, but drag/drop and crafted events can
+    // still deliver it.
+    const user = userEvent.setup({ applyAccept: false });
+    renderPicker();
+
+    await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    await user.upload(input!, new File(["untrusted"], filename));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Deployment \.zip bundles and raw checkpoints are not portable imports/i,
+    );
+    await waitFor(() => expect(uploadStartingSkill).not.toHaveBeenCalled());
+  },
+);
+
+test("keeps bundled motion opt-in for policy transfer", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [receipt] });
+  const user = userEvent.setup();
+  const onChange = renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /G1 parkour prior/i }));
+  expect(screen.getByRole("checkbox", { name: /Attach bundled motion/i })).not.toBeChecked();
+  expect(screen.getByText(/bundled, not selected/i)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /Use this starting point/i }));
+
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+    starting_skill_id: "g1-parkour",
+    initialization_mode: "actor_only",
+    reference_clip_id: null,
+    reference_robot: null,
+  }));
+});
+
+test("attaches bundled motion only after an explicit opt-in", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [receipt] });
+  const user = userEvent.setup();
+  const onChange = renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /G1 parkour prior/i }));
+  await user.click(screen.getByRole("checkbox", { name: /Attach bundled motion/i }));
+  await user.click(screen.getByRole("button", { name: /Use this starting point/i }));
+
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+    reference_clip_id: "parkour-reference",
+    reference_robot: "g1",
+  }));
+});
+
+const checkpoint = (
+  iterIndex: number,
+  overrides: Partial<PolicySummary> = {},
+): PolicySummary => ({
+  iter_index: iterIndex,
+  checkpoint: "checkpoint.pt",
+  checkpoint_bytes: 4096,
+  primary_metric: null,
+  fitness: null,
+  reward_version: "v1",
+  metric_id: null,
+  metric_version: null,
+  metric_source: null,
+  metric_sha256: null,
+  criterion_status: "not_recorded",
+  evidence_status: "unavailable",
+  route_evidence: null,
+  contact_evidence: null,
+  hold_evidence: null,
+  rollout_available: false,
+  selected: false,
+  selection_source: null,
+  ...overrides,
+});
+
+test("does not silently choose the newest unselected checkpoint", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  const user = userEvent.setup();
+  renderPicker(vi.fn(), [checkpoint(4), checkpoint(5)]);
+
+  await user.click(screen.getByRole("radio", { name: /Project checkpoint/i }));
+
+  expect(screen.getByLabelText(/Completed iteration/i)).toHaveValue("");
+  expect(screen.getByText(/does not assume the newest checkpoint is the best/i)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
+});
+
+test("prefers an older evidenced selection over a newer failed checkpoint", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  const user = userEvent.setup();
+  const onChange = renderPicker(vi.fn(), [
+    checkpoint(4, {
+      fitness: 0.94,
+      metric_id: "weave-stop",
+      metric_version: "v3",
+      metric_source: "generated",
+      metric_sha256: "c".repeat(64),
+      criterion_status: "passed",
+      evidence_status: "complete",
+      route_evidence: { key: "order_ok_frac", value: 1, kind: "fraction" },
+      contact_evidence: { key: "contact_frac", value: 0, kind: "fraction" },
+      hold_evidence: { key: "ch_hold", value: 1, kind: "score" },
+      rollout_available: true,
+      selected: true,
+      selection_source: "objective_criterion",
+    }),
+    checkpoint(5, {
+      fitness: 0.98,
+      criterion_status: "failed",
+    }),
+  ]);
+
+  await user.click(screen.getByRole("radio", { name: /Project checkpoint/i }));
+
+  expect(screen.getByLabelText(/Completed iteration/i)).toHaveValue("4");
+  expect(screen.getByLabelText(/Iteration 4 evidence/i)).toHaveTextContent("weave-stop / v3");
+  expect(screen.getByLabelText(/Iteration 4 evidence/i)).toHaveTextContent("order_ok_frac");
+  expect(screen.getByLabelText(/Iteration 4 evidence/i)).toHaveTextContent("objective_criterion");
+  await user.click(screen.getByRole("button", { name: /Use this starting point/i }));
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+    kind: "project_checkpoint",
+    warm_start_iteration: 4,
+  }));
+});
+
+test("admits validated reference-only data without granting policy loading", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [referenceOnlyReceipt] });
+  const user = userEvent.setup();
+  const onChange = renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /G1 motion only/i }));
+
+  expect(screen.getByRole("radio", { name: /^Motion only/i })).toBeEnabled();
+  expect(screen.getByRole("radio", { name: /^Motion only/i })).toBeChecked();
+  expect(screen.getByRole("radio", { name: /Actor only/i })).toBeDisabled();
+  expect(screen.getByRole("radio", { name: /Actor \+ critic/i })).toBeDisabled();
+
+  await user.click(screen.getByRole("button", { name: /Use this starting point/i }));
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+    starting_skill_id: "g1-motion-only",
+    initialization_mode: "reference_only",
+    reference_clip_id: "parkour-reference",
+    reference_robot: "g1",
+  }));
+});
+
+test("validated trust never authorizes actor loading", async () => {
+  const invalidValidatedPolicy: StartingSkillReceipt = {
+    ...receipt,
+    skill: { ...receipt.skill, trust_status: "validated" },
+    trust: { ...receipt.trust, status: "validated" },
+  };
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [invalidValidatedPolicy] });
+  const user = userEvent.setup();
+  renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /G1 parkour prior/i }));
+
+  expect(screen.getByText("blocked")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
+});
+
+test("a selectable receipt must pin the stored immutable manifest", async () => {
+  const staleReceipt: StartingSkillReceipt = {
+    ...receipt,
+    skill: { ...receipt.skill, manifest_digest: null },
+    // A stale trust display value must not substitute for the stored record
+    // digest that the route and worker re-resolve.
+    trust: { ...receipt.trust, manifest_digest: "b".repeat(64) },
+  };
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [staleReceipt] });
+  const user = userEvent.setup();
+  renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", { name: /G1 parkour prior/i }));
+
+  expect(screen.getByText("blocked")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
+});
+
+test("keeps blocked candidates inspectable without claiming the row is disabled", async () => {
+  const blockedReceipt: StartingSkillReceipt = {
+    ...receipt,
+    compatible: false,
+    selectable: false,
+    authorization: {
+      ...receipt.authorization!,
+      status: "blocked",
+      detail: "No initialization mode currently passes structural admission.",
+    },
+    compatibility: {
+      status: "incompatible",
+      allowed_initialization_modes: [],
+      reasons: [
+        "project_robot_unresolved: select a project robot before using this skill",
+      ],
+      reason_codes: ["project_robot_unresolved"],
+    },
+  };
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [blockedReceipt] });
+  const user = userEvent.setup();
+  renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  const row = await screen.findByRole("radio", { name: /G1 parkour prior/i });
+  expect(row).not.toHaveAttribute("aria-disabled");
+  await user.click(row);
+
+  expect(screen.getByText(/project_robot_unresolved/i)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
+});
+
+test("uses the canonical project robot in portable export examples", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  const user = userEvent.setup();
+  renderPicker(vi.fn(), [], "go1");
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+
+  expect(screen.getByText(/sculpt export --portable --robot go1/)).toBeInTheDocument();
+  expect(screen.getByText(/sculpt refs export-skill --robot go1/)).toBeInTheDocument();
+});

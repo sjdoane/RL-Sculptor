@@ -29,6 +29,7 @@ import type {
   RobotStateResponse,
   SystemGpuResponse,
   SystemKgStatsResponse,
+  StageReferenceAttachmentReceipt,
   TechniqueSummary,
 } from "./types";
 
@@ -807,8 +808,12 @@ export function clipUrl(
   return `/api/projects/${slug}/runs/${runId}/clips/iter_${iterIndex}.mp4`;
 }
 
-// ── Policies (trained checkpoints + deployment-bundle export) ─────────
-import type { PolicySummary } from "./types";
+// ── Policies + reusable starting skills ──────────────────────────────
+import type {
+  PolicySummary,
+  StartingSkillReceipt,
+  StartingSkillsResponse,
+} from "./types";
 
 /** Disk-backed list of exportable trained iterations. Pass `runId` only
  *  for mission stage runs (their iters live in the stage's own tree). */
@@ -828,6 +833,35 @@ export function policyExportUrl(
 ): string {
   const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
   return `/api/projects/${slug}/policies/${iterIndex}/export${q}`;
+}
+
+/** List portable starting skills with a compatibility + trust receipt for
+ * this exact project. Compatibility is project-relative, so this intentionally
+ * lives below `/projects/{slug}` rather than in a context-free global list. */
+export async function listStartingSkills(
+  slug: string,
+): Promise<StartingSkillsResponse> {
+  return handle<StartingSkillsResponse>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/starting-skills`),
+  );
+}
+
+/** Quarantine and validate a data-only RewardSculptor `.rskill`. Deployment
+ * ZIPs and raw/executable checkpoint formats are intentionally a separate
+ * artifact class and are rejected. The backend returns the immutable
+ * admission receipt; no bundled world is activated as a side effect. */
+export async function uploadStartingSkill(
+  slug: string,
+  bundle: File,
+): Promise<StartingSkillReceipt> {
+  const body = new FormData();
+  body.append("bundle", bundle, bundle.name);
+  return handle<StartingSkillReceipt>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/starting-skills`, {
+      method: "POST",
+      body,
+    }),
+  );
 }
 
 // ── Missions (Ship 18a) ──────────────────────────────────────────────
@@ -1362,6 +1396,10 @@ export type ModeRewardFile = {
   filename: string;
   path: string;
   clip_id: string;
+  reference_robot: string;
+  execution_context_digest: string;
+  context_current: boolean;
+  tracking_enabled: boolean;
   mtime: number;
   /** sha256 of the file, to match against the promoted version's
    *  `source_sha256`. Filenames cannot answer it: authoring chains to a new
@@ -1371,8 +1409,7 @@ export type ModeRewardFile = {
   unauthored: string[];
 };
 
-/** The per-mode reward a run would actually train, if the newest version in
- *  the chain is one.
+/** The per-mode reward selected by current.py, if that exact version is one.
  *
  *  `mode_reward_v<n>.py` is not a version — `promote` copies it to `v<n>.py`
  *  and repoints `current.py`. Until then the authored bodies are inert, and
@@ -1382,6 +1419,13 @@ export type PromotedModeReward = {
   version: number;
   filename: string;
   clip_id: string;
+  reference_robot: string;
+  execution_context_digest: string;
+  context_current: boolean;
+  /** True only when selection_current pins the same reward path and digest. */
+  selection_current: boolean;
+  promotion_blocker: string | null;
+  tracking_enabled: boolean;
   /** The mode-reward file this version was promoted from, and its exact bytes.
    *  `""` for a version promoted before these were recorded — which reads as
    *  "matches nothing", so the UI offers to promote again rather than claiming
@@ -1412,6 +1456,77 @@ export async function listModeRewards(
   return { mode_rewards: d.mode_rewards ?? [], promoted: d.promoted ?? null };
 }
 
+export type ModeEvidenceStatus = {
+  schema: number;
+  created_at: number;
+  recorded: boolean;
+  receipt_sha256: string;
+  trust_status: "observe_only" | "trusted";
+  evidence_status: "absent" | "available";
+  fitness_or_selection_authority: boolean;
+  training_consumer_active: boolean;
+  blockers: string[];
+  next_action: string;
+  authority: {
+    clip_id: string;
+    reference_robot: string;
+    clip_sha256: string;
+    reward_sha256: string;
+    graph_sha256: string;
+    execution_manifest_sha256: string;
+    context_sha256: string;
+    selection: { present: boolean; valid: boolean; tuple_hash?: string };
+  };
+  gauntlet: {
+    mode_order: string[];
+    have: {
+      scores: boolean;
+      transitions: boolean;
+      validation: boolean;
+      calibration: boolean;
+    };
+  };
+};
+
+function modeEvidenceUrl(
+  slug: string,
+  clipId: string,
+  robot: string,
+  suffix = "",
+): string {
+  const u = new URL(
+    `/api/projects/${encodeURIComponent(slug)}/mode-evidence${suffix}`,
+    window.location.origin,
+  );
+  u.searchParams.set("clip_id", clipId);
+  u.searchParams.set("robot", robot);
+  return u.pathname + u.search;
+}
+
+/** Exact-context status for independent per-mode objective evidence. */
+export async function getModeEvidence(
+  slug: string,
+  clipId: string,
+  robot: string,
+): Promise<ModeEvidenceStatus> {
+  return handle<ModeEvidenceStatus>(
+    await fetch(modeEvidenceUrl(slug, clipId, robot)),
+  );
+}
+
+/** Persist the current absence/readiness finding as an immutable receipt. */
+export async function recordModeEvidenceReceipt(
+  slug: string,
+  clipId: string,
+  robot: string,
+): Promise<ModeEvidenceStatus> {
+  return handle<ModeEvidenceStatus>(
+    await fetch(modeEvidenceUrl(slug, clipId, robot, "/receipt"), {
+      method: "POST",
+    }),
+  );
+}
+
 /** POST /references/compose — build ONE novel clip out of spans of several
  *  already-solved clips. This is the path for a goal whose motion exists in
  *  no single clip: its phases were each recorded, just never together.
@@ -1420,7 +1535,7 @@ export async function listModeRewards(
  *  tracking run on it. */
 export async function composeReference(body: {
   clip_id: string;
-  robot?: string;
+  robot: string;
   segments: ComposeSegment[];
   text?: string;
   labels?: string[];
@@ -1438,33 +1553,38 @@ export async function composeReference(body: {
   );
 }
 
-export async function getReference(clipId: string): Promise<RefDetail> {
+export async function getReference(
+  robot: string, clipId: string,
+): Promise<RefDetail> {
   return handle<RefDetail>(
-    await fetch(`/api/references/${encodeURIComponent(clipId)}`),
+    await fetch(
+      `/api/references/${encodeURIComponent(clipId)}?robot=${encodeURIComponent(robot)}`,
+    ),
   );
 }
 
 /** Preview keyframe-strip PNG URL. No existence check here — the
  *  backend 404s cleanly when a clip has no preview.png; callers should
  *  hide the <img> on error (see ReferencePickerDialog). */
-export function getReferencePreviewUrl(clipId: string): string {
-  return `/api/references/${encodeURIComponent(clipId)}/preview`;
+export function getReferencePreviewUrl(robot: string, clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/preview?robot=${encodeURIComponent(robot)}`;
 }
 
 /** GET /references/{clip_id}/file/clip.npz — the clip's raw motion arrays.
  *  A plain href rather than a fetch: this is a file download, and letting
  *  the browser stream it avoids buffering a multi-MB npz in JS. */
-export function getReferenceClipUrl(clipId: string): string {
-  return `/api/references/${encodeURIComponent(clipId)}/file/clip.npz`;
+export function getReferenceClipUrl(robot: string, clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/file/clip.npz?robot=${encodeURIComponent(robot)}`;
 }
 
 /** POST .../stages/{stage}/reference body {clip_id} — attach a
  *  reference clip to a stage. 409 if mission-scoped jobs are live (same
- *  guard family as regenerateStageMetric). Returns the updated mission. */
+ *  guard family as regenerateStageMetric). Returns the exact Tier-D
+ *  attachment receipt; callers invalidate and refetch the mission. */
 export async function attachStageReference(
   slug: string, missionSlug: string, stageName: string, clipId: string,
-): Promise<MissionDetail> {
-  return handle<MissionDetail>(
+): Promise<StageReferenceAttachmentReceipt> {
+  return handle<StageReferenceAttachmentReceipt>(
     await fetch(
       `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
       {
@@ -1479,8 +1599,8 @@ export async function attachStageReference(
 /** DELETE .../stages/{stage}/reference — detach. Same 409 guard. */
 export async function detachStageReference(
   slug: string, missionSlug: string, stageName: string,
-): Promise<MissionDetail> {
-  return handle<MissionDetail>(
+): Promise<void> {
+  return handle<void>(
     await fetch(
       `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
       { method: "DELETE" },
@@ -1598,11 +1718,25 @@ export type ReferenceMode = {
   start_s: number;
   end_s: number;
   source_clip_id: string | null;
+  reference_clip_id: string | null;
+  reward_terms: string[];
+  success_predicate: string | null;
 };
 
 export type ReferenceModeGraph = {
   clip_id: string;
   fps: number;
+  capability: {
+    kind: "phase_window_reference_scaffold";
+    paper_alignment: "ogmp_inspired";
+    dispatch_authority: "episode_time_window";
+    reference_generator: "fixed_composed_clip";
+    runtime_transition_guards: boolean;
+    policy_mode_conditioning: boolean;
+    rho_bounded_exploration: boolean;
+    closed_loop_receding_horizon_oracle: boolean;
+    summary: string;
+  };
   modes: ReferenceMode[];
   transitions: {
     from_mode: string;
@@ -1628,7 +1762,7 @@ export type ModeRewardResult = {
  *  than an error to paper over. */
 export async function getReferenceModes(
   clipId: string,
-  robot = "g1",
+  robot: string,
 ): Promise<ReferenceModeGraph> {
   const u = new URL(
     `/api/references/${encodeURIComponent(clipId)}/modes`,
@@ -1644,7 +1778,7 @@ export async function getReferenceModes(
 export async function scaffoldModeReward(
   slug: string,
   clipId: string,
-  body: { robot?: string; goal?: string; tracking?: boolean; filename?: string; overwrite?: boolean },
+  body: { robot: string; goal?: string; tracking?: boolean; filename?: string; overwrite?: boolean },
 ): Promise<ModeRewardResult> {
   return handle<ModeRewardResult>(
     await fetch(
@@ -1664,7 +1798,7 @@ export async function scaffoldModeReward(
 export async function authorModeReward(
   slug: string,
   clipId: string,
-  body: { mode: string; robot?: string; filename?: string; out_filename?: string; goal?: string; mode_goal?: string },
+  body: { mode: string; robot: string; filename?: string; out_filename?: string; goal?: string; mode_goal?: string },
 ): Promise<JobSummary> {
   return handle<JobSummary>(
     await fetch(

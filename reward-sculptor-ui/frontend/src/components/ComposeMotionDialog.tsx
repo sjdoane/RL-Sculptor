@@ -233,9 +233,9 @@ function ResultPanel(
         composed from {result.parent_clip_ids.join(" → ")}
       </div>
 
-      {/* The composite's phases ARE its OGMP modes — same derivation the
-          library performs, shown here so the automaton is visible before
-          the clip is attached and trained on. */}
+      {/* The composite's segments become an OGMP-inspired phase scaffold —
+          same derivation the library performs, shown before the clip is
+          attached and trained on. */}
       <div style={{ marginBottom: 10 }}>
         <ModeTimeline
           segments={result.parent_clip_ids.map((id, i) => ({
@@ -265,11 +265,11 @@ function ResultPanel(
  * synthesized sketch or running blind.
  */
 export function ComposeMotionDialog({
-  robot = "g1",
+  robot,
   onClose,
   onComposed,
 }: {
-  robot?: string;
+  robot: string;
   onClose: () => void;
   /** Fired after a successful compose so the caller can select the new
    *  clip — it is normally the one about to be attached. */

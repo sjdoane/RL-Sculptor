@@ -27,6 +27,7 @@ import {
 import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { ApiError } from "@/lib/api";
 import type { WorldAuthorResponse, WorldDraftPreview } from "@/lib/types";
+import { WORLD_ROBOT_MISMATCH_DETAIL } from "@/lib/worldLaunch";
 
 function errText(err: unknown): string {
   if (err instanceof ApiError) {
@@ -345,7 +346,9 @@ export default function AuthorWorldDialog({
                       <code className="mono">{draft.capability_id}</code>, but
                       the project&apos;s robot is{" "}
                       <code className="mono">{draft.project_capability_id}</code>.
-                      Training under this world uses the draft&apos;s robot.
+                      {" "}You can inspect this draft.{" "}
+                      <strong>Training is blocked.</strong>{" "}
+                      {WORLD_ROBOT_MISMATCH_DETAIL}
                     </span>
                   </div>
                 )}

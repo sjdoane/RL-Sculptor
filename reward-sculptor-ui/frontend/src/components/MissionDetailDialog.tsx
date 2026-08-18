@@ -577,7 +577,7 @@ function ReferenceRow({
           </Btn>
         </>
       )}
-      {pickerOpen && (
+      {pickerOpen && project.data && (
         <ReferencePickerDialog
           slug={slug}
           missionSlug={missionSlug}
@@ -591,7 +591,7 @@ function ReferenceRow({
           // `reference_tracking_seed_failed` — unrecoverable without
           // hand-editing mission.json, because a Stage stores a clip id with
           // no embodiment beside it.
-          robot={project.data ? referenceRobotForProject(project.data) : undefined}
+          robot={referenceRobotForProject(project.data)}
           onClose={() => setPickerOpen(false)}
         />
       )}

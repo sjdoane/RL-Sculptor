@@ -9,7 +9,7 @@ import {
   type BrowseReferencesResult,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
-import type { MissionDetail, RefMatch } from "@/lib/types";
+import type { RefMatch, StageReferenceAttachmentReceipt } from "@/lib/types";
 
 /** GET /references?q=... — deterministic (llm=0) search, the picker's
  *  as-you-type path. Disabled for an empty/whitespace query — the
@@ -104,7 +104,11 @@ export interface AttachStageReferenceVariables {
  *  caller (ReferencePickerDialog) toasts it. */
 export function useAttachStageReference(slug: string) {
   const qc = useQueryClient();
-  return useMutation<MissionDetail, Error, AttachStageReferenceVariables>({
+  return useMutation<
+    StageReferenceAttachmentReceipt,
+    Error,
+    AttachStageReferenceVariables
+  >({
     mutationFn: ({ missionSlug, stageName, clipId }) =>
       attachStageReference(slug, missionSlug, stageName, clipId),
     onSuccess: (_mission, { missionSlug }) => {
@@ -120,7 +124,7 @@ export interface DetachStageReferenceVariables {
 
 export function useDetachStageReference(slug: string) {
   const qc = useQueryClient();
-  return useMutation<MissionDetail, Error, DetachStageReferenceVariables>({
+  return useMutation<void, Error, DetachStageReferenceVariables>({
     mutationFn: ({ missionSlug, stageName }) =>
       detachStageReference(slug, missionSlug, stageName),
     onSuccess: (_mission, { missionSlug }) => {
