@@ -6,9 +6,10 @@ spec contract in `spec_metrics.py`:
     def compute_spec(arrays, behavior, meta) -> dict[str, float]
         # returns {"spec_score": float in [0,1], ...sub-components}
 
-computed PURELY from the persisted physical rollout arrays (joint_pos,
-joint_vel, projected_gravity_b, root_link_pos_w + behavior.json +
-joint_names) — NEVER from LLM judgment. It is generated from the NL goal,
+computed PURELY from the persisted physical rollout arrays (official
+first-episode validity, joint_pos, joint_vel, projected_gravity_b,
+root_link_pos_w, root_link_ang_vel_b + behavior.json + joint_names) — NEVER
+from LLM judgment. It is generated from the NL goal,
 then put through a validation chain (safety/contract/determinism/bounds +
 a monotonicity audit) and an independent LLM review, and must EARN
 steer-rights via calibration (Spearman vs a hand-authored ground-truth
@@ -121,10 +122,12 @@ REQUIRED_ROLES_ATTR = "REQUIRED_JOINT_ROLES"
 #: spec_metrics.py array contract; kept here as the single allow-list a
 #: generated metric is constrained to.
 _LEGACY_ALLOWED_ARRAYS = (
+    "first_episode_valid_mask",
     "joint_pos",
     "joint_vel",
     "projected_gravity_b",
     "root_link_pos_w",
+    "root_link_ang_vel_b",
     # §Metric-quality laws (LAW 3/4): per-foot ground contact (T, E) and
     # foot position in the PELVIS frame (T, E, 3) — anterior (x) component
     # is the signed forward-kick direction; the contact schedule

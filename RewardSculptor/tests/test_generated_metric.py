@@ -427,23 +427,28 @@ REQUIRED_JOINT_ROLES = ["left_hip_pitch", "right_hip_pitch", "left_knee", "right
 def compute_spec(arrays, behavior, meta):
     jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
     pg = arrays.get("projected_gravity_b")
-    if jp is None or root is None or pg is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if jp is None or root is None or pg is None or valid is None:
         return {"spec_score": 0.0}
     roles = (meta or {}).get("joint_roles", {}) or {}
     idx = [roles[r] for r in ("left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee") if r in roles]
     if not idx:
         return {"spec_score": 0.0}
-    z = root[..., 2]
-    drop = float(np.mean(z[:5].mean(axis=0) - z.min(axis=0)))               # pelvis dips
-    ret = float(np.mean(np.abs(z[-5:].mean(axis=0) - z[:5].mean(axis=0))))  # and returns
-    rom = float(np.mean(np.max(jp[..., idx], axis=0) - np.min(jp[..., idx], axis=0)))
-    up0 = float(np.mean(pg[:5, ..., 2].mean(axis=0) < -0.85))
-    gate = 1.0
-    gate *= 1.0 if drop > 0.20 else 0.0
-    gate *= 1.0 if ret < 0.08 else 0.0
-    gate *= 1.0 if up0 > 0.7 else 0.0
-    amp = float(np.clip(rom / 1.2, 0.0, 1.0))
-    return {"spec_score": float(np.clip(gate * amp, 0.0, 1.0))}
+    scores = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 10:
+            scores.append(0.0)
+            continue
+        z = root[keep, env, 2]
+        drop = float(z[:5].mean() - z.min())
+        ret = float(abs(z[-5:].mean() - z[:5].mean()))
+        lane_jp = jp[keep, env]
+        rom = float(np.max(lane_jp[:, idx]) - np.min(lane_jp[:, idx]))
+        up0 = float(np.mean(pg[keep[:5], env, 2]) < -0.85)
+        gate = float(drop > 0.20 and ret < 0.08 and up0 > 0.7)
+        scores.append(float(np.clip(gate * rom / 1.2, 0.0, 1.0)))
+    return {"spec_score": float(np.mean(scores))}
 '''
 
 ALL_ZERO = '''def compute_spec(arrays, behavior, meta):
@@ -726,6 +731,11 @@ def test_metric_prompt_requires_raw_exact_continuity() -> None:
     assert "must never bridge a violating frame" in prompt
     assert "A stated frame count is exact" in prompt
     assert "NEVER cap, scale, shorten" in prompt
+    assert "first_episode_valid_mask" in prompt
+    assert "Invalid reset/settling/padding frames may not start" in prompt
+    assert "runs may never bridge an invalid sample" in prompt
+    assert "use `root_link_ang_vel_b`" in prompt
+    assert "ALL columns of `joint_vel`" in prompt
 
 
 def test_validation_retry_feedback_is_cumulative(tmp_path, monkeypatch) -> None:
@@ -842,10 +852,18 @@ def test_generate_emits_regenerating_on_validation_failure(tmp_path):
 COARSE_DIP = '''import numpy as np
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
-    if root is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if root is None or valid is None:
         return {"spec_score": 0.0}
-    z = root[..., 2]; drop = float(np.mean(z[:6].mean(0) - z.min(0)))
-    return {"spec_score": 1.0 if drop > 0.20 else 0.0}
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 7:
+            passed.append(False)
+            continue
+        z = root[keep, env, 2]
+        passed.append(bool(z[:6].mean() - z.min() > 0.20))
+    return {"spec_score": float(np.mean(passed))}
 '''
 
 

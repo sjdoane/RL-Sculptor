@@ -144,33 +144,36 @@ ABSTRACT_OBJECTIVE = {
 
 def compute_spec(arrays, behavior, meta):
     root = arrays["root_link_pos_w"]
-    height_gain = float((root[..., 2].max(axis=0) - root[..., 2].min(axis=0)).mean())
     waypoint = arrays["goal__complete_course__waypoint_index"]
-    waypoint_max = float(waypoint.max())
-    ordered_steps = float(np.mean((np.diff(waypoint, axis=0) > 0).sum(axis=0) >= 4))
+    valid = arrays.get("first_episode_valid_mask")
     left_contact = arrays.get("left_foot_contact")
     right_contact = arrays.get("right_foot_contact")
-    if left_contact is None or right_contact is None:
-        airborne_hops = 0.0
-    else:
-        flight = (left_contact < 0.5) & (right_contact < 0.5)
+    success = arrays["goal__complete_course__success"]
+    if valid is None or left_contact is None or right_contact is None:
+        return {"spec_score": 0.0}
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 25:
+            passed.append(False)
+            continue
+        lane_root = root[keep, env]
+        lane_waypoint = waypoint[keep, env]
+        flight = ((left_contact[keep, env] < 0.5)
+                  & (right_contact[keep, env] < 0.5))
         starts = flight[1:] & (~flight[:-1])
-        airborne_hops = float(np.mean(starts.sum(axis=0) >= 3))
-    completed = float(arrays["goal__complete_course__success"].mean())
-    physical = float(height_gain > 0.9)
-    final_motion = np.linalg.norm(np.diff(root[-25:], axis=0), axis=-1)
-    final_pause = float(final_motion.mean() < 0.01)
-    progress = float(np.clip(waypoint_max / 4.0, 0.0, 1.0))
+        final_motion = np.linalg.norm(np.diff(lane_root[-25:], axis=0), axis=-1)
+        passed.append(bool(
+            lane_root[:, 2].max() - lane_root[:, 2].min() > 0.9
+            and np.sum(np.diff(lane_waypoint) > 0) >= 4
+            and starts.sum() >= 3
+            and final_motion.mean() < 0.01
+            and np.mean(success[keep[-3:], env]) >= 1.0
+        ))
+    score = float(np.mean(passed))
     return {
-        "spec_score": float(
-            physical * airborne_hops * final_pause
-            * ordered_steps * progress * completed),
-        "physical_traversal": physical,
-        "airborne_hops": airborne_hops,
-        "final_stable_pause": final_pause,
-        "ordered_waypoint_steps": ordered_steps,
-        "waypoint_progress": progress,
-        "completion_gate": completed,
+        "spec_score": score,
+        "completion_gate": score,
     }
 '''
 
@@ -476,21 +479,30 @@ ABSTRACT_OBJECTIVE = {{"phases": ["move_forward", "recover", "dwell"]}}
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
     success = arrays.get("{success_name}")
-    if root is None or success is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if root is None or success is None or valid is None:
         return {{"spec_score": 0.0}}
-    dx = root[-1, :, 0] - root[0, :, 0]
     dt = float(behavior.get("step_dt", 0.02) or 0.02)
-    speed = np.linalg.norm(
-        np.diff(root, axis=0)[..., :2], axis=-1) / dt
-    quiet = speed < 0.12
-    run = np.zeros(root.shape[1])
-    best = np.zeros(root.shape[1])
-    for t in range(quiet.shape[0]):
-        run = np.where(quiet[t], run + 1.0, 0.0)
-        best = np.maximum(best, run)
-    physical = (dx > 0.5) & (best >= round(2.0 / dt))
-    completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
-    return {{"spec_score": float(np.mean(physical & completed))}}
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < round(2.0 / dt) + 1:
+            passed.append(False)
+            continue
+        lane_root = root[keep, env]
+        speed = np.linalg.norm(np.diff(lane_root, axis=0)[..., :2], axis=-1) / dt
+        quiet = speed < 0.12
+        run = 0
+        best = 0
+        for is_quiet in quiet:
+            run = run + 1 if is_quiet else 0
+            best = max(best, run)
+        passed.append(bool(
+            lane_root[-1, 0] - lane_root[0, 0] > 0.5
+            and best >= round(2.0 / dt)
+            and np.mean(success[keep[-3:], env]) >= 1.0
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
 '''
     path = _write_metric(tmp_path, source, "planar_route.py")
 
@@ -514,6 +526,188 @@ def compute_spec(arrays, behavior, meta):
     assert scores["prompt_competent"] > 0.9
     assert scores["catalog_interrupted_hold"] == pytest.approx(0.0)
     assert result["gates"]["continuous_hold_interruption"]
+    assert result["gates"]["temporal_validity_channel"]
+    assert result["gates"]["temporal_invalid_support"]
+    assert scores["temporal_invalid_support"] == pytest.approx(0.0)
+
+
+def test_temporal_metric_rejects_reset_flight_outside_official_support(
+    tmp_path: Path,
+) -> None:
+    """Reset both-air frames plus an invalid sequence cannot establish flight.
+
+    The validator's adversarial rollout places reset-like bilateral flight and
+    the otherwise competent route in the invalid prefix, followed by only a
+    short valid post-route state. Reading the mask as a no-op is rejected.
+    """
+    draft = author_environment(
+        "Build a slalom with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": ["move_forward", "jump", "land", "dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    root = arrays["root_link_pos_w"]
+    left = arrays["left_foot_contact"]
+    right = arrays["right_foot_contact"]
+    success = arrays["{success_name}"]
+    valid = arrays.get("first_episode_valid_mask")
+    if valid is None:
+        return {{"spec_score": 0.0}}
+    flight = (left < 0.5) & (right < 0.5)
+    starts = flight[1:] & (~flight[:-1])
+    speed = np.linalg.norm(np.diff(root, axis=0)[..., :2], axis=-1) / 0.02
+    route = root[-1, :, 0] - root[0, :, 0] > 0.5
+    held = np.all(speed[-100:] < 0.12, axis=0)
+    completed = success[-1] > 0.5
+    passed = route & (starts.sum(axis=0) >= 1) & held & completed
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "ignores_validity.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Run through the ordered route, then jump and land, then hold "
+            "still for 100 uninterrupted frames"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["gates"]["temporal_validity_channel"]
+    assert not result["gates"]["temporal_invalid_support"]
+    assert result["archetype_scores"]["temporal_invalid_support"] > 0.9
+    assert any(
+        "reset-like bilateral-flight prefix" in reason
+        for reason in result["reasons"]
+    )
+
+
+def test_terminal_quiet_rejects_gravity_derivative_and_role_subset(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Walk to a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+ABSTRACT_OBJECTIVE = {{"phases": ["dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays.get("first_episode_valid_mask")
+    joint_vel = arrays["joint_vel"]
+    gravity = arrays["projected_gravity_b"]
+    recorded_angular = arrays.get("root_link_ang_vel_b")
+    success = arrays["{success_name}"]
+    if valid is None or recorded_angular is None:
+        return {{"spec_score": 0.0}}
+    roles = (meta or {{}}).get("joint_roles", {{}})
+    knees = [roles[name] for name in REQUIRED_JOINT_ROLES if name in roles]
+    passed = []
+    for env in range(joint_vel.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 100 or not knees:
+            passed.append(False)
+            continue
+        lane_joint = joint_vel[keep, env]
+        derived_angular = np.linalg.norm(
+            np.diff(gravity[keep, env], axis=0), axis=-1) / 0.02
+        passed.append(bool(
+            np.all(np.abs(lane_joint[-100:, knees]) < 0.12)
+            and np.all(derived_angular[-99:] < 0.12)
+            and success[keep[-1], env] > 0.5
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "narrow_quiet.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Hold 100 uninterrupted frames of base angular velocity and "
+            "whole-body joint velocity quiet"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["gates"]["recorded_base_angular_channel"]
+    assert result["gates"]["whole_body_joint_velocity_channel"]
+    assert not result["gates"]["recorded_base_angular_violation"]
+    assert not result["gates"]["whole_body_joint_velocity_violation"]
+    assert result["archetype_scores"]["recorded_base_angular_violation"] > 0.9
+    assert result["archetype_scores"]["whole_body_joint_velocity_violation"] > 0.9
+
+
+def test_terminal_quiet_accepts_recorded_base_angular_and_all_joints(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Walk to a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": ["dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays.get("first_episode_valid_mask")
+    joint_vel = arrays["joint_vel"]
+    angular = arrays.get("root_link_ang_vel_b")
+    success = arrays["{success_name}"]
+    if valid is None or angular is None:
+        return {{"spec_score": 0.0}}
+    passed = []
+    for env in range(joint_vel.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 100:
+            passed.append(False)
+            continue
+        passed.append(bool(
+            np.all(np.abs(joint_vel[keep[-100:], env, :]) < 0.12)
+            and np.all(np.linalg.norm(angular[keep[-100:], env], axis=-1) < 0.12)
+            and success[keep[-1], env] > 0.5
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "whole_body_quiet.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Hold 100 uninterrupted frames of base angular velocity and "
+            "whole-body joint velocity quiet"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["gates"]["temporal_invalid_support"]
+    assert result["gates"]["recorded_base_angular_violation"]
+    assert result["gates"]["whole_body_joint_velocity_violation"]
+    assert result["archetype_scores"]["temporal_invalid_support"] == pytest.approx(0.0)
+    assert result["archetype_scores"]["recorded_base_angular_violation"] == pytest.approx(0.0)
+    assert result["archetype_scores"]["whole_body_joint_velocity_violation"] == pytest.approx(0.0)
 
 
 def test_continuous_hold_rejects_quiet_sample_fraction_proxy(

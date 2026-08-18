@@ -23,10 +23,18 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 # world compiler and the metric runtime share one source without an import
 # cycle.
 BASE_METRIC_ARRAYS = (
+    # Official per-lane support for the first episode. Generated temporal
+    # metrics use this rather than treating frozen/reset padding as evidence
+    # for a phase, event, or hold.
+    "first_episode_valid_mask",
     "joint_pos",
     "joint_vel",
     "projected_gravity_b",
     "root_link_pos_w",
+    # Prefer the simulator-recorded physical channel for base-angular
+    # predicates. Differentiating projected gravity loses yaw and amplifies
+    # discretization noise, so it is not an equivalent substitute.
+    "root_link_ang_vel_b",
     "left_foot_contact",
     "right_foot_contact",
     "left_foot_pos_b",

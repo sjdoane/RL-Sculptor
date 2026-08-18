@@ -726,6 +726,63 @@ def _requires_uninterrupted_hold(behavior_goal: Optional[str]) -> bool:
     return explicit or (duration and dwell)
 
 
+def _requires_temporal_validity(behavior_goal: Optional[str]) -> bool:
+    """Return whether the requested evidence has temporal semantics.
+
+    A scalar final-state predicate does not need a timeline. Ordered phases,
+    physical events, and exact/continuous dwell claims do: reset and padding
+    samples must not become evidence for them.
+    """
+    goal = (behavior_goal or "").lower()
+    if _requires_uninterrupted_hold(goal):
+        return True
+    return any(
+        token in goal
+        for token in (
+            " ordered ", " in order", "sequence", " sequential",
+            " then ", " after ", " before ", "followed by",
+            "takeoff", "take-off", "airborne", "flight phase",
+            "landing", "land then", "event count", "transition count",
+            "post-completion", " frames", "consecutive",
+        )
+    )
+
+
+def _requires_base_angular_quiet(behavior_goal: Optional[str]) -> bool:
+    """Return whether recorded base angular velocity is part of a quiet gate."""
+    goal = (behavior_goal or "").lower()
+    angular = "angular" in goal or "rotational velocity" in goal
+    quiet = any(
+        token in goal
+        for token in (
+            "quiet", "still", "stationary", "stop", "hold", "dwell",
+            "settle", "settled", "low velocity", "low velocities",
+        )
+    )
+    return angular and quiet
+
+
+def _requires_whole_body_joint_quiet(
+    behavior_goal: Optional[str],
+) -> bool:
+    """Return whether terminal joint quiet is requested without a role scope."""
+    goal = (behavior_goal or "").lower()
+    joint_velocity = (
+        "joint velocity" in goal
+        or "joint velocities" in goal
+        or "joint-velocity" in goal
+        or "joint quiet" in goal
+    )
+    quiet = any(
+        token in goal
+        for token in (
+            "quiet", "still", "stationary", "stop", "hold", "dwell",
+            "settle", "settled", "low velocity", "low velocities",
+        )
+    )
+    return joint_velocity and quiet
+
+
 def _requested_terminal_hold_steps(
     behavior_goal: Optional[str], *, step_dt: float = 0.02,
 ) -> int:
@@ -777,6 +834,80 @@ def _interrupted_hold_probe(
     delta = 0.30 * float(step_dt)
     for step in np.unique(spike_steps):
         root[step:, :, 0] += delta
+    return probe
+
+
+def _invalid_temporal_support_probe(
+    arrays: Mapping[str, Any], *, tail_steps: int = 12,
+) -> dict[str, Any]:
+    """Put all apparent temporal evidence outside official support.
+
+    The invalid prefix deliberately begins with reset-like bilateral flight,
+    then contains the otherwise competent rollout.  Only a short repeated
+    post-route state is valid.  That suffix may truthfully prove a final
+    state, but cannot prove the earlier phase sequence or a long hold.
+    """
+    probe: dict[str, Any] = {}
+    first = next(
+        (
+            value for value in arrays.values()
+            if isinstance(value, np.ndarray) and value.ndim >= 2
+        ),
+        None,
+    )
+    if first is None:
+        return dict(arrays)
+    time_steps, num_envs = first.shape[:2]
+    tail_steps = max(1, min(int(tail_steps), max(1, time_steps // 3)))
+    for key, value in arrays.items():
+        if (
+            isinstance(value, np.ndarray)
+            and value.ndim >= 2
+            and value.shape[:2] == (time_steps, num_envs)
+        ):
+            suffix = np.repeat(value[-1:], tail_steps, axis=0)
+            probe[key] = np.concatenate((value.copy(), suffix), axis=0)
+        else:
+            probe[key] = value
+
+    valid = np.zeros((time_steps + tail_steps, num_envs), dtype=bool)
+    valid[-tail_steps:] = True
+    probe["first_episode_valid_mask"] = valid
+
+    # Reset transients can briefly show both feet off the ground before a
+    # controller owns the episode. Make that exact failure mode adversarial.
+    reset_steps = min(6, time_steps)
+    for key in ("left_foot_contact", "right_foot_contact"):
+        channel = probe.get(key)
+        if isinstance(channel, np.ndarray) and channel.ndim >= 2:
+            channel[:reset_steps] = 0.0
+    return probe
+
+
+def _terminal_channel_violation_probe(
+    arrays: Mapping[str, Any],
+    *,
+    channel_name: str,
+    hold_steps: int,
+    joint_columns: Optional[Sequence[int]] = None,
+) -> dict[str, Any]:
+    """Clone a competent rollout and violate one recorded terminal channel."""
+    probe = {
+        key: value.copy() if hasattr(value, "copy") else value
+        for key, value in arrays.items()
+    }
+    channel = probe.get(channel_name)
+    if not isinstance(channel, np.ndarray) or channel.ndim != 3:
+        return probe
+    start = max(0, channel.shape[0] - max(1, int(hold_steps)))
+    if channel_name == "joint_vel":
+        columns = list(joint_columns or range(channel.shape[2]))
+        if columns:
+            channel[start:, :, columns] = 1.0
+    else:
+        # Yaw is intentionally invisible in projected gravity. A metric that
+        # substitutes d(gravity)/dt therefore misses this physical violation.
+        channel[start:, :, 2] = 0.6
     return probe
 
 
@@ -1292,10 +1423,14 @@ def _abstract_objective_probe(
             joints[b:] = joints[b - 1]
 
     return {
+        "first_episode_valid_mask": np.ones(
+            (probe_steps, E), dtype=bool),
         "joint_pos": joints,
         "joint_vel": np.gradient(joints, axis=0) / 0.02,
         "projected_gravity_b": gravity,
         "root_link_pos_w": root,
+        "root_link_ang_vel_b": np.zeros(
+            (probe_steps, E, 3), dtype=np.float64),
         "left_foot_pos_b": lfoot,
         "right_foot_pos_b": rfoot,
         "left_foot_contact": contact_l,
@@ -1316,8 +1451,17 @@ def _archetypes() -> dict[str, dict]:
     t = np.arange(T)
 
     def arrays(joint_pos, joint_vel, gravity, root, lfoot=None, rfoot=None):
-        d = {"joint_pos": joint_pos, "joint_vel": joint_vel,
-             "projected_gravity_b": gravity, "root_link_pos_w": root}
+        time_steps, num_envs = root.shape[:2]
+        d = {
+            "first_episode_valid_mask": np.ones(
+                (time_steps, num_envs), dtype=bool),
+            "joint_pos": joint_pos,
+            "joint_vel": joint_vel,
+            "projected_gravity_b": gravity,
+            "root_link_pos_w": root,
+            "root_link_ang_vel_b": np.zeros(
+                (time_steps, num_envs, 3), dtype=np.float64),
+        }
         if lfoot is not None:
             d["left_foot_pos_b"] = lfoot
         if rfoot is not None:
@@ -1527,6 +1671,24 @@ def _score(fn, arrays, meta) -> float:
     return float(out.get("spec_score", float("nan")))
 
 
+def _score_with_actual_shape(fn, arrays, meta) -> float:
+    """Score a shape-changing adversarial probe with honest runtime facts."""
+    first = next(
+        value for value in arrays.values()
+        if isinstance(value, np.ndarray) and value.ndim >= 2
+    )
+    out = fn(
+        arrays,
+        {
+            "max_episode_steps": int(first.shape[0]),
+            "rollout_num_envs": int(first.shape[1]),
+            "step_dt": 0.02,
+        },
+        meta,
+    )
+    return float(out.get("spec_score", float("nan")))
+
+
 # §Ship 47: skills performed from a roughly stationary base. For these a
 # forward WALKER is a Goodhart distractor that must score LOW; for the
 # locomotion family a walker IS the target, and for an unresolved family
@@ -1558,6 +1720,24 @@ def _physical_vel(jp: np.ndarray) -> np.ndarray:
     (the best-of-N selector) so the two never diverge (a bare np.gradient is dt× too
     small and silently mis-scales any velocity-thresholding channel)."""
     return np.gradient(jp, axis=0) / _PROBE_DT
+
+
+def _with_official_base_channels(arrays: dict[str, Any]) -> dict[str, Any]:
+    """Attach universal runtime support channels to a synthetic rollout."""
+    first = next(
+        value for value in arrays.values()
+        if isinstance(value, np.ndarray) and value.ndim >= 2
+    )
+    time_steps, num_envs = first.shape[:2]
+    arrays.setdefault(
+        "first_episode_valid_mask",
+        np.ones((time_steps, num_envs), dtype=bool),
+    )
+    arrays.setdefault(
+        "root_link_ang_vel_b",
+        np.zeros((time_steps, num_envs, 3), dtype=np.float64),
+    )
+    return arrays
 
 
 def _selectivity_probe(fn, meta) -> dict[str, float]:
@@ -1605,6 +1785,7 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
         # not kick); contact 1.0 (feet on the ground). A metric that abstains on absence
         # (the contract) is unaffected; one that hard-reads them no longer false-rejects.
         z = np.zeros((T, E, 3)); c = np.ones((T, E))
+        _with_official_base_channels(d)
         d["left_foot_pos_b"] = z; d["right_foot_pos_b"] = z.copy()
         d["left_foot_contact"] = c; d["right_foot_contact"] = c.copy()
         return d
@@ -1719,8 +1900,12 @@ def _graded_fold_rung(depth: float, rom: float) -> dict:
     fold = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0
     jp = rom * fold[:, None, None] * np.ones((T, E, J))
     root = np.zeros((T, E, 3)); root[..., 2] = 0.7 - depth * fold[:, None]
-    return {"joint_pos": jp, "joint_vel": _physical_vel(jp),
-            "projected_gravity_b": _upright_g(), "root_link_pos_w": root}
+    return _with_official_base_channels({
+        "joint_pos": jp,
+        "joint_vel": _physical_vel(jp),
+        "projected_gravity_b": _upright_g(),
+        "root_link_pos_w": root,
+    })
 
 
 def _graded_posture_rung(tilt: float, rom: float) -> dict:
@@ -1735,8 +1920,12 @@ def _graded_posture_rung(tilt: float, rom: float) -> dict:
     g[..., 2] = -1.0 + tilt * fold[:, None]
     g[..., 0] = tilt * fold[:, None]
     root = np.zeros((T, E, 3)); root[..., 2] = 0.6
-    return {"joint_pos": jp, "joint_vel": _physical_vel(jp),
-            "projected_gravity_b": g, "root_link_pos_w": root}
+    return _with_official_base_channels({
+        "joint_pos": jp,
+        "joint_vel": _physical_vel(jp),
+        "projected_gravity_b": g,
+        "root_link_pos_w": root,
+    })
 
 
 def graded_discrimination(
@@ -1761,12 +1950,20 @@ def graded_discrimination(
     crash on a rung scores 0)."""
     jp0 = np.zeros((T, E, J))
     root_up = np.zeros((T, E, 3)); root_up[..., 2] = 0.7
-    still = {"joint_pos": jp0, "joint_vel": jp0,
-             "projected_gravity_b": _upright_g(), "root_link_pos_w": root_up}
+    still = _with_official_base_channels({
+        "joint_pos": jp0,
+        "joint_vel": jp0,
+        "projected_gravity_b": _upright_g(),
+        "root_link_pos_w": root_up,
+    })
     gf = np.zeros((T, E, 3)); gf[..., 0] = 1.0
     rootf = np.zeros((T, E, 3)); rootf[..., 2] = 0.3
-    fallen = {"joint_pos": jp0, "joint_vel": jp0,
-              "projected_gravity_b": gf, "root_link_pos_w": rootf}
+    fallen = _with_official_base_channels({
+        "joint_pos": jp0,
+        "joint_vel": jp0,
+        "projected_gravity_b": gf,
+        "root_link_pos_w": rootf,
+    })
 
     def _with_case(a: dict, case: str) -> dict:
         if channel_catalog is None:
@@ -2382,6 +2579,36 @@ def validate_generated_metric(
         reasons.append(f"[contract] references unavailable arrays: {sorted(bad_keys)} "
                        f"(allowed: {sorted(allowed_arrays)})")
 
+    temporal_validity_required = _requires_temporal_validity(behavior_goal)
+    if temporal_validity_required:
+        temporal_channel_ok = "first_episode_valid_mask" in referenced_keys
+        gates["temporal_validity_channel"] = temporal_channel_ok
+        if not temporal_channel_ok:
+            reasons.append(
+                "[temporal-validity] ordered phases, events, runs, and holds "
+                "must use arrays['first_episode_valid_mask']; reset, settling, "
+                "and padding frames are not behavioral evidence")
+
+    base_angular_quiet_required = _requires_base_angular_quiet(behavior_goal)
+    if base_angular_quiet_required:
+        recorded_angular_ok = "root_link_ang_vel_b" in referenced_keys
+        gates["recorded_base_angular_channel"] = recorded_angular_ok
+        if not recorded_angular_ok:
+            reasons.append(
+                "[base-angular] terminal base-angular quiet must use recorded "
+                "root_link_ang_vel_b; d(projected_gravity_b)/dt cannot observe "
+                "yaw and is not an equivalent physical channel")
+
+    whole_body_joint_quiet_required = _requires_whole_body_joint_quiet(
+        behavior_goal)
+    if whole_body_joint_quiet_required:
+        joint_velocity_ok = "joint_vel" in referenced_keys
+        gates["whole_body_joint_velocity_channel"] = joint_velocity_ok
+        if not joint_velocity_ok:
+            reasons.append(
+                "[joint-quiet] whole-body or unqualified joint quiet must use "
+                "the recorded joint_vel array across all joints")
+
     # Authored task metrics must consume the compiler's hold-qualified success
     # channel when one exists.  Distance/inside alone admit the two canonical
     # hacks: camping on the region boundary and transient predicate flicker.
@@ -2654,6 +2881,130 @@ def validate_generated_metric(
             reasons.append(f"[bounds] '{name}' out of [0,1] or non-finite: {s1}")
     gates["determinism"] = determ
     gates["bounded"] = bounded
+
+    # Temporal and whole-body semantics get their own counterexamples. Static
+    # array access is necessary but not sufficient: a metric can read a channel
+    # and then ignore it, or quietly narrow a whole-body predicate to two roles.
+    semantic_competent_key = (
+        "catalog_competent"
+        if catalog is not None
+        else (
+            "prompt_competent"
+            if "prompt_competent" in arche
+            else {
+                "kick": "active_kick",
+                "floss": "active_floss",
+                "jump": "active_jump",
+            }.get(family, "active")
+        )
+    )
+    semantic_competent = arche.get(semantic_competent_key)
+    semantic_baseline = scores.get(semantic_competent_key, float("nan"))
+    semantic_ceiling = min(float(distractor_ceiling), 0.05)
+
+    if temporal_validity_required and semantic_competent is not None:
+        temporal_probe = _invalid_temporal_support_probe(semantic_competent)
+        try:
+            temporal_score = _score_with_actual_shape(fn, temporal_probe, meta)
+        except Exception as e:  # noqa: BLE001 - probe failure rejects the metric
+            temporal_score = float("nan")
+            reasons.append(
+                "[temporal-validity] metric raised on invalid-support probe: "
+                f"{type(e).__name__}: {e}")
+        scores["temporal_invalid_support"] = temporal_score
+        temporal_support_ok = (
+            np.isfinite(temporal_score)
+            and (
+                not np.isfinite(semantic_baseline)
+                or semantic_baseline <= semantic_ceiling
+                or temporal_score <= semantic_ceiling
+            )
+        )
+        gates["temporal_invalid_support"] = temporal_support_ok
+        if not temporal_support_ok:
+            reasons.append(
+                "[temporal-validity] a reset-like bilateral-flight prefix and "
+                "otherwise competent sequence scored "
+                f"{temporal_score:.3f} even though only a short post-route "
+                "state was valid; invalid samples must not establish phases, "
+                "events, runs, or holds "
+                f"(required <= {semantic_ceiling:.3f})")
+
+    hold_steps = max(100, _requested_terminal_hold_steps(behavior_goal))
+    if base_angular_quiet_required and semantic_competent is not None:
+        angular_probe = _terminal_channel_violation_probe(
+            semantic_competent,
+            channel_name="root_link_ang_vel_b",
+            hold_steps=hold_steps,
+        )
+        try:
+            angular_score = _score(fn, angular_probe, meta)
+        except Exception as e:  # noqa: BLE001 - probe failure rejects the metric
+            angular_score = float("nan")
+            reasons.append(
+                "[base-angular] metric raised on recorded-yaw probe: "
+                f"{type(e).__name__}: {e}")
+        scores["recorded_base_angular_violation"] = angular_score
+        angular_ok = (
+            np.isfinite(angular_score)
+            and (
+                not np.isfinite(semantic_baseline)
+                or semantic_baseline <= semantic_ceiling
+                or angular_score <= semantic_ceiling
+            )
+        )
+        gates["recorded_base_angular_violation"] = angular_ok
+        if not angular_ok:
+            reasons.append(
+                "[base-angular] recorded yaw velocity remained high through "
+                f"the terminal window but scored {angular_score:.3f}; use "
+                "root_link_ang_vel_b rather than a projected-gravity derivative "
+                f"(required <= {semantic_ceiling:.3f})")
+
+    if whole_body_joint_quiet_required and semantic_competent is not None:
+        role_indices = {
+            int(meta["joint_roles"][role])
+            for role in required_roles
+            if role in meta.get("joint_roles", {})
+        }
+        joint_count = int(semantic_competent["joint_vel"].shape[2])
+        non_role_columns = [
+            index for index in range(joint_count)
+            if index not in role_indices
+        ]
+        # A declaration that genuinely spans every synthetic joint is already
+        # whole-body. Otherwise attack only the omitted joints, leaving every
+        # declared phase-specific role quiet.
+        violation_columns = non_role_columns or list(range(joint_count))
+        joint_probe = _terminal_channel_violation_probe(
+            semantic_competent,
+            channel_name="joint_vel",
+            hold_steps=hold_steps,
+            joint_columns=violation_columns,
+        )
+        try:
+            joint_score = _score(fn, joint_probe, meta)
+        except Exception as e:  # noqa: BLE001 - probe failure rejects the metric
+            joint_score = float("nan")
+            reasons.append(
+                "[joint-quiet] metric raised on omitted-joint probe: "
+                f"{type(e).__name__}: {e}")
+        scores["whole_body_joint_velocity_violation"] = joint_score
+        joint_quiet_ok = (
+            np.isfinite(joint_score)
+            and (
+                not np.isfinite(semantic_baseline)
+                or semantic_baseline <= semantic_ceiling
+                or joint_score <= semantic_ceiling
+            )
+        )
+        gates["whole_body_joint_velocity_violation"] = joint_quiet_ok
+        if not joint_quiet_ok:
+            reasons.append(
+                "[joint-quiet] non-role joints moved throughout the terminal "
+                f"window but scored {joint_score:.3f}; unqualified whole-body "
+                "joint quiet must reduce across every joint_vel column "
+                f"(required <= {semantic_ceiling:.3f})")
 
     # §Ship 49: permutation-robustness — relabel the joint axis (names AND the
     # joint_pos/joint_vel columns, CONSISTENTLY) and re-score. A metric that
