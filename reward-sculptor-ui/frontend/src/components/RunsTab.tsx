@@ -26,6 +26,7 @@ import { qk } from "@/lib/queryKeys";
 import {
   formatContradictionTooltip, formatIterMetrics, naturalnessChipText, selectionLabel, selectionSentence,
 } from "@/lib/selection";
+import { isDeployablePolicy } from "@/lib/policyEvidence";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative, sanitizeConsoleText } from "@/lib/utils";
 import type {
@@ -33,6 +34,7 @@ import type {
   IterEventSummary,
   MissionDetail,
   MissionSummary,
+  PolicySummary,
   ProjectDetail,
   RunDetail,
   RunEvent,
@@ -63,9 +65,111 @@ interface RunDisplayStatus {
   icon: string;
 }
 
+const POST_TRAINING_ROLLOUT_FAILED = "post_training_rollout_failed" as const;
+
+export function PolicyAvailabilityCard({
+  iteration,
+  evaluated,
+  exportHref,
+}: {
+  iteration: number;
+  evaluated: boolean;
+  exportHref: string | null;
+}) {
+  if (!evaluated) {
+    return (
+      <div
+        className="rs-card rs-card-pad"
+        role="status"
+        aria-label={`Iteration ${iteration} preserved unevaluated checkpoint`}
+      >
+        <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+          <Icon name="alert-triangle" size={15} />Preserved unevaluated checkpoint
+        </div>
+        <p className="rs-sub" style={{ margin: "0 0 8px", fontSize: 12, lineHeight: 1.5 }}>
+          Iteration {iteration} has checkpoint bytes, but no server-validated
+          completion and evaluation receipt. It is a recovery input, not a
+          deployable policy.
+        </p>
+        <p className="rs-sub" style={{ margin: 0, fontSize: 11.5, lineHeight: 1.5 }}>
+          To continue, use New run → Project policy → Interrupted or unevaluated after
+          the server lists an attested recovery input.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+        <Icon name="package" size={15} />Deploy this policy
+      </div>
+      <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
+        Download iter {iteration}&apos;s evaluated checkpoint bundled with its reward,
+        env spec, and policy network.
+      </p>
+      {exportHref && (
+        <a
+          href={exportHref}
+          download
+          className="rs-btn rs-btn-primary rs-btn-sm"
+        >
+          <Icon name="download" size={14} />Export policy bundle
+        </a>
+      )}
+    </div>
+  );
+}
+
+export function EvaluationFailureNotice({
+  classification,
+  error,
+}: {
+  classification: ErrorClassification;
+  error: string;
+}) {
+  return (
+    <div
+      className="rs-banner warn"
+      role="alert"
+      style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}
+    >
+      <div className="rs-flex rs-gap-8">
+        <Icon name="alert-triangle" size={17} />
+        <span className="rs-grow">
+          <b>{classification.title?.trim() || "Training completed; rollout evaluation failed"}</b>
+        </span>
+      </div>
+      {classification.detail && (
+        <p style={{ margin: 0, fontSize: 12.5 }}>{classification.detail}</p>
+      )}
+      <p style={{ margin: 0, fontSize: 12.5 }}>
+        The checkpoint was preserved, but rollout evidence was not completed. It is
+        a recovery input, not deployment evidence.
+      </p>
+      <p style={{ margin: 0, fontSize: 11.5 }}>
+        Continue only through New run → Project policy → Interrupted or unevaluated
+        after the server lists an attested recovery input.
+      </p>
+      <details>
+        <summary style={{ cursor: "pointer", fontSize: 11.5 }}>Worker detail</summary>
+        <pre className="mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 10, margin: "6px 0 0", opacity: 0.9 }}>
+          {error}
+        </pre>
+      </details>
+    </div>
+  );
+}
+
 /** Maps a run's raw status/error to a display descriptor for badges,
  *  falling back to the shared STATUS_META lookup for everything else. */
-function runDisplayStatus(run: Pick<RunSummary, "status" | "error">): RunDisplayStatus {
+function runDisplayStatus(run: Pick<
+  RunSummary,
+  "status" | "error" | "error_classification"
+>): RunDisplayStatus {
+  if (run.error_classification?.kind === POST_TRAINING_ROLLOUT_FAILED) {
+    return { label: "Evaluation failed", cls: "amber", icon: "alert-triangle" };
+  }
   if (run.error === CRITERION_NOT_MET_ERROR) {
     return { label: "Criterion not met", cls: "amber", icon: "alert-circle" };
   }
@@ -78,9 +182,13 @@ function runDisplayStatus(run: Pick<RunSummary, "status" | "error">): RunDisplay
 
 /** Badge variant that honors the benign-error remap above; otherwise
  *  identical to <Badge status={run.status} />. */
-function RunStatusBadge({
+export function RunStatusBadge({
   run, big, label,
-}: { run: Pick<RunSummary, "status" | "error">; big?: boolean; label?: string }) {
+}: {
+  run: Pick<RunSummary, "status" | "error" | "error_classification">;
+  big?: boolean;
+  label?: string;
+}) {
   const d = runDisplayStatus(run);
   return (
     <span className={"rs-badge " + d.cls + (big ? " big" : "")}>
@@ -466,6 +574,7 @@ function RunRow({
   // over stage_index+1 — falls back while the mission-detail label map is
   // still loading (or for disk-reconstructed rows with no stage_index).
   const numberLabel = displayLabel ?? (typeof r.stage_index === "number" ? String(r.stage_index + 1) : null);
+  const displayStatus = runDisplayStatus(r);
   return (
     <button className={"rs-runrow" + (selected ? " on" : "") + (stageContext ? " rs-stage" : "")} onClick={onSelect}>
       <RunStatusBadge run={r} label="" />
@@ -487,7 +596,11 @@ function RunRow({
           : r.primary_metric_history}
         w={46}
         h={20}
-        color={r.status === "errored" ? "var(--st-rose)" : r.status === "running" ? "var(--st-amber)" : "var(--st-emerald)"}
+        color={displayStatus.cls === "rose"
+          ? "var(--st-rose)"
+          : displayStatus.cls === "amber"
+            ? "var(--st-amber)"
+            : "var(--st-emerald)"}
       />
     </button>
   );
@@ -1405,6 +1518,7 @@ function ProjectDiskDetailPane({
   slug, summary,
 }: { slug: string; summary: RunSummary | null }) {
   const iters = useProjectIterations(slug);
+  const policies = usePolicies(slug);
   const rows = iters.data ?? [];
 
   const [picked, setPicked] = useState<number | null>(null);
@@ -1416,6 +1530,11 @@ function ProjectDiskDetailPane({
   }, [rows]);
   const activeIter = picked ?? defaultIter;
   const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+  const activePolicy = (policies.data ?? []).find(
+    (policy) => policy.iter_index === activeIter,
+  ) ?? null;
+  const activePolicyDeployable = activePolicy !== null
+    && isDeployablePolicy(activePolicy);
 
   return (
     <div className="rs-runs-detail">
@@ -1488,22 +1607,13 @@ function ProjectDiskDetailPane({
 
       <div className="rs-extra-col">
         {activeIter != null && activeRow?.has_checkpoint && (
-          <div className="rs-card rs-card-pad">
-            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
-              <Icon name="package" size={15} />Deploy this policy
-            </div>
-            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
-              Download iter {activeIter}'s checkpoint bundled with its
-              reward, env spec, and an ONNX/TorchScript policy network.
-            </p>
-            <a
-              href={policyExportUrl(slug, activeIter)}
-              download
-              className="rs-btn rs-btn-primary rs-btn-sm"
-            >
-              <Icon name="download" size={14} />Export policy bundle
-            </a>
-          </div>
+          <PolicyAvailabilityCard
+            iteration={activeIter}
+            evaluated={activePolicyDeployable}
+            exportHref={activePolicyDeployable
+              ? policyExportUrl(slug, activeIter)
+              : null}
+          />
         )}
         <StageRewardsCard slug={slug} stage={null} />
       </div>
@@ -1781,23 +1891,36 @@ function LiveRunDetailPane({
   const liveStageLabel = mission?.stages.find((s) => s.name === stageName)?.display_label ?? null;
 
   const mergedIters = useMergedIterations(iters, events.events);
+  const evaluationFailedAfterCheckpoint =
+    run.data?.error_classification?.kind === POST_TRAINING_ROLLOUT_FAILED;
+  const evaluationFailedIteration = evaluationFailedAfterCheckpoint
+    ? [...mergedIters]
+      .reverse()
+      .find((iter) => iter.status === "errored")?.iter_index
+        ?? mergedIters[mergedIters.length - 1]?.iter_index
+        ?? null
+    : null;
 
-  // Exportable trained checkpoints (disk-backed). Stage runs export from
-  // their own runs tree; plain sculpt runs share the project tree.
+  // Disk-backed checkpoints. Only entries with retained evaluation evidence
+  // are deployable; the rest remain recovery inputs.
   const policies = usePolicies(slug, isStageRun ? { runId } : undefined);
   const exportRunId = isStageRun ? runId : undefined;
-  const exportableIters = useMemo(
-    () => new Set((policies.data ?? []).map((p) => p.iter_index)),
+  const deployableIters = useMemo(
+    () => new Set(
+      (policies.data ?? [])
+        .filter(isDeployablePolicy)
+        .map((policy) => policy.iter_index),
+    ),
     [policies.data],
   );
   // Latest exportable iter OF THIS RUN — iter dirs accumulate across runs
   // in the project tree, so intersect with the run's own iterations.
-  const latestExportable = useMemo(() => {
+  const latestRunPolicy = useMemo<PolicySummary | null>(() => {
     const runIters = new Set(mergedIters.map((it) => it.iter_index));
-    let best: number | null = null;
+    let best: PolicySummary | null = null;
     for (const p of policies.data ?? []) {
-      if (runIters.has(p.iter_index) && (best === null || p.iter_index > best)) {
-        best = p.iter_index;
+      if (runIters.has(p.iter_index) && (best === null || p.iter_index > best.iter_index)) {
+        best = p;
       }
     }
     return best;
@@ -1822,7 +1945,12 @@ function LiveRunDetailPane({
           <EmptyState icon="clock" title="Not started" sub="This run is queued. Iterations appear once training begins." />
         </div>
       ) : (
-        <IterationTimeline iters={mergedIters} selected={selectedIter} onSelect={setSelectedIter} />
+        <IterationTimeline
+          iters={mergedIters}
+          selected={selectedIter}
+          onSelect={setSelectedIter}
+          evaluationFailedIteration={evaluationFailedIteration}
+        />
       )}
 
       <div className="rs-mid-col">
@@ -1918,33 +2046,25 @@ function LiveRunDetailPane({
           )}
         </div>
         {stageRewardsScope && <StageRewardsCard slug={slug} stage={stageRewardsScope} />}
-        {!isActive && latestExportable !== null && (
-          <div className="rs-card rs-card-pad">
-            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
-              <Icon name="package" size={15} />Deploy this policy
-            </div>
-            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
-              Download iter {latestExportable}'s checkpoint bundled with its
-              reward, env spec, and an ONNX/TorchScript policy network.
-            </p>
-            <a
-              href={policyExportUrl(slug, latestExportable, exportRunId)}
-              download
-              className="rs-btn rs-btn-primary rs-btn-sm"
-            >
-              <Icon name="download" size={14} />Export policy bundle
-            </a>
-          </div>
+        {!isActive && latestRunPolicy !== null && (
+          <PolicyAvailabilityCard
+            iteration={latestRunPolicy.iter_index}
+            evaluated={isDeployablePolicy(latestRunPolicy)}
+            exportHref={isDeployablePolicy(latestRunPolicy)
+              ? policyExportUrl(slug, latestRunPolicy.iter_index, exportRunId)
+              : null}
+          />
         )}
         {isActive && <RunGpuCard />}
         {selectedIter !== null && (
           <IterationDetailCard
             iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null}
             exportHref={
-              selectedIter !== null && exportableIters.has(selectedIter)
+              selectedIter !== null && deployableIters.has(selectedIter)
                 ? policyExportUrl(slug, selectedIter, exportRunId)
                 : null
             }
+            evaluationFailed={selectedIter === evaluationFailedIteration}
           />
         )}
       </div>
@@ -2315,12 +2435,25 @@ function RewardVersionTransition({
 }
 
 // ── iteration timeline ────────────────────────────────────────────────
-function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSummary[]; selected: number | null; onSelect: (n: number) => void }) {
+export function IterationTimeline({
+  iters,
+  selected,
+  onSelect,
+  evaluationFailedIteration = null,
+}: {
+  iters: IterEventSummary[];
+  selected: number | null;
+  onSelect: (n: number) => void;
+  evaluationFailedIteration?: number | null;
+}) {
   return (
     <div className="rs-iter-col">
       <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
       {iters.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>no iterations yet</p>}
-      {iters.map((it) => (
+      {iters.map((it) => {
+        const evaluationFailed = it.iter_index === evaluationFailedIteration;
+        const displayStatus = evaluationFailed ? "errored" as const : it.status;
+        return (
         <button
           key={it.iter_index}
           className={"rs-itercard" + (selected === it.iter_index ? " on" : "")}
@@ -2328,7 +2461,15 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
           onClick={() => onSelect(it.iter_index)}
         >
           <div className="rs-itercard-top">
-            <span className="it"><Badge status={it.status} label="" />iter {it.iter_index}</span>
+            <span className="it"><Badge status={displayStatus} label="" />iter {it.iter_index}</span>
+            {evaluationFailed && (
+              <span
+                className="rs-tag"
+                style={{ fontSize: 10, background: "var(--st-amber-bg)", color: "var(--st-amber-fg)" }}
+              >
+                evaluation failed
+              </span>
+            )}
             {/* §Ship 35: objective fitness is the PRIMARY metric (prominent,
                 violet); the reward metric is demoted to a small muted value.
                 Falls back to reward-as-primary on blind runs (no fitness). */}
@@ -2353,12 +2494,12 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
               )
             )}
           </div>
-          {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
+          {displayStatus === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
             <IterProgressBar rlIter={it.rl_iter ?? 0} rlTotal={it.rl_total} pct={it.pct ?? 0} etaS={it.eta_s ?? null} />
           )}
           {(it.reward_version_before !== null || it.reward_version_after !== null) && (
             <div className="rs-flex-between" style={{ marginTop: 5 }}>
-              <RewardVersionTransition versionBefore={it.reward_version_before} versionAfter={it.reward_version_after} editCount={it.edit_count} failureModes={it.failure_modes} status={it.status} />
+              <RewardVersionTransition versionBefore={it.reward_version_before} versionAfter={it.reward_version_after} editCount={it.edit_count} failureModes={it.failure_modes} status={displayStatus} />
               {it.metric_delta !== null && <Delta value={it.metric_delta} />}
             </div>
           )}
@@ -2421,7 +2562,8 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
             </span>
           )}
         </button>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -2462,6 +2604,14 @@ function RunErrorCard({
       </div>
     );
   }
+  if (classification?.kind === POST_TRAINING_ROLLOUT_FAILED) {
+    return (
+      <EvaluationFailureNotice
+        classification={classification}
+        error={error}
+      />
+    );
+  }
 
   const onRegenerate = () => {
     regen.mutate(undefined, {
@@ -2489,11 +2639,21 @@ function RunErrorCard({
   );
 }
 
-function IterationDetailCard({ iter, exportHref }: { iter: IterEventSummary | null; exportHref: string | null }) {
+function IterationDetailCard({
+  iter,
+  exportHref,
+  evaluationFailed = false,
+}: {
+  iter: IterEventSummary | null;
+  exportHref: string | null;
+  evaluationFailed?: boolean;
+}) {
   if (!iter) return null;
   return (
     <div className="rs-card rs-card-pad">
-      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}><Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {iter.status}</div>
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}>
+        <Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {evaluationFailed ? "evaluation failed" : iter.status}
+      </div>
       <div className="rs-vgap-8">
         {exportHref && (
           <div>

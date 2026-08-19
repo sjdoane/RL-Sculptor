@@ -13,6 +13,7 @@ import {
   listStartingSkills,
   uploadStartingSkill,
 } from "@/lib/api";
+import { isDeployablePolicy } from "@/lib/policyEvidence";
 import type {
   PolicyEvidenceValue,
   PolicyRecoverySnapshot,
@@ -194,26 +195,39 @@ function CheckpointReceipt({ checkpoint }: { checkpoint: PolicySummary }) {
           tone={checkpoint.metric_id && checkpoint.metric_sha256 ? "good" : "warning"}
         />
         <SummaryCell
-          icon="activity"
-          label="Route evidence"
-          title={evidenceValue(checkpoint.route_evidence)}
-          description={checkpoint.route_evidence?.key ?? "No route key persisted"}
-          tone={checkpoint.route_evidence ? "good" : "warning"}
+          icon="check-circle"
+          label="Evaluation coverage"
+          title={humanize(checkpoint.evidence_status)}
+          description="Metric-specific evidence retained by the evaluator"
+          tone={checkpoint.evidence_status === "complete" ? "good" : "neutral"}
         />
-        <SummaryCell
-          icon="shield-check"
-          label="Contact evidence"
-          title={evidenceValue(checkpoint.contact_evidence)}
-          description={checkpoint.contact_evidence?.key ?? "No contact key persisted"}
-          tone={checkpoint.contact_evidence ? "good" : "warning"}
-        />
-        <SummaryCell
-          icon="pause"
-          label="Hold evidence"
-          title={evidenceValue(checkpoint.hold_evidence)}
-          description={checkpoint.hold_evidence?.key ?? "No hold key persisted"}
-          tone={checkpoint.hold_evidence ? "good" : "warning"}
-        />
+        {checkpoint.route_evidence && (
+          <SummaryCell
+            icon="activity"
+            label="Route evidence"
+            title={evidenceValue(checkpoint.route_evidence)}
+            description={checkpoint.route_evidence.key}
+            tone="good"
+          />
+        )}
+        {checkpoint.contact_evidence && (
+          <SummaryCell
+            icon="shield-check"
+            label="Contact evidence"
+            title={evidenceValue(checkpoint.contact_evidence)}
+            description={checkpoint.contact_evidence.key}
+            tone="good"
+          />
+        )}
+        {checkpoint.hold_evidence && (
+          <SummaryCell
+            icon="pause"
+            label="Hold evidence"
+            title={evidenceValue(checkpoint.hold_evidence)}
+            description={checkpoint.hold_evidence.key}
+            tone="good"
+          />
+        )}
       </div>
       <div className="rs-sub" style={{ fontSize: 10.5, lineHeight: 1.45 }}>
         {checkpoint.selected
@@ -258,14 +272,14 @@ function RecoverySnapshotReceipt({
         <strong style={{ fontSize: 12.5 }}>
           Cycle {snapshot.iteration} · PPO snapshot {snapshot.ppo_step}
         </strong>
-        <span className="rs-badge amber">interrupted</span>
+        <span className="rs-badge amber">recovery input</span>
         <span className="rs-badge slate">unevaluated</span>
         {legacy && <span className="rs-badge amber">legacy receipt</span>}
       </div>
       <div className="rs-sub" style={{ fontSize: 11.5, lineHeight: 1.5 }}>
         The run last reported PPO iteration {snapshot.last_observed_ppo_iteration} and
         ended with status <strong>{humanize(snapshot.source_job_status)}</strong>.
-        This save has no rollout, objective score, criterion result, or success claim.
+        This recovery save has no rollout, objective score, criterion result, or success claim.
       </div>
       <dl
         style={{
@@ -892,10 +906,14 @@ export function StartingPointPickerDialog({
   });
   const recoverySnapshots = recoverySnapshotsQuery.data ?? [];
   const receipts = skillsQuery.data?.skills ?? [];
+  const evaluatedCheckpoints = useMemo(
+    () => checkpoints.filter(isDeployablePolicy),
+    [checkpoints],
+  );
   const selectedReceipt = receipts.find(
     (receipt) => receipt.skill.skill_id === draft.starting_skill_id,
   ) ?? null;
-  const selectedCheckpoint = checkpoints.find(
+  const selectedCheckpoint = evaluatedCheckpoints.find(
     (checkpoint) => checkpoint.iter_index === draft.warm_start_iteration,
   ) ?? null;
   const selectedRecoverySnapshot = recoverySnapshots.find(
@@ -976,7 +994,7 @@ export function StartingPointPickerDialog({
         return;
       }
       setProjectPolicySource("completed");
-      const marked = checkpoints.filter((checkpoint) => checkpoint.selected);
+      const marked = evaluatedCheckpoints.filter((checkpoint) => checkpoint.selected);
       const canonicalSelection = marked.length === 1 ? marked[0] : null;
       setDraft({
         ...DEFAULT_SELECTION,
@@ -1021,7 +1039,7 @@ export function StartingPointPickerDialog({
   const chooseProjectPolicySource = (source: ProjectPolicySource) => {
     setProjectPolicySource(source);
     if (source === "completed") {
-      const marked = checkpoints.filter((checkpoint) => checkpoint.selected);
+      const marked = evaluatedCheckpoints.filter((checkpoint) => checkpoint.selected);
       const canonicalSelection = marked.length === 1 ? marked[0] : null;
       setDraft((current) => ({
         ...DEFAULT_SELECTION,
@@ -1082,9 +1100,8 @@ export function StartingPointPickerDialog({
     });
   };
 
-  const checkpointValid = draft.warm_start_iteration != null
-    && Number.isInteger(draft.warm_start_iteration)
-    && draft.warm_start_iteration >= 0;
+  const checkpointValid = selectedCheckpoint !== null
+    && draft.warm_start_iteration === selectedCheckpoint.iter_index;
   const snapshotRef = draft.warm_start_snapshot ?? null;
   const interruptedSnapshotValid = selectedRecoverySnapshot?.selectable === true
     && snapshotRef?.snapshot_id === selectedRecoverySnapshot.snapshot_id
@@ -1169,7 +1186,7 @@ export function StartingPointPickerDialog({
             selected={draft.kind === "project_checkpoint"}
             icon="history"
             title="Project policy"
-            description="Choose a completed project checkpoint or an explicitly unevaluated interrupted snapshot."
+            description="Choose an evaluated policy or an explicitly acknowledged recovery checkpoint."
             onSelect={chooseKind}
           />
           <KindChoice
@@ -1212,8 +1229,8 @@ export function StartingPointPickerDialog({
                   onKeyDown={moveWithinRadioGroup}
                   className={projectPolicySource === "completed" ? "selected" : undefined}
                 >
-                  <span>Completed checkpoints</span>
-                  <small>Completed iteration artifact; available evidence shown below</small>
+                  <span>Evaluated policies</span>
+                  <small>Checkpoint with a server-validated completion receipt</small>
                 </button>
                 <button
                   type="button"
@@ -1224,8 +1241,8 @@ export function StartingPointPickerDialog({
                   onKeyDown={moveWithinRadioGroup}
                   className={projectPolicySource === "interrupted" ? "selected" : undefined}
                 >
-                  <span>Interrupted snapshots</span>
-                  <small>Periodic PPO save; unevaluated recovery input</small>
+                  <span>Interrupted or unevaluated</span>
+                  <small>Server-attested recovery input; not deployment evidence</small>
                 </button>
               </div>
             </fieldset>
@@ -1234,9 +1251,13 @@ export function StartingPointPickerDialog({
               <>
                 <div>
                   <label htmlFor="starting-point-checkpoint" style={{ display: "block", fontSize: 12, fontWeight: 650, marginBottom: 6 }}>
-                    Completed iteration
+                    Evaluated iteration
                   </label>
-                  {checkpoints.length > 0 ? (
+                  {checkpointsLoading ? (
+                    <div role="status" className="rs-sub" style={{ fontSize: 11.5 }}>
+                      Loading evaluated policies…
+                    </div>
+                  ) : evaluatedCheckpoints.length > 0 ? (
                     <select
                       id="starting-point-checkpoint"
                       className="rs-input"
@@ -1247,7 +1268,7 @@ export function StartingPointPickerDialog({
                       }))}
                     >
                       <option value="">Choose an iteration…</option>
-                      {[...checkpoints]
+                      {[...evaluatedCheckpoints]
                         .sort((a, b) => b.iter_index - a.iter_index)
                         .map((checkpoint) => (
                           <option key={checkpoint.iter_index} value={checkpoint.iter_index}>
@@ -1262,25 +1283,15 @@ export function StartingPointPickerDialog({
                         ))}
                     </select>
                   ) : (
-                    <input
-                      id="starting-point-checkpoint"
-                      className="rs-input mono"
-                      type="number"
-                      min={0}
-                      step={1}
-                      disabled={checkpointsLoading}
-                      value={draft.warm_start_iteration ?? ""}
-                      placeholder={checkpointsLoading ? "Loading checkpoints…" : "e.g. 12"}
-                      onChange={(event) => setDraft((current) => ({
-                        ...current,
-                        warm_start_iteration: event.target.value === "" ? null : Number(event.target.value),
-                      }))}
-                    />
+                    <div role="status" className="rs-sub" style={{ fontSize: 11.5, lineHeight: 1.45 }}>
+                      No evaluated policy is available. Preserved checkpoints appear under
+                      Interrupted or unevaluated only after server attestation.
+                    </div>
                   )}
                 </div>
                 {selectedCheckpoint ? (
                   <CheckpointReceipt checkpoint={selectedCheckpoint} />
-                ) : checkpoints.length > 0 ? (
+                ) : evaluatedCheckpoints.length > 0 ? (
                   <div
                     role="status"
                     style={{
@@ -1314,14 +1325,14 @@ export function StartingPointPickerDialog({
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "10px 12px", borderRadius: "var(--radius-md)", background: "var(--st-amber-bg)", color: "var(--st-amber-fg)", fontSize: 11.5, lineHeight: 1.45 }}>
                   <Icon name="alert-triangle" size={14} />
                   <span>
-                    Warm-start from an interrupted snapshot only when preserving partial training
-                    is worth the uncertainty. It is not a completed checkpoint, evaluated policy,
-                    full resume, or success claim.
+                    Warm-start from an interrupted or unevaluated checkpoint only when preserving
+                    partial training is worth the uncertainty. It is not an evaluated policy, full
+                    resume, deployment artifact, or success claim.
                   </span>
                 </div>
                 {recoverySnapshotsQuery.isLoading ? (
                   <div role="status" className="rs-sub" style={{ fontSize: 11.5 }}>
-                    Verifying interrupted snapshot receipts…
+                    Verifying recovery receipts…
                   </div>
                 ) : recoverySnapshotsQuery.isError ? (
                   <div role="alert" style={{ color: "var(--st-rose-fg)", fontSize: 11.5, lineHeight: 1.45 }}>
@@ -1330,10 +1341,10 @@ export function StartingPointPickerDialog({
                   </div>
                 ) : recoverySnapshots.length === 0 ? (
                   <div role="status" className="rs-sub" style={{ fontSize: 11.5, lineHeight: 1.45 }}>
-                    No server-attested interrupted snapshots are available for this project.
+                    No server-attested recovery checkpoints are available for this project.
                   </div>
                 ) : (
-                  <div role="radiogroup" aria-label="Interrupted PPO snapshots" className="rs-recovery-snapshot-list">
+                  <div role="radiogroup" aria-label="Interrupted or unevaluated checkpoints" className="rs-recovery-snapshot-list">
                     {[...recoverySnapshots]
                       .sort((a, b) => b.iteration - a.iteration || b.ppo_step - a.ppo_step)
                       .map((snapshot, index) => {
@@ -1346,7 +1357,7 @@ export function StartingPointPickerDialog({
                             role="radio"
                             aria-checked={selected}
                             tabIndex={selected || (!snapshotRef && index === 0) ? 0 : -1}
-                            aria-label={`Cycle ${snapshot.iteration}, PPO snapshot ${snapshot.ppo_step}, interrupted and unevaluated, ${snapshot.selectable ? "selectable" : "blocked"}`}
+                            aria-label={`Cycle ${snapshot.iteration}, PPO snapshot ${snapshot.ppo_step}, unevaluated recovery input, ${snapshot.selectable ? "selectable" : "blocked"}`}
                             aria-describedby={descriptionId}
                             onClick={() => chooseRecoverySnapshot(snapshot)}
                             onKeyDown={moveWithinRadioGroup}
@@ -1354,7 +1365,7 @@ export function StartingPointPickerDialog({
                           >
                             <span className="rs-recovery-snapshot-title">
                               <strong>Cycle {snapshot.iteration} · PPO snapshot {snapshot.ppo_step}</strong>
-                              <span className="rs-badge amber">interrupted</span>
+                              <span className="rs-badge amber">recovery input</span>
                               <span className="rs-badge slate">unevaluated</span>
                               {!snapshot.selectable && <span className="rs-badge rose">blocked</span>}
                             </span>
@@ -1386,7 +1397,7 @@ export function StartingPointPickerDialog({
                   />
                 ) : recoverySnapshots.length > 0 && !recoverySnapshotsQuery.isLoading ? (
                   <div role="status" className="rs-sub" style={{ fontSize: 11.5 }}>
-                    Choose one interrupted snapshot explicitly. None is selected by recency.
+                    Choose one recovery checkpoint explicitly. None is selected by recency.
                   </div>
                 ) : null}
               </>

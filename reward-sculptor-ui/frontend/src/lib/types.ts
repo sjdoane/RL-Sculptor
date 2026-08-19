@@ -647,6 +647,8 @@ export interface PolicySummary {
   iter_index: number;
   checkpoint: string; // "checkpoint.pt" | "checkpoint.zip"
   checkpoint_bytes: number;
+  /** Server-authoritative completion/export decision. */
+  deployable: boolean;
   primary_metric: number | null;
   fitness: number | null;
   reward_version: string | null;
@@ -1099,6 +1101,7 @@ export interface ErrorClassification {
     | "reward_contract_mismatch"
     | "driver_version"
     | "no_cuda"
+    | "post_training_rollout_failed"
     | "unknown";
   title: string | null;
   detail: string | null;
@@ -1107,6 +1110,17 @@ export interface ErrorClassification {
   action: {
     kind?: string;
     label?: string;
+  } | null;
+  evidence?: {
+    failure_stage?: "evaluation";
+    iteration?: number;
+    rl_iter?: number;
+    rl_total?: number;
+    checkpoint_preserved?: boolean;
+    checkpoint_name?: string;
+    checkpoint_bytes?: number;
+    checkpoint_sha256?: string;
+    rollout_started?: boolean;
   } | null;
 }
 

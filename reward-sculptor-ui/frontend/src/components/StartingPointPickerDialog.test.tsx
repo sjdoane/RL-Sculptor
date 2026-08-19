@@ -238,10 +238,10 @@ test("supports conventional arrow-key navigation across custom radio cards", asy
   expect(project).toHaveFocus();
   expect(project).toBeChecked();
 
-  const completed = screen.getByRole("radio", { name: /Completed checkpoints/i });
+  const completed = screen.getByRole("radio", { name: /Evaluated policies/i });
   completed.focus();
   await user.keyboard("{ArrowDown}");
-  const interrupted = screen.getByRole("radio", { name: /Interrupted snapshots/i });
+  const interrupted = screen.getByRole("radio", { name: /Interrupted or unevaluated/i });
   expect(interrupted).toHaveFocus();
   expect(interrupted).toBeChecked();
 
@@ -421,6 +421,7 @@ const checkpoint = (
   iter_index: iterIndex,
   checkpoint: "checkpoint.pt",
   checkpoint_bytes: 4096,
+  deployable: false,
   primary_metric: null,
   fitness: null,
   reward_version: "v1",
@@ -439,15 +440,17 @@ const checkpoint = (
   ...overrides,
 });
 
-test("does not silently choose the newest unselected checkpoint", async () => {
+test("keeps unevaluated checkpoints out of the evaluated policy picker", async () => {
   vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
   const user = userEvent.setup();
   renderPicker(vi.fn(), [checkpoint(4), checkpoint(5)]);
 
-  await user.click(screen.getByRole("radio", { name: /Project checkpoint/i }));
+  await user.click(screen.getByRole("radio", { name: /Project policy/i }));
 
-  expect(screen.getByLabelText(/Completed iteration/i)).toHaveValue("");
-  expect(screen.getByText(/does not assume the newest checkpoint is the best/i)).toBeInTheDocument();
+  expect(screen.getByText(/No evaluated policy is available/i)).toBeInTheDocument();
+  expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+  expect(screen.queryByRole("spinbutton")).not.toBeInTheDocument();
+  expect(screen.getByText(/only after server attestation/i)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
 });
 
@@ -456,6 +459,7 @@ test("prefers an older evidenced selection over a newer failed checkpoint", asyn
   const user = userEvent.setup();
   const onChange = renderPicker(vi.fn(), [
     checkpoint(4, {
+      deployable: true,
       fitness: 0.94,
       metric_id: "weave-stop",
       metric_version: "v3",
@@ -476,9 +480,10 @@ test("prefers an older evidenced selection over a newer failed checkpoint", asyn
     }),
   ]);
 
-  await user.click(screen.getByRole("radio", { name: /Project checkpoint/i }));
+  await user.click(screen.getByRole("radio", { name: /Project policy/i }));
 
-  expect(screen.getByLabelText(/Completed iteration/i)).toHaveValue("4");
+  expect(screen.getByLabelText(/Evaluated iteration/i)).toHaveValue("4");
+  expect(screen.queryByRole("option", { name: /Iteration 5/i })).not.toBeInTheDocument();
   expect(screen.getByLabelText(/Iteration 4 evidence/i)).toHaveTextContent("weave-stop / v3");
   expect(screen.getByLabelText(/Iteration 4 evidence/i)).toHaveTextContent("order_ok_frac");
   expect(screen.getByLabelText(/Iteration 4 evidence/i)).toHaveTextContent("objective_criterion");
@@ -487,6 +492,22 @@ test("prefers an older evidenced selection over a newer failed checkpoint", asyn
     kind: "project_checkpoint",
     warm_start_iteration: 4,
   }));
+});
+
+test("keeps a server-completed generic policy selectable without showcase evidence keys", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  const user = userEvent.setup();
+  renderPicker(vi.fn(), [checkpoint(3, {
+    deployable: true,
+    rollout_available: true,
+    evidence_status: "unavailable",
+  })]);
+
+  await user.click(screen.getByRole("radio", { name: /Project policy/i }));
+
+  await user.selectOptions(screen.getByLabelText(/Evaluated iteration/i), "3");
+  expect(screen.getByLabelText(/Evaluated iteration/i)).toHaveValue("3");
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeEnabled();
 });
 
 const recoverySnapshot = (
@@ -514,11 +535,11 @@ test("separates interrupted PPO snapshots and requires an explicit unevaluated a
   const onChange = renderPicker();
 
   await user.click(screen.getByRole("radio", { name: /Project policy/i }));
-  expect(screen.getByRole("radio", { name: /Completed checkpoints/i })).toBeChecked();
-  await user.click(screen.getByRole("radio", { name: /Interrupted snapshots/i }));
+  expect(screen.getByRole("radio", { name: /Evaluated policies/i })).toBeChecked();
+  await user.click(screen.getByRole("radio", { name: /Interrupted or unevaluated/i }));
 
   const row = await screen.findByRole("radio", {
-    name: /Cycle 2, PPO snapshot 50, interrupted and unevaluated/i,
+    name: /Cycle 2, PPO snapshot 50, unevaluated recovery input/i,
   });
   expect(row).toHaveAccessibleDescription(/actor \+ critic transfer/i);
   expect(row).toHaveAccessibleDescription(/optimizer\/counters reset/i);
@@ -561,7 +582,7 @@ test("fails closed when interrupted snapshot discovery cannot be verified", asyn
   renderPicker();
 
   await user.click(screen.getByRole("radio", { name: /Project policy/i }));
-  await user.click(screen.getByRole("radio", { name: /Interrupted snapshots/i }));
+  await user.click(screen.getByRole("radio", { name: /Interrupted or unevaluated/i }));
 
   expect(await screen.findByRole("alert")).toHaveTextContent(
     /No manual path or iteration fallback is allowed/i,
@@ -579,7 +600,7 @@ test("requires a separate acknowledgement for a legacy-reconstructed snapshot re
   renderPicker();
 
   await user.click(screen.getByRole("radio", { name: /Project policy/i }));
-  await user.click(screen.getByRole("radio", { name: /Interrupted snapshots/i }));
+  await user.click(screen.getByRole("radio", { name: /Interrupted or unevaluated/i }));
   await user.click(await screen.findByRole("radio", {
     name: /Cycle 2, PPO snapshot 50/i,
   }));
