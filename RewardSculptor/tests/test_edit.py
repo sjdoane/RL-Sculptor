@@ -775,7 +775,6 @@ def test_post_validate_unlinks_staging_on_validation_failure(tmp_path):
     check, so a failed validation left a broken v1.py that the UI then
     loaded on subsequent tab visits."""
     from sculptor.edit import _post_validate, EditValidationError
-    from sculptor.kg.store import SculptorKG
 
     class _KG:
         def get_node(self, _id):
@@ -874,6 +873,96 @@ def test_apply_prompt_edit_threads_kg_arxiv_ids_into_paper_refs(monkeypatch, tmp
     assert captured["lit_context_count"] == 1
 
 
+def test_prompt_edit_repairs_omitted_or_substituted_explicit_paper_pin(
+    monkeypatch, v0_path, kg,
+):
+    """Explicit prompt pins are a post-validation authority, not suggestions.
+
+    The first model response substitutes another valid KG paper (the live
+    failure mode); validation must reject it and the normal repair retry must
+    commit only the response whose references + grounding carry the exact pin.
+    """
+    import hashlib
+
+    from sculptor.edit import apply_prompt_edit
+    from sculptor.kg import query as kg_query_mod
+    from sculptor.kg.query import cite
+
+    pinned = "2401.16337"
+    kg.add_node(Paper(
+        id=make_paper_id(pinned), arxiv_id=pinned,
+        title="Pinned Humanoid Motion Paper", authors=["A Researcher"],
+        year=2024,
+    ))
+    monkeypatch.setattr(kg_query_mod, "query_semantic", lambda *a, **kw: [])
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")
+    ).hexdigest()[:16]
+
+    def _source(arxiv_id: str) -> str:
+        spec = {
+            "version": "v1",
+            "description": "explicit-paper prompt rewrite",
+            "author": "sculptor",
+            "parent_hash": parent_hash,
+            "hyperparameters": {"gain": 1.0},
+            "references": [{
+                "arxiv_id": arxiv_id,
+                "citation": cite(arxiv_id, store=kg),
+                "how_used": "grounds the requested shaping",
+            }],
+            "grounding": {
+                "gain": f"arXiv:{arxiv_id} grounds the requested shaping",
+            },
+        }
+        return (
+            f"REWARD_SPEC = {spec!r}\n"
+            "def compute_reward(state, action, next_state, info):\n"
+            "    value = float(state[0]) + 1.0\n"
+            "    return value, {'human_prompt': value}\n"
+        )
+
+    client = _StubClient(_source("1801.00690"), _source(pinned))
+    out = apply_prompt_edit(
+        current_reward_path=v0_path,
+        user_prompt=(
+            "Use exactly these paper IDs in REWARD_SPEC grounding/references, "
+            "in this order, with no additional references: "
+            "paper:2401.16337 paper:2401.16337"
+        ),
+        new_iter_id="v1",
+        reward_contract=_hopper_contract(),
+        kg_store=kg,
+        client=client,
+    )
+
+    assert len(client.messages.calls) == 2
+    first_prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "EXPLICIT_PAPER_PINS (HARD VALIDATION)" in first_prompt
+    assert 'ordered_arxiv_ids: ["2401.16337"]' in first_prompt
+    retry_prompt = client.messages.calls[1]["messages"][0]["content"]
+    assert "order exactly ['2401.16337']" in retry_prompt
+
+    spec = importlib.util.spec_from_file_location("pinned_v1", out)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert [r["arxiv_id"] for r in module.REWARD_SPEC["references"]] == [pinned]
+    assert f"arXiv:{pinned}" in module.REWARD_SPEC["grounding"]["gain"]
+
+
+def test_explicit_paper_pin_must_resolve_to_matching_paper_metadata(kg):
+    from sculptor.edit import _attest_explicit_paper_refs
+    from sculptor.kg.schema import Technique
+
+    bad_id = "2507.01243"
+    kg.add_node(Technique(
+        id=make_paper_id(bad_id), name="not actually a paper",
+    ))
+    with pytest.raises(EditValidationError, match="does not resolve to a Paper"):
+        _attest_explicit_paper_refs((bad_id,), kg)
+
+
 def test_post_validate_rejects_grounding_referencing_uncited_arxiv(monkeypatch, tmp_path):
     """Issue B cross-check (Test 1 2026-04-22): if `grounding` cites an
     arxiv_id that is NOT in `references`, `_post_validate` must reject.
@@ -882,7 +971,6 @@ def test_post_validate_rejects_grounding_referencing_uncited_arxiv(monkeypatch, 
     the edit would commit.
     """
     from sculptor.edit import EditValidationError, _post_validate
-    from sculptor.kg.store import SculptorKG
 
     # Minimal KG that asserts ID presence — stub has_node to True for
     # anything so references-in-KG doesn't fire. We're testing the

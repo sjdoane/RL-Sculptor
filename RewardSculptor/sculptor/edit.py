@@ -190,6 +190,25 @@ _ARXIV_IN_TEXT_RE = re.compile(
     r"(?:arxiv:)?(\d{4}\.\d{4,5})", flags=re.IGNORECASE
 )
 
+# Explicit prompt pins are user-authored provenance constraints, not retrieval
+# hints.  Keep their first-mentioned order so a prompt that asks for an exact
+# receipt can make that order part of the validated artifact.
+_EXPLICIT_PAPER_PIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])paper:"
+    r"([A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?)"
+)
+_NO_ADDITIONAL_REFS_RE = re.compile(
+    r"\bno\s+(?:additional|other|extra)\s+"
+    r"(?:papers?|paper\s+ids?|references?|citations?)\b",
+    flags=re.IGNORECASE,
+)
+_EXACT_REFS_RE = re.compile(
+    r"\b(?:use|include|cite|list)\s+(?:exactly|only)\s+"
+    r"(?:these|the\s+following)\s+"
+    r"(?:papers?|paper\s+ids?|references?|citations?)\b",
+    flags=re.IGNORECASE,
+)
+
 
 # ── Small allowlist of identifiers that don't need to be "grounded" ───────
 _ALLOWED_MATH = {
@@ -1308,6 +1327,55 @@ def _validate_reference_tracking_contract(
 
 
 # ── KG validation helpers ─────────────────────────────────────────────────
+def _explicit_paper_refs(prompt: str) -> tuple[str, ...]:
+    """Bare paper IDs explicitly pinned as ``paper:<id>`` in prompt order."""
+    refs: list[str] = []
+    for match in _EXPLICIT_PAPER_PIN_RE.finditer(str(prompt or "")):
+        arxiv_id = match.group(1)
+        if arxiv_id not in refs:
+            refs.append(arxiv_id)
+    return tuple(refs)
+
+
+def _prompt_requires_exact_paper_refs(prompt: str) -> bool:
+    """Whether the prompt explicitly forbids references beyond its pins."""
+    text = str(prompt or "")
+    return bool(
+        _NO_ADDITIONAL_REFS_RE.search(text)
+        or _EXACT_REFS_RE.search(text)
+    )
+
+
+def _attest_explicit_paper_refs(
+    arxiv_ids: Iterable[str], kg_store: SculptorKG,
+) -> dict[str, str]:
+    """Resolve explicit pins to exact Paper metadata, or fail closed."""
+    from sculptor.kg.schema import Paper
+
+    citations: dict[str, str] = {}
+    for arxiv_id in arxiv_ids:
+        node_id = make_paper_id(arxiv_id)
+        try:
+            node = kg_store.get_node(node_id)
+        except Exception as exc:  # noqa: BLE001 — explicit authority is hard
+            raise EditValidationError(
+                f"explicit paper pin {node_id!r} could not be verified "
+                f"against the KG: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(node, Paper):
+            raise EditValidationError(
+                f"explicit paper pin {node_id!r} does not resolve to a "
+                "Paper node in the KG"
+            )
+        if node.id != node_id or str(node.arxiv_id).strip() != arxiv_id:
+            raise EditValidationError(
+                f"explicit paper pin {node_id!r} disagrees with KG metadata "
+                f"(node.id={node.id!r}, arxiv_id={node.arxiv_id!r})"
+            )
+        citations[arxiv_id] = cite(arxiv_id, store=kg_store)
+    return citations
+
+
 def _missing_paper_ids(arxiv_ids: Iterable[str], kg_store: SculptorKG) -> list[str]:
     missing: list[str] = []
     for aid in arxiv_ids:
@@ -1479,6 +1547,9 @@ def _build_user_prompt(
     screen: Any = None,
     case_context: str = "",
     reference_signature: dict | None = None,
+    explicit_paper_refs: tuple[str, ...] = (),
+    explicit_paper_citations: dict[str, str] | None = None,
+    exact_paper_refs: bool = False,
 ) -> str:
     edits_json = [
         {
@@ -1650,6 +1721,29 @@ def _build_user_prompt(
         if rendered:
             reference_block = f"{rendered}\n\n"
 
+    explicit_papers_block = ""
+    if explicit_paper_refs:
+        exact_rule = (
+            "REWARD_SPEC.references must contain EXACTLY these arxiv_id "
+            "values in this order, with no additional entries."
+            if exact_paper_refs else
+            "Other KG-attested references are allowed, but each pinned "
+            "arxiv_id must appear exactly once."
+        )
+        explicit_papers_block = (
+            "# EXPLICIT_PAPER_PINS (HARD VALIDATION)\n"
+            "These are user-authored provenance constraints, not semantic "
+            "retrieval suggestions.\n"
+            f"ordered_arxiv_ids: {json.dumps(list(explicit_paper_refs))}\n"
+            "locally_attested_citations: "
+            f"{json.dumps(explicit_paper_citations or {}, sort_keys=True)}\n"
+            f"{exact_rule}\n"
+            "Use each locally attested citation verbatim. Also mention every "
+            "pinned ID as `arXiv:<id>` in at least one string value of "
+            "REWARD_SPEC.grounding. Missing, substituted, reordered (when "
+            "exact), or ungrounded pins fail validation and trigger repair.\n\n"
+        )
+
     return (
         f"# NEW_VERSION\n{new_version}\n\n"
         f"# PARENT_VERSION\n{current_version}\n\n"
@@ -1680,6 +1774,7 @@ def _build_user_prompt(
         f"{json.dumps(citation_map, indent=2, sort_keys=True)}\n\n"
         f"# PREVIOUS_REFERENCES (preserve entries whose term still exists)\n"
         f"{json.dumps(current_references, indent=2, sort_keys=True, default=str)}\n\n"
+        f"{explicit_papers_block}"
         f"{modes_block}"
         f"{elided_block}"
         f"# CURRENT_REWARD_SOURCE\n```python\n{current_source}\n```\n\n"
@@ -1777,6 +1872,9 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    replay_inputs=None,
                    replay_parent: "dict | None" = None,
                    hack_replays: "list[dict] | None" = None,
+                   explicit_paper_refs: tuple[str, ...] = (),
+                   explicit_paper_citations: "dict[str, str] | None" = None,
+                   exact_paper_refs: bool = False,
                    promote: bool = True) -> Any:
     """Write source, import, validate, return the imported module.
 
@@ -1921,6 +2019,39 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                 f"REWARD_SPEC.references cite arxiv_ids not in KG: "
                 f"{missing_refs}")
 
+        # Prompt-authored paper pins are authority, not retrieval hints. The
+        # ordinary KG check above only proves that whatever the model chose
+        # exists; it cannot detect omission or substitution of a requested
+        # paper. Enforce the locally-attested receipt here so the existing
+        # repair loop can correct the model instead of committing false
+        # provenance.
+        if explicit_paper_refs:
+            expected_ids = list(explicit_paper_refs)
+            if exact_paper_refs and ref_ids != expected_ids:
+                raise EditValidationError(
+                    "explicit paper pins require REWARD_SPEC.references "
+                    f"arxiv_id order exactly {expected_ids}, got {ref_ids}"
+                )
+            counts = {aid: ref_ids.count(aid) for aid in expected_ids}
+            bad_counts = {aid: count for aid, count in counts.items()
+                          if count != 1}
+            if bad_counts:
+                raise EditValidationError(
+                    "explicit paper pins must each appear exactly once in "
+                    f"REWARD_SPEC.references; counts={bad_counts}"
+                )
+            canonical = explicit_paper_citations or {}
+            for aid in expected_ids:
+                entry = next(r for r in refs if str(r["arxiv_id"]) == aid)
+                expected_citation = canonical.get(aid)
+                if (expected_citation is not None
+                        and entry.get("citation") != expected_citation):
+                    raise EditValidationError(
+                        f"explicit paper pin {aid!r} must use the locally "
+                        f"attested citation {expected_citation!r}; got "
+                        f"{entry.get('citation')!r}"
+                    )
+
         # Grounding ↔ references cross-check.
         grounding = spec.get("grounding") or {}
         if isinstance(grounding, dict):
@@ -1938,6 +2069,19 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                     f"a full reference entry for each, or remove the arxiv_id "
                     f"from grounding (physics first-principles text is OK)."
                 )
+            missing_grounding_pins = sorted(
+                set(explicit_paper_refs) - grounding_ids)
+            if missing_grounding_pins:
+                raise EditValidationError(
+                    "explicit paper pins are missing from structured "
+                    "REWARD_SPEC.grounding string values: "
+                    f"{missing_grounding_pins}; mention each as arXiv:<id>"
+                )
+        elif explicit_paper_refs:
+            raise EditValidationError(
+                "explicit paper pins require REWARD_SPEC.grounding to be a "
+                "dict whose string values mention every pinned arXiv ID"
+            )
 
         # §Ship 54-pre (#12) shaping↔metric partition gate — the ONE HARD gate.
         # Runs ONLY when an objective metric is steering the run; compares the
@@ -2001,6 +2145,8 @@ def apply_edits(
     hack_replays: "list[dict] | None" = None,
     n_candidates: int = 1,
     max_tokens: int | None = None,
+    explicit_paper_refs: tuple[str, ...] = (),
+    exact_paper_refs: bool = False,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
@@ -2050,6 +2196,9 @@ def apply_edits(
     owns_store = kg_store is None
     kg_store = kg_store or SculptorKG()
     try:
+        explicit_paper_refs = tuple(explicit_paper_refs or ())
+        explicit_paper_citations = _attest_explicit_paper_refs(
+            explicit_paper_refs, kg_store)
         current_module = _load_reward_module(current_reward_path)
         current_source = current_reward_path.read_text(encoding="utf-8")
         current_version = _current_reward_version(current_module)
@@ -2264,6 +2413,9 @@ def apply_edits(
             screen=plan.screen,
             case_context=case_context,
             reference_signature=reference_signature,
+            explicit_paper_refs=explicit_paper_refs,
+            explicit_paper_citations=explicit_paper_citations,
+            exact_paper_refs=exact_paper_refs,
         )
         if on_event is not None:
             on_event({
@@ -2310,6 +2462,9 @@ def apply_edits(
                         replay_inputs=replay_inputs,
                         replay_parent=replay_parent,
                         hack_replays=hack_replays,
+                        explicit_paper_refs=explicit_paper_refs,
+                        explicit_paper_citations=explicit_paper_citations,
+                        exact_paper_refs=exact_paper_refs,
                         promote=False,
                     )
                     rec["valid"] = True
@@ -2347,6 +2502,9 @@ def apply_edits(
                     replay_inputs=replay_inputs,
                     replay_parent=replay_parent,
                     hack_replays=hack_replays,
+                    explicit_paper_refs=explicit_paper_refs,
+                    explicit_paper_citations=explicit_paper_citations,
+                    exact_paper_refs=exact_paper_refs,
                 )
                 winner_promoted = True
                 if on_event is not None:
@@ -2397,6 +2555,9 @@ def apply_edits(
                     replay_inputs=replay_inputs,
                     replay_parent=replay_parent,
                     hack_replays=hack_replays,
+                    explicit_paper_refs=explicit_paper_refs,
+                    explicit_paper_citations=explicit_paper_citations,
+                    exact_paper_refs=exact_paper_refs,
                 )
                 winner_promoted = True
 
@@ -2437,6 +2598,9 @@ def apply_edits(
                         replay_inputs=replay_inputs,
                         replay_parent=replay_parent,
                         hack_replays=hack_replays,
+                        explicit_paper_refs=explicit_paper_refs,
+                        explicit_paper_citations=explicit_paper_citations,
+                        exact_paper_refs=exact_paper_refs,
                     )
                     last_err = None
                     break
@@ -2524,6 +2688,10 @@ def apply_prompt_edit(
             f"prompt must be ≤ {limit} chars (got {len(user_prompt)})"
         )
 
+    explicit_refs = _explicit_paper_refs(user_prompt)
+    exact_refs = bool(
+        explicit_refs and _prompt_requires_exact_paper_refs(user_prompt))
+
     # Always consult the KG — users editing reward functions through
     # the Rewards-tab prompt have historically bypassed literature
     # grounding entirely (pre-this-pass `literature_context=[]` was a
@@ -2581,12 +2749,17 @@ def apply_prompt_edit(
     # in the emitted REWARD_SPEC despite the grounding dict being rich.
     # Issue B from Test 1 (2026-04-22). `source_paper_ids` items are in
     # `make_paper_id()` form (`paper:<arxiv_id>`) — strip the prefix.
-    prompt_paper_refs: list[str] = sorted({
+    semantic_paper_refs: list[str] = sorted({
         pid[len("paper:"):]
         for match in lit_context
         for pid in (match.source_paper_ids or [])
         if pid.startswith("paper:")
     })
+    prompt_paper_refs = list(explicit_refs)
+    if not exact_refs:
+        prompt_paper_refs.extend(
+            aid for aid in semantic_paper_refs
+            if aid not in prompt_paper_refs)
 
     synthetic = Diagnosis(
         failure_modes=[],
@@ -2612,6 +2785,12 @@ def apply_prompt_edit(
         iter_dir=None,
         behavior_goal=user_prompt,
     )
+    explicit_kwargs: dict[str, Any] = {}
+    if explicit_refs:
+        explicit_kwargs = {
+            "explicit_paper_refs": explicit_refs,
+            "exact_paper_refs": exact_refs,
+        }
     return apply_edits(
         current_reward_path=current_reward_path,
         diagnosis=synthetic,
@@ -2621,6 +2800,7 @@ def apply_prompt_edit(
         client=client,
         on_event=on_event,
         max_tokens=max_tokens,
+        **explicit_kwargs,
     )
 
 
