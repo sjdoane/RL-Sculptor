@@ -31,6 +31,7 @@ from sculptor.world.compiler import (
     resolve_course,
     resolve_objects,
 )
+from sculptor.world.observation_geometry import height_scan_ray_count
 from sculptor.world.task_spec import validate_task_spec
 from sculptor.world.world_spec import validate_world_spec
 
@@ -209,7 +210,7 @@ def estimate_budget(world: Mapping[str, Any], task: Mapping[str, Any]) -> dict[s
         group, ())) for group in ("desired", "forbidden", "terminate_on"))
     height_scan = task.get("shared", {}).get("observations", {}).get(
         "height_scan", "auto")
-    rays = 45 if height_scan is True or (
+    rays = height_scan_ray_count() if height_scan is True or (
         height_scan == "auto" and terrain.get("kind") == "generator") else 0
     return {
         "geoms": geoms, "contacts": contacts, "rays": rays,

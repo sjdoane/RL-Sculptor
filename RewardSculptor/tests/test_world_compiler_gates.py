@@ -28,7 +28,8 @@ from sculptor.world.compiler import (
     reset_robot_along_waypoint_route,
 )
 from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
-from sculptor.world.gates import run_admission_gates
+from sculptor.world.gates import estimate_budget, run_admission_gates
+from sculptor.world.observation_geometry import inclusive_grid_sample_count
 from sculptor.world.capabilities import (
     build_robot_entity_cfg,
     resolve_robot_capability,
@@ -156,6 +157,53 @@ def test_generated_compilation_is_deterministic_and_robot_agnostic() -> None:
     assert sensor.secondary_policy == "first"
     assert sensor.secondary.entity == "ball"
     assert arm.robot.capability_id == "yam:parallel_gripper"
+
+
+@pytest.mark.parametrize(
+    ("generated", "height_scan", "expected_rays"),
+    [
+        (False, True, 54),
+        (True, "auto", 54),
+        (False, "auto", 0),
+        (True, False, 0),
+    ],
+)
+def test_budget_uses_compiler_inclusive_height_scan_grid(
+    generated: bool,
+    height_scan: object,
+    expected_rays: int,
+) -> None:
+    world = _world(generated=generated)
+    task = _task(height_scan=height_scan)
+    estimate = estimate_budget(
+        world,
+        task,
+    )
+
+    assert estimate["rays"] == expected_rays
+    runtime = compile_task_runtime(
+        world,
+        task,
+        resolve_robot_capability("unitree_g1:base"),
+    )
+    sensor = next((
+        item for item in runtime.sensor_cfgs
+        if item.name == "authored_height_scan"
+    ), None)
+    if expected_rays:
+        assert sensor is not None
+        assert inclusive_grid_sample_count(
+            sensor.pattern.size,
+            sensor.pattern.resolution,
+        ) == expected_rays
+    else:
+        assert sensor is None
+
+
+def test_inclusive_grid_sample_count_fails_closed_on_fractional_intervals() -> None:
+    assert inclusive_grid_sample_count((1.6, 1.0), 0.2) == 54
+    assert inclusive_grid_sample_count((0.4, 0.4), 0.2) == 9
+    assert inclusive_grid_sample_count((1.55, 1.0), 0.2) is None
 
 
 def test_authored_task_observations_reach_actor_and_critic() -> None:

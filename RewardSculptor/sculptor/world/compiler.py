@@ -38,6 +38,10 @@ from sculptor.world.capabilities import (
     simulator_capability,
 )
 from sculptor.world.channels import ChannelCatalog, compile_channel_catalog
+from sculptor.world.observation_geometry import (
+    HEIGHT_SCAN_GRID_RESOLUTION_M,
+    HEIGHT_SCAN_GRID_SIZE_M,
+)
 from sculptor.world.task_spec import validate_task_spec
 from sculptor.world.world_spec import validate_world_spec
 
@@ -1893,7 +1897,10 @@ def compile_task_runtime(
             name="authored_height_scan",
             frame=ObjRef(type="body", name=robot.root_body, entity="robot"),
             ray_alignment="yaw",
-            pattern=GridPatternCfg(size=(1.6, 1.0), resolution=0.2),
+            pattern=GridPatternCfg(
+                size=HEIGHT_SCAN_GRID_SIZE_M,
+                resolution=HEIGHT_SCAN_GRID_RESOLUTION_M,
+            ),
             max_distance=5.0, exclude_parent_body=True,
             include_geom_groups=(0,), debug_vis=False))
     raw_end_effectors = observations.get("end_effector_relative", ())
