@@ -753,7 +753,10 @@ def test_ship15_warm_start_event_shape():
     import inspect
     from sculptor.adapters import _mjlab_runner as runner_mod
 
-    src = inspect.getsource(runner_mod._cmd_train)
+    src = (
+        inspect.getsource(runner_mod._cmd_train)
+        + inspect.getsource(runner_mod._warm_start_loaded_receipt)
+    )
     # Event type.
     assert '"type": "warm_start_loaded"' in src or "'type': 'warm_start_loaded'" in src
     # Expected payload keys.

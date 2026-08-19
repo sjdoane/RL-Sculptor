@@ -1197,6 +1197,54 @@ def test_enforce_actuator_limits_swaps_to_dcmotor_with_real_velocity_limits(monk
     assert _recover_velocity_limit(_Fake()) is None
 
 
+def test_robot_materialization_owns_and_pins_actuator_physics(monkeypatch) -> None:
+    """Authored admission and runtime share one immutable actuator model."""
+    pytest.importorskip("mjlab")
+    from mjlab.actuator import DcMotorActuatorCfg
+    from mjlab.tasks.registry import load_env_cfg
+
+    from sculptor.adapters._mjlab_runner import _enforce_actuator_limits
+    from sculptor.world.capabilities import (
+        build_base_robot_entity_cfg,
+        build_robot_entity_cfg,
+        resolve_robot_capability,
+    )
+    from sculptor.world.compiler import _robot_asset_hash_from_cfg
+
+    capability = resolve_robot_capability("unitree_g1:base")
+    first = build_robot_entity_cfg(capability)
+    second = build_robot_entity_cfg(capability)
+    assert first.articulation is not second.articulation
+    assert first.articulation.actuators is not second.articulation.actuators
+    assert all(
+        isinstance(actuator, DcMotorActuatorCfg)
+        for actuator in first.articulation.actuators
+    )
+    admitted_hash = _robot_asset_hash_from_cfg(first)
+    base_hash = _robot_asset_hash_from_cfg(
+        build_base_robot_entity_cfg(capability)
+    )
+    assert base_hash != admitted_hash
+
+    first.articulation.actuators = ()
+    assert second.articulation.actuators
+    assert _robot_asset_hash_from_cfg(
+        build_robot_entity_cfg(capability)
+    ) == admitted_hash
+
+    # The legacy registered-task path also transforms copy-on-write and cannot
+    # poison later admission factory calls in the same worker process.
+    monkeypatch.delenv("RS_ENFORCE_ACTUATOR_LIMITS", raising=False)
+    legacy = load_env_cfg("Mjlab-Velocity-Flat-Unitree-G1")
+    _enforce_actuator_limits(legacy)
+    assert _robot_asset_hash_from_cfg(
+        legacy.scene.entities["robot"]
+    ) == admitted_hash
+    assert _robot_asset_hash_from_cfg(
+        build_robot_entity_cfg(capability)
+    ) == admitted_hash
+
+
 # ── §Ship 46: per-foot kick channels in the G1 info contract ───────────────
 def test_info_keys_for_task_adds_foot_channels_for_g1_only() -> None:
     """`_info_keys_for_task` is a pure function (no mjlab import): G1 gets

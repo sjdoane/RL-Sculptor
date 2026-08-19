@@ -33,6 +33,7 @@ from sculptor.world.artifacts import (
 from sculptor.world.capabilities import (
     RobotCapability,
     SimulatorCapability,
+    build_base_robot_entity_cfg,
     build_robot_entity_cfg,
     resolve_robot_capability,
     simulator_capability,
@@ -88,6 +89,7 @@ class ResolvedEvaluation:
     materialized_assets: Mapping[str, Any]
     admission: Mapping[str, Any]
     manifest_hash: str
+    installed_base_robot_asset_hash: str | None = None
 
     @classmethod
     def build(cls, **values: Any) -> "ResolvedEvaluation":
@@ -132,6 +134,8 @@ class ResolvedEvaluation:
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
         data["course"] = [item.to_dict() for item in self.course]
+        if self.installed_base_robot_asset_hash is None:
+            data.pop("installed_base_robot_asset_hash", None)
         return data
 
     def with_admission(self, admission: Mapping[str, Any]) -> "ResolvedEvaluation":
@@ -2057,7 +2061,15 @@ def verify_resolved_evaluation(
         build_robot_entity_cfg(robot))
     if manifest.robot_asset_hash != installed_asset_hash:
         raise WorldCompileError(
-            "installed robot asset differs from admitted evaluation")
+            "composed robot asset differs from admitted evaluation")
+    if manifest.installed_base_robot_asset_hash is not None:
+        installed_base_hash = _robot_asset_hash_from_cfg(
+            build_base_robot_entity_cfg(robot)
+        )
+        if manifest.installed_base_robot_asset_hash != installed_base_hash:
+            raise WorldCompileError(
+                "installed base robot asset differs from admitted evaluation"
+            )
 
     base = Path(asset_base).expanduser().resolve()
 
@@ -2243,6 +2255,8 @@ def compile_world(
         world_hash=_hash_mapping(world), task_hash=_hash_mapping(task),
         compiler_hash=simulator.compiler_version,
         robot_capability_hash=_hash_mapping(robot.to_dict()),
+        installed_base_robot_asset_hash=_robot_asset_hash_from_cfg(
+            build_base_robot_entity_cfg(robot)),
         robot_asset_hash=_robot_asset_hash_from_cfg(
             scene_cfg.entities["robot"]),
         simulator_capability_hash=_hash_mapping(simulator.to_dict()),
@@ -3590,11 +3604,17 @@ def apply_world_selection(
         extra_paths=([robot_data["descriptor_path"]]
                      if robot_data.get("descriptor_path") else ()))
     runtime_robot_hash = _runtime_robot_hash(env_cfg)
-    expected_robot_hash = manifest.robot_asset_hash.removeprefix("sha256:")
+    expected_robot_hashes = {
+        manifest.robot_asset_hash.removeprefix("sha256:"),
+    }
+    if manifest.installed_base_robot_asset_hash is not None:
+        expected_robot_hashes.add(
+            manifest.installed_base_robot_asset_hash.removeprefix("sha256:")
+        )
     if runtime_robot_hash is None:
         raise WorldCompileError(
             "runtime environment has no compilable 'robot' entity")
-    if runtime_robot_hash != expected_robot_hash:
+    if runtime_robot_hash not in expected_robot_hashes:
         raise WorldCompileError(
             "runtime robot asset does not match evaluation manifest")
 
@@ -3668,11 +3688,19 @@ def apply_world_selection(
         *(f"per-episode domain randomization → {msg}"
           for msg in world_dr_applied),
     )
+    effective_runtime_robot_hash = _runtime_robot_hash(env_cfg)
+    expected_effective_robot_hash = manifest.robot_asset_hash.removeprefix(
+        "sha256:"
+    )
+    if effective_runtime_robot_hash != expected_effective_robot_hash:
+        raise WorldCompileError(
+            "effective runtime robot asset does not match evaluation manifest"
+        )
     return ResolvedWorldBundle(
         tuple_hash=selection.tuple_hash,
         evaluation_lineage=selection.evaluation_lineage,
         manifest=manifest, channel_catalog=catalog, train=train,
         refs={kind: dataclasses.asdict(ref)
               for kind, ref in selection.refs.items()},
-        runtime_robot_asset_hash=runtime_robot_hash,
+        runtime_robot_asset_hash=effective_runtime_robot_hash,
         runtime_adjustments=runtime_adjustments)

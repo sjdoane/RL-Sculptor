@@ -4003,86 +4003,53 @@ def _apply_ground_texture(env_cfg: Any) -> None:
 # re-supply the velocity_limit mjlab dropped. Per-pattern no-load speeds, cited from
 # mjlab's own robot constants (single source of truth):
 #   G1  g1_constants.py:91-178   Go1 go1_constants.py:40-72
-_ACTUATOR_VELOCITY_LIMITS: dict[str, float] = {
-    # Unitree G1 (rad/s)
-    ".*_knee_joint": 20.0, ".*_hip_roll_joint": 20.0,                       # 7520-22
-    ".*_hip_pitch_joint": 32.0, ".*_hip_yaw_joint": 32.0, "waist_yaw_joint": 32.0,   # 7520-14
-    ".*_elbow_joint": 37.0, ".*_shoulder_pitch_joint": 37.0,
-    ".*_shoulder_roll_joint": 37.0, ".*_shoulder_yaw_joint": 37.0,
-    ".*_wrist_roll_joint": 37.0,                                            # 5020
-    ".*_wrist_pitch_joint": 22.0, ".*_wrist_yaw_joint": 22.0,               # 4010
-    ".*_ankle_pitch_joint": 37.0, ".*_ankle_roll_joint": 37.0,
-    "waist_pitch_joint": 37.0, "waist_roll_joint": 37.0,                    # 2×5020
-    # Unitree Go1 (rad/s)
-    ".*_hip_joint": 30.1, ".*_thigh_joint": 30.1, ".*_calf_joint": 20.06,
-}
-
-
 def _recover_velocity_limit(actuator_cfg: Any) -> "float | None":
     """The real motor no-load speed (rad/s) for an actuator group, recovered from
     its `target_names_expr` (cited from mjlab's robot constants — same source of
     truth that defines the group). None when no pattern matches (an unknown
     robot/group → the caller leaves it unchanged), so this never invents a limit."""
-    patterns = getattr(actuator_cfg, "target_names_expr", None) or ()
-    lims = [_ACTUATOR_VELOCITY_LIMITS[p] for p in patterns
-            if p in _ACTUATOR_VELOCITY_LIMITS]
-    return min(lims) if lims else None
+    from sculptor.world.capabilities import (
+        LEGACY_UNITREE_DC_MOTOR_PROFILE,
+        actuator_velocity_limit,
+    )
+
+    return actuator_velocity_limit(
+        actuator_cfg, LEGACY_UNITREE_DC_MOTOR_PROFILE,
+    )
 
 
 def _enforce_actuator_limits(env_cfg: Any) -> None:
     """Swap every `BuiltinPositionActuatorCfg` → `DcMotorActuatorCfg` so the sim
     enforces each motor's VELOCITY (no-load speed) limit via mjlab's research-standard
-    torque-speed model, on top of the torque (effort) limit it already clamps. Mutates
-    `env_cfg` BEFORE the env is built, so it is active in BOTH train and rollout (the
-    policy trains against — and is evaluated under — the same constrained physics).
+    torque-speed model, on top of the torque (effort) limit it already clamps. Replaces
+    each entity with an owned copy BEFORE the env is built, so it is active in BOTH
+    train and rollout without mutating MjLab's shared robot constants.
 
-    Gated by `RS_ENFORCE_ACTUATOR_LIMITS` (default ON — Sam's call 2026-06-20; set to
-    0/off to disable and recover the old velocity-unconstrained physics). FULLY
-    DEFENSIVE: any group whose velocity_limit can't be recovered, or any API drift,
-    leaves the actuator unchanged + warns — a run never breaks. `saturation_effort =
-    effort_limit` (the conservative triangular torque-speed envelope; raise to the
-    true peak/stall torque when a datasheet is known for a flat-topped curve)."""
+    Gated by `RS_ENFORCE_ACTUATOR_LIMITS` for legacy registered tasks. Authored worlds
+    compose the same versioned profile during admission, so a process flag cannot
+    change their pinned physics. Any unknown group is left unchanged with a warning.
+    `saturation_effort = effort_limit` gives the conservative triangular envelope."""
     import os
     if os.environ.get("RS_ENFORCE_ACTUATOR_LIMITS", "1").strip().lower() not in (
             "1", "true", "on", "yes"):
         return
     try:
-        from mjlab.actuator import BuiltinPositionActuatorCfg, DcMotorActuatorCfg
-    except Exception as e:  # noqa: BLE001 — mjlab without DcMotor → leave as-is
-        print(f"[runner] actuator-limit enforcement skipped (no DcMotorActuatorCfg): "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        return
-    try:
+        from sculptor.world.capabilities import (
+            LEGACY_UNITREE_DC_MOTOR_PROFILE,
+            apply_actuator_profile,
+        )
+
         entities = getattr(getattr(env_cfg, "scene", None), "entities", None) or {}
-        items = entities.items() if hasattr(entities, "items") else []
+        items = list(entities.items()) if hasattr(entities, "items") else []
         for ekey, ent in items:
             art = getattr(ent, "articulation", None)
             acts = list(getattr(art, "actuators", None) or []) if art is not None else []
             if not acts:
                 continue
-            new_acts, swapped, unresolved = [], 0, []
-            for a in acts:
-                vlim = _recover_velocity_limit(a)
-                eff = getattr(a, "effort_limit", None)
-                if isinstance(a, BuiltinPositionActuatorCfg) and vlim is not None and eff:
-                    extra = {}
-                    for f in ("viscous_damping", "frictionloss"):
-                        v = getattr(a, f, None)
-                        if v is not None:
-                            extra[f] = v
-                    new_acts.append(DcMotorActuatorCfg(
-                        target_names_expr=a.target_names_expr,
-                        stiffness=a.stiffness, damping=a.damping,
-                        effort_limit=float(eff), armature=a.armature,
-                        velocity_limit=float(vlim),
-                        saturation_effort=float(eff),   # conservative triangular envelope
-                        **extra))
-                    swapped += 1
-                else:
-                    new_acts.append(a)   # unrecoverable / non-builtin → unchanged
-                    if isinstance(a, BuiltinPositionActuatorCfg):
-                        unresolved.append(getattr(a, "target_names_expr", "?"))
-            art.actuators = tuple(new_acts)
+            owned, swapped, unresolved = apply_actuator_profile(
+                ent, LEGACY_UNITREE_DC_MOTOR_PROFILE, strict=False,
+            )
+            entities[ekey] = owned
             msg = (f"[runner] actuator-limit enforcement: entity {ekey!r} — "
                    f"{swapped}/{len(acts)} groups → DcMotor (velocity-limited)")
             if unresolved:

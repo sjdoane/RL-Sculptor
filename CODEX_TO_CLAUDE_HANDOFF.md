@@ -3737,3 +3737,39 @@ tensor signature
 `provenance_status: legacy_reconstructed`, allowed modes
 `[actor_only, actor_critic]`, `selectable: true`, `compatible: true`, and
 `training_authorized: false` pending route/worker proof.
+
+## Fresh slalom-to-jump continuation and actuator-identity repair (2026-08-18)
+
+The continuation demonstration now lives in a genuinely new project:
+`g1-slalom-jump-lab`. Its frozen task extends the attested slalom prior with
+one bilateral jump at the finish, a supported-landing requirement, and a
+100-frame upright whole-body hold. The first complete New Run flow was
+performed visibly in the UI. It imported the historical iter-38 bundle,
+selected actor+critic, required the reconstruction acknowledgement, pinned the
+schema-2 to schema-3 zero-initialized event-phase migration, generated
+`gen_001` as observe-only, and launched job `job_623c9e0616876759`.
+
+That job failed closed before PPO. The worker correctly refused to emit
+`warm_start_loaded`: MjLab robot factories returned independent wrappers over
+a shared articulation constant, and the runner's DC-motor enforcement mutated
+that shared object. Admission had pinned stock G1 hash `799777468601…`, while
+the actual velocity-limited robot and every subsequent factory call hashed to
+`7971d1a570b9…`. This was process-order-dependent physics drift, not a bad
+checkpoint or an installed-file change.
+
+The generic repair makes every robot factory result owned, declares the G1 and
+Go1 DC back-EMF actuator profiles in the immutable robot capability, and uses
+that same composed asset for admission, training, rollout, and effective
+runtime verification. New manifests independently pin the installed base
+asset and composed runtime asset. The legacy registered-task enforcement path
+is copy-on-write; environment flags cannot alter authored-world physics.
+Strict installed-asset and frozen-MJB verification remain unchanged.
+
+Verification for this slice: 186 focused adapter/compiler/runtime/warm-start
+tests passed after aligning the warm-start event source-inspection regression
+with its extracted receipt helper; all 152 world tests passed, the new
+ownership/identity regression passed, scoped Ruff
+`F,E9`, compileall, and diff check passed. The fresh project's existing
+selection predates the composed-physics manifest and must be re-admitted in the
+UI before relaunch. Preserve the failed job log as diagnostic evidence; do not
+reuse its selection as runtime authority.

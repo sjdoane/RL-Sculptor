@@ -1587,3 +1587,42 @@ UI sequence after restarting backend/frontend on the containing commit:
 Any change to the evidence bytes, source/observed selection material identity,
 runtime rows, contract fingerprint, safetensors signature, manifest digest,
 acknowledgement, or selected mode must block before subprocess creation.
+
+## Fresh-project continuation: slalom prior to one finish jump (2026-08-18)
+
+Use project `g1-slalom-jump-lab`, not the accepted showcase project. The goal
+is a visible continuation experiment: initialize actor+critic from the attested
+iter-38 slalom policy, complete the four-box route, perform exactly one
+bilateral jump at the finish with at least three air frames and `0.18 m` apex
+gain, land both feet inside the unchanged `0.35 m` finish disk, then hold the
+full upright/quiet conjunction for 100 frames.
+
+The first visible launch, `job_623c9e0616876759`, is intentionally retained as
+a fail-closed diagnostic. It stopped before PPO because post-selection actuator
+enforcement mutated MjLab's shared G1 articulation constant. Admission saw
+base hash `799777468601…`; the effective DC-motor model was `7971d1a570b9…`.
+Do not bypass the asset check or move warm-start attestation earlier.
+
+Before retrying:
+
+1. Run on the immutable-actuator-profile fix that owns factory configs and
+   records both installed-base and composed-runtime robot hashes.
+2. Re-run World admission in the UI so the current selection pins the composed
+   G1 physics and a fresh frozen evaluation MJB.
+3. Open New Run, reuse imported skill `80d2bda786a8`, select actor+critic, and
+   check the historical reconstruction acknowledgement.
+4. Reuse generated metric `gen_001` as observe-only if selectable. Otherwise
+   generate one best-of-one candidate; physical evidence remains authoritative.
+5. Preserve the original settings: one outer cycle, 750 PPO iterations, 1,024
+   envs on `cuda:0`, seed 42, two 1,200-step 1920x1080 rollouts, evidence env
+   10, Auto, no exact promoted recovery.
+6. Require exact `starting_skill_provenance_verified`, policy-contract receipt,
+   actor+critic `warm_start_loaded`, and event-phase migration receipts before
+   accepting PPO iteration 0 as live.
+
+After launch, do not edit reload-watched core or run an intermediate GPU audit.
+Acceptance is conjunctive: aligned scene, ordered regions/index 5, no forbidden
+contact or sustained fall, exactly one bilateral air event, apex and landing
+gates, and 100 uninterrupted in-finish horizontal/angular/joint/upright/pose
+quiet frames. Inspect all-lane trajectory and objective artifacts plus lane-10
+behavior, keyframes, full video, and the Results physical-scene audit.
