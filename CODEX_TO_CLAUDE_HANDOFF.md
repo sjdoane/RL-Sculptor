@@ -3773,3 +3773,46 @@ ownership/identity regression passed, scoped Ruff
 selection predates the composed-physics manifest and must be re-admitted in the
 UI before relaunch. Preserve the failed job log as diagnostic evidence; do not
 reuse its selection as runtime authority.
+
+## Interrupted PPO-50 recovery for the fresh jump continuation (2026-08-19)
+
+Job `job_d41e199695d2d7d8` was interrupted by CUDA/Warp error 999 after the
+truthful last-observed PPO iteration 58. It produced no rollout or success
+evidence. Its latest durable periodic save is cycle 2 / PPO 50, 6,202,705
+bytes, SHA-256
+`fe1f41c83736d2f6c54159207263ed18c158e147461a2663ec8545509a5f2c8f`.
+
+Commit `7812c87` adds a fail-closed interrupted-snapshot path. The server copied
+the checkpoint, effective policy contract, source selection, artifact tuple,
+and unique producer log into an immutable recovery record before exposing it
+to the UI. The current opaque receipt is:
+
+- snapshot id: `snap_8b0cf8e3235acd0e2c642504`;
+- receipt digest:
+  `dbb64c8170f462044822ba5aa9518b6754e1226db6cca88f1db8344d04c56848`;
+- source job/status: `job_d41e199695d2d7d8` / `errored`;
+- provenance: `legacy_reconstructed`;
+- source selection: v6 / tuple
+  `f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`;
+- effective policy-contract fingerprint:
+  `83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`.
+
+The UI deliberately separates this row from completed checkpoints, labels it
+interrupted and unevaluated, and requires two acknowledgements: the snapshot
+may be worse than the starting policy, and its receipt was reconstructed after
+the interruption. It transfers exactly actor + critic; optimizer, counters,
+exploration state, and resume claims reset. No file path is accepted from the
+browser.
+
+The worker must re-resolve the opaque receipt, reproduce the exact policy
+contract, and emit an unadapted `warm_start_loaded` for exactly one actor and
+one critic from the cached SHA above. Actual loaded path/bytes are re-hashed.
+Missing, duplicate, extra, adapted, or lineage-rejected evidence quarantines
+outputs and errors the run even if the subprocess exits zero.
+
+The next visible launch should keep the existing jump goal and use one outer
+cycle, 750 PPO iterations, 1,024 envs on `cuda:0`, seed 42, two 1,200-step
+1920x1080 rollouts, precommitted evidence environment 10, Auto, `gen_001`
+observe-only, and exact promoted recovery off. Do not call PPO-50 evaluated or
+successful. Do not edit reload-watched core or run a GPU audit once the worker
+is live.

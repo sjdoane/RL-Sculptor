@@ -1643,3 +1643,16 @@ provenance status/digest are `legacy_reconstructed` /
 The exact rebuild command and full import receipt are in
 `CODEX_TO_CLAUDE_HANDOFF.md` and
 `reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`.
+
+## 2026-08-19: interrupted snapshot recovery is visible and fail-closed
+
+Fresh project `g1-slalom-jump-lab` has one selectable interrupted input:
+cycle 2 / PPO 50 from `job_d41e199695d2d7d8`, checkpoint SHA
+`fe1f41c83736d2f6c54159207263ed18c158e147461a2663ec8545509a5f2c8f`,
+opaque id `snap_8b0cf8e3235acd0e2c642504`, receipt digest
+`dbb64c8170f462044822ba5aa9518b6754e1226db6cca88f1db8344d04c56848`.
+It is reconstructed, interrupted, and unevaluated—not a completed policy or
+success. The UI requires separate uncertainty and reconstruction
+acknowledgements and transfers actor+critic only. The worker now treats exact
+actual-loaded bytes/roles and lineage as a fatal publication gate. See the two
+runbooks above for the visible relaunch and acceptance conjunction.

@@ -1626,3 +1626,31 @@ contact or sustained fall, exactly one bilateral air event, apex and landing
 gates, and 100 uninterrupted in-finish horizontal/angular/joint/upright/pose
 quiet frames. Inspect all-lane trajectory and objective artifacts plus lane-10
 behavior, keyframes, full video, and the Results physical-scene audit.
+
+## Recover the interrupted PPO-50 jump policy (2026-08-19)
+
+Use this only in `g1-slalom-jump-lab`. Open **New Run -> Starting policy ->
+Change -> Project policy -> Interrupted snapshots**. Select **Cycle 2 · PPO
+snapshot 50** and verify all of the following before checking either box:
+
+- checkpoint SHA starts `fe1f41c837` and ends `5f2c8f` (5.9 MiB);
+- attestation receipt starts `dbb64c8170` and ends `c56848`;
+- source job is `job_d41e199695d2d7d8`;
+- the row says **interrupted**, **unevaluated**, and **legacy receipt**;
+- **What loads** says actor + critic weights;
+- **What resets** says optimizer, counters, and exploration state.
+
+Then acknowledge both the unevaluated snapshot and reconstructed receipt. The
+Apply action must be disabled before both checks and enabled after both. The
+opaque server record is
+`snap_8b0cf8e3235acd0e2c642504`; never paste a checkpoint path into a launch.
+
+Launch with one outer cycle, 750 PPO iterations, 1,024 envs, `cuda:0`, seed 42,
+two 1,200-step 1920x1080 episodes, Auto, `gen_001` observe-only, precommitted
+environment 10, and exact promoted recovery off. Before treating PPO as live,
+require `warm_start_snapshot_resolved`,
+`warm_start_snapshot_contract_verified`, and an unadapted
+`warm_start_loaded` whose exact roles are `[actor, critic]` and whose source and
+actual-loaded SHA are
+`fe1f41c83736d2f6c54159207263ed18c158e147461a2663ec8545509a5f2c8f`.
+Any missing or contradictory load proof must end as quarantined/errored.
