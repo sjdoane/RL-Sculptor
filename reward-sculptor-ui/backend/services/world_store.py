@@ -497,8 +497,9 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
         breakdown[kind] = breakdown.get(kind, 0) + 1
     world_robot = (shared.get("robot") or {}).get("capability_id")
     project_capability = project_capability_id(project_dir)
-    return {
-        "selection": selected.to_dict(),
+    selection_receipt = selected.to_dict()
+    payload = {
+        "selection": selection_receipt,
         "world_meta": world.get("meta", {}),
         "task_meta": task.get("meta", {}),
         "shared_summary": {
@@ -521,6 +522,87 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
         ],
         "clarifications": _clarification_summary(
             bundle.get("clarifications") or {}),
+    }
+    event_program = _event_program_summary(task, selection_receipt)
+    if event_program is not None:
+        payload["event_program"] = event_program
+    return payload
+
+
+def _event_program_summary(
+    task: Mapping[str, Any],
+    selection_receipt: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project the admitted linear event program for researcher display.
+
+    The selected TaskSpec remains the authority.  This adapter deliberately
+    copies its exact transition predicates and pins them back to the immutable
+    task artifact/selection tuple; it does not infer a program from a task
+    name, prompt, or goal shape.  Legacy tasks therefore keep the old response
+    shape with no ``event_program`` key.
+    """
+    shared = task.get("shared")
+    if not isinstance(shared, Mapping):
+        return None
+    event_sequence = shared.get("event_sequence")
+    if not isinstance(event_sequence, Mapping):
+        return None
+    phases = event_sequence.get("phases")
+    if not isinstance(phases, list) or len(phases) != 3:
+        return None
+    if not all(isinstance(phase, Mapping) for phase in phases):
+        return None
+
+    route, jump, hold = phases
+    route_until = route.get("until")
+    jump_until = jump.get("until")
+    if not isinstance(route_until, Mapping) \
+            or not isinstance(jump_until, Mapping):
+        return None
+    minimum_hold_s = hold.get("minimum_hold_s")
+    task_ref = (selection_receipt.get("refs") or {}).get("task")
+    return {
+        "id": event_sequence.get("id"),
+        "ordered_phase_ids": [phase.get("id") for phase in phases],
+        "transition_spec": [
+            {
+                "from": route.get("id"),
+                "to": jump.get("id"),
+                "when": dict(route_until),
+            },
+            {
+                "from": jump.get("id"),
+                "to": hold.get("id"),
+                "when": dict(jump_until),
+            },
+            {
+                "from": hold.get("id"),
+                "to": "terminal",
+                "when": {
+                    "event": "minimum_hold_elapsed",
+                    "minimum_hold_s": minimum_hold_s,
+                },
+            },
+        ],
+        "minimum_air_time_s": jump_until.get("min_air_time_s"),
+        "minimum_height_delta_m": jump_until.get("min_height_delta_m"),
+        "support_selectors": jump_until.get("support_contacts"),
+        "terminal_hold_duration_s": minimum_hold_s,
+        "episode_length_s": (shared.get("termination") or {}).get(
+            "episode_length_s"),
+        "train_only_phase_sampling": (task.get("train") or {}).get(
+            "event_phase_sampling"),
+        "evaluation_start_phase": route.get("id"),
+        "observation_extension": {
+            "term": "authored_event_phase",
+            "encoding": "one_hot",
+            "width": 3,
+        },
+        "provenance": {
+            "selection_version": selection_receipt.get("selection_version"),
+            "selection_tuple_hash": selection_receipt.get("tuple_hash"),
+            "task_artifact": task_ref,
+        },
     }
 
 

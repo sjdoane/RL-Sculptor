@@ -19,7 +19,11 @@ import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProject
 import { useLaunchRun } from "@/hooks/useRuns";
 import { useWorldSelection, useWorldValidation } from "@/hooks/useWorlds";
 import { ApiError, getProjectSettings, getReference, listModeRewards, listPolicies } from "@/lib/api";
-import type { ProjectDetail, StartingPointSelection } from "@/lib/types";
+import type {
+  ProjectDetail,
+  StartingPointSelection,
+  WorldEventProgram,
+} from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
 import {
   WORLD_ROBOT_MISMATCH_TITLE,
@@ -52,6 +56,7 @@ const SCRATCH_STARTING_POINT: StartingPointSelection = {
   reference_clip_id: null,
   reference_robot: null,
   import_manifest_digest: null,
+  policy_contract_migration: null,
 };
 
 const MJLAB_TIMING: Record<string, {
@@ -123,6 +128,80 @@ function ReadinessCell({
       <div style={{ marginTop: 3, fontSize: 10.5, lineHeight: 1.35, color: "var(--rs-muted)", overflow: "hidden", textOverflow: "ellipsis" }}>
         {detail}
       </div>
+    </div>
+  );
+}
+
+export function PolicyInterfaceMigrationNotice({
+  startingPoint,
+  eventProgram,
+}: {
+  startingPoint: StartingPointSelection;
+  eventProgram: WorldEventProgram | undefined;
+}) {
+  const policyTransfer = startingPoint.kind === "project_checkpoint"
+    || (
+      startingPoint.kind === "shared_skill"
+      && (
+        startingPoint.initialization_mode === "actor_only"
+        || startingPoint.initialization_mode === "actor_critic"
+      )
+    );
+  if (!eventProgram || !policyTransfer) return null;
+
+  const migration = startingPoint.kind === "shared_skill"
+    ? startingPoint.policy_contract_migration ?? null
+    : null;
+  return (
+    <div
+      aria-label={migration
+        ? "Warm-start policy interface migration"
+        : "Warm-start policy interface admission"}
+    >
+      <Banner kind="info" icon="git-branch">
+        <div style={{ fontSize: 11.5, lineHeight: 1.5 }}>
+          <strong>
+            {migration
+              ? "Policy interface migration · reverified at launch"
+              : "Policy interface admission · verified at launch"}
+          </strong>
+          <div style={{ marginTop: 3 }}>
+            This event task adds{" "}
+            <strong>{eventProgram.observation_extension.width}-wide one-hot phase observations</strong>
+            {" "}to the target actor and critic interfaces as{" "}
+            <code className="mono">{eventProgram.observation_extension.term}</code>.
+            Optimizer state is not resumed.
+          </div>
+          {startingPoint.kind === "project_checkpoint" ? (
+            <div style={{ marginTop: 4 }}>
+              If this checkpoint is legacy schema 2, launch admits only the
+              verified schema-2 → schema-3 zero-initialized extension for its
+              actor and critic inputs. Otherwise it must match schema 3 exactly;
+              an incompatible interface fails closed. A direct project
+              checkpoint has no import preflight receipt, so contract and tensor
+              verification occurs only when launch begins.
+            </div>
+          ) : migration ? (
+            <div style={{ marginTop: 4 }}>
+              Verified import migration type:{" "}
+              <code className="mono">{migration.type}</code>. The immutable
+              compatibility receipt declares schema {migration.from_schema} →{" "}
+              {migration.to_schema}; the requested inherited{" "}
+              {startingPoint.initialization_mode === "actor_only"
+                ? "actor receives the zero-initialized extension and the critic starts fresh"
+                : "actor and critic receive the zero-initialized extension"}.
+              {" "}Launch still revalidates the current project contract and
+              exact weights.
+            </div>
+          ) : (
+            <div style={{ marginTop: 4 }}>
+              The selected import receipt does not declare a migration type.
+              Launch must prove an exact schema-3 policy interface or refuse the
+              run; this notice does not infer a legacy migration.
+            </div>
+          )}
+        </div>
+      </Banner>
     </div>
   );
 }
@@ -1167,6 +1246,10 @@ export function NewRunDialog({
                   Change <Icon name="chevron-right" size={14} />
                 </span>
               </button>
+              <PolicyInterfaceMigrationNotice
+                startingPoint={startingPoint}
+                eventProgram={worldSel.data?.event_program}
+              />
               <div
                 style={{
                   display: "flex", alignItems: "center", gap: 11,

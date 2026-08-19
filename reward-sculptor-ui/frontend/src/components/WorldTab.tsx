@@ -18,6 +18,7 @@ import {
   useWorldSelection,
   useWorldValidation,
 } from "@/hooks/useWorlds";
+import type { WorldEventProgram } from "@/lib/types";
 import { WORLD_ROBOT_MISMATCH_DETAIL } from "@/lib/worldLaunch";
 
 /** "5 elements — 3 platform · 2 gap"; gaps carry no geometry, so call
@@ -34,6 +35,168 @@ export function courseBreakdownText(
   const gaps = breakdown?.["gap"] ?? 0;
   const suffix = gaps > 0 ? " (gaps are spacing — no geometry)" : "";
   return `${total} elements — ${parts.join(" · ")}${suffix}`;
+}
+
+function eventPhaseCopy(
+  phaseId: string,
+  program: WorldEventProgram,
+): { gate: string; detail: string } {
+  if (phaseId === "route") {
+    return {
+      gate: "Raw goal completion",
+      detail: "Complete the authored waypoint goal in order.",
+    };
+  }
+  if (phaseId === "jump") {
+    return {
+      gate: `Both feet · ${program.minimum_air_time_s.toFixed(2)} s · ${program.minimum_height_delta_m.toFixed(2)} m`,
+      detail: "Leave support, clear the height gate, then land on both feet.",
+    };
+  }
+  return {
+    gate: `Landing, then ${program.terminal_hold_duration_s.toFixed(1)} s`,
+    detail: "Remain in the terminal phase until the hold completes.",
+  };
+}
+
+/** The compact rail is the visible counterpart of the selected immutable
+ * TaskSpec. It describes only the admitted linear automaton. */
+export function TaskProgramCard({
+  program,
+}: {
+  program: WorldEventProgram;
+}) {
+  const resetMix = program.ordered_phase_ids
+    .map((phase) =>
+      `${Math.round((program.train_only_phase_sampling[phase] ?? 0) * 100)}% ${phase.toUpperCase()}`)
+    .join(" · ");
+  return (
+    <section className="rs-card" aria-labelledby="task-program-title">
+      <div className="rs-card-head">
+        <div>
+          <div id="task-program-title" className="rs-card-title">
+            Task program <Badge status="promoted" label="Immutable" />
+          </div>
+          <div className="rs-hintline" style={{ marginTop: 3 }}>
+            One ordered attempt: finish the route, execute one jump, then hold.
+          </div>
+        </div>
+        <code className="mono" style={{ fontSize: 11, color: "var(--rs-muted)" }}>
+          {program.id}
+        </code>
+      </div>
+      <div className="rs-card-pad" style={{ display: "grid", gap: 12 }}>
+        <div
+          role="region"
+          aria-label="Ordered task phases; scroll horizontally on a narrow screen"
+          tabIndex={0}
+          style={{ overflowX: "auto", paddingBottom: 3 }}
+        >
+          <ol
+            aria-label="ROUTE then JUMP then HOLD"
+            style={{
+              display: "flex", alignItems: "stretch", minWidth: 590,
+              listStyle: "none", margin: 0, padding: 0,
+            }}
+          >
+            {program.ordered_phase_ids.map((phase, index) => {
+              const copy = eventPhaseCopy(phase, program);
+              return (
+                <li
+                  key={phase}
+                  style={{
+                    display: "flex", alignItems: "center", flex: 1,
+                    minWidth: 0,
+                  }}
+                >
+                  <div
+                    style={{
+                      alignSelf: "stretch", flex: 1, minWidth: 0,
+                      border: "1px solid var(--hairline)",
+                      borderTop: "2px solid var(--rs-primary)",
+                      borderRadius: "var(--radius-md)",
+                      background: "var(--surface-strong)", padding: "10px 11px",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 7 }}>
+                      <span className="mono" aria-hidden style={{ fontSize: 10, color: "var(--rs-muted)" }}>
+                        {String(index + 1).padStart(2, "0")}
+                      </span>
+                      <strong style={{ fontSize: 12.5, letterSpacing: ".05em" }}>
+                        {phase.toUpperCase()}
+                      </strong>
+                    </div>
+                    <div style={{ marginTop: 7, fontSize: 11.5, fontWeight: 650 }}>
+                      {copy.gate}
+                    </div>
+                    <div className="rs-hintline" style={{ marginTop: 3, lineHeight: 1.4 }}>
+                      {copy.detail}
+                    </div>
+                  </div>
+                  {index < program.ordered_phase_ids.length - 1 && (
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        flex: "0 0 30px", textAlign: "center",
+                        color: "var(--rs-primary)", fontSize: 18,
+                      }}
+                    >
+                      →
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+            gap: 8,
+          }}
+        >
+          <div className="rs-hintline">
+            <strong style={{ color: "var(--ink)" }}>Episode</strong><br />
+            {program.episode_length_s} s maximum
+          </div>
+          <div className="rs-hintline">
+            <strong style={{ color: "var(--ink)" }}>Training resets only</strong><br />
+            {resetMix}
+          </div>
+          <div className="rs-hintline">
+            <strong style={{ color: "var(--ink)" }}>Evaluation</strong><br />
+            Always starts at {program.evaluation_start_phase.toUpperCase()}
+          </div>
+          <div className="rs-hintline">
+            <strong style={{ color: "var(--ink)" }}>Policy input</strong><br />
+            <code className="mono">{program.observation_extension.term}</code>
+            {" · "}{program.observation_extension.width}-wide one-hot
+          </div>
+        </div>
+
+        <details>
+          <summary style={{ cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>
+            Exact program JSON and provenance
+          </summary>
+          <pre
+            className="mono"
+            style={{
+              margin: "8px 0 0", maxHeight: 300, overflow: "auto",
+              border: "1px solid var(--hairline)",
+              borderRadius: "var(--radius-md)",
+              background: "var(--canvas-soft)", padding: 11,
+              fontSize: 10.5, lineHeight: 1.45, whiteSpace: "pre-wrap",
+              overflowWrap: "anywhere",
+            }}
+          >
+            {JSON.stringify(program, null, 2)}
+          </pre>
+        </details>
+      </div>
+    </section>
+  );
 }
 
 export default function WorldTab({
@@ -129,6 +292,7 @@ export default function WorldTab({
           </span>
         </div>
       )}
+      {s.event_program && <TaskProgramCard program={s.event_program} />}
       <div className="rs-card">
         <div className="rs-card-head">
           <div className="rs-card-title">

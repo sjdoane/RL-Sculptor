@@ -55,6 +55,7 @@ const DEFAULT_SELECTION: StartingPointSelection = {
   reference_clip_id: null,
   reference_robot: null,
   import_manifest_digest: null,
+  policy_contract_migration: null,
 };
 
 export interface StartingPointPickerDialogProps {
@@ -741,6 +742,8 @@ export function StartingPointPickerDialog({
           ? receipt.components.reference?.robot ?? null
           : null,
         import_manifest_digest: receipt.skill.manifest_digest,
+        policy_contract_migration:
+          receipt.compatibility.policy_contract_migration ?? null,
       });
       if (receipt.selectable && isAdmittedTrust(receipt)
           && hasImmutableManifest(receipt)) {
@@ -812,6 +815,8 @@ export function StartingPointPickerDialog({
         ? choice?.components.reference?.robot ?? null
         : null,
       import_manifest_digest: choice?.skill.manifest_digest ?? null,
+      policy_contract_migration:
+        choice?.compatibility.policy_contract_migration ?? null,
     });
   };
 
@@ -830,6 +835,8 @@ export function StartingPointPickerDialog({
         ? receipt.components.reference?.robot ?? null
         : null,
       import_manifest_digest: receipt.skill.manifest_digest,
+      policy_contract_migration:
+        receipt.compatibility.policy_contract_migration ?? null,
     });
   };
 

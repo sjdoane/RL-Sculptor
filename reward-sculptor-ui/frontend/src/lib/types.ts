@@ -723,6 +723,19 @@ export interface StartingSkillCompatibility {
    * reason text. Older receipts may not include this field. */
   reason_codes?: string[];
   mode_reasons?: Partial<Record<StartingSkillInitializationMode, string[]>>;
+  /** The sole admitted schema-2 -> schema-3 policy-interface extension.
+   *  This is structural compatibility evidence, not launch authorization. */
+  policy_contract_migration?: PolicyContractMigration | null;
+}
+
+export interface PolicyContractMigration {
+  type: string;
+  from_schema: number;
+  to_schema: number;
+  observation_term: string;
+  extension_width: number;
+  ordered_phase_ids: string[];
+  optimizer_resume: false;
 }
 
 export interface StartingSkillTrustReceipt {
@@ -825,6 +838,10 @@ export interface StartingPointSelection {
   reference_clip_id: string | null;
   reference_robot: string | null;
   import_manifest_digest: string | null;
+  /** Copied from the selected import's compatibility receipt so the launch
+   *  review can disclose it. Direct project checkpoints leave this null and
+   *  are verified only by the launch path. */
+  policy_contract_migration?: PolicyContractMigration | null;
 }
 
 /** Every event the WS stream emits. The frontend switches on
@@ -1842,7 +1859,11 @@ export interface WorldApplyResponse {
 
 export interface WorldSelection {
   selection: { selection_version: number; tuple_hash: string;
-    evaluation_lineage: string; [extra: string]: unknown };
+    evaluation_lineage: string;
+    refs?: Record<string, {
+      kind: string; version: string; path: string; sha256: string;
+    }>;
+    [extra: string]: unknown };
   world_meta: { version?: string; parent?: string | null; prompt?: string;
     grounding?: string[]; [extra: string]: unknown };
   task_meta: { [extra: string]: unknown };
@@ -1873,6 +1894,39 @@ export interface WorldSelection {
       source: string | null;
       value: unknown;
     }[];
+  };
+  /** Present only for an admitted TaskSpec with shared.event_sequence. */
+  event_program?: WorldEventProgram;
+}
+
+export interface WorldEventProgramTransition {
+  from: string;
+  to: string;
+  when: Record<string, unknown>;
+}
+
+export interface WorldEventProgram {
+  id: string;
+  ordered_phase_ids: ["route", "jump", "hold"];
+  transition_spec: WorldEventProgramTransition[];
+  minimum_air_time_s: number;
+  minimum_height_delta_m: number;
+  support_selectors: [string, string][];
+  terminal_hold_duration_s: number;
+  episode_length_s: number;
+  train_only_phase_sampling: Record<string, number>;
+  evaluation_start_phase: "route";
+  observation_extension: {
+    term: "authored_event_phase";
+    encoding: "one_hot";
+    width: 3;
+  };
+  provenance: {
+    selection_version: number;
+    selection_tuple_hash: string;
+    task_artifact: {
+      kind: string; version: string; path: string; sha256: string;
+    };
   };
 }
 

@@ -94,6 +94,67 @@ def test_apply_promotes_selection_and_lineage(client: TestClient):
     assert lineage[-1]["refs"]["world"]["version"]
 
 
+def test_selection_projects_compound_event_program_with_task_provenance(
+        client: TestClient):
+    slug = _make_project(client, "Compound event program")
+    prompt = (
+        "weave through four markers, then jump at the finish and hold for "
+        "2 seconds"
+    )
+    authored = client.post(
+        f"/projects/{slug}/worlds/author",
+        json={"prompt": prompt, "robot_capability_id": "unitree_g1:base"},
+    )
+    assert authored.status_code == 200, authored.text
+    applied = client.post(
+        f"/projects/{slug}/worlds/author/apply",
+        json={"session_id": authored.json()["session_id"], "answers": []},
+    )
+    assert applied.status_code == 200, applied.text
+
+    response = client.get(f"/projects/{slug}/worlds/selection")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    program = body["event_program"]
+    assert program["ordered_phase_ids"] == ["route", "jump", "hold"]
+    assert [transition["when"]["event"]
+            for transition in program["transition_spec"]] == [
+        "goal_complete", "bilateral_support_cycle", "minimum_hold_elapsed",
+    ]
+    assert program["minimum_air_time_s"] == 0.06
+    assert program["minimum_height_delta_m"] == 0.18
+    assert program["support_selectors"] == [
+        ["robot:left_foot", "world:terrain"],
+        ["robot:right_foot", "world:terrain"],
+    ]
+    assert program["terminal_hold_duration_s"] == 2.0
+    assert program["episode_length_s"] == 24.0
+    assert program["train_only_phase_sampling"] == {
+        "route": 0.5, "jump": 0.4, "hold": 0.1,
+    }
+    assert program["evaluation_start_phase"] == "route"
+    assert program["observation_extension"] == {
+        "term": "authored_event_phase", "encoding": "one_hot", "width": 3,
+    }
+    assert program["provenance"]["selection_tuple_hash"] \
+        == body["selection"]["tuple_hash"]
+    assert program["provenance"]["task_artifact"]["sha256"] \
+        == body["selection"]["refs"]["task"]["sha256"]
+
+
+def test_selection_omits_event_program_for_legacy_task(client: TestClient):
+    slug = _make_project(client, "Legacy single-goal task")
+    draft = _author(client, slug)
+    applied = client.post(
+        f"/projects/{slug}/worlds/author/apply",
+        json={"session_id": draft["session_id"], "answers": []},
+    )
+    assert applied.status_code == 200, applied.text
+
+    body = client.get(f"/projects/{slug}/worlds/selection").json()
+    assert "event_program" not in body
+
+
 def test_selection_404_before_any_authoring(client: TestClient):
     slug = _make_project(client)
     r = client.get(f"/projects/{slug}/worlds/selection")
