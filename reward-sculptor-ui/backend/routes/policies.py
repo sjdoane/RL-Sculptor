@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from backend.models.project import ProblemDetail
 from backend.models.run import PolicyRecoverySnapshot, PolicySummary
 from backend.routes.runs import _find_run, _resolve_run_root
+from backend.services.iteration_completion import is_completed_iteration
 from backend.services.job_manager import JobManager
 from backend.services.project_store import ProjectStore
 
@@ -209,6 +210,7 @@ def _policy_receipt_fields(
         else "not_recorded"
     )
     return {
+        "deployable": True,
         "metric_id": _metric_text(metric, "id"),
         "metric_version": _metric_text(metric, "version"),
         "metric_source": _metric_text(metric, "source"),
@@ -263,6 +265,9 @@ def list_policies(
             ),
         )
         for row in list_exportable_iters(runs_root)
+        if is_completed_iteration(
+            runs_root / f"iter_{int(row['iter_index'])}"
+        )
     ]
 
 
@@ -319,6 +324,7 @@ def list_recovery_snapshots(
     responses={
         200: {"content": {"application/zip": {}}},
         404: {"model": ProblemDetail},
+        409: {"model": ProblemDetail},
         500: {"model": ProblemDetail},
         503: {"model": ProblemDetail},
     },
@@ -337,6 +343,22 @@ def export_policy(
         return _problem(
             404, "iteration not found",
             detail="iter_index must be >= 0", type="/problems/not-found")
+    iter_dir = runs_root / f"iter_{iter_index}"
+    has_checkpoint = any(
+        _nonempty_file(iter_dir / name)
+        for name in ("checkpoint.pt", "checkpoint.zip")
+    )
+    if has_checkpoint and not is_completed_iteration(iter_dir):
+        return _problem(
+            409,
+            "policy evaluation is incomplete",
+            detail=(
+                f"iter {iter_index} preserved a checkpoint but has no valid "
+                "completion marker or full legacy rollout/fitness evidence; "
+                "use the interrupted-snapshot recovery flow instead"
+            ),
+            type="/problems/policy-evaluation-incomplete",
+        )
     try:
         from sculptor.export import ExportError, export_policy_bundle
     except Exception as e:  # noqa: BLE001

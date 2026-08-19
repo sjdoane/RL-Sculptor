@@ -280,6 +280,45 @@ def _find_latest_reward_version(rewards_dir: Path) -> tuple[int, Path]:
 
 
 _ITERATION_COMPLETE_MARKER = "iteration_complete.json"
+_ITERATION_CHECKPOINT_NAMES = frozenset({"checkpoint.pt", "checkpoint.zip"})
+
+
+def _is_canonical_iteration_checkpoint(
+    iter_dir: Path, checkpoint_path: Path
+) -> bool:
+    """Return whether the checkpoint is a plain canonical file in iter_dir."""
+    iter_dir = Path(iter_dir)
+    checkpoint_path = Path(checkpoint_path)
+    try:
+        if checkpoint_path.is_symlink():
+            return False
+        resolved = checkpoint_path.resolve(strict=True)
+        return (
+            resolved.parent == iter_dir.resolve(strict=True)
+            and resolved.name in _ITERATION_CHECKPOINT_NAMES
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _checkpoint_sha256_and_size(checkpoint_path: Path) -> tuple[str, int]:
+    """Return a byte-exact receipt for one plain, non-empty checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
+        raise ValueError(
+            "iteration completion requires a regular checkpoint file"
+        )
+    digest = hashlib.sha256()
+    byte_count = 0
+    with checkpoint_path.open("rb") as checkpoint_handle:
+        for chunk in iter(lambda: checkpoint_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            byte_count += len(chunk)
+    if byte_count <= 0:
+        raise ValueError(
+            "iteration completion requires a non-empty checkpoint file"
+        )
+    return digest.hexdigest(), byte_count
 
 
 def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
@@ -293,12 +332,44 @@ def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
         payload = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return (
+    valid_base = (
         isinstance(payload, dict)
-        and payload.get("schema") == 1
+        and payload.get("schema") in (1, 2)
         and type(payload.get("iter")) is int
         and payload.get("iter") == iter_index
         and payload.get("state") == "completed"
+    )
+    if not valid_base:
+        return False
+    # Schema 1 predates exact-byte receipts. Preserve its historical resume
+    # behavior, while every newly written schema-2 marker must still bind the
+    # checkpoint it claims before work can be skipped.
+    if payload.get("schema") == 1:
+        return True
+    disclosed = payload.get("checkpoint")
+    expected_sha256 = payload.get("checkpoint_sha256")
+    expected_bytes = payload.get("checkpoint_bytes")
+    if (
+        not isinstance(disclosed, str)
+        or not disclosed.strip()
+        or not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or type(expected_bytes) is not int
+        or expected_bytes <= 0
+    ):
+        return False
+    checkpoint = Path(disclosed).expanduser()
+    if not checkpoint.is_absolute():
+        checkpoint = iter_dir / checkpoint
+    if not _is_canonical_iteration_checkpoint(iter_dir, checkpoint):
+        return False
+    try:
+        actual_sha256, actual_bytes = _checkpoint_sha256_and_size(checkpoint)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return (
+        actual_sha256 == expected_sha256
+        and actual_bytes == expected_bytes
     )
 
 
@@ -332,17 +403,29 @@ def _write_iteration_completion_marker(
     reward_version_after: int | None,
     world_selection_hash: str | None,
 ) -> None:
-    """Atomically make a completed iteration distinguishable from a crash."""
+    """Atomically attest the exact checkpoint of a completed iteration."""
     from sculptor.run_context import write_json_atomic
+
+    checkpoint_path = Path(checkpoint_path)
+    if not _is_canonical_iteration_checkpoint(iter_dir, checkpoint_path):
+        raise ValueError(
+            "iteration completion checkpoint must be checkpoint.pt or "
+            "checkpoint.zip inside the exact iteration directory"
+        )
+    checkpoint_sha256, checkpoint_bytes = _checkpoint_sha256_and_size(
+        checkpoint_path
+    )
 
     write_json_atomic(
         iter_dir / _ITERATION_COMPLETE_MARKER,
         {
-            "schema": 1,
+            "schema": 2,
             "state": "completed",
             "iter": int(iter_index),
             "completed_at": _utc_now_iso(),
-            "checkpoint": str(checkpoint_path),
+            "checkpoint": str(checkpoint_path.resolve()),
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_bytes": checkpoint_bytes,
             "reward_version_before": int(reward_version_before),
             "reward_version_after": reward_version_after,
             "world_selection_hash": world_selection_hash,

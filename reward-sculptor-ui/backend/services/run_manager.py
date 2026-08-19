@@ -28,7 +28,7 @@ import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 from backend.services.cuda_errors import CudaErrorClass, classify
 from backend.services.job_manager import Job
@@ -2509,6 +2509,7 @@ def run_sculpt_job(
                 "suggestions": list(classification.suggestions or []),
                 "problem_type": classification.problem_type,
                 "action": classification.action,
+                "evidence": classification.evidence,
             }
             job.emit({
                 "type": "run_errored",
@@ -2520,6 +2521,7 @@ def run_sculpt_job(
                 "error_suggestions": classification.suggestions,
                 "error_problem_type": classification.problem_type,
                 "error_action": classification.action,
+                "error_evidence": classification.evidence,
             })
 
         return {
@@ -3033,9 +3035,18 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
     completion so the frontend can reconstruct full timeline state from
     a single GET."""
     by_iter: dict[int, dict[str, Any]] = {}
+    started_iter_indices: set[int] = set()
+    active_iter: int | None = None
     for ev in job.events:
         etype = ev.get("type")
         iter_idx = ev.get("iter")
+        if etype == "iter_started" and isinstance(iter_idx, int):
+            active_iter = iter_idx
+            started_iter_indices.add(iter_idx)
+        elif not isinstance(iter_idx, int) and etype == "iter_progress":
+            # The inner runner has no outer index; ordered progress belongs to
+            # the most recently started outer iteration.
+            iter_idx = active_iter
         if not isinstance(iter_idx, int):
             continue
         slot = by_iter.setdefault(
@@ -3070,6 +3081,11 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 # signal below the completion gate). None when the metric
                 # doesn't emit progress_score.
                 "progress": None,
+                "failure_stage": None,
+                "ppo_iterations_completed": None,
+                "ppo_iterations_requested": None,
+                "checkpoint_preserved": False,
+                "checkpoint_sha256": None,
             },
         )
         if etype == "iter_started":
@@ -3179,6 +3195,12 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 slot["best_fitness"] = float(ev.get("best_so_far"))
             if isinstance(ev.get("progress"), (int, float)):
                 slot["progress"] = float(ev.get("progress"))
+        elif etype == "iter_progress":
+            rl_iter = ev.get("rl_iter")
+            rl_total = ev.get("rl_total")
+            if type(rl_iter) is int and type(rl_total) is int:
+                slot["ppo_iterations_completed"] = rl_iter
+                slot["ppo_iterations_requested"] = rl_total
         elif etype == "best_reward_selected":
             if isinstance(ev.get("fitness"), (int, float)):
                 slot["best_fitness"] = float(ev.get("fitness"))
@@ -3199,12 +3221,51 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
     # (highest-started) iter keeps its event-derived status. Defense-in-depth
     # alongside the watcher pre-seed: `completed` is otherwise STRICTLY
     # stdout-`iter_completed`-driven with no artifact fallback.
-    started_idxs = [i for i, s in by_iter.items() if s.get("started_at")]
+    # An event timestamp is optional metadata, not proof that the iteration
+    # started.  Use the explicit lifecycle event so terminal reconciliation
+    # also works for durable/replayed logs whose ``iter_started`` record did
+    # not carry ``ts``.
+    started_idxs = sorted(started_iter_indices)
     if started_idxs:
         max_started = max(started_idxs)
         for i, s in by_iter.items():
             if i < max_started and s["status"] == "running":
                 s["status"] = "completed"
+        terminal_slot = by_iter[max_started]
+        if terminal_slot["status"] == "running" and job.status in {
+            "errored", "stopped",
+        }:
+            terminal_slot["status"] = job.status
+            terminal_event = next(
+                (
+                    event for event in reversed(job.events)
+                    if event.get("type") in {"run_errored", "run_stopped"}
+                ),
+                None,
+            )
+            if terminal_event is not None:
+                terminal_slot["completed_at"] = terminal_event.get("ts")
+
+        raw_classification = job.params.get("error_classification")
+        if isinstance(raw_classification, dict):
+            evidence = raw_classification.get("evidence")
+            if (
+                isinstance(evidence, dict)
+                and evidence.get("iteration") == max_started
+            ):
+                terminal_slot["failure_stage"] = evidence.get("failure_stage")
+                terminal_slot["ppo_iterations_completed"] = evidence.get(
+                    "rl_iter"
+                )
+                terminal_slot["ppo_iterations_requested"] = evidence.get(
+                    "rl_total"
+                )
+                terminal_slot["checkpoint_preserved"] = (
+                    evidence.get("checkpoint_preserved") is True
+                )
+                checkpoint_sha = evidence.get("checkpoint_sha256")
+                if isinstance(checkpoint_sha, str):
+                    terminal_slot["checkpoint_sha256"] = checkpoint_sha
 
     return [by_iter[k] for k in sorted(by_iter.keys())]
 
@@ -3214,11 +3275,211 @@ def build_iterations_summary(job: Job) -> list[dict[str, Any]]:
 
 
 # ── error classification on non-zero exit ─────────────────────────────
+def _post_training_rollout_failure_evidence(
+    log_path: Path, project_dir: Path,
+) -> dict[str, Any] | None:
+    """Prove completed/reused training, a later rollout failure, and checkpoint."""
+    active_iteration: int | None = None
+    terminal: dict[str, int] | None = None
+    terminal_source: Literal["ppo_progress", "train_skip"] | None = None
+    attested_checkpoint: Path | None = None
+    terminal_line = -1
+    rollout_started_after_terminal = False
+    rollout_failure_after_terminal = False
+    try:
+        handle = Path(log_path).open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with handle:
+        for line_number, raw_line in enumerate(handle):
+            marker = raw_line.find(EVENT_TAG)
+            if marker >= 0:
+                payload_text = raw_line[marker + len(EVENT_TAG):].strip()
+                try:
+                    event = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    event = None
+                if isinstance(event, dict):
+                    if (
+                        event.get("type") == "iter_started"
+                        and type(event.get("iter")) is int
+                        and event["iter"] >= 0
+                    ):
+                        active_iteration = int(event["iter"])
+                        # An outer iteration is a hard evidence boundary.  A
+                        # terminal progress record from an earlier iteration
+                        # must never classify a later rollout failure.
+                        terminal = None
+                        terminal_source = None
+                        attested_checkpoint = None
+                        terminal_line = -1
+                        rollout_started_after_terminal = False
+                        rollout_failure_after_terminal = False
+                    if event.get("type") == "iter_progress":
+                        rl_iter = event.get("rl_iter")
+                        rl_total = event.get("rl_total")
+                        event_iteration = event.get("iter")
+                        if (
+                            type(rl_iter) is int
+                            and type(rl_total) is int
+                            and rl_total > 0
+                            and rl_iter == rl_total
+                            and active_iteration is not None
+                            and (
+                                type(event_iteration) is not int
+                                or event_iteration == active_iteration
+                            )
+                        ):
+                            terminal = {
+                                "iteration": active_iteration,
+                                "rl_iter": rl_iter,
+                                "rl_total": rl_total,
+                            }
+                            terminal_source = "ppo_progress"
+                            attested_checkpoint = None
+                            terminal_line = line_number
+                            rollout_started_after_terminal = False
+                            rollout_failure_after_terminal = False
+                    if (
+                        event.get("type") == "phase_skipped"
+                        and event.get("phase") == "train"
+                        and type(event.get("iter")) is int
+                        and event.get("iter") == active_iteration
+                        and isinstance(event.get("checkpoint"), str)
+                    ):
+                        # `_train_or_resume` emits this only after validating
+                        # the local promoted checkpoint.  Bind the structured
+                        # attestation to the exact iteration path again here;
+                        # the mere presence of some checkpoint elsewhere must
+                        # not upgrade an evaluation failure.
+                        checkpoint_path = Path(event["checkpoint"])
+                        expected_names = {"checkpoint.pt", "checkpoint.zip"}
+                        expected = (
+                            Path(project_dir)
+                            / "runs"
+                            / f"iter_{active_iteration}"
+                            / checkpoint_path.name
+                        )
+                        try:
+                            checkpoint_attested = (
+                                checkpoint_path.is_absolute()
+                                and checkpoint_path.name in expected_names
+                                and Path(os.path.abspath(checkpoint_path))
+                                == Path(os.path.abspath(expected))
+                                and not expected.is_symlink()
+                                and expected.is_file()
+                                and expected.stat().st_size > 0
+                            )
+                        except OSError:
+                            checkpoint_attested = False
+                        if checkpoint_attested:
+                            terminal = {"iteration": active_iteration}
+                            terminal_source = "train_skip"
+                            attested_checkpoint = expected
+                            terminal_line = line_number
+                            rollout_started_after_terminal = False
+                            rollout_failure_after_terminal = False
+                    if (
+                        terminal is not None
+                        and line_number > terminal_line
+                        and event.get("type") == "rollout_started"
+                    ):
+                        rollout_started_after_terminal = True
+            if (
+                terminal is not None
+                and line_number > terminal_line
+                and "mjlab rollout runner exited" in raw_line.lower()
+            ):
+                rollout_failure_after_terminal = True
+    if terminal is None or not rollout_failure_after_terminal:
+        return None
+    checkpoint: Path | None = attested_checkpoint
+    if terminal_source == "ppo_progress":
+        iter_dir = Path(project_dir) / "runs" / f"iter_{terminal['iteration']}"
+        for name in ("checkpoint.pt", "checkpoint.zip"):
+            candidate = iter_dir / name
+            try:
+                if (
+                    not candidate.is_symlink()
+                    and candidate.is_file()
+                    and candidate.stat().st_size > 0
+                ):
+                    checkpoint = candidate
+                    break
+            except OSError:
+                continue
+    if checkpoint is None:
+        return None
+    try:
+        if (
+            checkpoint.is_symlink()
+            or not checkpoint.is_file()
+            or checkpoint.stat().st_size <= 0
+        ):
+            return None
+        checkpoint_sha256 = _file_sha256(checkpoint)
+        checkpoint_bytes = checkpoint.stat().st_size
+    except OSError:
+        return None
+    evidence: dict[str, Any] = {
+        "failure_stage": "evaluation",
+        "iteration": terminal["iteration"],
+        "checkpoint_preserved": True,
+        "checkpoint_name": checkpoint.name,
+        "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_sha256": checkpoint_sha256,
+        "rollout_started": rollout_started_after_terminal,
+    }
+    if terminal_source == "ppo_progress":
+        evidence.update({
+            "rl_iter": terminal["rl_iter"],
+            "rl_total": terminal["rl_total"],
+        })
+    else:
+        evidence.update({
+            "training_skipped": True,
+            "checkpoint_attested": True,
+        })
+    return evidence
+
+
 def _classify_run_failure(
     log_path: Path, project_dir: Path,
 ) -> CudaErrorClass:
-    """Scan the run's log for known failure signatures. Tail only — the
-    actual error message is almost always in the last few KiB."""
+    """Classify a non-zero run without conflating train and eval stages."""
+    post_training = _post_training_rollout_failure_evidence(
+        log_path, project_dir,
+    )
+    if post_training is not None:
+        iteration = int(post_training["iteration"])
+        rl_iter = post_training.get("rl_iter")
+        rl_total = post_training.get("rl_total")
+        if type(rl_iter) is int and type(rl_total) is int:
+            stage_detail = (
+                f"PPO reached {rl_iter}/{rl_total} for iter {iteration} and "
+                "the final checkpoint was preserved"
+            )
+        else:
+            stage_detail = (
+                f"Iter {iteration} reused its attested local training "
+                "checkpoint"
+            )
+        return CudaErrorClass(
+            kind="post_training_rollout_failed",
+            title="Training checkpoint preserved; evaluation failed",
+            detail=(
+                f"{stage_detail}, but rollout/evaluation "
+                "failed before completion and objective evidence were written."
+            ),
+            suggestions=[
+                "Treat this checkpoint as an interrupted recovery input, not "
+                "a completed policy.",
+                "Fix the rollout/evaluation failure, then relaunch from the "
+                "attested actor+critic snapshot.",
+            ],
+            problem_type="/problems/post-training-rollout-failed",
+            evidence=post_training,
+        )
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")[-32768:]
     except OSError:

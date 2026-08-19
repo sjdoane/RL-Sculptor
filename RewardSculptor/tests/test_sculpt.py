@@ -11,6 +11,7 @@ No live LLM. No training. Exercises:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import textwrap
@@ -27,6 +28,7 @@ from sculptor.adapters.base import (
 from sculptor.sculpt import (
     _find_resume_start_iteration,
     _should_early_stop,
+    _write_iteration_completion_marker,
     regenerate_reward_template,
     sculpt_init,
     sculpt_run,
@@ -102,6 +104,50 @@ def test_resume_does_not_jump_over_completion_marker_gap(tmp_path: Path):
     _write_completion_marker(runs, 4)
 
     assert _find_resume_start_iteration(rewards, runs) == 3
+
+
+def test_completion_marker_attests_exact_checkpoint_bytes(tmp_path: Path):
+    iter_dir = tmp_path / "runs" / "iter_7"
+    iter_dir.mkdir(parents=True)
+    checkpoint = iter_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"exact actor and critic bytes")
+
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=7,
+        checkpoint_path=checkpoint,
+        reward_version_before=3,
+        reward_version_after=4,
+        world_selection_hash="a" * 64,
+    )
+
+    marker = json.loads(
+        (iter_dir / "iteration_complete.json").read_text(encoding="utf-8")
+    )
+    assert marker["schema"] == 2
+    assert marker["checkpoint_sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    assert marker["checkpoint_bytes"] == checkpoint.stat().st_size
+
+    rewards_dir = tmp_path / "rewards"
+    _write_reward_version(rewards_dir, 7)
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 8
+
+    external = tmp_path / "checkpoint.pt"
+    external.write_bytes(checkpoint.read_bytes())
+    forged = dict(marker)
+    forged["checkpoint"] = str(external)
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps(forged), encoding="utf-8"
+    )
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 7
+
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps(marker), encoding="utf-8"
+    )
+    checkpoint.write_bytes(b"x" * checkpoint.stat().st_size)
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 7
 
 
 # ── Metric-plateau auto-kill compatibility ───────────────────────────────
@@ -564,6 +610,12 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         )
         assert completion["state"] == "completed"
         assert completion["iter"] == i
+        assert completion["schema"] == 2
+        checkpoint = proj / "runs" / f"iter_{i}" / "checkpoint.zip"
+        assert completion["checkpoint_sha256"] == hashlib.sha256(
+            checkpoint.read_bytes()
+        ).hexdigest()
+        assert completion["checkpoint_bytes"] == checkpoint.stat().st_size
     for n in (1, 2, 3):
         assert (proj / "rewards" / f"v{n}.py").is_file()
     # current.py now re-exports v3

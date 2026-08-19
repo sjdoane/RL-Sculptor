@@ -320,6 +320,15 @@ class IterEventSummary(BaseModel):
     # progress_score — ranks iterations below the completion gate). None
     # when the metric doesn't emit it.
     progress: Optional[float] = None
+    # Stage-aware terminal truth. A non-empty checkpoint after PPO does not
+    # make the outer iteration completed when rollout/evaluation then fails.
+    failure_stage: Optional[Literal["evaluation"]] = None
+    ppo_iterations_completed: Optional[int] = None
+    ppo_iterations_requested: Optional[int] = None
+    checkpoint_preserved: bool = False
+    checkpoint_sha256: Optional[
+        Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    ] = None
     # §env generalization: diagnoser env-curriculum change applied at
     # this iter's boundary (env_spec_updated event): {"new_version":
     # "v2" | None, "applied": ["entropy_coef_scale=1.5", ...],
@@ -342,6 +351,7 @@ class ErrorClassification(BaseModel):
     suggestions: list[str] = []
     problem_type: str = "about:blank"
     action: Optional[dict] = None
+    evidence: Optional[dict] = None
 
 
 class RunSummary(BaseModel):
@@ -413,6 +423,9 @@ class PolicySummary(BaseModel):
     iter_index: int
     checkpoint: str                       # "checkpoint.pt" | "checkpoint.zip"
     checkpoint_bytes: int
+    # Server-authoritative completion decision. Evidence coverage below is
+    # descriptive and must never become a second, task-specific deploy gate.
+    deployable: bool
     primary_metric: Optional[float] = None
     fitness: Optional[float] = None
     reward_version: Optional[str] = None

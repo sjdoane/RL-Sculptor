@@ -9,8 +9,10 @@ so in the manifest; that's fine for route-level tests).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import struct
 import zipfile
 from pathlib import Path
 
@@ -29,10 +31,43 @@ def _make_project(client: TestClient) -> str:
     return r.json()["slug"]
 
 
+def _npy_bytes() -> bytes:
+    header = "{'descr': '|u1', 'fortran_order': False, 'shape': (1,), }"
+    preamble_size = 10
+    padding = (-(preamble_size + len(header) + 1)) % 16
+    encoded = (header + (" " * padding) + "\n").encode("latin1")
+    return (
+        b"\x93NUMPY\x01\x00"
+        + struct.pack("<H", len(encoded))
+        + encoded
+        + b"\x00"
+    )
+
+
+def _mp4_box(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I4s", 8 + len(payload), kind) + payload
+
+
+def _minimal_structural_mp4() -> bytes:
+    track = _mp4_box(
+        b"trak",
+        _mp4_box(b"tkhd", b"\x00" * 16) + _mp4_box(b"mdia", b""),
+    )
+    movie = _mp4_box(
+        b"moov", _mp4_box(b"mvhd", b"\x00" * 16) + track,
+    )
+    return (
+        _mp4_box(b"ftyp", b"isom\x00\x00\x00\x00isom")
+        + movie
+        + _mp4_box(b"mdat", b"\x00")
+    )
+
+
 def _plant_iter(
     project_dir: Path, i: int, *, metric: float = 10.0,
     reward_version: str = "v0", fitness: float | None = None,
     fitness_doc: dict | None = None, rollout: bool = False,
+    completed: bool = True, legacy_complete: bool = False,
 ) -> None:
     it = project_dir / "runs" / f"iter_{i}"
     it.mkdir(parents=True, exist_ok=True)
@@ -53,6 +88,35 @@ def _plant_iter(
     if rollout:
         (it / "rollout").mkdir()
         (it / "rollout" / "rollout.mp4").write_bytes(b"immutable-rollout")
+    if legacy_complete:
+        rollout_dir = it / "rollout"
+        rollout_dir.mkdir(exist_ok=True)
+        (rollout_dir / "behavior.json").write_text(
+            json.dumps({"episodes": 1}), encoding="utf-8",
+        )
+        with zipfile.ZipFile(
+            rollout_dir / "trajectory.npz", "w", zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("trajectory.npy", _npy_bytes())
+        (rollout_dir / "rollout.mp4").write_bytes(
+            _minimal_structural_mp4()
+        )
+        if not (it / "fitness.json").is_file():
+            (it / "fitness.json").write_text(
+                json.dumps({"fitness": metric}), encoding="utf-8",
+            )
+    if completed:
+        checkpoint = (it / "checkpoint.pt").resolve()
+        (it / "iteration_complete.json").write_text(json.dumps({
+            "schema": 2,
+            "state": "completed",
+            "iter": i,
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": hashlib.sha256(
+                checkpoint.read_bytes()
+            ).hexdigest(),
+            "checkpoint_bytes": checkpoint.stat().st_size,
+        }), encoding="utf-8")
 
 
 def test_list_policies_empty(client: TestClient, tmp_projects_root: Path):
@@ -83,6 +147,114 @@ def test_list_policies_returns_disk_iters(
     assert rows[1]["fitness"] == pytest.approx(0.37)
     assert rows[0]["checkpoint"] == "checkpoint.pt"
     assert rows[0]["checkpoint_bytes"] > 0
+    assert rows[0]["deployable"] is True
+
+
+def test_policy_listing_excludes_preserved_but_unevaluated_checkpoint(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(project_dir, 2, completed=False)
+
+    listed = client.get(f"/projects/{slug}/policies")
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+    exported = client.get(f"/projects/{slug}/policies/2/export")
+    assert exported.status_code == 409
+    assert exported.json()["type"] == (
+        "/problems/policy-evaluation-incomplete"
+    )
+    assert "interrupted-snapshot recovery" in exported.json()["detail"]
+
+
+def test_policy_listing_rejects_unhashed_completion_marker(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(project_dir, 2, completed=False)
+    iter_dir = project_dir / "runs" / "iter_2"
+    checkpoint = (iter_dir / "checkpoint.pt").resolve()
+    (iter_dir / "iteration_complete.json").write_text(json.dumps({
+        "schema": 1,
+        "state": "completed",
+        "iter": 2,
+        "checkpoint": str(checkpoint),
+    }), encoding="utf-8")
+
+    listed = client.get(f"/projects/{slug}/policies")
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+
+@pytest.mark.parametrize("tamper", ["content", "byte-count"])
+def test_policy_listing_rejects_completion_marker_checkpoint_mismatch(
+    client: TestClient, tmp_projects_root: Path, tamper: str,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(project_dir, 2)
+    iter_dir = project_dir / "runs" / "iter_2"
+    checkpoint = iter_dir / "checkpoint.pt"
+    marker_path = iter_dir / "iteration_complete.json"
+    if tamper == "content":
+        mutated = bytearray(checkpoint.read_bytes())
+        mutated[-1] ^= 1
+        checkpoint.write_bytes(mutated)
+    else:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["checkpoint_bytes"] += 1
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    listed = client.get(f"/projects/{slug}/policies")
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+
+def test_policy_listing_retains_explicit_full_legacy_completion(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(
+        project_dir,
+        1,
+        fitness=0.5,
+        completed=False,
+        legacy_complete=True,
+    )
+
+    response = client.get(f"/projects/{slug}/policies")
+    assert response.status_code == 200
+    assert [row["iter_index"] for row in response.json()] == [1]
+
+
+@pytest.mark.parametrize("corrupt", ["trajectory", "video"])
+def test_policy_listing_rejects_corrupt_legacy_binary_evidence(
+    client: TestClient, tmp_projects_root: Path, corrupt: str,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(
+        project_dir,
+        1,
+        fitness=0.5,
+        completed=False,
+        legacy_complete=True,
+    )
+    rollout_dir = project_dir / "runs" / "iter_1" / "rollout"
+    target = (
+        rollout_dir / "trajectory.npz"
+        if corrupt == "trajectory"
+        else rollout_dir / "rollout.mp4"
+    )
+    target.write_bytes(b"nonempty but corrupt")
+
+    response = client.get(f"/projects/{slug}/policies")
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 def test_policy_listing_uses_evidenced_selection_not_newest(
@@ -231,6 +403,14 @@ def test_export_corrupt_checkpoint_still_ships_raw(
     it = pdir / "runs" / "iter_0"
     it.mkdir(parents=True)
     (it / "checkpoint.pt").write_bytes(b"garbage")
+    (it / "iteration_complete.json").write_text(json.dumps({
+        "schema": 2,
+        "state": "completed",
+        "iter": 0,
+        "checkpoint": str((it / "checkpoint.pt").resolve()),
+        "checkpoint_sha256": hashlib.sha256(b"garbage").hexdigest(),
+        "checkpoint_bytes": len(b"garbage"),
+    }), encoding="utf-8")
     r = client.get(f"/projects/{slug}/policies/0/export")
     assert r.status_code == 200
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:

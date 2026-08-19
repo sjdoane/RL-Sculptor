@@ -2910,6 +2910,187 @@ def test_env_extension_suggestion_surfaced_in_iter_summary() -> None:
     assert s1["env_extension_suggestion"] is None
 
 
+def test_post_training_rollout_failure_is_stage_aware_and_closes_iteration(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    from backend.services.job_manager import Job
+    from backend.services.run_manager import (
+        _classify_run_failure,
+        build_iterations_summary,
+    )
+
+    project_dir = tmp_projects_root / "post-training-eval-failure"
+    iter_dir = project_dir / "runs" / "iter_2"
+    iter_dir.mkdir(parents=True)
+    checkpoint = iter_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"preserved-final-actor-critic")
+    log_path = project_dir / "runs" / "_run_job_evalfailed.log"
+    log_path.write_text("\n".join([
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "iter_started", "iter": 2,
+        }),
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "iter_progress", "rl_iter": 750, "rl_total": 750,
+        }),
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "rollout_started", "n_episodes": 2,
+        }),
+        "RuntimeError: mjlab rollout runner exited 1",
+    ]) + "\n", encoding="utf-8")
+
+    classification = _classify_run_failure(log_path, project_dir)
+    assert classification.kind == "post_training_rollout_failed"
+    assert classification.title == (
+        "Training checkpoint preserved; evaluation failed"
+    )
+    assert classification.problem_type == (
+        "/problems/post-training-rollout-failed"
+    )
+    assert classification.evidence == {
+        "failure_stage": "evaluation",
+        "iteration": 2,
+        "rl_iter": 750,
+        "rl_total": 750,
+        "checkpoint_preserved": True,
+        "checkpoint_name": "checkpoint.pt",
+        "checkpoint_bytes": checkpoint.stat().st_size,
+        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "rollout_started": True,
+    }
+
+    job = Job(
+        job_id="job_evalfailed",
+        kind="sculpt_run",
+        project_slug="post-training-eval-failure",
+        status="errored",
+        error=classification.title,
+        params={
+            "behavior_goal": "bound from a reference motion",
+            "iterations": 3,
+            "error_classification": {
+                "kind": classification.kind,
+                "title": classification.title,
+                "detail": classification.detail,
+                "suggestions": classification.suggestions,
+                "problem_type": classification.problem_type,
+                "action": classification.action,
+                "evidence": classification.evidence,
+            },
+        },
+    )
+    job.events = [
+        {"type": "iter_started", "iter": 2},
+        {"type": "iter_progress", "rl_iter": 750, "rl_total": 750},
+        {"type": "run_errored", "ts": "2026-08-19T12:00:00+00:00"},
+    ]
+    summary = build_iterations_summary(job)
+    assert summary == [{
+        **summary[0],
+        "status": "errored",
+        "failure_stage": "evaluation",
+        "ppo_iterations_completed": 750,
+        "ppo_iterations_requested": 750,
+        "checkpoint_preserved": True,
+        "checkpoint_sha256": classification.evidence["checkpoint_sha256"],
+    }]
+    assert summary[0]["status"] == "errored"
+    assert summary[0]["completed_at"] == "2026-08-19T12:00:00+00:00"
+
+
+def test_post_training_classification_requires_terminal_progress(
+    tmp_path: Path,
+) -> None:
+    from backend.services.run_manager import _classify_run_failure
+
+    project_dir = tmp_path / "not-finished-training"
+    iter_dir = project_dir / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "checkpoint.pt").write_bytes(b"periodic-copy")
+    log_path = project_dir / "runs" / "_run_job_partial.log"
+    log_path.write_text("\n".join([
+        '[SCULPT-EVENT] {"type":"iter_started","iter":0}',
+        '[SCULPT-EVENT] {"type":"iter_progress","rl_iter":749,"rl_total":750}',
+        "RuntimeError: mjlab rollout runner exited 1",
+    ]), encoding="utf-8")
+
+    classification = _classify_run_failure(log_path, project_dir)
+    assert classification.kind == "unknown"
+    assert classification.title == "Training failed"
+
+
+def test_post_training_rollout_failure_accepts_attested_same_iter_retry(
+    tmp_path: Path,
+) -> None:
+    """A retry may reuse its own checkpoint and skip PPO entirely.
+
+    The structured train-skip event is sufficient stage evidence only when it
+    binds the exact active iteration and exact promoted checkpoint path.  An
+    earlier iteration's terminal PPO event must not leak across that boundary.
+    """
+    from backend.services.run_manager import _classify_run_failure
+
+    project_dir = tmp_path / "eval-retry"
+    iter_dir = project_dir / "runs" / "iter_2"
+    iter_dir.mkdir(parents=True)
+    checkpoint = iter_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"same-iteration-retry-actor-critic")
+    log_path = project_dir / "runs" / "_run_job_evalretry.log"
+    log_path.write_text("\n".join([
+        '[SCULPT-EVENT] {"type":"iter_started","iter":1}',
+        '[SCULPT-EVENT] {"type":"iter_progress","rl_iter":750,'
+        '"rl_total":750}',
+        '[SCULPT-EVENT] {"type":"iter_started","iter":2}',
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "phase_skipped",
+            "iter": 2,
+            "phase": "train",
+            "reason": "checkpoint already on disk",
+            "checkpoint": str(checkpoint),
+        }),
+        '[SCULPT-EVENT] {"type":"rollout_started","n_episodes":2}',
+        "RuntimeError: mjlab rollout runner exited 1",
+    ]) + "\n", encoding="utf-8")
+
+    classification = _classify_run_failure(log_path, project_dir)
+
+    assert classification.kind == "post_training_rollout_failed"
+    assert classification.evidence == {
+        "failure_stage": "evaluation",
+        "iteration": 2,
+        "checkpoint_preserved": True,
+        "checkpoint_name": "checkpoint.pt",
+        "checkpoint_bytes": checkpoint.stat().st_size,
+        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "rollout_started": True,
+        "training_skipped": True,
+        "checkpoint_attested": True,
+    }
+    assert "Iter 2 reused its attested local training checkpoint" in (
+        classification.detail
+    )
+    assert "750/750" not in classification.detail
+
+    other_iter_dir = project_dir / "runs" / "iter_1"
+    other_iter_dir.mkdir()
+    other_checkpoint = other_iter_dir / "checkpoint.pt"
+    other_checkpoint.write_bytes(b"wrong-iteration-checkpoint")
+    log_path.write_text("\n".join([
+        '[SCULPT-EVENT] {"type":"iter_started","iter":2}',
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "phase_skipped",
+            "iter": 2,
+            "phase": "train",
+            "reason": "checkpoint already on disk",
+            "checkpoint": str(other_checkpoint),
+        }),
+        '[SCULPT-EVENT] {"type":"rollout_started","n_episodes":2}',
+        "RuntimeError: mjlab rollout runner exited 1",
+    ]) + "\n", encoding="utf-8")
+
+    wrong_iteration = _classify_run_failure(log_path, project_dir)
+    assert wrong_iteration.kind == "unknown"
+
+
 def test_iter_detail_has_realism_audit_none_when_no_event(
     client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch,
 ) -> None:

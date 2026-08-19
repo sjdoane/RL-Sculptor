@@ -34,6 +34,9 @@ class CudaErrorClass:
     # Optional action descriptor so the UI can render a one-click remediation
     # (e.g. "Regenerate reward template" → calls a known endpoint).
     action: Optional[dict] = None
+    # Structured, non-path evidence for stage-aware failures. Kept separate
+    # from prose so run/iteration summaries can render truthful progress.
+    evidence: Optional[dict] = None
 
 
 def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorClass:

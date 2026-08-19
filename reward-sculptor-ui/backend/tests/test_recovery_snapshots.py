@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import shutil
+import struct
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,12 +19,43 @@ def _event(payload: dict) -> str:
     return "[SCULPT-EVENT] " + json.dumps(payload, separators=(",", ":"))
 
 
+def _legacy_npy_bytes() -> bytes:
+    header = "{'descr': '|u1', 'fortran_order': False, 'shape': (1,), }"
+    padding = (-(10 + len(header) + 1)) % 16
+    encoded = (header + (" " * padding) + "\n").encode("latin1")
+    return b"\x93NUMPY\x01\x00" + struct.pack("<H", len(encoded)) + encoded + b"\x00"
+
+
+def _legacy_mp4_box(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I4s", 8 + len(payload), kind) + payload
+
+
+def _legacy_structural_mp4() -> bytes:
+    track = _legacy_mp4_box(
+        b"trak",
+        _legacy_mp4_box(b"tkhd", b"\x00" * 16)
+        + _legacy_mp4_box(b"mdia", b""),
+    )
+    return (
+        _legacy_mp4_box(b"ftyp", b"isom\x00\x00\x00\x00isom")
+        + _legacy_mp4_box(
+            b"moov", _legacy_mp4_box(b"mvhd", b"\x00" * 16) + track,
+        )
+        + _legacy_mp4_box(b"mdat", b"\x00")
+    )
+
+
 def _plant_interrupted_snapshot(
     project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     model_step: int = 50,
+    observed_step: int = 58,
     completed: bool = False,
+    include_final_checkpoint: bool = False,
+    training_completed: bool = False,
+    contract_event_type: str = "warm_start_observation_extended",
+    warm_start_role: str | None = "actor_critic",
     symlink_model: bool = False,
 ) -> tuple[Path, bytes]:
     """Plant the minimum exact evidence used by legacy reconstruction."""
@@ -36,7 +69,7 @@ def _plant_interrupted_snapshot(
     logs_dir.mkdir(parents=True, exist_ok=True)
     env_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_bytes = b"actor-and-critic-at-ppo-50"
+    checkpoint_bytes = f"actor-and-critic-at-ppo-{model_step}".encode()
     model_path = logs_dir / f"model_{model_step}.pt"
     if symlink_model:
         outside = project_dir.parent / "outside-model.pt"
@@ -46,13 +79,31 @@ def _plant_interrupted_snapshot(
         model_path.write_bytes(checkpoint_bytes)
     # model_0 is intentionally never a recoverable trained snapshot.
     (logs_dir / "model_0.pt").write_bytes(b"initial-policy")
+    if completed or include_final_checkpoint:
+        final_checkpoint = iter_dir / "checkpoint.pt"
+        final_checkpoint.write_bytes(checkpoint_bytes)
     if completed:
-        (iter_dir / "checkpoint.pt").write_bytes(b"completed-policy")
+        (iter_dir / "iteration_complete.json").write_text(json.dumps({
+            "schema": 2,
+            "state": "completed",
+            "iter": iteration,
+            "checkpoint": str(final_checkpoint.resolve()),
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+            "checkpoint_bytes": len(checkpoint_bytes),
+        }), encoding="utf-8")
 
     contract = {
         "schema": 3,
-        "adapter": {"class": "test.Adapter", "task_id": "test-task"},
+        "identity": {
+            "adapter_class": "test.Adapter", "task_id": "test-task",
+        },
         "policy": {"roles": ["actor", "critic"]},
+        "versions": {
+            "torch": "2.11",
+            "mjlab": "1.3.0",
+            "rsl_rl": "5.0.1",
+            "adapter": "0.1.0",
+        },
     }
     contract_path = iter_dir / "warm_start_effective_policy_contract.json"
     contract_path.write_text(json.dumps(contract), encoding="utf-8")
@@ -86,6 +137,51 @@ def _plant_interrupted_snapshot(
     monkeypatch.setattr(
         recovery_snapshots.WorldArtifactStore, "read_selection", _read_selection,
     )
+    monkeypatch.setattr(
+        recovery_snapshots,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: dict(contract),
+    )
+
+    context_event: list[str] = []
+    if warm_start_role is None:
+        config_path = project_dir / "config.toml"
+        config_path.write_text("[target]\nname = 'fixture'\n", encoding="utf-8")
+        config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        reports_dir = project_dir / "reports"
+        reports_dir.mkdir()
+        context_path = reports_dir / "run_context.json"
+        context_path.write_text(json.dumps({
+            "schema": 3,
+            "start_iter": iteration,
+            "iterations": 1,
+            "code_git": {"sha": "1" * 40, "dirty": False},
+            "config": {
+                "path": str(config_path.resolve()),
+                "sha256": config_sha,
+                "effective": {
+                    "adapter": {
+                        "class": "test.Adapter",
+                        "config": {"task_id": "test-task"},
+                    },
+                },
+            },
+            "seeds": {"base_seed": 42},
+            "packages": {
+                "torch": "2.11.0",
+                "mjlab": "1.3.0",
+                "rsl-rl-lib": "5.0.1",
+                "reward-sculptor": "0.1.0",
+            },
+        }), encoding="utf-8")
+        context_event = [_event({
+            "type": "run_context_captured",
+            "path": str(context_path.resolve()),
+            "code_sha": "1" * 40,
+            "code_dirty": False,
+            "config_sha256": config_sha,
+            "base_seed": 42,
+        })]
 
     log_path = project_dir / "runs" / "_run_job_deadbeefcafebabe.log"
     log_path.write_text("\n".join([
@@ -95,22 +191,51 @@ def _plant_interrupted_snapshot(
             "tuple_hash": "f" * 64,
             "selection": "selection_v6.json",
         }),
-        _event({"type": "iter_started", "iter": iteration, "steps": 750}),
+        *context_event,
         _event({
-            "type": "warm_start_observation_extended",
-            "effective_policy_contract": str(contract_path.resolve()),
-            "effective_policy_contract_sha256": contract_sha,
+            "type": "iter_started",
+            "iter": iteration,
+            "steps": 750,
+            **(
+                {"warm_start_source": "/server-owned/source.pt"}
+                if warm_start_role is not None
+                else {}
+            ),
         }),
+        *(
+            [
+                _event({
+                    "type": contract_event_type,
+                    "effective_policy_contract": str(contract_path.resolve()),
+                    "effective_policy_contract_sha256": contract_sha,
+                }),
+                _event({
+                    "type": "warm_start_loaded",
+                    "source": "/server-owned/source.pt",
+                    "source_sha256": "a" * 64,
+                    "load_cfg_keys": (
+                        ["actor"]
+                        if warm_start_role == "actor_only"
+                        else ["actor", "critic"]
+                    ),
+                }),
+            ]
+            if warm_start_role is not None
+            else []
+        ),
         _event({
-            "type": "warm_start_loaded",
-            "source": "/server-owned/source.pt",
-            "source_sha256": "a" * 64,
-            "load_cfg_keys": ["actor", "critic"],
+            "type": "learning_vitals",
+            "rl_iter": observed_step,
+            "rl_total": 750,
         }),
-        _event({
-            "type": "learning_vitals", "rl_iter": 58, "rl_total": 750,
-        }),
-        "RuntimeError: mjlab runner exited 1",
+        *(
+            [_event({
+                "type": "iter_progress", "rl_iter": 750, "rl_total": 750,
+            })]
+            if training_completed
+            else []
+        ),
+        "RuntimeError: mjlab rollout runner exited 1",
     ]) + "\n", encoding="utf-8")
     return model_path, checkpoint_bytes
 
@@ -167,6 +292,196 @@ def test_discovery_materializes_one_immutable_nonzero_snapshot(
     ]
     assert {path.parent for path in evidence_paths} == {cached.parent}
     assert all(path.is_file() for path in evidence_paths)
+
+
+def test_post_training_rollout_failure_admits_only_latest_exact_contract_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.recovery_snapshots import (
+        discover_recovery_snapshots,
+        resolve_recovery_snapshot,
+    )
+
+    project_dir = tmp_path / "post-training-rollout-failure"
+    origin, expected = _plant_interrupted_snapshot(
+        project_dir,
+        monkeypatch,
+        model_step=749,
+        observed_step=749,
+        include_final_checkpoint=True,
+        training_completed=True,
+        contract_event_type="warm_start_observation_contract_verified",
+    )
+    logs_dir = origin.parent
+    (logs_dir / "model_100.pt").write_bytes(b"periodic-100")
+    (logs_dir / "model_700.pt").write_bytes(b"periodic-700")
+
+    rows = discover_recovery_snapshots(project_dir)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["ppo_step"] == 749
+    assert row["last_observed_ppo_iteration"] == 750
+    assert row["checkpoint_sha256"] == hashlib.sha256(expected).hexdigest()
+    assert len(list(
+        (project_dir / "runs" / "_recovery").glob("*/receipt.json")
+    )) == 1
+
+    _, receipt = resolve_recovery_snapshot(
+        project_dir,
+        snapshot_id=row["snapshot_id"],
+        checkpoint_sha256=row["checkpoint_sha256"],
+        receipt_digest=row["receipt_digest"],
+    )
+    assert receipt["source"]["selection_version"] == 6
+    assert receipt["source"]["tuple_hash"] == "f" * 64
+    assert receipt["source"]["matches_pinned_selection"] is False
+    assert receipt["checkpoint"]["origin_path"] == str(origin)
+
+    # Discovery is stable: cached authority suppresses lower periodic saves.
+    assert discover_recovery_snapshots(project_dir) == rows
+    assert len(list(
+        (project_dir / "runs" / "_recovery").glob("*/receipt.json")
+    )) == 1
+
+
+def test_post_training_actor_only_warm_start_admits_produced_actor_critic_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.recovery_snapshots import (
+        discover_recovery_snapshots,
+        resolve_recovery_snapshot,
+    )
+
+    project_dir = tmp_path / "actor-only-post-training-failure"
+    _plant_interrupted_snapshot(
+        project_dir,
+        monkeypatch,
+        model_step=749,
+        observed_step=749,
+        include_final_checkpoint=True,
+        training_completed=True,
+        contract_event_type="warm_start_observation_contract_verified",
+        warm_start_role="actor_only",
+    )
+
+    rows = discover_recovery_snapshots(project_dir)
+    assert len(rows) == 1
+    _, receipt = resolve_recovery_snapshot(
+        project_dir,
+        snapshot_id=rows[0]["snapshot_id"],
+        checkpoint_sha256=rows[0]["checkpoint_sha256"],
+        receipt_digest=rows[0]["receipt_digest"],
+    )
+    assert receipt["source"]["producer_initialization_roles"] == ["actor"]
+    assert receipt["source"]["effective_policy_contract_authority"] == (
+        "warm_start_effective_contract_event"
+    )
+
+
+def test_post_training_scratch_run_caches_exact_contract_context_and_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.recovery_snapshots import (
+        discover_recovery_snapshots,
+        resolve_recovery_snapshot,
+    )
+
+    project_dir = tmp_path / "scratch-post-training-failure"
+    _plant_interrupted_snapshot(
+        project_dir,
+        monkeypatch,
+        model_step=749,
+        observed_step=749,
+        include_final_checkpoint=True,
+        training_completed=True,
+        warm_start_role=None,
+    )
+
+    rows = discover_recovery_snapshots(project_dir)
+    assert len(rows) == 1
+    _, receipt = resolve_recovery_snapshot(
+        project_dir,
+        snapshot_id=rows[0]["snapshot_id"],
+        checkpoint_sha256=rows[0]["checkpoint_sha256"],
+        receipt_digest=rows[0]["receipt_digest"],
+    )
+    source = receipt["source"]
+    assert source["producer_initialization_roles"] == []
+    assert source["effective_policy_contract_authority"] == (
+        "scratch_run_context_selection"
+    )
+    recovery_dir = Path(receipt["checkpoint"]["path"]).parent
+    assert Path(source["run_context_path"]) == recovery_dir / "run_context.json"
+    assert Path(source["run_config_path"]) == recovery_dir / "config.toml"
+    assert Path(source["effective_policy_contract_path"]) == (
+        recovery_dir / "effective_policy_contract.json"
+    )
+
+
+def test_latest_snapshot_uses_unique_same_iteration_retry_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.recovery_snapshots import (
+        discover_recovery_snapshots,
+        resolve_recovery_snapshot,
+    )
+
+    project_dir = tmp_path / "same-iteration-retry"
+    _plant_interrupted_snapshot(
+        project_dir,
+        monkeypatch,
+        model_step=749,
+        observed_step=749,
+        include_final_checkpoint=True,
+    )
+    current_log = project_dir / "runs" / "_run_job_deadbeefcafebabe.log"
+    old_log = project_dir / "runs" / "_run_job_earlierretry.log"
+    old_log.write_text(
+        current_log.read_text(encoding="utf-8").replace(
+            '"rl_iter":749', '"rl_iter":58'
+        ),
+        encoding="utf-8",
+    )
+
+    rows = discover_recovery_snapshots(project_dir)
+    assert len(rows) == 1
+    assert rows[0]["source_job_id"] == "job_deadbeefcafebabe"
+    _, receipt = resolve_recovery_snapshot(
+        project_dir,
+        snapshot_id=rows[0]["snapshot_id"],
+        checkpoint_sha256=rows[0]["checkpoint_sha256"],
+        receipt_digest=rows[0]["receipt_digest"],
+    )
+    assert receipt["source"]["last_observed_ppo_step"] == 749
+
+
+def test_full_legacy_completion_suppresses_new_recovery_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.recovery_snapshots import discover_recovery_snapshots
+
+    project_dir = tmp_path / "legacy-completed"
+    _plant_interrupted_snapshot(
+        project_dir,
+        monkeypatch,
+        include_final_checkpoint=True,
+    )
+    iter_dir = project_dir / "runs" / "iter_2"
+    rollout_dir = iter_dir / "rollout"
+    rollout_dir.mkdir()
+    (rollout_dir / "behavior.json").write_text(
+        json.dumps({"episodes": 2}), encoding="utf-8",
+    )
+    with zipfile.ZipFile(
+        rollout_dir / "trajectory.npz", "w", zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr("trajectory.npy", _legacy_npy_bytes())
+    (rollout_dir / "rollout.mp4").write_bytes(_legacy_structural_mp4())
+    (iter_dir / "fitness.json").write_text(
+        json.dumps({"fitness": 0.25}), encoding="utf-8",
+    )
+
+    assert discover_recovery_snapshots(project_dir) == []
 
 
 @pytest.mark.parametrize("mode", ["model0", "completed", "symlink"])
