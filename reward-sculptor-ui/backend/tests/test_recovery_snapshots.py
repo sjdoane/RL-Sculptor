@@ -229,9 +229,15 @@ def _plant_interrupted_snapshot(
             "rl_total": 750,
         }),
         *(
-            [_event({
-                "type": "iter_progress", "rl_iter": 750, "rl_total": 750,
-            })]
+            [
+                _event({
+                    "type": "iter_progress", "rl_iter": 750, "rl_total": 750,
+                }),
+                json.dumps({
+                    "status": "ok",
+                    "checkpoint": str((iter_dir / "checkpoint.pt").resolve()),
+                }, separators=(",", ":")),
+            ]
             if training_completed
             else []
         ),
@@ -433,12 +439,20 @@ def test_latest_snapshot_uses_unique_same_iteration_retry_log(
         model_step=749,
         observed_step=749,
         include_final_checkpoint=True,
+        training_completed=True,
     )
     current_log = project_dir / "runs" / "_run_job_deadbeefcafebabe.log"
     old_log = project_dir / "runs" / "_run_job_earlierretry.log"
+    current_text = current_log.read_text(encoding="utf-8")
+    successful_handoff = json.dumps({
+        "status": "ok",
+        "checkpoint": str(
+            (project_dir / "runs" / "iter_2" / "checkpoint.pt").resolve()
+        ),
+    }, separators=(",", ":"))
     old_log.write_text(
-        current_log.read_text(encoding="utf-8").replace(
-            '"rl_iter":749', '"rl_iter":58'
+        current_text.replace('"rl_iter":749', '"rl_iter":58').replace(
+            successful_handoff, "RuntimeError: mjlab runner exited 1",
         ),
         encoding="utf-8",
     )
@@ -452,7 +466,7 @@ def test_latest_snapshot_uses_unique_same_iteration_retry_log(
         checkpoint_sha256=rows[0]["checkpoint_sha256"],
         receipt_digest=rows[0]["receipt_digest"],
     )
-    assert receipt["source"]["last_observed_ppo_step"] == 749
+    assert receipt["source"]["last_observed_ppo_step"] == 750
 
 
 def test_full_legacy_completion_suppresses_new_recovery_admission(

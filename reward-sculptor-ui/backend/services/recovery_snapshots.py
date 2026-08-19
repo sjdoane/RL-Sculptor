@@ -101,6 +101,33 @@ def _events_from_log(path: Path) -> tuple[list[dict[str, Any]], str]:
     return events, text
 
 
+def _successful_train_checkpoints(text: str) -> list[str]:
+    """Return exact checkpoint paths from successful train subprocess output.
+
+    ``iter_progress`` is an outer orchestration signal and may be advanced to
+    the requested total while a failed train subprocess is being torn down.
+    The train runner's own compact JSON result is therefore the only legacy
+    evidence that a final ``model_(steps - 1).pt`` save was handed back to the
+    orchestrator before post-training evaluation began.
+    """
+    checkpoints: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(value, dict)
+            and value.get("status") == "ok"
+            and isinstance(value.get("checkpoint"), str)
+        ):
+            checkpoints.append(value["checkpoint"])
+    return checkpoints
+
+
 def _attested_run_context(
     project_dir: Path,
     *,
@@ -346,6 +373,25 @@ def _matching_origin_log(
         )
         if not terminal_error or last_observed < ppo_step:
             continue
+        requested_steps = started[0].get("steps")
+        if type(requested_steps) is not int or requested_steps <= 0:
+            continue
+        canonical_checkpoint = (
+            project_dir / "runs" / f"iter_{iteration}" / "checkpoint.pt"
+        )
+        successful_train_checkpoints = _successful_train_checkpoints(text)
+        exact_train_handoffs = [
+            checkpoint
+            for checkpoint in successful_train_checkpoints
+            if Path(checkpoint).expanduser() == canonical_checkpoint
+        ]
+        training_completed = len(exact_train_handoffs) == 1
+        # A final RSL-RL save is model_(steps - 1).pt.  Outer progress alone
+        # cannot attest it because failure cleanup may still publish the
+        # requested total.  Partial saves remain admissible from interrupted
+        # training, but final saves require the train subprocess handoff.
+        if ppo_step >= requested_steps - 1 and not training_completed:
+            continue
         job_id = log_path.stem.removeprefix("_run_")
         pin = pins[0]
         candidates.append({
@@ -354,6 +400,11 @@ def _matching_origin_log(
             "log_path": log_path,
             "log_sha256": file_sha256(log_path),
             "last_observed_ppo_step": last_observed,
+            "requested_steps": requested_steps,
+            "training_completed": training_completed,
+            "training_checkpoint_path": (
+                canonical_checkpoint if training_completed else None
+            ),
             "selection": pin.get("selection"),
             "tuple_hash": pin.get("tuple_hash"),
             "contract_authority": (
@@ -493,6 +544,22 @@ def _materialize_legacy_receipt(
         raise RecoverySnapshotError(
             "PPO snapshot is newer than the worker's truthful observed progress"
         )
+    if (
+        log_evidence.get("training_completed")
+        and ppo_step >= int(log_evidence["requested_steps"]) - 1
+    ):
+        training_checkpoint = _assert_plain_file(
+            Path(str(log_evidence["training_checkpoint_path"])),
+            parent=iter_dir,
+            label="successful training checkpoint",
+        )
+        if (
+            training_checkpoint != iter_dir / "checkpoint.pt"
+            or file_sha256(training_checkpoint) != file_sha256(origin_checkpoint)
+        ):
+            raise RecoverySnapshotError(
+                "final PPO snapshot differs from the successful training checkpoint"
+            )
 
     raw_selection = log_evidence.get("selection")
     if not isinstance(raw_selection, str) or not re.fullmatch(
