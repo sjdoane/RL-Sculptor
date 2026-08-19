@@ -918,6 +918,63 @@ def test_recovery_load_receipt_rejects_other_loaded_bytes_or_adaptation(
         )
 
 
+def test_recovery_same_iteration_retry_accepts_exact_local_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from backend.services.run_manager import (
+        _verify_local_checkpoint_reuse_events,
+    )
+
+    project_dir = tmp_path / "project"
+    selected = (
+        project_dir / "runs" / "_recovery" / ("snap_" + "a" * 24)
+    )
+    selected = selected / "checkpoint.pt"
+    local = project_dir / "runs" / "iter_2" / "checkpoint.pt"
+    selected.parent.mkdir(parents=True)
+    local.parent.mkdir(parents=True)
+    checkpoint_bytes = b"exact-actor-and-critic"
+    selected.write_bytes(checkpoint_bytes)
+    local.write_bytes(checkpoint_bytes)
+    digest = hashlib.sha256(checkpoint_bytes).hexdigest()
+    phase_event = {
+        "type": "phase_skipped",
+        "iter": 2,
+        "phase": "train",
+        "reason": "checkpoint already on disk",
+        "checkpoint": str(local),
+    }
+    skip_event = {
+        "type": "warm_start_skipped",
+        "iter": 2,
+        "reason": "local_checkpoint_wins",
+        "source": str(selected),
+    }
+
+    receipt = _verify_local_checkpoint_reuse_events(
+        phase_event,
+        skip_event,
+        expected_checkpoint=selected,
+        expected_sha256=digest,
+        initialization_mode="actor_critic",
+        project_dir=project_dir,
+    )
+    assert receipt["reuse_kind"] == "content_equivalent_local_checkpoint"
+    assert receipt["load_cfg_keys"] == ["actor", "critic"]
+    assert receipt["loaded_checkpoint_sha256"] == digest
+
+    local.write_bytes(b"different")
+    with pytest.raises(ValueError, match="differ from the selected"):
+        _verify_local_checkpoint_reuse_events(
+            phase_event,
+            skip_event,
+            expected_checkpoint=selected,
+            expected_sha256=digest,
+            initialization_mode="actor_critic",
+            project_dir=project_dir,
+        )
+
+
 def test_worker_revalidates_snapshot_and_forwards_exact_actor_critic_transfer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -168,6 +168,95 @@ def _verify_starting_skill_load_event(
     }
 
 
+def _verify_local_checkpoint_reuse_events(
+    phase_event: dict[str, Any],
+    skip_event: dict[str, Any],
+    *,
+    expected_checkpoint: Path,
+    expected_sha256: str,
+    initialization_mode: str,
+    project_dir: Path,
+) -> dict[str, Any]:
+    """Prove a same-iteration retry reused the selected recovery bytes.
+
+    The core intentionally lets an existing canonical iteration checkpoint
+    win over an explicit warm start so an evaluation-only retry does not
+    retrain or overwrite it. That is equivalent to loading the selected
+    recovery input only when both event records agree and the local bytes have
+    the exact pinned digest. Actor-only transfers are excluded because reusing
+    a full local checkpoint would silently load more roles than requested.
+    """
+    if initialization_mode != "actor_critic":
+        raise ValueError(
+            "local checkpoint reuse is valid only for actor+critic recovery"
+        )
+    if (
+        phase_event.get("type") != "phase_skipped"
+        or phase_event.get("phase") != "train"
+        or phase_event.get("reason") != "checkpoint already on disk"
+    ):
+        raise ValueError("worker has no exact local train-skip receipt")
+    if (
+        skip_event.get("type") != "warm_start_skipped"
+        or skip_event.get("reason") != "local_checkpoint_wins"
+    ):
+        raise ValueError("worker has no exact local warm-start-skip receipt")
+
+    expected = Path(expected_checkpoint).expanduser().resolve(strict=True)
+    expected_root = (Path(project_dir) / "runs" / "_recovery").resolve(
+        strict=True,
+    )
+    try:
+        expected.relative_to(expected_root)
+    except ValueError as exc:
+        raise ValueError(
+            "local checkpoint reuse is restricted to attested recovery inputs"
+        ) from exc
+    if _file_sha256(expected) != expected_sha256:
+        raise ValueError("selected recovery checkpoint digest changed")
+
+    source_value = skip_event.get("source")
+    if not isinstance(source_value, str) or not source_value:
+        raise ValueError("warm_start_skipped has no selected source")
+    source = Path(source_value).expanduser().resolve(strict=True)
+    if source != expected:
+        raise ValueError("warm_start_skipped source is not the selected recovery")
+
+    local_value = phase_event.get("checkpoint")
+    if not isinstance(local_value, str) or not local_value:
+        raise ValueError("phase_skipped has no local checkpoint")
+    local_input = Path(local_value).expanduser()
+    if local_input.is_symlink():
+        raise ValueError("local checkpoint reuse cannot follow a symlink")
+    local = local_input.resolve(strict=True)
+    runs_root = (Path(project_dir) / "runs").resolve(strict=True)
+    try:
+        relative = local.relative_to(runs_root)
+    except ValueError as exc:
+        raise ValueError("local checkpoint escapes project runs") from exc
+    if (
+        len(relative.parts) != 2
+        or not re.fullmatch(r"iter_[0-9]+", relative.parts[0])
+        or relative.parts[1] not in {"checkpoint.pt", "checkpoint.zip"}
+    ):
+        raise ValueError("local checkpoint is not a canonical iteration output")
+    local_sha256 = _file_sha256(local)
+    if local_sha256 != expected_sha256:
+        raise ValueError(
+            "local checkpoint bytes differ from the selected recovery input"
+        )
+    return {
+        "source": str(source),
+        "source_sha256": expected_sha256,
+        "loaded_checkpoint": str(local),
+        "loaded_checkpoint_sha256": local_sha256,
+        "adapted": False,
+        "load_cfg_keys": ["actor", "critic"],
+        "initialization_mode": initialization_mode,
+        "reuse_kind": "content_equivalent_local_checkpoint",
+    }
+
+
 def resolve_project_robot_slug(project_dir: Path) -> str:
     """Resolve the exact policy/reference robot namespace.
 
@@ -2327,9 +2416,63 @@ def run_sculpt_job(
         )
         verified_starting_skill_load: dict[str, Any] | None = None
         starting_skill_load_error: str | None = None
+        local_checkpoint_phase_skip: dict[str, Any] | None = None
 
         def _observe_lineage_event(event: dict[str, Any]) -> None:
-            nonlocal verified_starting_skill_load, starting_skill_load_error
+            nonlocal verified_starting_skill_load
+            nonlocal starting_skill_load_error
+            nonlocal local_checkpoint_phase_skip
+            if (
+                starting_skill_load_required
+                and verified_recovery_snapshot_receipt is not None
+                and event.get("type") == "phase_skipped"
+                and event.get("phase") == "train"
+            ):
+                local_checkpoint_phase_skip = dict(event)
+            if (
+                starting_skill_load_required
+                and verified_recovery_snapshot_receipt is not None
+                and event.get("type") == "warm_start_skipped"
+                and event.get("reason") == "local_checkpoint_wins"
+            ):
+                try:
+                    if warm_start_checkpoint is None or warm_start_sha256 is None:
+                        raise ValueError(
+                            "selected recovery has no resolved checkpoint pin"
+                        )
+                    if local_checkpoint_phase_skip is None:
+                        raise ValueError(
+                            "warm-start skip has no preceding local train skip"
+                        )
+                    receipt = _verify_local_checkpoint_reuse_events(
+                        local_checkpoint_phase_skip,
+                        event,
+                        expected_checkpoint=warm_start_checkpoint,
+                        expected_sha256=warm_start_sha256,
+                        initialization_mode=str(initialization_mode),
+                        project_dir=project_dir,
+                    )
+                    if (
+                        verified_starting_skill_load is not None
+                        and verified_starting_skill_load != receipt
+                    ):
+                        raise ValueError(
+                            "worker emitted conflicting recovery reuse receipts"
+                        )
+                    verified_starting_skill_load = receipt
+                    job.params["starting_skill_load_receipt"] = receipt
+                    job.emit({
+                        "type": "warm_start_reuse_verified",
+                        **receipt,
+                    })
+                except Exception as exc:  # noqa: BLE001 - fail after drain
+                    starting_skill_load_error = f"{type(exc).__name__}: {exc}"
+                    job.emit({
+                        "type": "starting_skill_load_rejected",
+                        "source": "worker_stdout",
+                        "error": starting_skill_load_error,
+                    })
+                    return
             if starting_skill_load_required and event.get("type") == "warm_start_loaded":
                 try:
                     if warm_start_checkpoint is None or warm_start_sha256 is None:
