@@ -355,6 +355,15 @@ def _matching_origin_log(
             # reconstruction from this iteration's pinned selection.
             if effective or loaded_events or run_context is None:
                 continue
+        last_learned = max(
+            (
+                int(event["rl_iter"])
+                for event in events
+                if event.get("type") == "learning_vitals"
+                and type(event.get("rl_iter")) is int
+            ),
+            default=-1,
+        )
         last_observed = max(
             (
                 int(event["rl_iter"])
@@ -371,7 +380,11 @@ def _matching_origin_log(
             or "sculpt exited with code" in text
             or any(event.get("type") == "run_errored" for event in events)
         )
-        if not terminal_error or last_observed < ppo_step:
+        if (
+            not terminal_error
+            or last_observed < ppo_step
+            or last_learned < ppo_step
+        ):
             continue
         requested_steps = started[0].get("steps")
         if type(requested_steps) is not int or requested_steps <= 0:
@@ -400,6 +413,7 @@ def _matching_origin_log(
             "log_path": log_path,
             "log_sha256": file_sha256(log_path),
             "last_observed_ppo_step": last_observed,
+            "last_learned_ppo_step": last_learned,
             "requested_steps": requested_steps,
             "training_completed": training_completed,
             "training_checkpoint_path": (

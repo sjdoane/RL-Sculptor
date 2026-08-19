@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from backend.models.mission import StageIterationSummary
 from backend.models.project import ProblemDetail
 from backend.models.run import (
+    ErrorClassification,
     IterEventSummary,
     RunControl,
     RunControlState,
@@ -47,12 +48,14 @@ from backend.routes.missions import (
 )
 from backend.services import mission_store, world_store
 from backend.services.job_manager import Job, JobManager
+from backend.services.iteration_completion import is_completed_iteration
 from backend.services.physical_scene_audit import (
     audit_physical_scene_alignment,
 )
 from backend.services.project_store import ProjectStore
 from backend.services.project_robot import resolve_project_reference_robot
 from backend.services.run_manager import (
+    _post_training_rollout_failure_evidence,
     build_iterations_summary,
     control_file_path,
     read_control_file,
@@ -411,12 +414,33 @@ def _read_project_metric_history(project_dir: Path) -> list[Optional[float]]:
 
 
 def _iter_looks_completed(iter_dir: Path) -> bool:
-    """An iteration that finished training leaves `metrics.json` (and
-    usually a checkpoint). Either marker counts — older iters may have
-    one without the other."""
-    if (iter_dir / "metrics.json").is_file():
-        return True
-    return _find_stage_checkpoint(iter_dir) is not None
+    """Return the same server-validated completion truth used by policies."""
+    return is_completed_iteration(iter_dir)
+
+
+def _project_disk_evaluation_failure(
+    project_dir: Path, iteration: int,
+) -> dict[str, Any] | None:
+    """Return the latest durable rollout-failure proof for one iteration."""
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    runs_dir = project_dir / "runs"
+    for log_path in runs_dir.glob("_run_job_*.log"):
+        if log_path.is_symlink() or not log_path.is_file():
+            continue
+        evidence = _post_training_rollout_failure_evidence(
+            log_path, project_dir,
+        )
+        if evidence is None or evidence.get("iteration") != iteration:
+            continue
+        try:
+            modified_at = log_path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((modified_at, evidence))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def _synthesize_project_disk_run_row(
@@ -433,9 +457,10 @@ def _synthesize_project_disk_run_row(
     job's row already reaches these artifacts, and there is no per-run
     partition on disk that would let us row-split honestly.
 
-    Status comes from the LAST iteration's disk state: a finished
-    marker (metrics.json / checkpoint) reads "completed"; a bare iter
-    dir means the process died mid-iteration → errored/"interrupted".
+    Status comes from the LAST iteration's disk state: only validated
+    completion evidence reads "completed". A durable post-training rollout
+    failure reads "evaluation failed"; otherwise an incomplete iteration is
+    reported as interrupted.
     A run that ended between iterations is indistinguishable from a
     clean finish on disk, so this is best-effort truth, not history.
     """
@@ -446,13 +471,35 @@ def _synthesize_project_disk_run_row(
         return None
 
     completed = sum(1 for _, d in pairs if _iter_looks_completed(d))
-    _, last_dir = pairs[-1]
+    last_iteration, last_dir = pairs[-1]
+    evaluation_failure = _project_disk_evaluation_failure(
+        project_dir, last_iteration,
+    )
     if _iter_looks_completed(last_dir):
         run_status = "completed"
         error = None
+        error_classification = None
+    elif evaluation_failure is not None:
+        run_status = "errored"
+        error = "Training checkpoint preserved; evaluation failed"
+        error_classification = ErrorClassification(
+            kind="post_training_rollout_failed",
+            title="Training checkpoint preserved; evaluation failed",
+            detail=(
+                "Training produced a preserved checkpoint, but rollout/"
+                "evaluation failed before completion evidence was written."
+            ),
+            suggestions=[
+                "Continue from the attested recovery snapshot after fixing "
+                "the evaluation failure.",
+            ],
+            problem_type="/problems/post-training-rollout-failed",
+            evidence=evaluation_failure,
+        )
     else:
         run_status = "errored"
         error = "interrupted"
+        error_classification = None
 
     meta = _load_json_dict(project_dir / "metadata.json") or {}
     goal = str(meta.get("behavior_goal") or "")
@@ -483,6 +530,7 @@ def _synthesize_project_disk_run_row(
         started_at=started_at,
         ended_at=ended_at,
         error=error,
+        error_classification=error_classification,
         kind="sculpt_run",
         parent_id=None,
         mission_slug=None,

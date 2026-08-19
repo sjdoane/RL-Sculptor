@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -41,6 +42,7 @@ def _seed_project_iter(
     fitness: float | None = None,
     reward_version: str | None = None,
     fitness_contradiction: dict | None = None,
+    with_completion: bool | None = None,
 ) -> Path:
     iter_dir = project_dir / "runs" / f"iter_{i}"
     iter_dir.mkdir(parents=True, exist_ok=True)
@@ -50,7 +52,22 @@ def _seed_project_iter(
             payload["metrics"]["mean_return"] = mean_return
         (iter_dir / "metrics.json").write_text(json.dumps(payload))
     if with_checkpoint:
-        (iter_dir / "checkpoint.pt").write_bytes(b"x" * 16)
+        checkpoint = iter_dir / "checkpoint.pt"
+        checkpoint_bytes = b"x" * 16
+        checkpoint.write_bytes(checkpoint_bytes)
+        if with_completion is None:
+            with_completion = with_metrics
+        if with_completion:
+            (iter_dir / "iteration_complete.json").write_text(json.dumps({
+                "schema": 2,
+                "state": "completed",
+                "iter": i,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": hashlib.sha256(
+                    checkpoint_bytes
+                ).hexdigest(),
+                "checkpoint_bytes": len(checkpoint_bytes),
+            }))
     if with_rollout:
         rd = iter_dir / "rollout"
         rd.mkdir(parents=True, exist_ok=True)
@@ -111,6 +128,62 @@ def test_project_disk_row_interrupted_last_iter(
     assert rows[0]["status"] == "errored"
     assert rows[0]["error"] == "interrupted"
     assert rows[0]["iterations_completed"] == 1
+
+
+def test_project_disk_row_preserved_checkpoint_is_evaluation_failure(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_project_iter(
+        project_dir,
+        0,
+        with_metrics=True,
+        with_checkpoint=True,
+        with_completion=False,
+    )
+    log_path = project_dir / "runs" / "_run_job_evalfailure.log"
+    log_path.write_text("\n".join([
+        '[SCULPT-EVENT] {"type":"iter_started","iter":0,"steps":100}',
+        '[SCULPT-EVENT] {"type":"iter_progress","rl_iter":100,'
+        '"rl_total":100}',
+        '[SCULPT-EVENT] {"type":"rollout_started"}',
+        "RuntimeError: mjlab rollout runner exited 1",
+    ]) + "\n")
+
+    r = client.get(f"/projects/{slug}/runs")
+    rows = [row for row in r.json() if row["run_id"] == "disk:project"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "errored"
+    assert rows[0]["error"] == (
+        "Training checkpoint preserved; evaluation failed"
+    )
+    classification = rows[0]["error_classification"]
+    assert classification["kind"] == "post_training_rollout_failed"
+    assert classification["evidence"]["failure_stage"] == "evaluation"
+    assert rows[0]["iterations_completed"] == 0
+
+
+def test_project_disk_row_checkpoint_without_failure_proof_is_interrupted(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_project_iter(
+        project_dir,
+        0,
+        with_metrics=True,
+        with_checkpoint=True,
+        with_completion=False,
+    )
+
+    r = client.get(f"/projects/{slug}/runs")
+    rows = [row for row in r.json() if row["run_id"] == "disk:project"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "errored"
+    assert rows[0]["error"] == "interrupted"
+    assert rows[0]["error_classification"] is None
+    assert rows[0]["iterations_completed"] == 0
 
 
 def test_project_disk_row_metric_history_from_reports(

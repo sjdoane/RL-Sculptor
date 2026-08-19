@@ -469,6 +469,27 @@ def test_latest_snapshot_uses_unique_same_iteration_retry_log(
     assert receipt["source"]["last_observed_ppo_step"] == 750
 
 
+def test_partial_snapshot_rejects_synthetic_outer_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.recovery_snapshots import discover_recovery_snapshots
+
+    project_dir = tmp_path / "synthetic-outer-progress"
+    _plant_interrupted_snapshot(
+        project_dir,
+        monkeypatch,
+        model_step=700,
+        observed_step=58,
+    )
+    log_path = project_dir / "runs" / "_run_job_deadbeefcafebabe.log"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(_event({
+            "type": "iter_progress", "rl_iter": 750, "rl_total": 750,
+        }) + "\n")
+
+    assert discover_recovery_snapshots(project_dir) == []
+
+
 def test_full_legacy_completion_suppresses_new_recovery_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
