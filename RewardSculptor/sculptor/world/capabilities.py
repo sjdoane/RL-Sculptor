@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,7 +39,26 @@ class ActuatorProfile:
 
     profile_id: str
     model: str
-    velocity_limits_rad_s: dict[str, float]
+    velocity_limits_rad_s: tuple[tuple[str, float], ...]
+
+    def __post_init__(self) -> None:
+        raw = self.velocity_limits_rad_s
+        items = raw.items() if isinstance(raw, dict) else raw
+        normalized = tuple(sorted(
+            (str(pattern), float(limit)) for pattern, limit in items
+        ))
+        if (
+            not self.profile_id
+            or not self.model
+            or not normalized
+            or len({pattern for pattern, _ in normalized}) != len(normalized)
+            or any(
+                not pattern or not math.isfinite(limit) or limit <= 0.0
+                for pattern, limit in normalized
+            )
+        ):
+            raise CapabilityError("actuator profile is malformed")
+        object.__setattr__(self, "velocity_limits_rad_s", normalized)
 
 
 @dataclass(frozen=True)
@@ -114,6 +134,10 @@ class RobotCapability:
             k: list(v) for k, v in self.reward_state_schema.items()}
         data["reward_state_sources"] = dict(self.reward_state_sources)
         data["reward_info_keys"] = list(self.reward_info_keys)
+        if self.actuator_profile is not None:
+            data["actuator_profile"]["velocity_limits_rad_s"] = dict(
+                self.actuator_profile.velocity_limits_rad_s
+            )
         return data
 
 
@@ -122,10 +146,11 @@ def actuator_velocity_limit(
 ) -> float | None:
     """Resolve one declared no-load speed without guessing joint semantics."""
     patterns = getattr(actuator_cfg, "target_names_expr", None) or ()
+    profile_limits = dict(profile.velocity_limits_rad_s)
     limits = [
-        profile.velocity_limits_rad_s[pattern]
+        profile_limits[pattern]
         for pattern in patterns
-        if pattern in profile.velocity_limits_rad_s
+        if pattern in profile_limits
     ]
     return min(limits) if limits else None
 
@@ -283,8 +308,8 @@ LEGACY_UNITREE_DC_MOTOR_PROFILE = ActuatorProfile(
     profile_id="unitree_legacy_dc_motor_back_emf_v1",
     model="dc_motor_back_emf",
     velocity_limits_rad_s={
-        **G1_DC_MOTOR_PROFILE.velocity_limits_rad_s,
-        **GO1_DC_MOTOR_PROFILE.velocity_limits_rad_s,
+        **dict(G1_DC_MOTOR_PROFILE.velocity_limits_rad_s),
+        **dict(GO1_DC_MOTOR_PROFILE.velocity_limits_rad_s),
     },
 )
 

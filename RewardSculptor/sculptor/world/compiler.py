@@ -31,8 +31,10 @@ from sculptor.world.artifacts import (
     sha256_bytes,
 )
 from sculptor.world.capabilities import (
+    CapabilityError,
     RobotCapability,
     SimulatorCapability,
+    apply_actuator_profile,
     build_base_robot_entity_cfg,
     build_robot_entity_cfg,
     resolve_robot_capability,
@@ -3654,6 +3656,27 @@ def apply_world_selection(
             zones=manifest.zones,
             robot=robot,
         )
+    runtime_scene = getattr(env_cfg, "scene", env_cfg)
+    runtime_entities = getattr(runtime_scene, "entities", {}) or {}
+    runtime_robot = (
+        runtime_entities.get("robot")
+        if hasattr(runtime_entities, "get")
+        else None
+    )
+    if runtime_robot is None:
+        raise WorldCompileError(
+            "runtime environment lost its robot during authored selection"
+        )
+    try:
+        runtime_entities["robot"] = apply_actuator_profile(
+            runtime_robot,
+            robot.actuator_profile,
+            strict=True,
+        )[0]
+    except CapabilityError as exc:
+        raise WorldCompileError(
+            "runtime robot could not apply the admitted actuator profile"
+        ) from exc
     # Entity init poses are authored in environment-local coordinates.  mjlab
     # only applies replicated env origins to fixed mocap and floating entities
     # through an explicit reset event.  Install it for BOTH train and eval so

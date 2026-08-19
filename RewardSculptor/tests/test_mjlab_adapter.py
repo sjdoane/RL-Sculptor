@@ -1212,6 +1212,9 @@ def test_robot_materialization_owns_and_pins_actuator_physics(monkeypatch) -> No
     from sculptor.world.compiler import _robot_asset_hash_from_cfg
 
     capability = resolve_robot_capability("unitree_g1:base")
+    assert isinstance(
+        capability.actuator_profile.velocity_limits_rad_s, tuple
+    )
     first = build_robot_entity_cfg(capability)
     second = build_robot_entity_cfg(capability)
     assert first.articulation is not second.articulation

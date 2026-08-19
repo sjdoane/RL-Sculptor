@@ -31,7 +31,7 @@ from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
 from sculptor.world.gates import estimate_budget, run_admission_gates
 from sculptor.world.observation_geometry import inclusive_grid_sample_count
 from sculptor.world.capabilities import (
-    build_robot_entity_cfg,
+    build_base_robot_entity_cfg,
     resolve_robot_capability,
 )
 
@@ -1351,6 +1351,11 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
         world, task, materialize_dir=store.env_dir / "eval_assets",
         settle_steps=20)
     assert report.ok and compiled is not None
+    assert compiled.resolved_eval.installed_base_robot_asset_hash
+    assert (
+        compiled.resolved_eval.installed_base_robot_asset_hash
+        != compiled.resolved_eval.robot_asset_hash
+    )
 
     rewards = project / "rewards"
     rewards.mkdir(parents=True)
@@ -1375,11 +1380,15 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
     immutable = store.env_dir / f"selection_v{selection.selection_version}.json"
 
     base = SceneCfg(num_envs=1, entities={
-        "robot": build_robot_entity_cfg(resolve_robot_capability(
+        "robot": build_base_robot_entity_cfg(resolve_robot_capability(
             "unitree_g1:base")),
     })
     bundle = apply_world_selection(base, immutable, train=False)
     assert bundle.tuple_hash == selection.tuple_hash
+    assert (
+        bundle.runtime_robot_asset_hash
+        == compiled.resolved_eval.robot_asset_hash
+    )
     cfg_type, _ = materialized_terrain_types()
     assert isinstance(base.terrain, cfg_type)
     replay = Scene(base, device="cpu")

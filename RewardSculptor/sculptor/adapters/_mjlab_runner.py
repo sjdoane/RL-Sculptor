@@ -2992,10 +2992,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # train=True additionally applies the train-only curricula section.
     env_spec = _resolve_env_spec(args)
     _apply_env_spec(env_cfg, env_spec, train=True, task_id=args.task_id)
-    # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
-    # the TRAIN env too (not just rollout) so the policy trains against the same
-    # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
-    _enforce_actuator_limits(env_cfg)
+    # Authored worlds already carry their admitted actuator profile. Only a
+    # legacy registered task may receive the environment-gated compatibility
+    # transform, and it must receive it in both training and rollout.
+    if world_bundle is None:
+        _enforce_actuator_limits(env_cfg)
 
     # Reward injection (optional).
     if args.reward_module_path:
@@ -4151,9 +4152,10 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     _apply_ground_texture(env_cfg)
     # 720p + no ghost neighbor envs in the background (cosmetic, guarded).
     _configure_rollout_viewer(env_cfg, args)
-    # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
-    # the rollout physics matches what the policy trained under.
-    _enforce_actuator_limits(env_cfg)
+    # Authored physics is descriptor-pinned. Legacy registered tasks repeat
+    # the same compatibility transform used in training.
+    if world_bundle is None:
+        _enforce_actuator_limits(env_cfg)
     # §Selection statistics: deterministic eval seeding for repeat rollouts
     # of the SAME checkpoint (multi-seed evaluation / fresh-seed re-eval of
     # the kept best). --seed 0 (default) leaves the legacy RNG state
