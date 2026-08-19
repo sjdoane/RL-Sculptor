@@ -592,6 +592,7 @@ class MjlabAdapter(SculptorAdapter):
         # config would let an unsynced or changed config select a different
         # observation interface than the UI admitted before queueing.
         for key in (
+            "SCULPTOR_WARM_START_CHECKPOINT_SHA256",
             "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256",
             "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
             "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON",

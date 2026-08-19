@@ -29,6 +29,32 @@ def contract_fingerprint(contract: dict[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def recovery_snapshot_receipt_fingerprint(
+    receipt: Mapping[str, Any],
+) -> str:
+    """Fingerprint a server recovery receipt without its digest field.
+
+    The digest is carried alongside the receipt in the API and persisted in
+    the receipt itself.  Excluding that one field keeps the identity
+    non-recursive while binding every source checkpoint, contract, selection,
+    tuple, and worker-log provenance field.
+    """
+    body = copy.deepcopy(dict(receipt))
+    body.pop("receipt_digest", None)
+    try:
+        canonical = json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "recovery snapshot receipt must be canonical JSON data"
+        ) from exc
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _package_version(name: str) -> Optional[str]:
     try:
         return version(name)
@@ -696,6 +722,203 @@ def build_iteration_warm_start_contract_receipt(
     }
 
 
+def build_recovery_snapshot_warm_start_contract_receipt(
+    project_dir: Path,
+    *,
+    recovery_receipt: Mapping[str, Any],
+    target_selection_path: Path,
+) -> dict[str, Any]:
+    """Build a runner receipt from one server-attested interrupted snapshot.
+
+    Recovery is deliberately separate from iteration warm-start admission.
+    An interrupted worker may have captured a newer launch selection and
+    effective policy contract than the iteration's early artifact tuple.  The
+    server receipt binds that observed runtime evidence to exact snapshot
+    bytes; this function verifies the receipt and compares its source contract
+    with the current immutable target without reinterpreting the stale tuple.
+    """
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    receipt = copy.deepcopy(dict(recovery_receipt))
+    if receipt.get("schema") != 1:
+        raise ValueError("recovery snapshot receipt schema is unsupported")
+    if receipt.get("kind") != "interrupted_ppo_snapshot":
+        raise ValueError("recovery snapshot receipt kind is unsupported")
+    snapshot_id = receipt.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9_-]{0,127}", snapshot_id
+    ):
+        raise ValueError("recovery snapshot id is not canonical")
+    receipt_digest = receipt.get("receipt_digest")
+    if not isinstance(receipt_digest, str) or not re.fullmatch(
+        r"[a-f0-9]{64}", receipt_digest
+    ):
+        raise ValueError("recovery snapshot receipt digest is not canonical")
+    if recovery_snapshot_receipt_fingerprint(receipt) != receipt_digest:
+        raise ValueError("recovery snapshot receipt digest does not match")
+
+    checkpoint = receipt.get("checkpoint")
+    source = receipt.get("source")
+    if not isinstance(checkpoint, Mapping) or not isinstance(source, Mapping):
+        raise ValueError(
+            "recovery snapshot receipt lacks checkpoint/source evidence"
+        )
+
+    def require_text(mapping: Mapping[str, Any], key: str) -> str:
+        value = mapping.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"recovery snapshot receipt has no {key}"
+            )
+        return value
+
+    def require_sha(mapping: Mapping[str, Any], key: str) -> str:
+        value = require_text(mapping, key)
+        if not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError(
+                f"recovery snapshot {key} is not a canonical SHA-256"
+            )
+        return value
+
+    checkpoint_sha256 = require_sha(checkpoint, "sha256")
+    if require_sha(checkpoint, "origin_sha256") != checkpoint_sha256:
+        raise ValueError(
+            "recovery snapshot copy differs from its origin checkpoint"
+        )
+    for key in ("path", "origin_path"):
+        require_text(checkpoint, key)
+    checkpoint_bytes = checkpoint.get("bytes")
+    ppo_step = checkpoint.get("ppo_step")
+    if (
+        not isinstance(checkpoint_bytes, int)
+        or isinstance(checkpoint_bytes, bool)
+        or checkpoint_bytes <= 0
+    ):
+        raise ValueError("recovery snapshot byte size must be positive")
+    if (
+        not isinstance(ppo_step, int)
+        or isinstance(ppo_step, bool)
+        or ppo_step <= 0
+    ):
+        raise ValueError("recovery snapshot PPO step must be positive")
+
+    source_contract = source.get("effective_policy_contract")
+    if not isinstance(source_contract, Mapping):
+        raise ValueError(
+            "recovery snapshot has no effective source policy contract"
+        )
+    source_contract = copy.deepcopy(dict(source_contract))
+    source_contract_sha256 = require_sha(
+        source, "effective_policy_contract_sha256",
+    )
+    if contract_fingerprint(source_contract) != source_contract_sha256:
+        raise ValueError(
+            "recovery snapshot source policy-contract fingerprint differs"
+        )
+    for key in (
+        "effective_policy_contract_path",
+        "selection_path",
+        "artifact_tuple_path",
+        "job_id",
+        "log_path",
+    ):
+        require_text(source, key)
+    for key in (
+        "selection_sha256",
+        "tuple_hash",
+        "artifact_tuple_sha256",
+        "log_sha256",
+    ):
+        require_sha(source, key)
+    selection_version = source.get("selection_version")
+    source_iteration = source.get("iteration")
+    last_observed_ppo_step = source.get("last_observed_ppo_step")
+    for label, value, minimum in (
+        ("selection_version", selection_version, 1),
+        ("iteration", source_iteration, 0),
+        ("last_observed_ppo_step", last_observed_ppo_step, 1),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < minimum
+        ):
+            raise ValueError(
+                f"recovery snapshot {label} is not a valid integer"
+            )
+    if ppo_step > last_observed_ppo_step:
+        raise ValueError(
+            "recovery snapshot PPO step exceeds observed worker progress"
+        )
+    if source.get("status") not in {"errored", "stopped"}:
+        raise ValueError(
+            "recovery snapshot source job is not terminally interrupted"
+        )
+    if not isinstance(source.get("matches_pinned_selection"), bool):
+        raise ValueError(
+            "recovery snapshot tuple/selection relation is not explicit"
+        )
+    if receipt.get("provenance_status") not in {
+        "origin_persisted", "legacy_reconstructed",
+    }:
+        raise ValueError(
+            "recovery snapshot provenance status is unsupported"
+        )
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    target_selection_path = Path(target_selection_path).expanduser().resolve()
+    store = WorldArtifactStore(project_dir)
+    target_selection = store.read_selection(target_selection_path)
+    if target_selection is None:
+        raise FileNotFoundError(
+            f"immutable target selection is absent: {target_selection_path}"
+        )
+    target_contract = build_project_policy_contract(
+        project_dir,
+        world_selection_path=target_selection_path,
+    )
+    migration = policy_contract_migration(source_contract, target_contract)
+    if source_contract == target_contract:
+        compatibility = {
+            "type": "exact_policy_contract",
+            "from_schema": source_contract.get("schema"),
+            "to_schema": target_contract.get("schema"),
+            "optimizer_resume": False,
+        }
+    elif migration is not None:
+        compatibility = migration
+    else:
+        reasons = compare_policy_contracts(source_contract, target_contract)
+        raise ValueError(
+            "recovery snapshot policy contract is incompatible with the "
+            f"immutable target selection: {'; '.join(reasons)}"
+        )
+
+    return {
+        "schema": 1,
+        "kind": "interrupted_ppo_snapshot",
+        "snapshot_id": snapshot_id,
+        "source": {
+            "checkpoint_sha256": checkpoint_sha256,
+            "contract": source_contract,
+            "contract_sha256": source_contract_sha256,
+            "load_cfg_keys": ["actor", "critic"],
+            "optimizer_resume": False,
+            "recovery_receipt": receipt,
+            "recovery_receipt_digest": receipt_digest,
+        },
+        "target": {
+            "selection_path": str(target_selection_path),
+            "selection_sha256": file_sha256(target_selection_path),
+            "selection_version": target_selection.selection_version,
+            "tuple_hash": target_selection.tuple_hash,
+            "contract": target_contract,
+            "contract_sha256": contract_fingerprint(target_contract),
+        },
+        "compatibility": compatibility,
+    }
+
+
 def build_skill_warm_start_contract_receipt(
     *,
     skill_id: str,
@@ -777,8 +1000,10 @@ __all__ = [
     "EVENT_CONTRACT_SCHEMA",
     "build_project_policy_contract",
     "build_iteration_warm_start_contract_receipt",
+    "build_recovery_snapshot_warm_start_contract_receipt",
     "build_skill_warm_start_contract_receipt",
     "compare_policy_contracts",
     "contract_fingerprint",
     "policy_contract_migration",
+    "recovery_snapshot_receipt_fingerprint",
 ]

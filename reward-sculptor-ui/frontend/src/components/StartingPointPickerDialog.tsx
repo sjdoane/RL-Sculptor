@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -8,11 +9,13 @@ import { Icon } from "@/components/rs/icon";
 import { Btn, Modal } from "@/components/rs/primitives";
 import {
   ApiError,
+  listPolicyRecoverySnapshots,
   listStartingSkills,
   uploadStartingSkill,
 } from "@/lib/api";
 import type {
   PolicyEvidenceValue,
+  PolicyRecoverySnapshot,
   PolicySummary,
   StartingPointKind,
   StartingPointSelection,
@@ -22,6 +25,7 @@ import type {
 } from "@/lib/types";
 
 const ACCEPTED_BUNDLE_EXTENSIONS = [".rskill"] as const;
+type ProjectPolicySource = "completed" | "interrupted";
 
 const INITIALIZATION_COPY: Record<
   StartingSkillInitializationMode,
@@ -50,6 +54,8 @@ const INITIALIZATION_COPY: Record<
 const DEFAULT_SELECTION: StartingPointSelection = {
   kind: "scratch",
   warm_start_iteration: null,
+  warm_start_snapshot: null,
+  warm_start_snapshot_display: null,
   starting_skill_id: null,
   initialization_mode: null,
   reference_clip_id: null,
@@ -220,6 +226,131 @@ function CheckpointReceipt({ checkpoint }: { checkpoint: PolicySummary }) {
   );
 }
 
+function RecoverySnapshotReceipt({
+  snapshot,
+  acknowledged,
+  legacyAcknowledged,
+  onAcknowledgedChange,
+  onLegacyAcknowledgedChange,
+}: {
+  snapshot: PolicyRecoverySnapshot;
+  acknowledged: boolean;
+  legacyAcknowledged: boolean;
+  onAcknowledgedChange: (checked: boolean) => void;
+  onLegacyAcknowledgedChange: (checked: boolean) => void;
+}) {
+  const legacy = snapshot.provenance_status === "legacy_reconstructed";
+  return (
+    <div
+      role="region"
+      aria-label={`Cycle ${snapshot.iteration} PPO snapshot ${snapshot.ppo_step} recovery disclosure`}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+        padding: 12,
+        border: "1px solid var(--st-amber)",
+        borderRadius: "var(--radius-md)",
+        background: "var(--st-amber-bg)",
+      }}
+    >
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 7 }}>
+        <strong style={{ fontSize: 12.5 }}>
+          Cycle {snapshot.iteration} · PPO snapshot {snapshot.ppo_step}
+        </strong>
+        <span className="rs-badge amber">interrupted</span>
+        <span className="rs-badge slate">unevaluated</span>
+        {legacy && <span className="rs-badge amber">legacy receipt</span>}
+      </div>
+      <div className="rs-sub" style={{ fontSize: 11.5, lineHeight: 1.5 }}>
+        The run last reported PPO iteration {snapshot.last_observed_ppo_iteration} and
+        ended with status <strong>{humanize(snapshot.source_job_status)}</strong>.
+        This save has no rollout, objective score, criterion result, or success claim.
+      </div>
+      <dl
+        style={{
+          display: "grid",
+          gridTemplateColumns: "max-content minmax(0, 1fr)",
+          gap: "5px 12px",
+          margin: 0,
+          fontSize: 11,
+          lineHeight: 1.45,
+        }}
+      >
+        <dt className="rs-sub">What loads</dt>
+        <dd style={{ margin: 0 }}>Actor + critic weights</dd>
+        <dt className="rs-sub">What resets</dt>
+        <dd style={{ margin: 0 }}>Optimizer, counters, and exploration state</dd>
+        <dt className="rs-sub">Checkpoint</dt>
+        <dd style={{ margin: 0 }}>
+          <DigestValue value={snapshot.checkpoint_sha256} /> · {formatBytes(snapshot.checkpoint_bytes)}
+        </dd>
+        <dt className="rs-sub">Attestation receipt</dt>
+        <dd style={{ margin: 0 }}><DigestValue value={snapshot.receipt_digest} /></dd>
+        <dt className="rs-sub">Source job</dt>
+        <dd className="mono" style={{ margin: 0, overflowWrap: "anywhere" }}>
+          {snapshot.source_job_id}
+        </dd>
+      </dl>
+      {snapshot.blocker && (
+        <div role="alert" style={{ fontSize: 11.5, lineHeight: 1.45, color: "var(--st-rose-fg)" }}>
+          <strong>Blocked:</strong> {snapshot.blocker}
+        </div>
+      )}
+      <label
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 9,
+          minHeight: 44,
+          cursor: snapshot.selectable ? "pointer" : "not-allowed",
+          opacity: snapshot.selectable ? 1 : 0.55,
+          fontSize: 11.5,
+          lineHeight: 1.45,
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={acknowledged}
+          disabled={!snapshot.selectable}
+          onChange={(event) => onAcknowledgedChange(event.target.checked)}
+          style={{ marginTop: 3 }}
+        />
+        <span>
+          I understand this snapshot is unevaluated and may be worse than the
+          run&apos;s starting policy.
+        </span>
+      </label>
+      {legacy && (
+        <label
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 9,
+            minHeight: 44,
+            cursor: snapshot.selectable ? "pointer" : "not-allowed",
+            opacity: snapshot.selectable ? 1 : 0.55,
+            fontSize: 11.5,
+            lineHeight: 1.45,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={legacyAcknowledged}
+            disabled={!snapshot.selectable}
+            onChange={(event) => onLegacyAcknowledgedChange(event.target.checked)}
+            style={{ marginTop: 3 }}
+          />
+          <span>
+            I understand this snapshot receipt was reconstructed after the
+            interruption from retained job and log evidence.
+          </span>
+        </label>
+      )}
+    </div>
+  );
+}
+
 function isAdmittedTrust(
   receipt: StartingSkillReceipt,
   mode: StartingSkillInitializationMode | null = null,
@@ -262,6 +393,36 @@ function loadedRoles(
   return [];
 }
 
+function moveWithinRadioGroup(event: ReactKeyboardEvent<HTMLButtonElement>) {
+  const direction = event.key === "ArrowRight" || event.key === "ArrowDown"
+    ? 1
+    : event.key === "ArrowLeft" || event.key === "ArrowUp"
+      ? -1
+      : 0;
+  const jumpToEdge = event.key === "Home" ? "first" : event.key === "End" ? "last" : null;
+  if (direction === 0 && jumpToEdge === null) return;
+
+  const group = event.currentTarget.closest<HTMLElement>('[role="radiogroup"]');
+  if (!group) return;
+  const radios = Array.from(
+    group.querySelectorAll<HTMLButtonElement>(':scope > [role="radio"]'),
+  ).filter((radio) => !radio.disabled);
+  const currentIndex = radios.indexOf(event.currentTarget);
+  if (currentIndex < 0 || radios.length === 0) return;
+
+  event.preventDefault();
+  const nextIndex = jumpToEdge === "first"
+    ? 0
+    : jumpToEdge === "last"
+      ? radios.length - 1
+      : (currentIndex + direction + radios.length) % radios.length;
+  const next = radios[nextIndex];
+  next.click();
+  // Selection can reveal an auto-focused detail control. Arrow navigation
+  // should still keep the user's focus in the radio group they are moving.
+  next.focus();
+}
+
 function KindChoice({
   kind,
   selected,
@@ -282,7 +443,9 @@ function KindChoice({
       type="button"
       role="radio"
       aria-checked={selected}
+      tabIndex={selected ? 0 : -1}
       onClick={() => onSelect(kind)}
+      onKeyDown={moveWithinRadioGroup}
       style={{
         display: "flex",
         minHeight: 118,
@@ -704,23 +867,39 @@ export function StartingPointPickerDialog({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const queryKey = useMemo(() => ["starting-skills", slug] as const, [slug]);
   const [draft, setDraft] = useState<StartingPointSelection>({ ...DEFAULT_SELECTION, ...value });
+  const [projectPolicySource, setProjectPolicySource] = useState<ProjectPolicySource>(
+    value.warm_start_snapshot ? "interrupted" : "completed",
+  );
   const [dragOver, setDragOver] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
 
   useEffect(() => {
     setDraft({ ...DEFAULT_SELECTION, ...value });
+    setProjectPolicySource(value.warm_start_snapshot ? "interrupted" : "completed");
   }, [value]);
 
   const skillsQuery = useQuery({
     queryKey,
     queryFn: () => listStartingSkills(slug),
   });
+  const recoverySnapshotsQuery = useQuery({
+    queryKey: ["policy-recovery-snapshots", slug],
+    queryFn: () => listPolicyRecoverySnapshots(slug),
+    enabled: draft.kind === "project_checkpoint"
+      && projectPolicySource === "interrupted",
+    staleTime: 10_000,
+    retry: false,
+  });
+  const recoverySnapshots = recoverySnapshotsQuery.data ?? [];
   const receipts = skillsQuery.data?.skills ?? [];
   const selectedReceipt = receipts.find(
     (receipt) => receipt.skill.skill_id === draft.starting_skill_id,
   ) ?? null;
   const selectedCheckpoint = checkpoints.find(
     (checkpoint) => checkpoint.iter_index === draft.warm_start_iteration,
+  ) ?? null;
+  const selectedRecoverySnapshot = recoverySnapshots.find(
+    (snapshot) => snapshot.snapshot_id === draft.warm_start_snapshot?.snapshot_id,
   ) ?? null;
 
   const upload = useMutation({
@@ -785,22 +964,28 @@ export function StartingPointPickerDialog({
 
   const chooseKind = (kind: StartingPointKind) => {
     if (kind === "scratch") {
+      setProjectPolicySource("completed");
       setDraft({ ...DEFAULT_SELECTION });
       return;
     }
     if (kind === "project_checkpoint") {
+      if (draft.kind === "project_checkpoint") {
+        setProjectPolicySource(
+          draft.warm_start_snapshot ? "interrupted" : "completed",
+        );
+        return;
+      }
+      setProjectPolicySource("completed");
       const marked = checkpoints.filter((checkpoint) => checkpoint.selected);
       const canonicalSelection = marked.length === 1 ? marked[0] : null;
       setDraft({
         ...DEFAULT_SELECTION,
         kind,
-        warm_start_iteration:
-          draft.kind === "project_checkpoint" && draft.warm_start_iteration != null
-            ? draft.warm_start_iteration
-            : canonicalSelection?.iter_index ?? null,
+        warm_start_iteration: canonicalSelection?.iter_index ?? null,
       });
       return;
     }
+    setProjectPolicySource("completed");
     const remembered = receipts.find(
       (receipt) => receipt.skill.skill_id === draft.starting_skill_id,
     );
@@ -833,6 +1018,47 @@ export function StartingPointPickerDialog({
     });
   };
 
+  const chooseProjectPolicySource = (source: ProjectPolicySource) => {
+    setProjectPolicySource(source);
+    if (source === "completed") {
+      const marked = checkpoints.filter((checkpoint) => checkpoint.selected);
+      const canonicalSelection = marked.length === 1 ? marked[0] : null;
+      setDraft((current) => ({
+        ...DEFAULT_SELECTION,
+        kind: "project_checkpoint",
+        warm_start_iteration: current.warm_start_snapshot == null
+          ? current.warm_start_iteration
+          : canonicalSelection?.iter_index ?? null,
+      }));
+      return;
+    }
+    setDraft({
+      ...DEFAULT_SELECTION,
+      kind: "project_checkpoint",
+    });
+  };
+
+  const chooseRecoverySnapshot = (snapshot: PolicyRecoverySnapshot) => {
+    setDraft({
+      ...DEFAULT_SELECTION,
+      kind: "project_checkpoint",
+      warm_start_snapshot: {
+        snapshot_id: snapshot.snapshot_id,
+        checkpoint_sha256: snapshot.checkpoint_sha256,
+        receipt_digest: snapshot.receipt_digest,
+        acknowledge_interrupted_snapshot: false,
+        acknowledge_legacy_reconstructed_snapshot: false,
+      },
+      warm_start_snapshot_display: {
+        iteration: snapshot.iteration,
+        ppo_step: snapshot.ppo_step,
+        last_observed_ppo_iteration: snapshot.last_observed_ppo_iteration,
+        checkpoint_bytes: snapshot.checkpoint_bytes,
+        provenance_status: snapshot.provenance_status,
+      },
+    });
+  };
+
   const chooseReceipt = (receipt: StartingSkillReceipt) => {
     const initializationMode = preferredInitialization(receipt);
     const attachRequiredReference = initializationMode === "reference_only";
@@ -859,6 +1085,18 @@ export function StartingPointPickerDialog({
   const checkpointValid = draft.warm_start_iteration != null
     && Number.isInteger(draft.warm_start_iteration)
     && draft.warm_start_iteration >= 0;
+  const snapshotRef = draft.warm_start_snapshot ?? null;
+  const interruptedSnapshotValid = selectedRecoverySnapshot?.selectable === true
+    && snapshotRef?.snapshot_id === selectedRecoverySnapshot.snapshot_id
+    && snapshotRef.checkpoint_sha256 === selectedRecoverySnapshot.checkpoint_sha256
+    && snapshotRef.receipt_digest === selectedRecoverySnapshot.receipt_digest
+    && /^[a-f0-9]{64}$/.test(snapshotRef.checkpoint_sha256)
+    && /^[a-f0-9]{64}$/.test(snapshotRef.receipt_digest)
+    && snapshotRef.acknowledge_interrupted_snapshot
+    && (
+      selectedRecoverySnapshot.provenance_status !== "legacy_reconstructed"
+      || snapshotRef.acknowledge_legacy_reconstructed_snapshot === true
+    );
   const requiredReferenceValid = draft.initialization_mode !== "reference_only"
     || (
       draft.reference_clip_id === selectedReceipt?.components.reference?.clip_id
@@ -880,7 +1118,14 @@ export function StartingPointPickerDialog({
       || draft.acknowledge_legacy_reconstructed_initialization
     );
   const canApply = draft.kind === "scratch"
-    || (draft.kind === "project_checkpoint" && checkpointValid)
+    || (
+      draft.kind === "project_checkpoint"
+      && (
+        projectPolicySource === "completed"
+          ? checkpointValid
+          : interruptedSnapshotValid
+      )
+    )
     || (draft.kind === "shared_skill" && sharedSkillValid);
 
   return (
@@ -923,8 +1168,8 @@ export function StartingPointPickerDialog({
             kind="project_checkpoint"
             selected={draft.kind === "project_checkpoint"}
             icon="history"
-            title="Project checkpoint"
-            description="Continue from a policy produced by an earlier iteration in this project."
+            title="Project policy"
+            description="Choose a completed project checkpoint or an explicitly unevaluated interrupted snapshot."
             onSelect={chooseKind}
           />
           <KindChoice
@@ -953,84 +1198,199 @@ export function StartingPointPickerDialog({
 
         {draft.kind === "project_checkpoint" && (
           <div className="rs-card" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
-            <div>
-              <label htmlFor="starting-point-checkpoint" style={{ display: "block", fontSize: 12, fontWeight: 650, marginBottom: 6 }}>
-                Completed iteration
-              </label>
-              {checkpoints.length > 0 ? (
-                <select
-                  id="starting-point-checkpoint"
-                  className="rs-input"
-                  autoFocus
-                  value={draft.warm_start_iteration ?? ""}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    warm_start_iteration: event.target.value === "" ? null : Number(event.target.value),
-                  }))}
+            <fieldset style={{ margin: 0, padding: 0, border: 0 }}>
+              <legend style={{ fontSize: 12, fontWeight: 650, marginBottom: 7 }}>
+                Choose project policy evidence
+              </legend>
+              <div role="radiogroup" aria-label="Project policy source" className="rs-project-policy-sources">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={projectPolicySource === "completed"}
+                  tabIndex={projectPolicySource === "completed" ? 0 : -1}
+                  onClick={() => chooseProjectPolicySource("completed")}
+                  onKeyDown={moveWithinRadioGroup}
+                  className={projectPolicySource === "completed" ? "selected" : undefined}
                 >
-                  <option value="">Choose an iteration…</option>
-                  {[...checkpoints]
-                    .sort((a, b) => b.iter_index - a.iter_index)
-                    .map((checkpoint) => (
-                      <option key={checkpoint.iter_index} value={checkpoint.iter_index}>
-                        Iteration {checkpoint.iter_index}
-                        {checkpoint.selected ? " · selected" : ""}
-                        {checkpoint.criterion_status && checkpoint.criterion_status !== "not_recorded"
-                          ? ` · criterion ${checkpoint.criterion_status}`
-                          : ""}
-                        {checkpoint.rollout_available ? " · rollout" : ""}
-                        {checkpoint.fitness != null ? ` · score ${checkpoint.fitness.toFixed(3)}` : ""}
-                      </option>
-                    ))}
-                </select>
-              ) : (
-                <input
-                  id="starting-point-checkpoint"
-                  className="rs-input mono"
-                  type="number"
-                  min={0}
-                  step={1}
-                  autoFocus
-                  disabled={checkpointsLoading}
-                  value={draft.warm_start_iteration ?? ""}
-                  placeholder={checkpointsLoading ? "Loading checkpoints…" : "e.g. 12"}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    warm_start_iteration: event.target.value === "" ? null : Number(event.target.value),
-                  }))}
-                />
-              )}
-            </div>
-            {selectedCheckpoint ? (
-              <CheckpointReceipt checkpoint={selectedCheckpoint} />
-            ) : checkpoints.length > 0 ? (
-              <div
-                role="status"
-                style={{
-                  display: "flex",
-                  alignItems: "flex-start",
-                  gap: 8,
-                  padding: "10px 12px",
-                  borderRadius: "var(--radius-md)",
-                  background: "var(--st-amber-bg)",
-                  color: "var(--st-amber-fg)",
-                  fontSize: 11.5,
-                  lineHeight: 1.45,
-                }}
-              >
-                <Icon name="alert-triangle" size={14} />
-                <span>
-                  Choose a checkpoint explicitly. RewardSculptor does not assume the newest
-                  checkpoint is the best; only a coherent selection receipt may preselect one.
-                </span>
+                  <span>Completed checkpoints</span>
+                  <small>Completed iteration artifact; available evidence shown below</small>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={projectPolicySource === "interrupted"}
+                  tabIndex={projectPolicySource === "interrupted" ? 0 : -1}
+                  onClick={() => chooseProjectPolicySource("interrupted")}
+                  onKeyDown={moveWithinRadioGroup}
+                  className={projectPolicySource === "interrupted" ? "selected" : undefined}
+                >
+                  <span>Interrupted snapshots</span>
+                  <small>Periodic PPO save; unevaluated recovery input</small>
+                </button>
               </div>
-            ) : null}
-            <div style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "10px 12px", borderRadius: "var(--radius-md)", background: "var(--st-blue-bg)", color: "var(--st-blue-fg)", fontSize: 11.5, lineHeight: 1.45 }}>
-              <Icon name="info" size={14} />
-              <span>
-                This is a policy transfer, not a full resume: actor and critic load, while optimizer state, iteration counters, and exploration state start fresh.
-              </span>
-            </div>
+            </fieldset>
+
+            {projectPolicySource === "completed" ? (
+              <>
+                <div>
+                  <label htmlFor="starting-point-checkpoint" style={{ display: "block", fontSize: 12, fontWeight: 650, marginBottom: 6 }}>
+                    Completed iteration
+                  </label>
+                  {checkpoints.length > 0 ? (
+                    <select
+                      id="starting-point-checkpoint"
+                      className="rs-input"
+                      value={draft.warm_start_iteration ?? ""}
+                      onChange={(event) => setDraft((current) => ({
+                        ...current,
+                        warm_start_iteration: event.target.value === "" ? null : Number(event.target.value),
+                      }))}
+                    >
+                      <option value="">Choose an iteration…</option>
+                      {[...checkpoints]
+                        .sort((a, b) => b.iter_index - a.iter_index)
+                        .map((checkpoint) => (
+                          <option key={checkpoint.iter_index} value={checkpoint.iter_index}>
+                            Iteration {checkpoint.iter_index}
+                            {checkpoint.selected ? " · selected" : ""}
+                            {checkpoint.criterion_status && checkpoint.criterion_status !== "not_recorded"
+                              ? ` · criterion ${checkpoint.criterion_status}`
+                              : ""}
+                            {checkpoint.rollout_available ? " · rollout" : ""}
+                            {checkpoint.fitness != null ? ` · score ${checkpoint.fitness.toFixed(3)}` : ""}
+                          </option>
+                        ))}
+                    </select>
+                  ) : (
+                    <input
+                      id="starting-point-checkpoint"
+                      className="rs-input mono"
+                      type="number"
+                      min={0}
+                      step={1}
+                      disabled={checkpointsLoading}
+                      value={draft.warm_start_iteration ?? ""}
+                      placeholder={checkpointsLoading ? "Loading checkpoints…" : "e.g. 12"}
+                      onChange={(event) => setDraft((current) => ({
+                        ...current,
+                        warm_start_iteration: event.target.value === "" ? null : Number(event.target.value),
+                      }))}
+                    />
+                  )}
+                </div>
+                {selectedCheckpoint ? (
+                  <CheckpointReceipt checkpoint={selectedCheckpoint} />
+                ) : checkpoints.length > 0 ? (
+                  <div
+                    role="status"
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 8,
+                      padding: "10px 12px",
+                      borderRadius: "var(--radius-md)",
+                      background: "var(--st-amber-bg)",
+                      color: "var(--st-amber-fg)",
+                      fontSize: 11.5,
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    <Icon name="alert-triangle" size={14} />
+                    <span>
+                      Choose a checkpoint explicitly. RewardSculptor does not assume the newest
+                      checkpoint is the best; only a coherent selection receipt may preselect one.
+                    </span>
+                  </div>
+                ) : null}
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "10px 12px", borderRadius: "var(--radius-md)", background: "var(--st-blue-bg)", color: "var(--st-blue-fg)", fontSize: 11.5, lineHeight: 1.45 }}>
+                  <Icon name="info" size={14} />
+                  <span>
+                    This is a policy transfer, not a full resume: actor and critic load, while optimizer state, iteration counters, and exploration state start fresh.
+                  </span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "10px 12px", borderRadius: "var(--radius-md)", background: "var(--st-amber-bg)", color: "var(--st-amber-fg)", fontSize: 11.5, lineHeight: 1.45 }}>
+                  <Icon name="alert-triangle" size={14} />
+                  <span>
+                    Warm-start from an interrupted snapshot only when preserving partial training
+                    is worth the uncertainty. It is not a completed checkpoint, evaluated policy,
+                    full resume, or success claim.
+                  </span>
+                </div>
+                {recoverySnapshotsQuery.isLoading ? (
+                  <div role="status" className="rs-sub" style={{ fontSize: 11.5 }}>
+                    Verifying interrupted snapshot receipts…
+                  </div>
+                ) : recoverySnapshotsQuery.isError ? (
+                  <div role="alert" style={{ color: "var(--st-rose-fg)", fontSize: 11.5, lineHeight: 1.45 }}>
+                    Recovery snapshots could not be verified: {problemMessage(recoverySnapshotsQuery.error)}{" "}
+                    No manual path or iteration fallback is allowed.
+                  </div>
+                ) : recoverySnapshots.length === 0 ? (
+                  <div role="status" className="rs-sub" style={{ fontSize: 11.5, lineHeight: 1.45 }}>
+                    No server-attested interrupted snapshots are available for this project.
+                  </div>
+                ) : (
+                  <div role="radiogroup" aria-label="Interrupted PPO snapshots" className="rs-recovery-snapshot-list">
+                    {[...recoverySnapshots]
+                      .sort((a, b) => b.iteration - a.iteration || b.ppo_step - a.ppo_step)
+                      .map((snapshot, index) => {
+                        const selected = snapshot.snapshot_id === snapshotRef?.snapshot_id;
+                        const descriptionId = `recovery-${snapshot.snapshot_id}-description`;
+                        return (
+                          <button
+                            key={snapshot.snapshot_id}
+                            type="button"
+                            role="radio"
+                            aria-checked={selected}
+                            tabIndex={selected || (!snapshotRef && index === 0) ? 0 : -1}
+                            aria-label={`Cycle ${snapshot.iteration}, PPO snapshot ${snapshot.ppo_step}, interrupted and unevaluated, ${snapshot.selectable ? "selectable" : "blocked"}`}
+                            aria-describedby={descriptionId}
+                            onClick={() => chooseRecoverySnapshot(snapshot)}
+                            onKeyDown={moveWithinRadioGroup}
+                            className={selected ? "selected" : undefined}
+                          >
+                            <span className="rs-recovery-snapshot-title">
+                              <strong>Cycle {snapshot.iteration} · PPO snapshot {snapshot.ppo_step}</strong>
+                              <span className="rs-badge amber">interrupted</span>
+                              <span className="rs-badge slate">unevaluated</span>
+                              {!snapshot.selectable && <span className="rs-badge rose">blocked</span>}
+                            </span>
+                            <small id={descriptionId}>
+                              Actor + critic transfer · optimizer/counters reset · SHA {shortDigest(snapshot.checkpoint_sha256)} · {formatBytes(snapshot.checkpoint_bytes)}
+                            </small>
+                          </button>
+                        );
+                      })}
+                  </div>
+                )}
+                {selectedRecoverySnapshot ? (
+                  <RecoverySnapshotReceipt
+                    snapshot={selectedRecoverySnapshot}
+                    acknowledged={snapshotRef?.acknowledge_interrupted_snapshot === true}
+                    legacyAcknowledged={snapshotRef?.acknowledge_legacy_reconstructed_snapshot === true}
+                    onAcknowledgedChange={(checked) => setDraft((current) => ({
+                      ...current,
+                      warm_start_snapshot: current.warm_start_snapshot
+                        ? { ...current.warm_start_snapshot, acknowledge_interrupted_snapshot: checked }
+                        : null,
+                    }))}
+                    onLegacyAcknowledgedChange={(checked) => setDraft((current) => ({
+                      ...current,
+                      warm_start_snapshot: current.warm_start_snapshot
+                        ? { ...current.warm_start_snapshot, acknowledge_legacy_reconstructed_snapshot: checked }
+                        : null,
+                    }))}
+                  />
+                ) : recoverySnapshots.length > 0 && !recoverySnapshotsQuery.isLoading ? (
+                  <div role="status" className="rs-sub" style={{ fontSize: 11.5 }}>
+                    Choose one interrupted snapshot explicitly. None is selected by recency.
+                  </div>
+                ) : null}
+              </>
+            )}
           </div>
         )}
 

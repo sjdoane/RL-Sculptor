@@ -783,6 +783,57 @@ def test_unverified_load_event_cannot_create_initialization_edge(
         assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
 
 
+def test_project_actor_critic_lineage_is_earned_only_after_exact_load(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A project checkpoint earns no edge until both requested roles load."""
+    kg_path = tmp_path / "lineage.db"
+    monkeypatch.setenv("RS_KG_PATH", str(kg_path))
+    project = tmp_path / "project"
+    _seed_world(project)
+    checkpoint = project / "runs" / "iter_2" / "logs" / "model_50.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"interrupted-project-snapshot")
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    session = RunLineageSession(
+        project_dir=project,
+        project_slug="lineage-project",
+        run_id="job-actor-only-rejected",
+        requested_initialization_mode="actor_critic",
+    )
+    session.record_started()
+
+    with pytest.raises(LineageObservationError, match="expected exactly"):
+        session.observe_event({
+            "type": "warm_start_loaded",
+            "source": str(checkpoint),
+            "source_sha256": checkpoint_sha,
+            "load_cfg_keys": ["actor"],
+        })
+
+    with SculptorKG(kg_path) as kg:
+        assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
+
+    with pytest.raises(LineageObservationError, match="expected exactly"):
+        session.observe_event({
+            "type": "warm_start_loaded",
+            "source": str(checkpoint),
+            "source_sha256": checkpoint_sha,
+            "load_cfg_keys": ["actor", "critic", "critic"],
+        })
+    with SculptorKG(kg_path) as kg:
+        assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
+
+    session.observe_event({
+        "type": "warm_start_loaded",
+        "source": str(checkpoint),
+        "source_sha256": checkpoint_sha,
+        "load_cfg_keys": ["critic", "actor"],
+    })
+    with SculptorKG(kg_path) as kg:
+        assert kg.count_edges(Relation.INITIALIZED_FROM) == 1
+
+
 def test_no_kg_skips_every_lineage_side_effect(tmp_path: Path, monkeypatch) -> None:
     kg_path = tmp_path / "must-not-exist.db"
     monkeypatch.setenv("RS_KG_PATH", str(kg_path))

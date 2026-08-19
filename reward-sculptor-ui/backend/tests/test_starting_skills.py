@@ -1139,6 +1139,9 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
         "source": str(checkpoint),
         "source_sha256": record.checkpoint_sha256,
         "source_sha8": record.checkpoint_sha256[:8],
+        "loaded_checkpoint": str(checkpoint),
+        "loaded_checkpoint_sha256": record.checkpoint_sha256,
+        "adapted": False,
         "load_cfg_keys": ["actor", "critic"],
         "source_policy_contract_sha256": policy_receipt["source"][
             "contract_sha256"
@@ -1390,6 +1393,9 @@ def test_runtime_load_receipt_rejects_wrong_digest_roles_or_source(
         "type": "warm_start_loaded",
         "source": str(checkpoint),
         "source_sha256": digest,
+        "loaded_checkpoint": str(checkpoint),
+        "loaded_checkpoint_sha256": digest,
+        "adapted": False,
         "load_cfg_keys": ["actor"],
     }
     event.update(mutation)

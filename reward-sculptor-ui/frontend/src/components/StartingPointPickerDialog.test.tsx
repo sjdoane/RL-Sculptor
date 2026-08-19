@@ -4,8 +4,13 @@ import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
 
 import { StartingPointPickerDialog } from "@/components/StartingPointPickerDialog";
-import { listStartingSkills, uploadStartingSkill } from "@/lib/api";
+import {
+  listPolicyRecoverySnapshots,
+  listStartingSkills,
+  uploadStartingSkill,
+} from "@/lib/api";
 import type {
+  PolicyRecoverySnapshot,
   PolicySummary,
   StartingPointSelection,
   StartingSkillReceipt,
@@ -15,6 +20,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...original,
+    listPolicyRecoverySnapshots: vi.fn(),
     listStartingSkills: vi.fn(),
     uploadStartingSkill: vi.fn(),
   };
@@ -218,6 +224,31 @@ function renderPicker(
   );
   return onChange;
 }
+
+test("supports conventional arrow-key navigation across custom radio cards", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  vi.mocked(listPolicyRecoverySnapshots).mockResolvedValue([]);
+  const user = userEvent.setup();
+  renderPicker();
+
+  const scratch = screen.getByRole("radio", { name: /From scratch/i });
+  const project = screen.getByRole("radio", { name: /Project policy/i });
+  scratch.focus();
+  await user.keyboard("{ArrowRight}");
+  expect(project).toHaveFocus();
+  expect(project).toBeChecked();
+
+  const completed = screen.getByRole("radio", { name: /Completed checkpoints/i });
+  completed.focus();
+  await user.keyboard("{ArrowDown}");
+  const interrupted = screen.getByRole("radio", { name: /Interrupted snapshots/i });
+  expect(interrupted).toHaveFocus();
+  expect(interrupted).toBeChecked();
+
+  await user.keyboard("{Home}");
+  expect(completed).toHaveFocus();
+  expect(completed).toBeChecked();
+});
 
 test("makes policy, motion, world, trust, and initialization semantics explicit", async () => {
   vi.mocked(listStartingSkills).mockResolvedValue({ skills: [receipt] });
@@ -456,6 +487,111 @@ test("prefers an older evidenced selection over a newer failed checkpoint", asyn
     kind: "project_checkpoint",
     warm_start_iteration: 4,
   }));
+});
+
+const recoverySnapshot = (
+  overrides: Partial<PolicyRecoverySnapshot> = {},
+): PolicyRecoverySnapshot => ({
+  snapshot_id: "snap_7fd3a41b",
+  iteration: 2,
+  ppo_step: 50,
+  source_job_id: "job_d41e199695d2d7d8",
+  source_job_status: "errored",
+  last_observed_ppo_iteration: 58,
+  checkpoint_bytes: 6_202_705,
+  checkpoint_sha256: "a".repeat(64),
+  receipt_digest: "b".repeat(64),
+  provenance_status: "origin_persisted",
+  selectable: true,
+  blocker: null,
+  ...overrides,
+});
+
+test("separates interrupted PPO snapshots and requires an explicit unevaluated acknowledgement", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  vi.mocked(listPolicyRecoverySnapshots).mockResolvedValue([recoverySnapshot()]);
+  const user = userEvent.setup();
+  const onChange = renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Project policy/i }));
+  expect(screen.getByRole("radio", { name: /Completed checkpoints/i })).toBeChecked();
+  await user.click(screen.getByRole("radio", { name: /Interrupted snapshots/i }));
+
+  const row = await screen.findByRole("radio", {
+    name: /Cycle 2, PPO snapshot 50, interrupted and unevaluated/i,
+  });
+  expect(row).toHaveAccessibleDescription(/actor \+ critic transfer/i);
+  expect(row).toHaveAccessibleDescription(/optimizer\/counters reset/i);
+  expect(row).toHaveTextContent(/actor \+ critic transfer/i);
+  expect(row).toHaveTextContent(/optimizer\/counters reset/i);
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
+
+  await user.click(row);
+  expect(screen.getByLabelText(/Cycle 2 PPO snapshot 50 recovery disclosure/i))
+    .toHaveTextContent(/no rollout, objective score, criterion result, or success claim/i);
+  const acknowledgement = screen.getByRole("checkbox", {
+    name: /snapshot is unevaluated and may be worse/i,
+  });
+  await user.click(acknowledgement);
+  const apply = screen.getByRole("button", { name: /Use this starting point/i });
+  expect(apply).toBeEnabled();
+  await user.click(apply);
+
+  const selection = onChange.mock.calls[0][0] as StartingPointSelection;
+  expect(selection).toMatchObject({
+    kind: "project_checkpoint",
+    warm_start_iteration: null,
+    warm_start_snapshot: {
+      snapshot_id: "snap_7fd3a41b",
+      checkpoint_sha256: "a".repeat(64),
+      receipt_digest: "b".repeat(64),
+      acknowledge_interrupted_snapshot: true,
+    },
+  });
+  expect(selection.warm_start_snapshot).not.toHaveProperty("checkpoint");
+  expect(selection.warm_start_snapshot).not.toHaveProperty("path");
+});
+
+test("fails closed when interrupted snapshot discovery cannot be verified", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  vi.mocked(listPolicyRecoverySnapshots).mockRejectedValue(
+    new Error("attestation store unavailable"),
+  );
+  const user = userEvent.setup();
+  renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Project policy/i }));
+  await user.click(screen.getByRole("radio", { name: /Interrupted snapshots/i }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    /No manual path or iteration fallback is allowed/i,
+  );
+  expect(screen.queryByRole("spinbutton")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Use this starting point/i })).toBeDisabled();
+});
+
+test("requires a separate acknowledgement for a legacy-reconstructed snapshot receipt", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  vi.mocked(listPolicyRecoverySnapshots).mockResolvedValue([
+    recoverySnapshot({ provenance_status: "legacy_reconstructed" }),
+  ]);
+  const user = userEvent.setup();
+  renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Project policy/i }));
+  await user.click(screen.getByRole("radio", { name: /Interrupted snapshots/i }));
+  await user.click(await screen.findByRole("radio", {
+    name: /Cycle 2, PPO snapshot 50/i,
+  }));
+  await user.click(screen.getByRole("checkbox", {
+    name: /snapshot is unevaluated and may be worse/i,
+  }));
+  const apply = screen.getByRole("button", { name: /Use this starting point/i });
+  expect(apply).toBeDisabled();
+  await user.click(screen.getByRole("checkbox", {
+    name: /receipt was reconstructed after the interruption/i,
+  }));
+  expect(apply).toBeEnabled();
 });
 
 test("admits validated reference-only data without granting policy loading", async () => {

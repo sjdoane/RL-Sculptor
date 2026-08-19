@@ -1119,7 +1119,10 @@ class RunLineageSession:
             raise LineageObservationError(
                 "warm_start_loaded has no structural load_cfg_keys evidence"
             )
-        keys = sorted(set(raw_keys))
+        # Keep multiplicity: an exact role receipt is a structural contract,
+        # not a set-membership claim.  Duplicate or extra roles must fail the
+        # same equality check as a missing critic.
+        keys = sorted(raw_keys)
         if "actor" not in keys:
             raise LineageObservationError(
                 "warm_start_loaded did not report actor weight loading"
@@ -1130,7 +1133,10 @@ class RunLineageSession:
             if self.requested_initialization_mode == "actor_critic"
             else ["actor"]
         )
-        if self.starting_skill_record is not None and keys != expected_keys:
+        role_contract_is_explicit = self.requested_initialization_mode in {
+            "actor_only", "actor_critic",
+        }
+        if role_contract_is_explicit and keys != expected_keys:
             raise LineageObservationError(
                 f"worker loaded roles {keys}, expected exactly {expected_keys}"
             )

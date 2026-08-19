@@ -810,6 +810,7 @@ export function clipUrl(
 
 // ── Policies + reusable starting skills ──────────────────────────────
 import type {
+  PolicyRecoverySnapshot,
   PolicySummary,
   StartingSkillReceipt,
   StartingSkillsResponse,
@@ -823,6 +824,19 @@ export async function listPolicies(
   const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
   return handle<PolicySummary[]>(
     await fetch(`/api/projects/${slug}/policies${q}`),
+  );
+}
+
+/** List server-attested periodic PPO saves from interrupted project runs.
+ * The response deliberately contains opaque ids and immutable digests, never
+ * a client-selectable path. These rows are unevaluated recovery inputs. */
+export async function listPolicyRecoverySnapshots(
+  slug: string,
+): Promise<PolicyRecoverySnapshot[]> {
+  return handle<PolicyRecoverySnapshot[]>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/policies/recovery-snapshots`,
+    ),
   );
 }
 

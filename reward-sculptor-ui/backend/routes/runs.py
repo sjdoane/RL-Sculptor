@@ -61,6 +61,7 @@ from backend.services.run_manager import (
     run_sculpt_job,
     write_control_file,
 )
+from backend.services.recovery_snapshots import resolve_recovery_snapshot
 from sculptor.skill_bundle import ImportTarget, compatibility_for
 from sculptor.skill_library import SkillLibrary, SkillLibraryError
 from sculptor.compatibility_provenance import (
@@ -69,6 +70,7 @@ from sculptor.compatibility_provenance import (
 )
 from sculptor.policy_contract import (
     build_iteration_warm_start_contract_receipt,
+    build_recovery_snapshot_warm_start_contract_receipt,
     build_skill_warm_start_contract_receipt,
 )
 from sculptor.reference_authority import (
@@ -557,23 +559,45 @@ def launch_run(
             )
 
     project_dir = Path(detail.project_dir)
-    if body.warm_start_iteration is not None and body.starting_skill_id is not None:
+    policy_sources = sum((
+        body.warm_start_iteration is not None,
+        body.warm_start_snapshot is not None,
+        body.starting_skill_id is not None,
+    ))
+    if policy_sources > 1:
         return _problem(
             status.HTTP_412_PRECONDITION_FAILED,
             "choose one starting policy source",
             detail=(
-                "warm_start_iteration recovers this project's checkpoint; "
-                "starting_skill_id selects a shared/imported skill. They cannot "
-                "both initialize the same run."
+                "completed project checkpoints, interrupted PPO snapshots, "
+                "and shared/imported skills are distinct sources; choose "
+                "exactly one"
             ),
             type_="/problems/starting-skill",
         )
-    if body.initialization_mode is not None and body.starting_skill_id is None:
+    if (
+        body.initialization_mode is not None
+        and body.starting_skill_id is None
+        and body.warm_start_snapshot is None
+    ):
         return _problem(
             status.HTTP_412_PRECONDITION_FAILED,
             "initialization mode has no starting skill",
             detail="select a starting_skill_id or clear initialization_mode",
             type_="/problems/starting-skill",
+        )
+    if (
+        body.warm_start_snapshot is not None
+        and body.initialization_mode not in {None, "actor_critic"}
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "interrupted snapshots require actor and critic initialization",
+            detail=(
+                "use initialization_mode=actor_critic (or omit the field); "
+                "optimizer state is never resumed"
+            ),
+            type_="/problems/recovery-snapshot-initialization-mode",
         )
     if (
         body.acknowledge_legacy_reconstructed_initialization
@@ -625,10 +649,15 @@ def launch_run(
         )
 
     selected_skill = None
+    selected_snapshot_receipt: Optional[dict[str, Any]] = None
     starting_skill_target_receipt: Optional[dict[str, Any]] = None
     warm_start_policy_contract_receipt: dict[str, Any] | None = None
     contract_provenance_launch_receipt: dict[str, Any] | None = None
-    selected_mode = body.initialization_mode or "actor_only"
+    selected_mode = (
+        "actor_critic"
+        if body.warm_start_snapshot is not None
+        else (body.initialization_mode or "actor_only")
+    )
     resolved_reference_clip_id = body.reference_clip_id
     resolved_reference_robot = body.reference_robot
     reference_feasibility: Optional[dict[str, Any]] = None
@@ -938,6 +967,88 @@ def launch_run(
                     detail=f"{type(exc).__name__}: {exc}",
                     type_="/problems/warm-start-policy-contract",
                 )
+    if body.warm_start_snapshot is not None:
+        snapshot_ref = body.warm_start_snapshot
+        if not snapshot_ref.acknowledge_interrupted_snapshot:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "interrupted snapshot acknowledgement is required",
+                detail=(
+                    "confirm that this PPO save is unevaluated and may be "
+                    "worse than the run's starting policy"
+                ),
+                type_="/problems/recovery-snapshot-acknowledgement",
+            )
+        try:
+            _, selected_snapshot_receipt = resolve_recovery_snapshot(
+                project_dir,
+                snapshot_id=snapshot_ref.snapshot_id,
+                checkpoint_sha256=snapshot_ref.checkpoint_sha256,
+                receipt_digest=snapshot_ref.receipt_digest,
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "interrupted snapshot changed after selection",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/recovery-snapshot-stale",
+            )
+        provenance_status = selected_snapshot_receipt.get(
+            "provenance_status"
+        )
+        if (
+            provenance_status == "legacy_reconstructed"
+            and not snapshot_ref.acknowledge_legacy_reconstructed_snapshot
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "historical snapshot reconstruction acknowledgement is required",
+                detail=(
+                    "this worker predates origin-persisted snapshot receipts; "
+                    "confirm the disclosed log/selection reconstruction"
+                ),
+                type_="/problems/recovery-snapshot-provenance",
+            )
+        if (
+            provenance_status != "legacy_reconstructed"
+            and snapshot_ref.acknowledge_legacy_reconstructed_snapshot
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "historical acknowledgement does not match this snapshot",
+                detail="refresh the interrupted-snapshot receipt",
+                type_="/problems/recovery-snapshot-provenance",
+            )
+        if authored_world_receipt is None:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world is required for interrupted snapshot transfer",
+                detail="re-admit the training world before launching",
+                type_="/problems/recovery-snapshot-policy-contract",
+            )
+        try:
+            target_selection = (
+                project_dir
+                / "env"
+                / (
+                    "selection_v"
+                    f"{int(authored_world_receipt['selection_version'])}.json"
+                )
+            )
+            warm_start_policy_contract_receipt = (
+                build_recovery_snapshot_warm_start_contract_receipt(
+                    project_dir,
+                    recovery_receipt=selected_snapshot_receipt,
+                    target_selection_path=target_selection,
+                )
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "interrupted snapshot policy contract is unavailable",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/recovery-snapshot-policy-contract",
+            )
     if bool(resolved_reference_clip_id) != bool(resolved_reference_robot):
         return _problem(
             status.HTTP_412_PRECONDITION_FAILED,
@@ -1081,7 +1192,11 @@ def launch_run(
                 "target_robot": target_robot,
             }
     run_params: dict[str, Any] = body.model_dump()
-    run_params["initialization_mode"] = selected_mode if selected_skill else None
+    run_params["initialization_mode"] = (
+        selected_mode
+        if selected_skill is not None or selected_snapshot_receipt is not None
+        else None
+    )
     run_params["reference_clip_id"] = resolved_reference_clip_id
     run_params["reference_robot"] = resolved_reference_robot
     run_params["reference_feasibility"] = reference_feasibility
@@ -1092,6 +1207,7 @@ def launch_run(
     run_params["warm_start_policy_contract_receipt"] = (
         warm_start_policy_contract_receipt
     )
+    run_params["recovery_snapshot_receipt"] = selected_snapshot_receipt
     run_params["compatibility_contract_provenance_receipt"] = (
         contract_provenance_launch_receipt
     )

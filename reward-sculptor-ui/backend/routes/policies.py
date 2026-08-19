@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.models.project import ProblemDetail
-from backend.models.run import PolicySummary
+from backend.models.run import PolicyRecoverySnapshot, PolicySummary
 from backend.routes.runs import _find_run, _resolve_run_root
 from backend.services.job_manager import JobManager
 from backend.services.project_store import ProjectStore
@@ -263,6 +263,52 @@ def list_policies(
             ),
         )
         for row in list_exportable_iters(runs_root)
+    ]
+
+
+# ── GET /projects/{slug}/policies/recovery-snapshots ────────────────────
+@router.get(
+    "/projects/{slug}/policies/recovery-snapshots",
+    response_model=list[PolicyRecoverySnapshot],
+    responses={
+        404: {"model": ProblemDetail},
+        409: {"model": ProblemDetail},
+    },
+)
+def list_recovery_snapshots(
+    slug: str,
+    store: ProjectStore = Depends(get_store),
+    jobs: JobManager = Depends(get_job_manager),
+) -> Any:
+    """List attested, unevaluated PPO saves from interrupted local runs.
+
+    This route is deliberately separate from ``/policies`` and export.  It
+    returns opaque ids and digests only; the server-owned checkpoint path is
+    never part of the browser contract.
+    """
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            404,
+            "project not found",
+            detail=f"no project with slug {slug!r}",
+            type="/problems/not-found",
+        )
+    if jobs.has_active_sculpt_run(slug):
+        return _problem(
+            409,
+            "recovery snapshots are unavailable while training is active",
+            detail=(
+                "wait for the active project worker to stop before selecting "
+                "an interrupted PPO snapshot"
+            ),
+            type="/problems/recovery-snapshot-active",
+        )
+    from backend.services.recovery_snapshots import discover_recovery_snapshots
+
+    return [
+        PolicyRecoverySnapshot(**row)
+        for row in discover_recovery_snapshots(Path(detail.project_dir))
     ]
 
 

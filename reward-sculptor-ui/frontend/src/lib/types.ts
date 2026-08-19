@@ -388,6 +388,10 @@ export interface RunParamsPayload {
   // Explicit policy-only recovery. The backend resolves this iteration to a
   // non-empty checkpoint inside this project's runs directory.
   warm_start_iteration?: number | null;
+  /** Content-pinned periodic PPO save from an interrupted project run.
+   * The opaque id is resolved and every digest is rechecked by the server;
+   * no client-controlled filesystem path crosses this boundary. */
+  warm_start_snapshot?: WarmStartSnapshotRef | null;
   // A reusable, content-addressed starting skill imported through the
   // researcher-facing bundle flow. `initialization_mode` is deliberately
   // explicit: loading an actor is not the same experiment as also loading a
@@ -661,6 +665,42 @@ export interface PolicySummary {
   selection_source: string | null;
 }
 
+/** Opaque launch reference for one server-attested interrupted PPO snapshot. */
+export interface WarmStartSnapshotRef {
+  snapshot_id: string;
+  checkpoint_sha256: string;
+  receipt_digest: string;
+  acknowledge_interrupted_snapshot: boolean;
+  acknowledge_legacy_reconstructed_snapshot?: boolean;
+}
+
+/** Research disclosure returned by the project-local recovery endpoint.
+ * These saves are unevaluated transfer inputs, never completed policies. */
+export interface PolicyRecoverySnapshot {
+  snapshot_id: string;
+  iteration: number;
+  ppo_step: number;
+  source_job_id: string;
+  source_job_status: string;
+  last_observed_ppo_iteration: number;
+  checkpoint_bytes: number;
+  checkpoint_sha256: string;
+  receipt_digest: string;
+  provenance_status: "origin_persisted" | "legacy_reconstructed";
+  selectable: boolean;
+  blocker: string | null;
+}
+
+/** UI-only copy retained with the opaque request so New Run can disclose the
+ * source without leaking or reconstructing a filesystem path. */
+export interface WarmStartSnapshotDisplay {
+  iteration: number;
+  ppo_step: number;
+  last_observed_ppo_iteration: number;
+  checkpoint_bytes: number;
+  provenance_status: "origin_persisted" | "legacy_reconstructed";
+}
+
 export interface PolicyEvidenceValue {
   key: string;
   value: number;
@@ -854,6 +894,8 @@ export type StartingPointKind =
 export interface StartingPointSelection {
   kind: StartingPointKind;
   warm_start_iteration: number | null;
+  warm_start_snapshot?: WarmStartSnapshotRef | null;
+  warm_start_snapshot_display?: WarmStartSnapshotDisplay | null;
   starting_skill_id: string | null;
   initialization_mode: StartingSkillInitializationMode | null;
   reference_clip_id: string | null;

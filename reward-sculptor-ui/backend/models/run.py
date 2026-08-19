@@ -184,6 +184,11 @@ class RunParams(BaseModel):
     passes it to ``sculpt run --init-policy``.  It never changes the selected
     reward, environment, or objective-metric mode."""
 
+    warm_start_snapshot: Optional["WarmStartSnapshotRef"] = None
+    """Opaque content pins for one server-attested interrupted PPO save.
+    Loading is always actor+critic transfer; optimizer state and counters
+    intentionally restart."""
+
     starting_skill_id: Optional[
         Annotated[str, Field(pattern=r"^[a-f0-9]{12}$")]
     ] = None
@@ -222,6 +227,20 @@ class RunParams(BaseModel):
     """Reference-library embodiment namespace for ``reference_clip_id``.
     Required when a clip is selected so identically named clips can never be
     resolved from the wrong robot library."""
+
+
+class WarmStartSnapshotRef(BaseModel):
+    """Optimistic-concurrency pins for an interrupted PPO snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: Annotated[
+        str, Field(pattern=r"^snap_[a-f0-9]{24}$")
+    ]
+    checkpoint_sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    receipt_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    acknowledge_interrupted_snapshot: bool = False
+    acknowledge_legacy_reconstructed_snapshot: bool = False
 
 
 class RunControl(BaseModel):
@@ -418,6 +437,29 @@ class PolicySummary(BaseModel):
     # index + source and the matching candidate's selected=true marker.
     selected: bool = False
     selection_source: Optional[str] = None
+
+
+class PolicyRecoverySnapshot(BaseModel):
+    """One periodic PPO save from an iteration with no promoted checkpoint.
+
+    These rows are recovery inputs only.  They carry no rollout, objective, or
+    success claim, and the exact digest must be echoed when launching.
+    """
+
+    snapshot_id: Annotated[
+        str, Field(pattern=r"^snap_[a-f0-9]{24}$")
+    ]
+    iteration: Annotated[int, Field(ge=0)]
+    ppo_step: Annotated[int, Field(gt=0)]
+    source_job_id: str
+    source_job_status: Literal["errored", "stopped"]
+    last_observed_ppo_iteration: Annotated[int, Field(gt=0)]
+    checkpoint_bytes: int
+    checkpoint_sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    receipt_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    provenance_status: Literal["origin_persisted", "legacy_reconstructed"]
+    selectable: bool
+    blocker: Optional[str] = None
 
 
 class RunWSMessage(BaseModel):

@@ -10,10 +10,12 @@ import pytest
 from sculptor.policy_contract import (
     _shape_for_observation_term,
     build_iteration_warm_start_contract_receipt,
+    build_recovery_snapshot_warm_start_contract_receipt,
     build_skill_warm_start_contract_receipt,
     compare_policy_contracts,
     contract_fingerprint,
     policy_contract_migration,
+    recovery_snapshot_receipt_fingerprint,
 )
 from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
 
@@ -241,6 +243,49 @@ def _selection_pair(project_dir: Path) -> tuple[Path, Path]:
     return source_path, target_path
 
 
+def _recovery_snapshot_receipt(source_contract: dict) -> dict:
+    receipt = {
+        "schema": 1,
+        "kind": "interrupted_ppo_snapshot",
+        "snapshot_id": "snapshot_deadbeef",
+        "checkpoint": {
+            "path": "runs/_recovery/snapshot_deadbeef/checkpoint.pt",
+            "sha256": "a" * 64,
+            "bytes": 6_202_705,
+            "ppo_step": 50,
+            "origin_path": "runs/iter_2/logs/model_50.pt",
+            "origin_sha256": "a" * 64,
+        },
+        "source": {
+            "effective_policy_contract": copy.deepcopy(source_contract),
+            "effective_policy_contract_sha256": contract_fingerprint(
+                source_contract
+            ),
+            "effective_policy_contract_path": (
+                "runs/iter_2/warm_start_effective_policy_contract.json"
+            ),
+            "selection_path": "env/selection_v6.json",
+            "selection_sha256": "b" * 64,
+            "selection_version": 6,
+            "tuple_hash": "c" * 64,
+            "artifact_tuple_path": "runs/iter_2/artifact_tuple.json",
+            "artifact_tuple_sha256": "d" * 64,
+            "matches_pinned_selection": False,
+            "job_id": "job_interrupted",
+            "status": "errored",
+            "log_path": "runs/_run_job_interrupted.log",
+            "log_sha256": "e" * 64,
+            "last_observed_ppo_step": 58,
+            "iteration": 2,
+        },
+        "provenance_status": "legacy_reconstructed",
+    }
+    receipt["receipt_digest"] = recovery_snapshot_receipt_fingerprint(
+        receipt
+    )
+    return receipt
+
+
 def test_iteration_warm_start_receipt_binds_exact_source_and_target(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -278,4 +323,134 @@ def test_iteration_warm_start_receipt_binds_exact_source_and_target(
     with pytest.raises(ValueError, match="exactly match"):
         build_iteration_warm_start_contract_receipt(
             tmp_path, 38, target_selection_path=target_path,
+        )
+
+
+def test_recovery_snapshot_receipt_binds_exact_runtime_contract_and_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source_path, target_path = _selection_pair(tmp_path)
+    source_contract = _event_contract(_legacy_contract())
+    target_contract = copy.deepcopy(source_contract)
+    recovery = _recovery_snapshot_receipt(source_contract)
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: copy.deepcopy(target_contract),
+    )
+
+    receipt = build_recovery_snapshot_warm_start_contract_receipt(
+        tmp_path,
+        recovery_receipt=recovery,
+        target_selection_path=target_path,
+    )
+
+    assert receipt["kind"] == "interrupted_ppo_snapshot"
+    assert receipt["source"]["checkpoint_sha256"] == "a" * 64
+    assert receipt["source"]["contract"] == source_contract
+    assert receipt["source"]["load_cfg_keys"] == ["actor", "critic"]
+    assert receipt["source"]["optimizer_resume"] is False
+    assert receipt["source"]["recovery_receipt_digest"] == (
+        recovery["receipt_digest"]
+    )
+    assert receipt["compatibility"] == {
+        "type": "exact_policy_contract",
+        "from_schema": 3,
+        "to_schema": 3,
+        "optimizer_resume": False,
+    }
+
+    mutated = copy.deepcopy(recovery)
+    mutated["source"]["log_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="receipt digest does not match"):
+        build_recovery_snapshot_warm_start_contract_receipt(
+            tmp_path,
+            recovery_receipt=mutated,
+            target_selection_path=target_path,
+        )
+
+
+def test_recovery_snapshot_receipt_admits_only_existing_event_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source_path, target_path = _selection_pair(tmp_path)
+    source_contract = _legacy_contract()
+    target_contract = _event_contract(source_contract)
+    recovery = _recovery_snapshot_receipt(source_contract)
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: copy.deepcopy(target_contract),
+    )
+
+    receipt = build_recovery_snapshot_warm_start_contract_receipt(
+        tmp_path,
+        recovery_receipt=recovery,
+        target_selection_path=target_path,
+    )
+    assert receipt["compatibility"]["type"] == (
+        "zero_initialized_event_phase_observation"
+    )
+    assert receipt["compatibility"]["optimizer_resume"] is False
+
+    incompatible = copy.deepcopy(source_contract)
+    incompatible["timing"]["control_dt_s"] = 0.125
+    recovery = _recovery_snapshot_receipt(incompatible)
+    with pytest.raises(ValueError, match="incompatible"):
+        build_recovery_snapshot_warm_start_contract_receipt(
+            tmp_path,
+            recovery_receipt=recovery,
+            target_selection_path=target_path,
+        )
+
+
+def test_runner_attests_exact_schema3_recovery_snapshot_and_rejects_sha_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sculptor.policy_contract as policy_contract
+    from sculptor.adapters._mjlab_runner import (
+        _attest_warm_start_policy_contract,
+    )
+
+    _source_path, target_path = _selection_pair(tmp_path)
+    contract = _event_contract(_legacy_contract())
+    recovery = _recovery_snapshot_receipt(contract)
+    monkeypatch.setattr(
+        policy_contract,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: copy.deepcopy(contract),
+    )
+    receipt = build_recovery_snapshot_warm_start_contract_receipt(
+        tmp_path,
+        recovery_receipt=recovery,
+        target_selection_path=target_path,
+    )
+    contract_sha256 = contract_fingerprint(contract)
+    compatibility = receipt["compatibility"]
+    for name, value in {
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON": json.dumps(
+            receipt, sort_keys=True,
+        ),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON": json.dumps(
+            contract, sort_keys=True,
+        ),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256": contract_sha256,
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256": contract_sha256,
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON": json.dumps(
+            compatibility, sort_keys=True,
+        ),
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    admitted = _attest_warm_start_policy_contract(
+        world_selection=target_path,
+        extension_width=3,
+        source_checkpoint_sha256="a" * 64,
+    )
+    assert admitted["active"] is True
+    assert admitted["admission_kind"] == "exact_policy_contract"
+
+    with pytest.raises(RuntimeError, match="receipt disagrees"):
+        _attest_warm_start_policy_contract(
+            world_selection=target_path,
+            extension_width=3,
+            source_checkpoint_sha256="f" * 64,
         )

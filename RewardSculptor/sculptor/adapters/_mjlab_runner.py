@@ -2425,6 +2425,28 @@ def _install_learning_vitals(runner: Any, total_iters: int) -> bool:
     return True
 
 
+def _completed_iter_progress_event(
+    *, max_iterations: int, elapsed_s: float, completed: bool,
+) -> dict[str, Any] | None:
+    """Return the terminal 100% tick only after ``runner.learn`` succeeds.
+
+    This deliberately returns ``None`` when training raises.  Emitting a
+    synthetic max-iteration event from a ``finally`` block made interrupted
+    runs look complete in the UI even though only the last periodic
+    ``model_N.pt`` snapshot was durable.
+    """
+    if not completed:
+        return None
+    return {
+        "type": "iter_progress",
+        "rl_iter": int(max_iterations),
+        "rl_total": int(max_iterations),
+        "pct": 100.0,
+        "elapsed_s": round(float(elapsed_s), 1),
+        "eta_s": 0.0,
+    }
+
+
 def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
     """Keep directly-parameterized Gaussian policy noise positive.
 
@@ -2711,6 +2733,50 @@ def _event_policy_contract_admission_kind(
         "runner received an unrecognized event-observation "
         "policy-contract migration"
     )
+
+
+def _expected_warm_start_checkpoint_sha256() -> str | None:
+    """Resolve the immutable source digest pin for every warm-start kind.
+
+    ``SCULPTOR_WARM_START_CHECKPOINT_SHA256`` is the generic launch
+    authority used by project checkpoints and interrupted snapshots.  The
+    older starting-skill-specific name remains an admitted compatibility
+    alias for portable imports.  If both are present they must name the same
+    bytes; otherwise the runner fails before ``runner.load``.
+    """
+    generic = os.environ.get("SCULPTOR_WARM_START_CHECKPOINT_SHA256")
+    imported_skill = os.environ.get(
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"
+    )
+    if generic and imported_skill and generic != imported_skill:
+        raise RuntimeError(
+            "generic warm-start and starting-skill checkpoint digest pins "
+            "disagree"
+        )
+    expected = generic or imported_skill
+    if expected is None:
+        return None
+    if (
+        len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+    ):
+        raise RuntimeError(
+            "warm-start checkpoint digest pin must be canonical lowercase "
+            "SHA-256"
+        )
+    return expected
+
+
+def _verify_warm_start_checkpoint_sha256(actual_sha256: str) -> str | None:
+    """Verify checkpoint bytes against the launch pin, when one is set."""
+    expected = _expected_warm_start_checkpoint_sha256()
+    if expected and actual_sha256 != expected:
+        raise RuntimeError(
+            "pretrained policy digest differs from the immutable "
+            "warm-start launch pin: expected "
+            f"{expected}, got {actual_sha256}"
+        )
+    return expected
 
 
 def _attest_warm_start_policy_contract(
@@ -3224,18 +3290,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             for chunk in iter(lambda: checkpoint_stream.read(1 << 20), b""):
                 source_digest.update(chunk)
         source_sha256 = source_digest.hexdigest()
-        expected_source_sha256 = os.environ.get(
-            "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"
-        )
-        if (
-            expected_source_sha256
-            and source_sha256 != expected_source_sha256
-        ):
-            raise RuntimeError(
-                "pretrained policy digest differs from the immutable "
-                "starting-skill launch pin: expected "
-                f"{expected_source_sha256}, got {source_sha256}"
-            )
+        _verify_warm_start_checkpoint_sha256(source_sha256)
         load_path = ckpt
         effective_contract_sha256: str | None = None
         extension_receipt: dict[str, Any] = {"adapted": False}
@@ -3701,11 +3756,13 @@ def _cmd_train(args: argparse.Namespace) -> None:
     if not _install_learning_vitals(runner, int(args.max_iterations)):
         print("[runner] learning vitals unavailable: runner exposes no logger",
               file=sys.stderr, flush=True)
+    _learn_completed = False
     try:
         runner.learn(
             num_learning_iterations=args.max_iterations,
             init_at_random_ep_len=True,
         )
+        _learn_completed = True
     finally:
         if std_guard_handle is not None:
             std_guard_handle.remove()
@@ -3739,18 +3796,19 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 )
         # Disable the sink so rollout / next-iter training start clean.
         _COMPONENT_SINK = None
-        # Final tick at 100 % so the UI snaps to "done" immediately.
-        print(
-            "[SCULPT-EVENT] " + _json.dumps({
-                "type": "iter_progress",
-                "rl_iter": int(args.max_iterations),
-                "rl_total": int(args.max_iterations),
-                "pct": 100.0,
-                "elapsed_s": round(_time.time() - _t0, 1),
-                "eta_s": 0.0,
-            }),
-            flush=True,
+        # Final tick at 100% only when the learning call actually returned.
+        # On an exception, the last periodic snapshot remains the honest
+        # progress authority and the UI must continue to show interruption.
+        _terminal_progress = _completed_iter_progress_event(
+            max_iterations=int(args.max_iterations),
+            elapsed_s=_time.time() - _t0,
+            completed=_learn_completed,
         )
+        if _terminal_progress is not None:
+            print(
+                "[SCULPT-EVENT] " + _json.dumps(_terminal_progress),
+                flush=True,
+            )
 
     # Capture the latest periodic checkpoint rsl_rl wrote under logs/.
     # Avoid runner.save() — it internally calls `wandb.save(path, ...)`

@@ -292,6 +292,68 @@ def test_warm_start_loaded_receipt_names_exact_loaded_bytes(tmp_path: Path) -> N
     assert receipt["load_cfg_keys"] == ["actor", "critic"]
 
 
+def test_generic_warm_start_checkpoint_pin_is_runtime_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _verify_warm_start_checkpoint_sha256,
+    )
+
+    digest = "a" * 64
+    monkeypatch.setenv("SCULPTOR_WARM_START_CHECKPOINT_SHA256", digest)
+    monkeypatch.delenv(
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256", raising=False,
+    )
+
+    assert _verify_warm_start_checkpoint_sha256(digest) == digest
+    with pytest.raises(RuntimeError, match="warm-start launch pin"):
+        _verify_warm_start_checkpoint_sha256("b" * 64)
+
+
+def test_imported_skill_checkpoint_pin_remains_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _verify_warm_start_checkpoint_sha256,
+    )
+
+    digest = "c" * 64
+    monkeypatch.delenv(
+        "SCULPTOR_WARM_START_CHECKPOINT_SHA256", raising=False,
+    )
+    monkeypatch.setenv(
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256", digest,
+    )
+
+    assert _verify_warm_start_checkpoint_sha256(digest) == digest
+
+
+def test_conflicting_or_noncanonical_warm_start_pins_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _expected_warm_start_checkpoint_sha256,
+    )
+
+    monkeypatch.setenv(
+        "SCULPTOR_WARM_START_CHECKPOINT_SHA256", "a" * 64,
+    )
+    monkeypatch.setenv(
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256", "b" * 64,
+    )
+    with pytest.raises(RuntimeError, match="digest pins disagree"):
+        _expected_warm_start_checkpoint_sha256()
+
+    monkeypatch.delenv(
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256", raising=False,
+    )
+    monkeypatch.setenv(
+        "SCULPTOR_WARM_START_CHECKPOINT_SHA256", "A" * 64,
+    )
+    with pytest.raises(RuntimeError, match="canonical lowercase SHA-256"):
+        _expected_warm_start_checkpoint_sha256()
+
+
 def test_event_policy_contract_admits_exact_schema3_direct_load() -> None:
     from sculptor.adapters._mjlab_runner import (
         _event_policy_contract_admission_kind,
@@ -573,6 +635,7 @@ def test_remote_device_env_forwards_policy_contract_pins(
     from sculptor.adapters.mjlab import MjlabAdapter
 
     pins = {
+        "SCULPTOR_WARM_START_CHECKPOINT_SHA256": "c" * 64,
         "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256": "c" * 64,
         "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON": (
             '{"schema":1}'
@@ -2184,3 +2247,30 @@ def test_rollout_video_culling_never_raises() -> None:
     _hide_untracked_authored_geometry(SimpleNamespace(), 0)
     _hide_untracked_authored_geometry(
         SimpleNamespace(sim=SimpleNamespace(mj_model=object())), 0)
+
+
+def test_terminal_progress_never_claims_success_after_interruption() -> None:
+    from sculptor.adapters._mjlab_runner import _completed_iter_progress_event
+
+    assert _completed_iter_progress_event(
+        max_iterations=750,
+        elapsed_s=178.7,
+        completed=False,
+    ) is None
+
+
+def test_terminal_progress_reports_completion_after_learn_returns() -> None:
+    from sculptor.adapters._mjlab_runner import _completed_iter_progress_event
+
+    assert _completed_iter_progress_event(
+        max_iterations=750,
+        elapsed_s=178.74,
+        completed=True,
+    ) == {
+        "type": "iter_progress",
+        "rl_iter": 750,
+        "rl_total": 750,
+        "pct": 100.0,
+        "elapsed_s": 178.7,
+        "eta_s": 0.0,
+    }

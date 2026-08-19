@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from collections import Counter
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -85,6 +86,7 @@ def _verify_starting_skill_load_event(
     expected_checkpoint: Path,
     expected_sha256: str,
     initialization_mode: str,
+    require_unadapted: bool = False,
 ) -> dict[str, Any] | None:
     """Return an exact runtime load receipt or reject contradictory evidence."""
     if event.get("type") != "warm_start_loaded":
@@ -110,19 +112,57 @@ def _verify_starting_skill_load_event(
         isinstance(key, str) for key in raw_keys
     ):
         raise ValueError("warm_start_loaded has no structural load keys")
-    keys = sorted(set(raw_keys))
+    keys = sorted(raw_keys)
     expected_keys = (
         ["actor", "critic"]
         if initialization_mode == "actor_critic"
         else ["actor"]
     )
-    if keys != expected_keys:
+    if Counter(keys) != Counter(expected_keys):
         raise ValueError(
             f"worker loaded roles {keys}, expected exactly {expected_keys}"
         )
+    raw_loaded = event.get("loaded_checkpoint")
+    if not isinstance(raw_loaded, str) or not raw_loaded:
+        raise ValueError(
+            "warm_start_loaded has no actual loaded checkpoint path"
+        )
+    loaded = Path(raw_loaded).expanduser().resolve(strict=True)
+    loaded_sha256 = _file_sha256(loaded)
+    if event.get("loaded_checkpoint_sha256") != loaded_sha256:
+        raise ValueError(
+            "warm_start_loaded actual digest does not match loaded bytes"
+        )
+    adapted = event.get("adapted")
+    if not isinstance(adapted, bool):
+        raise ValueError("warm_start_loaded has no explicit adaptation fact")
+    if require_unadapted and adapted:
+        raise ValueError(
+            "exact recovery snapshots cannot be adapted before loading"
+        )
+    if not adapted:
+        if loaded != expected or loaded_sha256 != expected_sha256:
+            raise ValueError(
+                "unadapted warm start did not load the selected checkpoint bytes"
+            )
+    else:
+        derived_from = event.get("derived_from")
+        if (
+            not isinstance(derived_from, dict)
+            or derived_from.get("source") != str(source)
+            or derived_from.get("source_sha256") != expected_sha256
+            or event.get("policy_contract_migration")
+            != "zero_initialized_event_phase_observation"
+        ):
+            raise ValueError(
+                "adapted warm start lacks exact source and migration lineage"
+            )
     return {
         "source": str(source),
         "source_sha256": actual_sha256,
+        "loaded_checkpoint": str(loaded),
+        "loaded_checkpoint_sha256": loaded_sha256,
+        "adapted": adapted,
         "load_cfg_keys": keys,
         "initialization_mode": initialization_mode,
     }
@@ -691,6 +731,10 @@ def run_sculpt_job(
     start_mode = start_mode if start_mode in ("manual", "auto") else "auto"
     resume_exact_tuple = bool(run_params.get("resume_exact_tuple", False))
     warm_start_iteration = run_params.get("warm_start_iteration")
+    warm_start_snapshot = run_params.get("warm_start_snapshot")
+    expected_recovery_snapshot_receipt = run_params.get(
+        "recovery_snapshot_receipt"
+    )
     starting_skill_id = run_params.get("starting_skill_id")
     expected_starting_skill_target_receipt = run_params.get(
         "starting_skill_target_receipt"
@@ -705,7 +749,9 @@ def run_sculpt_job(
         run_params.get("acknowledge_legacy_reconstructed_initialization", False)
     )
     initialization_mode = run_params.get("initialization_mode") or (
-        "actor_critic" if warm_start_iteration is not None else "actor_only"
+        "actor_critic"
+        if warm_start_iteration is not None or warm_start_snapshot is not None
+        else "actor_only"
     )
     reference_clip_id = run_params.get("reference_clip_id")
     reference_robot = run_params.get("reference_robot")
@@ -771,6 +817,172 @@ def run_sculpt_job(
         verified_warm_start_policy_contract_receipt: Optional[
             dict[str, Any]
         ] = None
+        verified_recovery_snapshot_receipt: Optional[dict[str, Any]] = None
+        if warm_start_snapshot is not None:
+            if warm_start_iteration is not None or starting_skill_id is not None:
+                raise RuntimeError(
+                    "interrupted snapshot was combined with another policy "
+                    "source after route admission"
+                )
+            if not isinstance(warm_start_snapshot, dict):
+                raise RuntimeError("interrupted snapshot request is malformed")
+            if not isinstance(expected_recovery_snapshot_receipt, dict):
+                raise RuntimeError(
+                    "interrupted snapshot has no immutable admission receipt"
+                )
+            if not bool(
+                warm_start_snapshot.get("acknowledge_interrupted_snapshot")
+            ):
+                raise RuntimeError(
+                    "interrupted snapshot acknowledgement was not preserved"
+                )
+            try:
+                from backend.services.recovery_snapshots import (
+                    resolve_recovery_snapshot,
+                )
+
+                warm_start_checkpoint, verified_recovery_snapshot_receipt = (
+                    await asyncio.to_thread(
+                        resolve_recovery_snapshot,
+                        project_dir,
+                        snapshot_id=str(warm_start_snapshot["snapshot_id"]),
+                        checkpoint_sha256=str(
+                            warm_start_snapshot["checkpoint_sha256"]
+                        ),
+                        receipt_digest=str(
+                            warm_start_snapshot["receipt_digest"]
+                        ),
+                    )
+                )
+                warm_start_sha256 = await asyncio.to_thread(
+                    _file_sha256, warm_start_checkpoint,
+                )
+            except Exception as exc:
+                job.emit({
+                    "type": "warm_start_snapshot_failed",
+                    "source": "worker_launch",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not re-attest the interrupted PPO snapshot; the "
+                    "sculpt subprocess was not started"
+                ) from exc
+            if verified_recovery_snapshot_receipt != (
+                expected_recovery_snapshot_receipt
+            ):
+                raise RuntimeError(
+                    "interrupted snapshot receipt changed after route "
+                    "admission; the sculpt subprocess was not started"
+                )
+            provenance_status = verified_recovery_snapshot_receipt.get(
+                "provenance_status"
+            )
+            if (
+                provenance_status == "legacy_reconstructed"
+                and not bool(
+                    warm_start_snapshot.get(
+                        "acknowledge_legacy_reconstructed_snapshot"
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    "legacy snapshot reconstruction acknowledgement was not "
+                    "preserved"
+                )
+            source_payload = verified_recovery_snapshot_receipt["source"]
+            checkpoint_payload = verified_recovery_snapshot_receipt[
+                "checkpoint"
+            ]
+            job.params["recovery_snapshot_receipt_revalidated"] = (
+                verified_recovery_snapshot_receipt
+            )
+            job.emit({
+                "type": "warm_start_snapshot_resolved",
+                "source": "worker_launch",
+                "snapshot_id": verified_recovery_snapshot_receipt[
+                    "snapshot_id"
+                ],
+                "iteration": source_payload["iteration"],
+                "ppo_step": checkpoint_payload["ppo_step"],
+                "last_observed_ppo_iteration": source_payload[
+                    "last_observed_ppo_step"
+                ],
+                "checkpoint": str(warm_start_checkpoint),
+                "checkpoint_sha256": warm_start_sha256,
+                "receipt_digest": verified_recovery_snapshot_receipt[
+                    "receipt_digest"
+                ],
+                "provenance_status": provenance_status,
+                "load_cfg_keys": ["actor", "critic"],
+                "optimizer_resume": False,
+            })
+            if not isinstance(
+                expected_warm_start_policy_contract_receipt, dict
+            ):
+                raise RuntimeError(
+                    "interrupted snapshot has no immutable policy-contract "
+                    "receipt"
+                )
+            try:
+                from sculptor.policy_contract import (
+                    build_recovery_snapshot_warm_start_contract_receipt,
+                )
+
+                target_selection_path = Path(
+                    expected_warm_start_policy_contract_receipt["target"][
+                        "selection_path"
+                    ]
+                )
+                verified_warm_start_policy_contract_receipt = (
+                    await asyncio.to_thread(
+                        build_recovery_snapshot_warm_start_contract_receipt,
+                        project_dir,
+                        recovery_receipt=(
+                            verified_recovery_snapshot_receipt
+                        ),
+                        target_selection_path=target_selection_path,
+                    )
+                )
+            except Exception as exc:
+                job.emit({
+                    "type": "warm_start_snapshot_contract_failed",
+                    "source": "worker_launch",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not re-attest the interrupted snapshot policy "
+                    "contract; the sculpt subprocess was not started"
+                ) from exc
+            if verified_warm_start_policy_contract_receipt != (
+                expected_warm_start_policy_contract_receipt
+            ):
+                raise RuntimeError(
+                    "interrupted snapshot policy-contract receipt changed "
+                    "after route admission"
+                )
+            job.params[
+                "warm_start_policy_contract_receipt_revalidated"
+            ] = verified_warm_start_policy_contract_receipt
+            job.emit({
+                "type": "warm_start_snapshot_contract_verified",
+                "source": "worker_launch",
+                "snapshot_id": verified_recovery_snapshot_receipt[
+                    "snapshot_id"
+                ],
+                "source_contract_sha256": (
+                    verified_warm_start_policy_contract_receipt["source"]
+                    ["contract_sha256"]
+                ),
+                "target_contract_sha256": (
+                    verified_warm_start_policy_contract_receipt["target"]
+                    ["contract_sha256"]
+                ),
+                "compatibility": (
+                    verified_warm_start_policy_contract_receipt[
+                        "compatibility"
+                    ]
+                ),
+            })
         if warm_start_iteration is not None:
             try:
                 warm_start_checkpoint = await asyncio.to_thread(
@@ -1554,7 +1766,7 @@ def run_sculpt_job(
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         if warm_start_sha256:
-            env["SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"] = str(
+            env["SCULPTOR_WARM_START_CHECKPOINT_SHA256"] = str(
                 warm_start_sha256
             )
         if verified_warm_start_policy_contract_receipt is not None:
@@ -1877,6 +2089,15 @@ def run_sculpt_job(
                 job.params.setdefault(
                     "warm_start_iteration", int(warm_start_iteration),
                 )
+            if verified_recovery_snapshot_receipt is not None:
+                job.params.setdefault(
+                    "warm_start_snapshot_id",
+                    verified_recovery_snapshot_receipt["snapshot_id"],
+                )
+                job.params.setdefault(
+                    "warm_start_snapshot_receipt_digest",
+                    verified_recovery_snapshot_receipt["receipt_digest"],
+                )
             job.params.setdefault(
                 "warm_start_checkpoint", str(warm_start_checkpoint),
             )
@@ -1966,7 +2187,11 @@ def run_sculpt_job(
             reference_sha256 = starting_skill_record.reference_sha256
         requested_lineage_mode = (
             str(initialization_mode)
-            if starting_skill_record is not None or warm_start_iteration is not None
+            if (
+                starting_skill_record is not None
+                or warm_start_iteration is not None
+                or verified_recovery_snapshot_receipt is not None
+            )
             else "auto_resume"
         )
         lineage = RunLineageSession(
@@ -2091,8 +2316,13 @@ def run_sculpt_job(
             })
 
         starting_skill_load_required = bool(
-            starting_skill_record is not None
-            and starting_skill_record.policy_roles
+            (
+                (
+                    starting_skill_record is not None
+                    and starting_skill_record.policy_roles
+                )
+                or verified_recovery_snapshot_receipt is not None
+            )
             and initialization_mode != "reference_only"
         )
         verified_starting_skill_load: dict[str, Any] | None = None
@@ -2111,6 +2341,9 @@ def run_sculpt_job(
                         expected_checkpoint=warm_start_checkpoint,
                         expected_sha256=warm_start_sha256,
                         initialization_mode=str(initialization_mode),
+                        require_unadapted=(
+                            verified_recovery_snapshot_receipt is not None
+                        ),
                     )
                     if receipt is None:
                         raise ValueError("worker load event was not recognized")
@@ -2134,6 +2367,13 @@ def run_sculpt_job(
             try:
                 lineage.observe_event(event)
             except Exception as exc:  # noqa: BLE001 - event remains visible
+                if (
+                    starting_skill_load_required
+                    and event.get("type") == "warm_start_loaded"
+                ):
+                    starting_skill_load_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 job.emit({
                     "type": "lineage_observation_rejected",
                     "phase": str(event.get("type") or "unknown"),

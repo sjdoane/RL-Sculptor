@@ -10,7 +10,9 @@ import { courseBreakdownText } from "@/components/WorldTab";
 import { useBehaviorDraft, useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { referenceRobotForProject } from "@/lib/referenceRobot";
 import {
+  interruptedSnapshotReadinessIssue,
   resolveBundleMotionUpdate,
+  startingPointRunFields,
   type MotionSelection,
 } from "@/lib/startingPoint";
 import { useSystemInfo } from "@/hooks/useDashboard";
@@ -51,6 +53,8 @@ const MAX_BEHAVIOR_GOAL_LENGTH = 500;
 const SCRATCH_STARTING_POINT: StartingPointSelection = {
   kind: "scratch",
   warm_start_iteration: null,
+  warm_start_snapshot: null,
+  warm_start_snapshot_display: null,
   starting_skill_id: null,
   initialization_mode: null,
   reference_clip_id: null,
@@ -151,6 +155,8 @@ export function PolicyInterfaceMigrationNotice({
     );
   if (!eventProgram || !policyTransfer) return null;
 
+  const interruptedSnapshot = startingPoint.kind === "project_checkpoint"
+    && startingPoint.warm_start_snapshot != null;
   const migration = startingPoint.kind === "shared_skill"
     ? startingPoint.policy_contract_migration ?? null
     : null;
@@ -165,6 +171,8 @@ export function PolicyInterfaceMigrationNotice({
           <strong>
             {migration
               ? "Policy interface migration · reverified at launch"
+              : interruptedSnapshot
+                ? "Interrupted snapshot admission · reverified at launch"
               : "Policy interface admission · verified at launch"}
           </strong>
           <div style={{ marginTop: 3 }}>
@@ -174,7 +182,16 @@ export function PolicyInterfaceMigrationNotice({
             <code className="mono">{eventProgram.observation_extension.term}</code>.
             Optimizer state is not resumed.
           </div>
-          {startingPoint.kind === "project_checkpoint" ? (
+          {interruptedSnapshot ? (
+            <div style={{ marginTop: 4 }}>
+              The selected periodic PPO save has a server-attested recovery
+              receipt, but remains unevaluated. Launch rechecks the opaque
+              receipt id, receipt digest, exact checkpoint SHA-256, target
+              policy contract, and tensor load. Initialization is earned only
+              by <code className="mono">warm_start_loaded</code> for actor and
+              critic; optimizer state and counters reset.
+            </div>
+          ) : startingPoint.kind === "project_checkpoint" ? (
             <div style={{ marginTop: 4 }}>
               If this checkpoint is legacy schema 2, launch admits only the
               verified schema-2 → schema-3 zero-initialized extension for its
@@ -755,26 +772,7 @@ export function NewRunDialog({
       // their newly generated drafts, while recovery can reject them in favor
       // of the last promoted atomic tuple.
       resume_exact_tuple: resumeExactTuple,
-      warm_start_iteration:
-        startingPoint.kind === "project_checkpoint"
-          ? startingPoint.warm_start_iteration
-          : null,
-      starting_skill_id:
-        startingPoint.kind === "shared_skill"
-          ? startingPoint.starting_skill_id
-          : null,
-      expected_starting_skill_manifest_digest:
-        startingPoint.kind === "shared_skill"
-          ? startingPoint.import_manifest_digest
-          : null,
-      initialization_mode:
-        startingPoint.kind === "shared_skill"
-          ? startingPoint.initialization_mode
-          : null,
-      acknowledge_legacy_reconstructed_initialization:
-        startingPoint.kind === "shared_skill"
-          ? startingPoint.acknowledge_legacy_reconstructed_initialization
-          : false,
+      ...startingPointRunFields(startingPoint),
       reference_clip_id: referenceClipId,
       reference_robot: referenceClipId ? selectedReferenceRobot : null,
     };
@@ -853,6 +851,7 @@ export function NewRunDialog({
     !worldLaunchReady
       ? "Choose a training environment or confirm the project default scene."
       : null,
+    interruptedSnapshotReadinessIssue(startingPoint),
     startingPoint.kind === "shared_skill"
       && projectReferenceRobot === "unassigned"
       ? "Select a project robot before using an imported starting point."
@@ -892,12 +891,16 @@ export function NewRunDialog({
   const startingPointTitle = startingPoint.kind === "scratch"
     ? "New policy"
     : startingPoint.kind === "project_checkpoint"
-      ? `Project checkpoint · iteration ${startingPoint.warm_start_iteration ?? "—"}`
+      ? startingPoint.warm_start_snapshot
+        ? `Interrupted snapshot · cycle ${startingPoint.warm_start_snapshot_display?.iteration ?? "—"} / PPO ${startingPoint.warm_start_snapshot_display?.ppo_step ?? "—"}`
+        : `Project checkpoint · iteration ${startingPoint.warm_start_iteration ?? "—"}`
       : `Imported skill · ${startingPoint.starting_skill_id ?? "—"}`;
   const startingPointDetail = startingPoint.kind === "scratch"
     ? "Initialize new actor and critic networks. Add a motion below if you want reference-guided exploration."
     : startingPoint.kind === "project_checkpoint"
-      ? "Transfer this project's actor and critic into a fresh training run; optimizer state and counters reset."
+      ? startingPoint.warm_start_snapshot
+        ? `Unevaluated interrupted save · actor + critic transfer · optimizer/counters reset · SHA ${startingPoint.warm_start_snapshot.checkpoint_sha256.slice(0, 10)}…`
+        : "Transfer this project's actor and critic into a fresh training run; optimizer state and counters reset."
       : `${(startingPoint.initialization_mode ?? "unselected").replaceAll("_", " ")} · ${startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed" ? "legacy-reconstructed contract acknowledged" : "origin-persisted contract"} · manifest-pinned import receipt${startingPoint.import_manifest_digest ? ` · ${startingPoint.import_manifest_digest.slice(0, 10)}…` : ""}`;
 
   return (

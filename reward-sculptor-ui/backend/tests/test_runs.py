@@ -483,11 +483,15 @@ def test_tier_d_reference_receipt_pins_exact_clip_and_rollout_digests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from backend.services import world_store
+    from sculptor import policy_contract as policy_contract_module
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
     slug = _make_project_with_library(client, "TierDAdmission")
     project_dir = _configure_g1_project(client, slug)
+    certified_policy_contract = (
+        policy_contract_module.build_project_policy_contract(project_dir)
+    )
     clip_sha, rollout_sha = _register_feasibility_reference(
         tmp_path,
         robot="g1",
@@ -495,16 +499,24 @@ def test_tier_d_reference_receipt_pins_exact_clip_and_rollout_digests(
         tier_d=True,
         project_dir=project_dir,
     )
-    selection = project_dir / "env" / "selection_current.json"
-    selection.parent.mkdir(parents=True, exist_ok=True)
-    selection.write_text("{}", encoding="utf-8")
+    # This route-level test isolates the Tier-D receipt. World compilation and
+    # target-contract comparison have their own canonical artifact tests, so
+    # use the explicit CPU seam with the exact contract certified above.
+    selection_path = project_dir / "env" / "selection_current.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        policy_contract_module,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: certified_policy_contract,
+    )
     monkeypatch.setattr(
         world_store,
         "training_preflight",
         lambda _p: {
             "ok": True,
             "selection_version": 1,
-            "tuple_hash": "c" * 64,
+            "tuple_hash": "tier-d-route-fixture",
             "errors": [],
             "robot_matches_project": True,
             "world_robot": "unitree_g1:base",
@@ -542,11 +554,15 @@ def test_active_reference_reward_cannot_bypass_tierd_when_picker_is_empty(
 ) -> None:
     """The executing reward, rather than picker state, owns admission."""
     from backend.services import world_store
+    from sculptor import policy_contract as policy_contract_module
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
     slug = _make_project_with_library(client, "ActiveReferenceAuthority")
     project_dir = _configure_g1_project(client, slug)
+    certified_policy_contract = (
+        policy_contract_module.build_project_policy_contract(project_dir)
+    )
     _register_feasibility_reference(
         tmp_path,
         robot="g1",
@@ -554,16 +570,21 @@ def test_active_reference_reward_cannot_bypass_tierd_when_picker_is_empty(
         tier_d=True,
         project_dir=project_dir,
     )
-    selection = project_dir / "env" / "selection_current.json"
-    selection.parent.mkdir(parents=True, exist_ok=True)
-    selection.write_text("{}", encoding="utf-8")
+    selection_path = project_dir / "env" / "selection_current.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        policy_contract_module,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: certified_policy_contract,
+    )
     monkeypatch.setattr(
         world_store,
         "training_preflight",
         lambda _p: {
             "ok": True,
             "selection_version": 1,
-            "tuple_hash": "c" * 64,
+            "tuple_hash": "tier-d-route-fixture",
             "errors": [],
             "robot_matches_project": True,
             "world_robot": "unitree_g1:base",

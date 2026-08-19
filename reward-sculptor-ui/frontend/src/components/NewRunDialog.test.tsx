@@ -77,6 +77,31 @@ test("does not claim direct-checkpoint migration passed before launch", () => {
   expect(notice).toHaveTextContent(/verification occurs only when launch begins/i);
 });
 
+test("labels an interrupted project snapshot as unevaluated and reverified", () => {
+  render(
+    <PolicyInterfaceMigrationNotice
+      startingPoint={{
+        ...checkpoint,
+        warm_start_iteration: null,
+        warm_start_snapshot: {
+          snapshot_id: "snap_7fd3a41b",
+          checkpoint_sha256: "a".repeat(64),
+          receipt_digest: "b".repeat(64),
+          acknowledge_interrupted_snapshot: true,
+        },
+      }}
+      eventProgram={EVENT_PROGRAM}
+    />,
+  );
+
+  const notice = screen.getByLabelText("Warm-start policy interface admission");
+  expect(notice).toHaveTextContent(/Interrupted snapshot admission · reverified at launch/i);
+  expect(notice).toHaveTextContent(/remains unevaluated/i);
+  expect(notice).toHaveTextContent(/opaque receipt id/i);
+  expect(notice).toHaveTextContent(/warm_start_loaded/i);
+  expect(notice).toHaveTextContent(/optimizer state and counters reset/i);
+});
+
 test("shows the verified migration type from an imported skill receipt", () => {
   const imported: StartingPointSelection = {
     kind: "shared_skill",
