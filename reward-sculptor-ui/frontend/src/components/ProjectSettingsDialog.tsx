@@ -232,6 +232,9 @@ function IterationSettingsSection({
  *  from the name. Everything else is rendered generically — the editable
  *  set comes from the backend so this list can lag without hiding a key. */
 const ENV_TRAIN_HINTS: Record<string, string> = {
+  friction_range:
+    "Train-only foot/ground friction randomization; evaluation remains at the " +
+    "nominal setting. Keep mild ranges near the model's nominal friction.",
   entropy_coef_scale:
     "Multiplies PPO's entropy bonus. Above 1 the policy's action-noise std " +
     "climbs all run, and the action-rate penalty grows with the square of it " +
@@ -249,7 +252,7 @@ const ENV_TRAIN_HINTS: Record<string, string> = {
 /** The environment the loop trains under. Read-only until now: these decide
  *  whether a run can succeed, and the only way to change one was to wait for
  *  the diagnoser to try it between iterations. */
-function EnvSpecTrainSection({
+export function EnvSpecTrainSection({
   project, open,
 }: { project: ProjectDetail; open: boolean }) {
   const qc = useQueryClient();
@@ -259,6 +262,9 @@ function EnvSpecTrainSection({
     enabled: open,
   });
   const [form, setForm] = useState<Record<string, string>>({});
+  const [adding, setAdding] = useState(false);
+  const [newKey, setNewKey] = useState("");
+  const [newValue, setNewValue] = useState("");
   const loaded = (q.data?.current?.train ?? {}) as Record<string, unknown>;
 
   useEffect(() => {
@@ -290,10 +296,11 @@ function EnvSpecTrainSection({
     },
   });
 
-  // Only keys the backend will accept, and only ones the spec actually sets —
-  // an empty spec has nothing meaningful to edit.
-  const keys = (q.data?.editable_train_keys ?? [])
-    .filter((k) => k in loaded);
+  // The backend owns the editable-key catalog. Existing values stay inline;
+  // unset values require an explicit add flow below.
+  const editableKeys = q.data?.editable_train_keys ?? [];
+  const keys = editableKeys.filter((k) => k in loaded);
+  const unsetKeys = editableKeys.filter((k) => !(k in loaded));
   const edits = keys.flatMap((k) => {
     const raw = form[k] ?? "";
     if (raw === JSON.stringify(loaded[k])) return [];
@@ -309,6 +316,32 @@ function EnvSpecTrainSection({
     if (raw === JSON.stringify(loaded[k])) return false;
     try { JSON.parse(raw); return false; } catch { return true; }
   });
+  let parsedNewValue: { valid: true; value: unknown } | { valid: false } | null = null;
+  if (newValue.trim() !== "") {
+    try {
+      parsedNewValue = { valid: true, value: JSON.parse(newValue) };
+    } catch {
+      parsedNewValue = { valid: false };
+    }
+  }
+
+  const cancelAdd = () => {
+    setAdding(false);
+    setNewKey("");
+    setNewValue("");
+  };
+
+  const saveNewSetting = () => {
+    if (!newKey || !parsedNewValue?.valid) return;
+    mut.mutate(
+      [{
+        parameter: newKey,
+        new_value: parsedNewValue.value,
+        rationale: "added from project settings",
+      }],
+      { onSuccess: cancelAdd },
+    );
+  };
 
   if (q.data && !q.data.active) return null;
 
@@ -344,8 +377,90 @@ function EnvSpecTrainSection({
           </Field>
         ))}
       </div>
+      {adding ? (
+        <div
+          style={{
+            border: "1px solid var(--hairline)",
+            borderRadius: "var(--radius-sm)",
+            marginTop: 12,
+            padding: 12,
+          }}
+        >
+          <p className="rs-caption" style={{ margin: "0 0 8px" }}>Add train setting</p>
+          <div className="rs-row2">
+            <Field label="Train setting" htmlFor="env-new-key">
+              <select
+                id="env-new-key"
+                className="rs-input mono"
+                value={newKey}
+                onChange={(e) => {
+                  setNewKey(e.target.value);
+                  setNewValue("");
+                }}
+                disabled={mut.isPending || q.isLoading}
+              >
+                <option value="" disabled>Select an unset setting</option>
+                {unsetKeys.map((k) => <option key={k} value={k}>{k}</option>)}
+              </select>
+              {newKey && ENV_TRAIN_HINTS[newKey] && (
+                <p className="rs-hintline">{ENV_TRAIN_HINTS[newKey]}</p>
+              )}
+            </Field>
+            <Field label="JSON value" htmlFor="env-new-value">
+              <input
+                id="env-new-value"
+                className="rs-input mono"
+                value={newValue}
+                onChange={(e) => setNewValue(e.target.value)}
+                placeholder="Enter a value, for example [0.8, 1.2]"
+                aria-invalid={parsedNewValue?.valid === false}
+                disabled={!newKey || mut.isPending || q.isLoading}
+              />
+              <p className="rs-hintline">
+                This is validated by the same bounds and whole-spec checks as automated edits.
+              </p>
+            </Field>
+          </div>
+          {parsedNewValue?.valid === false && (
+            <p
+              className="rs-hintline"
+              role="status"
+              aria-live="polite"
+              style={{ color: "var(--st-amber)", marginTop: 8 }}
+            >
+              Enter a valid JSON value before saving.
+            </p>
+          )}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 10 }}>
+            <Btn kind="quiet" size="sm" onClick={cancelAdd} disabled={mut.isPending}>
+              Cancel
+            </Btn>
+            <Btn
+              kind="primary"
+              size="sm"
+              icon={mut.isPending ? "loader" : "check"}
+              onClick={saveNewSetting}
+              disabled={!newKey || !parsedNewValue?.valid || mut.isPending}
+            >
+              Save setting
+            </Btn>
+          </div>
+        </div>
+      ) : unsetKeys.length > 0 ? (
+        <div style={{ paddingTop: 10 }}>
+          <Btn
+            kind="quiet"
+            size="sm"
+            icon="plus"
+            onClick={() => setAdding(true)}
+            disabled={mut.isPending || q.isLoading}
+          >
+            Add train setting
+          </Btn>
+        </div>
+      ) : null}
       {malformed.length > 0 && (
-        <p className="rs-hintline" style={{ color: "var(--st-amber)", marginTop: 8 }}>
+        <p className="rs-hintline" role="status" aria-live="polite" style={{ color: "var(--st-amber)", marginTop: 8 }}>
           Not valid JSON yet: {malformed.join(", ")}
         </p>
       )}
