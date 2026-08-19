@@ -1766,11 +1766,13 @@ class WorldAuthor:
                     "author model must return world_spec and task_spec objects"
                 )
             if grounding_items:
-                # The provenance ledger records which KG nodes informed this
-                # draft even when the model omits or clears meta.grounding.
+                # The local retriever, not the language model, is authoritative
+                # for provenance. This also guarantees that explicit
+                # ``paper:<id>`` pins verified by the KG survive even when the
+                # model emits a non-empty but unrelated grounding list.
                 for spec in (world, task):
                     meta = spec.get("meta")
-                    if isinstance(meta, dict) and not meta.get("grounding"):
+                    if isinstance(meta, dict):
                         meta["grounding"] = list(grounding_items)
             robot = world.get("shared", {}).get("robot", {})
             if robot.get("capability_id") != cap.capability_id:

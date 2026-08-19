@@ -35,6 +35,7 @@ from sculptor.kg.schema import (
 from sculptor.kg.store import SculptorKG
 from sculptor.world.author import author_environment
 from sculptor.world.grounding import (
+    ExplicitGroundingError,
     GroundingItem,
     gather_grounding,
     grounding_context,
@@ -122,6 +123,71 @@ def test_paper_retrieval_honors_intent_tag_filter(seeded_kg, const_embedder):
     assert off_domain.id not in ids  # terrain intent filters objects-only
 
 
+def test_explicit_paper_pins_are_resolved_before_semantic_retrieval(
+    seeded_kg,
+):
+    items = gather_grounding(
+        "Use paper:2109.11978 for this rough terrain world.",
+        store=seeded_kg,
+        top_k_techniques=0,
+        top_k_failure_modes=0,
+        top_k_papers=0,
+    )
+    assert grounding_ids(items) == ["paper:2109.11978"]
+    assert items[0].name == "Rough-terrain curriculum grids"
+
+
+def test_unresolved_explicit_paper_pin_fails_clearly(seeded_kg):
+    with pytest.raises(
+        ExplicitGroundingError,
+        match=r"paper:9999\.99999.*shared/project KG",
+    ):
+        gather_grounding(
+            "Ground this in paper:9999.99999.",
+            store=seeded_kg,
+            top_k_techniques=0,
+            top_k_failure_modes=0,
+            top_k_papers=0,
+        )
+
+
+def test_explicit_paper_pins_dedupe_in_first_mentioned_order(seeded_kg):
+    second = Paper(
+        id=make_paper_id("2501.00001"),
+        arxiv_id="2501.00001",
+        title="Second explicit reference",
+        abstract="Another grounded method.",
+        tags=["terrain"],
+        tier="A",
+    )
+    seeded_kg.add_node(second)
+    prompt = (
+        "Use paper:2501.00001, then paper:2109.11978; "
+        "paper:2501.00001 is intentionally repeated."
+    )
+    items = gather_grounding(
+        prompt,
+        store=seeded_kg,
+        top_k_techniques=0,
+        top_k_failure_modes=0,
+        top_k_papers=0,
+    )
+    assert grounding_ids(items) == [
+        "paper:2501.00001",
+        "paper:2109.11978",
+    ]
+
+
+def test_no_explicit_pins_preserve_existing_semantic_behavior(
+    seeded_kg, const_embedder,
+):
+    items = gather_grounding(PROMPT, store=seeded_kg)
+    assert {item.kind for item in items} == {
+        "technique", "failure_mode", "paper",
+    }
+    assert items[0].kind == "technique"
+
+
 def test_fail_soft_when_embedder_is_broken(seeded_kg, monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("embedding model unavailable")
@@ -187,6 +253,35 @@ def test_model_request_gets_evidence_and_ledger_is_injected():
     assert captured["kg_grounding"] == [item.to_dict() for item in items]
     assert draft.world_spec["meta"]["grounding"] == grounding_ids(items)
     assert draft.task_spec["meta"]["grounding"] == grounding_ids(items)
+
+
+def test_local_grounding_overrides_nonempty_model_grounding_receipts():
+    explicit = "paper:2109.11978"
+    baseline = author_environment(
+        PROMPT, robot_capability_id="unitree_g1:base")
+
+    class _Model:
+        def generate_authoring(self, request):
+            world = copy.deepcopy(baseline.world_spec)
+            task = copy.deepcopy(baseline.task_spec)
+            world["meta"]["grounding"] = ["paper:model-substitute"]
+            task["meta"]["grounding"] = ["paper:model-substitute"]
+            return {
+                "world_spec": world,
+                "task_spec": task,
+                "parameter_provenance": (
+                    world["meta"]["parameter_provenance"]
+                ),
+            }
+
+    draft = author_environment(
+        f"{PROMPT}; use {explicit}",
+        model=_Model(),
+        robot_capability_id="unitree_g1:base",
+        grounding=[explicit],
+    )
+    assert draft.world_spec["meta"]["grounding"] == [explicit]
+    assert draft.task_spec["meta"]["grounding"] == [explicit]
 
 
 def test_cli_grounds_by_default_and_flag_disables(tmp_path, monkeypatch):
