@@ -316,19 +316,69 @@ class WorldChannelRuntime:
     def _event_command_value(
         self, source: Mapping[str, Any], attribute: str,
     ) -> np.ndarray:
-        """Consume the exact reward-time event snapshot for this row."""
+        """Consume reward-time truth, or current command truth in evaluation.
+
+        Training installs :class:`TorchWorldRewardRuntime`, which publishes an
+        exact pre-transition reward snapshot for the recorder.  Deterministic
+        evaluation does not instantiate that reward runtime, but the authored
+        command term remains the authority for the same event state.  Fall
+        back to its read-only tensors only when no snapshot exists at all; a
+        present but incomplete snapshot still fails closed rather than mixing
+        values from two simulator times.
+        """
         event_id = str(source.get("event_sequence", ""))
         snapshots = getattr(
             self.env, "_sculptor_event_reward_snapshot", None)
         snapshot = snapshots.get(event_id) \
             if isinstance(snapshots, Mapping) else None
-        value = snapshot.get(attribute) \
-            if isinstance(snapshot, Mapping) else None
+        if isinstance(snapshot, Mapping):
+            value = snapshot.get(attribute)
+        else:
+            value = self._event_command_attribute(event_id, attribute)
         array = _to_numpy(value)
         if array.shape == (self.num_envs,):
             return array
         raise WorldRuntimeError(
             f"event reward-time snapshot {event_id!r}/{attribute} is absent")
+
+    def _event_command_attribute(self, event_id: str, attribute: str) -> Any:
+        """Read one event value without advancing the command automaton."""
+        manager = getattr(self.env, "command_manager", None)
+        if manager is None:
+            raise WorldRuntimeError(
+                "event evaluation channel requires a command manager")
+        for name in tuple(getattr(manager, "active_terms", ()) or ()):
+            try:
+                term = manager.get_term(name)
+            except (AttributeError, KeyError, RuntimeError):
+                continue
+            if str(getattr(term, "event_sequence_id", "")) != event_id:
+                continue
+            support_prefix = "event_support_contact_"
+            if attribute.startswith(support_prefix):
+                try:
+                    index = int(attribute.removeprefix(support_prefix))
+                except ValueError as exc:
+                    raise WorldRuntimeError(
+                        f"event support-contact attribute {attribute!r} is invalid"
+                    ) from exc
+                contacts = _to_numpy(
+                    getattr(term, "event_support_contacts", None))
+                if (
+                    contacts.ndim != 2
+                    or contacts.shape[0] != self.num_envs
+                    or index < 0
+                    or index >= contacts.shape[1]
+                ):
+                    raise WorldRuntimeError(
+                        "event command support contacts have an invalid shape")
+                return contacts[:, index]
+            value = getattr(term, attribute, None)
+            if value is None:
+                raise WorldRuntimeError(
+                    f"event command {event_id!r}/{attribute} is absent")
+            return value
+        raise WorldRuntimeError(f"event command {event_id!r} is not active")
 
     def _configuration_error(self) -> np.ndarray:
         target = self.goal.get("target")

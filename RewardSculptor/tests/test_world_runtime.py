@@ -155,6 +155,7 @@ def test_event_success_requires_hold_duration_inside_finish() -> None:
         event_phase_height_delta=np.asarray([0.2], dtype=np.float32),
         event_phase_vertical_velocity=np.asarray([0.0], dtype=np.float32),
         event_sequence_violation=np.asarray([False]),
+        event_support_contacts=np.asarray([[True, True]]),
     )
 
     class Manager:
@@ -188,6 +189,21 @@ def test_event_success_requires_hold_duration_inside_finish() -> None:
     runtime._waypoint_index[:] = len(runtime._waypoints)
     runtime._last_waypoint_complete[:] = True
     success_name = "goal__complete_slalom_and_stop__success"
+    phase_name = "event__route_jump_hold__phase"
+
+    # Deterministic evaluation has no TorchWorldRewardRuntime to seed a
+    # reward-time snapshot.  The recorder must read the authored command term
+    # without advancing it, including the event channels needed by success.
+    evaluation_sample = runtime.sample()
+    assert evaluation_sample.channels[phase_name].item() == 1
+    assert not evaluation_sample.channels[success_name].item()
+    assert getattr(env, "_sculptor_event_reward_snapshot", None) is None
+
+    # A published reward-time snapshot is an all-or-nothing temporal receipt.
+    # Never fill a missing field from the later command state.
+    env._sculptor_event_reward_snapshot = {"route_jump_hold": {}}
+    with pytest.raises(WorldRuntimeError, match="simulator value is missing"):
+        runtime.sample()
 
     def sample():
         env._sculptor_event_reward_snapshot = {
@@ -212,7 +228,6 @@ def test_event_success_requires_hold_duration_inside_finish() -> None:
     command.event_phase[:] = 2
     command.event_sequence_violation[:] = True
     invalid_hold = sample()
-    phase_name = "event__route_jump_hold__phase"
     assert invalid_hold.channels[phase_name].item() == 2
     assert invalid_hold.reward_info[phase_name].item() == -1
     for _ in range(109):
