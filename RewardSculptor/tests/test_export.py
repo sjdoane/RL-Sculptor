@@ -163,6 +163,41 @@ def _make_library_reference(
     return clip_path, provenance_path, provenance
 
 
+def _use_base_policy_contract_for_synthetic_world(
+    monkeypatch: pytest.MonkeyPatch, project: Path,
+) -> None:
+    """Keep exporter tests independent from full world-admission fixtures.
+
+    ``_make_project`` intentionally writes minimal world tuple members because
+    these tests exercise archive construction, robot namespacing, and hostile
+    import.  Policy-contract/world-overlay behavior has its own real admitted
+    fixtures.  Delegate to the real base-task builder while still asserting
+    that the exporter supplied the immutable iteration selection it owns.
+    """
+    from sculptor.policy_contract import build_project_policy_contract
+
+    absent_selection = project / "env" / "synthetic-base-selection-absent.json"
+
+    def build_base_contract(
+        source_project: Path,
+        *,
+        observed_network=None,
+        world_selection_path=None,
+    ):
+        assert Path(source_project) == project
+        assert world_selection_path is not None
+        return build_project_policy_contract(
+            source_project,
+            observed_network=observed_network,
+            world_selection_path=absent_selection,
+        )
+
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        build_base_contract,
+    )
+
+
 # ── discovery ──────────────────────────────────────────────────────────────
 
 def test_list_exportable_iters_empty_and_missing(tmp_path):
@@ -231,8 +266,11 @@ def test_export_bundle_contents_and_manifest(tmp_path):
     assert all(len(f["sha256"]) == 64 for f in manifest["files"])
 
 
-def test_portable_starting_skill_is_data_only_and_importable(tmp_path):
+def test_portable_starting_skill_is_data_only_and_importable(
+    tmp_path, monkeypatch,
+):
     project = _make_project(tmp_path)
+    _use_base_policy_contract_for_synthetic_world(monkeypatch, project)
     deployment = export_policy_bundle(project)
     portable = export_starting_skill_bundle(
         project, robot_slug="go1",
@@ -294,8 +332,11 @@ def test_portable_export_requires_rskill_extension(tmp_path):
         )
 
 
-def test_portable_export_derives_and_cross_checks_project_robot(tmp_path):
+def test_portable_export_derives_and_cross_checks_project_robot(
+    tmp_path, monkeypatch,
+):
     project = _make_project(tmp_path)
+    _use_base_policy_contract_for_synthetic_world(monkeypatch, project)
     (project / "metadata.json").write_text(json.dumps({
         # Catalog identity and policy/reference identity are deliberately
         # different for this legacy G1 project.

@@ -450,6 +450,8 @@ def export_starting_skill_bundle(
     complete portable manifest.
     """
     project = Path(project_dir).resolve()
+    if out_path is not None and Path(out_path).suffix.lower() != ".rskill":
+        raise ExportError("portable starting-skill output must end in .rskill")
     try:
         from sculptor.project_robot import resolve_project_reference_robot
 
@@ -572,9 +574,6 @@ def export_starting_skill_bundle(
         else:
             out = Path(out_path)
             out.parent.mkdir(parents=True, exist_ok=True)
-        if out.suffix.lower() != ".rskill":
-            raise ExportError("portable starting-skill output must end in .rskill")
-
         manifest_path = stage / "portable-manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True, default=str),
