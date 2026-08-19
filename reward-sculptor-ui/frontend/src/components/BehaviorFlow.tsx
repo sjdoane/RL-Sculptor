@@ -194,9 +194,9 @@ export function BehaviorFlow({
       {
         key: "modes",
         label: "Author phase-specific rewards",
-        hint: "A composite's segments become OGMP-inspired time windows. Each "
-            + "gets its own reward terms; runtime currently dispatches by the "
-            + "episode clock, not by a closed-loop mode controller.",
+        hint: "A compound behavior becomes an OGMP-inspired event program. Each "
+            + "phase gets its own reward terms and advances only when its "
+            + "compiled transition predicate is satisfied.",
         done: modeReadiness.authoredCurrent,
         evidence: modeCount
           ? `${authoredCount}/${modeCount} authored · ${modeFile?.filename}`
