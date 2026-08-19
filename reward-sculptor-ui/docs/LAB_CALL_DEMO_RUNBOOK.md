@@ -1654,3 +1654,46 @@ require `warm_start_snapshot_resolved`,
 actual-loaded SHA are
 `fe1f41c83736d2f6c54159207263ed18c158e147461a2663ec8545509a5f2c8f`.
 Any missing or contradictory load proof must end as quarantined/errored.
+
+## Run the evaluated iter-2 policy into a real finish jump
+
+Use `g1-slalom-jump-lab` and start from the **evaluated project policy iter
+2**, not the interrupted PPO-50 snapshot and not reward proposal v3. The
+selected evaluation contract must remain selection v8 / tuple
+`f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`,
+reward v2 / env v1. Iter 2 checkpoint SHA-256 is
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`.
+
+The iter-2 video is a useful visual baseline but not success. Official truth
+is 17/64 raw route completions, 0/64 valid jumps, 0/64 holds, and 0/64 authored
+success. The apparent `0.99949` route score is an observe-only dense channel,
+not the raw index-5 predicate.
+
+Visible UI sequence:
+
+1. Open **New Run -> Starting policy -> Change -> Project policy** and select
+   the evaluated iter-2 row. Verify it says actor + critic and evaluated; do
+   not select the interrupted snapshot.
+2. Select `gen_001` as **observe-only**. Keep exact promoted recovery off.
+3. Set one outer cycle, 750 PPO iterations, 1,024 environments, `cuda:0`, seed
+   42, two 1,200-step 1920x1080 rollouts, Auto, and precommitted environment
+   10. Turn dry run off.
+4. Launch and require clean captured code, selection v8/tuple above,
+   `warm_start_loaded` for exactly actor+critic with exact source and loaded
+   SHA, authored horizon `24 s`, JUMP-phase horizontal-only arbitration plus
+   the disclosed grounded-gait mask, and PPO iteration 0.
+
+The runtime change is intentionally generic and causal: the task horizon now
+controls physical termination, and only a valid typed JUMP phase stops native
+vertical-velocity and grounded-gait shaping from vetoing takeoff. All native
+terms return for ROUTE/HOLD or a violated sequence; safety, landing,
+uprightness, and terminal stillness remain active.
+
+After launch, do not edit reload-watched core or run an intermediate GPU audit.
+After completion inspect the immutable all-lane trajectory/objectives, lane-10
+requested/resolved behavior, keyframes and full video, and Results scene audit.
+Acceptance remains conjunctive: ordered disks/index 5; all forbidden contacts
+false; no sustained fall; exactly one bilateral air event of at least three
+frames with apex gain at least `0.18 m`; bilateral landing inside finish; and
+100 uninterrupted in-finish horizontal, angular, joint, uprightness, and
+default-pose quiet frames.

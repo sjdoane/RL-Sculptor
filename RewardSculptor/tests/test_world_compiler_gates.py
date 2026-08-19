@@ -15,10 +15,12 @@ from mjlab.scene import Scene, SceneCfg
 
 from sculptor.world.compiler import (
     ResolvedEvaluation,
+    WorldCompileError,
     _clearance_adjusted_waypoint_points,
     _horizon_aware_terminal_brake_radius,
     _horizon_aware_waypoint_cruise,
     _install_task_observations,
+    _reconcile_task_termination,
     _reconcile_waypoint_course,
     apply_world_selection,
     compile_task_runtime,
@@ -34,6 +36,27 @@ from sculptor.world.capabilities import (
     build_base_robot_entity_cfg,
     resolve_robot_capability,
 )
+
+
+def test_authored_task_episode_horizon_is_applied_fail_closed() -> None:
+    manifest = SimpleNamespace(task_shared={
+        "termination": {"episode_length_s": 24.0},
+    })
+    env_cfg = SimpleNamespace(episode_length_s=20.0)
+
+    assert _reconcile_task_termination(env_cfg, manifest) == (
+        "termination:episode_length_s→24 (authoritative TaskSpec)",
+    )
+    assert env_cfg.episode_length_s == 24.0
+    # Reconciliation is idempotent and an undeclared horizon is a no-op.
+    assert _reconcile_task_termination(env_cfg, manifest) == ()
+    assert _reconcile_task_termination(
+        env_cfg, SimpleNamespace(task_shared={"termination": {}})) == ()
+
+    with pytest.raises(
+        WorldCompileError, match="cannot apply the authored episode horizon"
+    ):
+        _reconcile_task_termination(SimpleNamespace(), manifest)
 
 
 def _world(*, generated: bool = False, robot: str = "unitree_g1:base") -> dict:
@@ -1383,8 +1406,10 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
         "robot": build_base_robot_entity_cfg(resolve_robot_capability(
             "unitree_g1:base")),
     })
-    bundle = apply_world_selection(base, immutable, train=False)
+    env_cfg = SimpleNamespace(scene=base, episode_length_s=20.0)
+    bundle = apply_world_selection(env_cfg, immutable, train=False)
     assert bundle.tuple_hash == selection.tuple_hash
+    assert env_cfg.episode_length_s == 10.0
     assert (
         bundle.runtime_robot_asset_hash
         == compiled.resolved_eval.robot_asset_hash
@@ -1461,6 +1486,7 @@ def test_authored_plane_removes_only_generator_dependent_curriculum(
     # njmax=1500 / nconmax=35 are sized for ITS scene, not for the authored
     # course now standing in front of the robot.
     assert bundle.runtime_adjustments == (
+        "termination:episode_length_s→10 (authoritative TaskSpec)",
         (
             "constraint budget for authored scene: njmax 1500→1536, "
             "nconmax 35→512 (task defaults are sized for the task's own "

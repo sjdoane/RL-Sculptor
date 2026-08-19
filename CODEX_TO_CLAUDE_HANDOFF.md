@@ -3816,3 +3816,61 @@ cycle, 750 PPO iterations, 1,024 envs on `cuda:0`, seed 42, two 1,200-step
 observe-only, and exact promoted recovery off. Do not call PPO-50 evaluated or
 successful. Do not edit reload-watched core or run a GPU audit once the worker
 is live.
+
+## Iter 2 physical baseline and phase-correct jump continuation
+
+The fresh project's first completed/evaluated continuation checkpoint is iter
+2, SHA-256
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`.
+The visible evaluation-only UI job was `job_8b81d661ef49b31f`. Its evaluation
+tuple is selection v8 / tuple
+`f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`,
+reward v2 SHA
+`22fc7521463f9f62d0844d026ef53194c7c4a70a47b29f8c11efdd18e499bfa5`,
+and env v1 SHA
+`d0c4d54e1e7d527ff41f418d15443ecab60fee036ad06ff2b60204bac21d8703`.
+The older checkpoint-training tuple in `artifact_tuple.json` is lineage, not
+the evaluation tuple; keep those two labels distinct.
+
+The immutable 64-lane trajectory is diagnostic, not successful: 17/64 lanes
+reached raw index 5 and JUMP, none reached HOLD or authored success, 58/64 were
+contact-free, no lane had the required three-frame bilateral air event, and
+the maximum apex gain was only `0.01083 m`. Lane 10 was contact-free and
+reached index 5 at frame 986, but had only 13 JUMP frames, no measurable jump,
+`0.149 m/s` final horizontal speed, pose RMS `0.672`, and zero strict hold
+frames. The scene itself is exact after env-origin subtraction. `gen_001`'s
+`route_channel=0.99949` is dense travel shaping, not raw route completion; it
+is observe-only, uncalibrated (Spearman 0, trust 0.4), and must never replace
+the physical audit.
+
+Two generic conflicts explain that result. First, the frozen TaskSpec declares
+24 seconds while MjLab's registered G1 default terminated the official
+rollout at 20 seconds. Median JUMP entry was frame 940, leaving only 59 frames,
+so the route, jump, landing, and 100-frame hold conjunction was structurally
+unprovable. TaskSpec termination is now applied to the simulator before route
+scheduling and reasserted after EnvSpec overlays. Second, MjLab's native
+linear-velocity tracker treats vertical velocity as an error against zero;
+with the authored weight/std it nearly cancels the entire launch reward.
+During only a valid typed JUMP phase it now uses the same Gaussian over XY
+error, while grounded-gait priors (`pose`, `foot_clearance`,
+`foot_swing_height`, `body_ang_vel`, `angular_momentum`) are masked. ROUTE,
+HOLD, invalid event sequences, and worlds without this capability remain
+native. Uprightness, yaw tracking, hardware limits when present, action
+smoothness, slip, landing, contact, survival, and terminal-stillness terms stay
+active.
+
+Reject the automatically proposed reward v3/env v2 for the next causal run:
+it simultaneously changes launch height, velocity, weight, and entropy, its
+counterfactual credit is almost entirely ordinary supported gait, and it
+missed the horizon conflict. The next run must keep selection v8 exactly and
+change only the generic runtime arbitration above. Focused compiler/adapter
+verification is 132 passed; scoped Ruff `F,E9`, compileall, and diff check
+pass.
+
+Launch visibly from evaluated project policy iter 2 with actor+critic, one
+750-PPO cycle, 1,024 envs on `cuda:0`, seed 42, two 1,200-step 1920x1080
+rollouts, Auto, `gen_001` observe-only, precommitted evidence environment 10,
+and exact promoted recovery off. Require exact actor+critic load of the SHA
+above, a 24-second runtime-horizon receipt, the JUMP arbitration receipt, and
+PPO iteration 0 before treating training as live. Do not edit reload-watched
+core or run a GPU audit after launch.

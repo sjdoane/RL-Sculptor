@@ -23,6 +23,7 @@ reward terms unchanged (useful for the GPU smoke test).
 from __future__ import annotations
 
 import argparse
+from functools import wraps
 import json
 import os
 import sys
@@ -59,6 +60,18 @@ _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE = 2.0
 # Command tracking, direct contact, survival, and native realism terms are
 # separate rewards and remain active.
 _CLEARANCE_STAGE_PRIMARY_SCALE = 0.0
+
+# Native locomotion-shaping terms that prescribe a grounded gait or suppress
+# the body dynamics needed for an authored vertical JUMP.  Hardware limits,
+# contact safety, horizontal/yaw command tracking, uprightness, action
+# smoothness, slip, and landing-impact terms intentionally remain active.
+_EVENT_JUMP_MASKED_REALISM_TERMS = frozenset({
+    "pose",
+    "foot_clearance",
+    "foot_swing_height",
+    "body_ang_vel",
+    "angular_momentum",
+})
 
 
 def _install_sculptor_termination_economics(
@@ -850,6 +863,25 @@ def _apply_world_selection(
     return bundle
 
 
+def _reassert_authored_task_termination(
+    env_cfg: Any, world_bundle: Any | None,
+) -> None:
+    """Keep frozen TaskSpec termination authoritative after EnvSpec overlays."""
+    if world_bundle is None:
+        return
+    from sculptor.world.compiler import _reconcile_task_termination
+
+    for adjustment in _reconcile_task_termination(
+        env_cfg, world_bundle.manifest
+    ):
+        print(
+            "[runner] authored-world runtime adjustment reasserted after "
+            f"EnvSpec: {adjustment}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset[str]:
     """Return base reward terms that are part of an authored command contract.
 
@@ -879,6 +911,208 @@ def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset
             and installed:
         return frozenset({"track_linear_velocity", "track_angular_velocity"})
     return frozenset()
+
+
+def _authored_event_jump_phase(env: Any) -> Any:
+    """Return valid per-environment JUMP-phase truth from a typed command.
+
+    The compiler's authored event command is the sole owner of ROUTE → JUMP →
+    HOLD state.  Reward arbitration consumes that capability directly instead
+    of inferring takeoff from contacts, robot height, or a task/robot name.
+    Missing or malformed sequence-violation truth fails closed: native reward
+    behavior is retained rather than granting jump-specific shaping after an
+    invalid event.
+    """
+    import torch
+
+    jump_phase = torch.zeros(
+        int(env.num_envs), device=env.device, dtype=torch.bool)
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        return jump_phase
+
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+        except (KeyError, RuntimeError):
+            continue
+        event_sequence_id = str(
+            getattr(term, "event_sequence_id", ""))
+        if not event_sequence_id:
+            continue
+        event_phase = getattr(term, "event_phase", None)
+        event_sequence_violation = getattr(
+            term, "event_sequence_violation", None)
+        if (
+            not torch.is_tensor(event_phase)
+            or tuple(event_phase.shape) != tuple(jump_phase.shape)
+            or not torch.is_tensor(event_sequence_violation)
+            or tuple(event_sequence_violation.shape) != tuple(jump_phase.shape)
+        ):
+            raise RuntimeError(
+                f"authored event command {event_sequence_id!r} exposes "
+                "malformed phase or sequence-violation truth"
+            )
+        jump_phase |= (
+            (event_phase.to(device=env.device, dtype=torch.long) == 1)
+            & ~event_sequence_violation.to(
+                device=env.device, dtype=torch.bool)
+        )
+    return jump_phase
+
+
+def _build_event_jump_linear_velocity_tracker(native_func: Any) -> Any:
+    """Keep authored horizontal tracking without suppressing vertical launch.
+
+    MjLab's native linear-velocity reward assumes commanded Z velocity is zero
+    and therefore includes ``actual_z**2`` in its error.  That is appropriate
+    for ROUTE and HOLD, but it directly rewards staying grounded during an
+    explicitly authored JUMP phase.  Replace only that valid phase's value
+    with the same Gaussian over XY error.  Route, hold, invalid sequences, and
+    environments without the typed capability remain byte-for-byte native.
+    """
+    if getattr(native_func, "_sculptor_event_jump_horizontal_only", False):
+        return native_func
+
+    @wraps(native_func)
+    def event_jump_horizontal_tracker(env: Any, **params: Any) -> Any:
+        import torch
+
+        native_reward = native_func(env, **params)
+        jump_phase = _authored_event_jump_phase(env)
+        if (
+            not torch.is_tensor(native_reward)
+            or tuple(native_reward.shape) != tuple(jump_phase.shape)
+        ):
+            return native_reward
+
+        asset_cfg = params.get("asset_cfg")
+        asset_name = str(getattr(asset_cfg, "name", "robot"))
+        asset = env.scene[asset_name]
+        command = env.command_manager.get_command(params["command_name"])
+        if command is None:
+            raise RuntimeError(
+                f"authored command {params['command_name']!r} is absent"
+            )
+        actual = asset.data.root_link_lin_vel_b
+        xy_error = torch.sum(
+            torch.square(command[:, :2] - actual[:, :2]), dim=1)
+        std = float(params["std"])
+        horizontal_reward = torch.exp(-xy_error / std**2)
+        return torch.where(
+            jump_phase.to(device=native_reward.device),
+            horizontal_reward.to(
+                device=native_reward.device, dtype=native_reward.dtype),
+            native_reward,
+        )
+
+    event_jump_horizontal_tracker._sculptor_event_jump_horizontal_only = True
+    return event_jump_horizontal_tracker
+
+
+def _mask_event_jump_reward(env: Any, value: Any) -> Any:
+    """Zero one native term only on valid authored JUMP lanes."""
+    import torch
+
+    jump_phase = _authored_event_jump_phase(env)
+    if (
+        not torch.is_tensor(value)
+        or value.ndim < 1
+        or int(value.shape[0]) != int(jump_phase.shape[0])
+    ):
+        return value
+    broadcast_shape = (int(jump_phase.shape[0]),) + (1,) * (value.ndim - 1)
+    return torch.where(
+        jump_phase.to(device=value.device).reshape(broadcast_shape),
+        torch.zeros_like(value),
+        value,
+    )
+
+
+def _build_event_jump_masked_reward_term(native_func: Any) -> Any:
+    """Wrap a function or stateful term while preserving native bookkeeping."""
+    import inspect
+
+    if getattr(native_func, "_sculptor_event_jump_masked", False):
+        return native_func
+
+    if inspect.isclass(native_func):
+        class EventJumpMaskedTerm(native_func):  # type: ignore[misc,valid-type]
+            def __call__(self, env: Any, *args: Any, **kwargs: Any) -> Any:
+                value = super().__call__(env, *args, **kwargs)
+                return _mask_event_jump_reward(env, value)
+
+        EventJumpMaskedTerm.__name__ = (
+            f"EventJumpMasked{native_func.__name__}")
+        EventJumpMaskedTerm.__qualname__ = EventJumpMaskedTerm.__name__
+        EventJumpMaskedTerm._sculptor_event_jump_masked = True
+        return EventJumpMaskedTerm
+
+    @wraps(native_func)
+    def event_jump_masked(env: Any, *args: Any, **kwargs: Any) -> Any:
+        value = native_func(env, *args, **kwargs)
+        return _mask_event_jump_reward(env, value)
+
+    event_jump_masked._sculptor_event_jump_masked = True
+    return event_jump_masked
+
+
+def _install_authored_event_jump_linear_tracking(
+    rewards: Mapping[str, Any], world_bundle: Any | None,
+) -> bool:
+    """Install phase-correct linear tracking for ROUTE/JUMP/HOLD programs."""
+    if "track_linear_velocity" not in _full_weight_authored_command_rewards(
+        world_bundle
+    ):
+        return False
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    event_sequence = (
+        task_shared.get("event_sequence")
+        if isinstance(task_shared, Mapping)
+        else None
+    )
+    phases = (
+        event_sequence.get("phases", ())
+        if isinstance(event_sequence, Mapping)
+        else ()
+    )
+    if not (
+        isinstance(phases, (list, tuple))
+        and len(phases) == 3
+        and all(isinstance(phase, Mapping) for phase in phases)
+        and tuple(str(phase.get("id", "")) for phase in phases)
+        == ("route", "jump", "hold")
+    ):
+        return False
+
+    term = rewards.get("track_linear_velocity")
+    native_func = getattr(term, "func", None)
+    if term is None or not callable(native_func):
+        return False
+    if getattr(native_func, "_sculptor_event_jump_horizontal_only", False):
+        return True
+    term.func = _build_event_jump_linear_velocity_tracker(native_func)
+    return True
+
+
+def _install_authored_event_jump_realism_firewall(
+    rewards: Mapping[str, Any], world_bundle: Any | None,
+) -> tuple[str, ...]:
+    """Mask grounded-gait priors only for a valid authored JUMP phase."""
+    if not _install_authored_event_jump_linear_tracking(
+        rewards, world_bundle
+    ):
+        return ()
+    masked: list[str] = []
+    for name in sorted(_EVENT_JUMP_MASKED_REALISM_TERMS):
+        term = rewards.get(name)
+        native_func = getattr(term, "func", None)
+        if term is None or not callable(native_func):
+            continue
+        term.func = _build_event_jump_masked_reward_term(native_func)
+        masked.append(name)
+    return tuple(masked)
 
 
 def _authored_terminal_standing_enabled(world_bundle: Any | None) -> bool:
@@ -3058,6 +3292,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # train=True additionally applies the train-only curricula section.
     env_spec = _resolve_env_spec(args)
     _apply_env_spec(env_cfg, env_spec, train=True, task_id=args.task_id)
+    _reassert_authored_task_termination(env_cfg, world_bundle)
     # Authored worlds already carry their admitted actuator profile. Only a
     # legacy registered task may receive the environment-gated compatibility
     # transform, and it must receive it in both training and rollout.
@@ -3133,6 +3368,22 @@ def _cmd_train(args: argparse.Namespace) -> None:
         else:
             env_cfg.rewards = {}
 
+        event_jump_masked_terms = (
+            _install_authored_event_jump_realism_firewall(
+                env_cfg.rewards, world_bundle)
+        )
+        event_jump_horizontal_tracking = bool(
+            event_jump_masked_terms
+            or getattr(
+                getattr(
+                    env_cfg.rewards.get("track_linear_velocity"),
+                    "func", None,
+                ),
+                "_sculptor_event_jump_horizontal_only",
+                False,
+            )
+        )
+
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
         terminal_hold_s = _authored_terminal_hold_s(world_bundle)
         terminal_standing = terminal_hold_s > 0.0
@@ -3190,6 +3441,18 @@ def _cmd_train(args: argparse.Namespace) -> None:
             print(
                 "[runner] preserved authored command supervision at full weight: "
                 + ", ".join(sorted(full_weight_terms)),
+                file=sys.stderr,
+                flush=True,
+            )
+        if event_jump_horizontal_tracking:
+            print(
+                "[runner] installed authored JUMP-phase reward arbitration: "
+                "track_linear_velocity is horizontal-only; grounded-gait "
+                "priors masked=" + ",".join(event_jump_masked_terms) + "; "
+                "all native rewards restored for ROUTE/HOLD and invalid "
+                "event sequences; upright, angular tracking, hardware "
+                "limits, action smoothness, slip, landing, contact, and "
+                "survival terms remain active when present",
                 file=sys.stderr,
                 flush=True,
             )
@@ -4188,6 +4451,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # corrupted by mid-air spawns.
     _apply_env_spec(
         env_cfg, _resolve_env_spec(args), train=False, task_id=args.task_id)
+    _reassert_authored_task_termination(env_cfg, world_bundle)
     # §D17: stage-FIXED eval-reset override — reference-derived lying
     # start for get-up stages, applied ONLY here (never to training),
     # AFTER the shared-only env-spec above and strictly ADDITIVE to it.

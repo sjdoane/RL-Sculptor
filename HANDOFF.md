@@ -1656,3 +1656,23 @@ success. The UI requires separate uncertainty and reconstruction
 acknowledgements and transfers actor+critic only. The worker now treats exact
 actual-loaded bytes/roles and lineage as a fatal publication gate. See the two
 runbooks above for the visible relaunch and acceptance conjunction.
+
+## Iter 2 baseline: route-like video, no physical jump
+
+The completed fresh-project iter 2 policy is now an evaluated warm-start, but
+its official evidence is still diagnostic: 17/64 lanes reached raw route index
+5, 0/64 produced a valid three-frame jump, 0/64 entered HOLD, and 0/64 passed
+the authored conjunction. The high observe-only `route_channel` is dense
+travel and must not be read as route completion.
+
+The causal blockers were runtime-generic. A frozen 24-second TaskSpec was
+physically truncated by MjLab's 20-second registered default, and native
+linear-velocity tracking penalized vertical launch against a zero-Z command.
+Task termination is now authoritative before and after EnvSpec overlays. Only
+during a valid typed JUMP phase, linear tracking becomes horizontal-only and
+grounded-gait priors are masked; route, hold, invalid sequences, and all safety
+and landing supervision remain native. The next UI run keeps exact selection
+v8/reward v2/env v1 and starts actor+critic from iter 2 SHA
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`.
+Do not use the automatically proposed multi-factor reward v3/env v2 for this
+causal test.

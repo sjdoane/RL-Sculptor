@@ -87,6 +87,203 @@ def test_authored_waypoint_command_rewards_keep_nominal_weight() -> None:
     assert _full_weight_authored_command_rewards(bundle) == frozenset()
 
 
+def test_authored_task_horizon_is_reasserted_after_env_overlay() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _reassert_authored_task_termination,
+    )
+
+    env_cfg = SimpleNamespace(episode_length_s=12.0)
+    world_bundle = SimpleNamespace(manifest=SimpleNamespace(task_shared={
+        "termination": {"episode_length_s": 24.0},
+    }))
+    _reassert_authored_task_termination(env_cfg, world_bundle)
+    assert env_cfg.episode_length_s == 24.0
+
+    # Registered non-authored tasks keep their own EnvSpec authority.
+    env_cfg.episode_length_s = 12.0
+    _reassert_authored_task_termination(env_cfg, None)
+    assert env_cfg.episode_length_s == 12.0
+
+
+def test_event_jump_linear_tracking_preserves_xy_without_penalizing_launch(
+) -> None:
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _build_event_jump_masked_reward_term,
+        _install_authored_event_jump_linear_tracking,
+        _install_authored_event_jump_realism_firewall,
+    )
+
+    command_term = SimpleNamespace(
+        event_sequence_id="route_jump_hold",
+        event_phase=torch.tensor([0, 1, 2, 1]),
+        event_sequence_violation=torch.tensor([
+            False, False, False, True,
+        ]),
+    )
+    velocity_command = torch.zeros((4, 3))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command_term
+
+        @staticmethod
+        def get_command(name):
+            assert name == "twist"
+            return velocity_command
+
+    actual_velocity = torch.tensor([
+        [0.0, 0.0, 1.0],
+        [0.1, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ])
+    env = SimpleNamespace(
+        num_envs=4,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+        scene={
+            "robot": SimpleNamespace(data=SimpleNamespace(
+                root_link_lin_vel_b=actual_velocity,
+            )),
+        },
+    )
+
+    def native_tracker(env, *, std, command_name):
+        command = env.command_manager.get_command(command_name)
+        actual = env.scene["robot"].data.root_link_lin_vel_b
+        error = torch.sum(
+            torch.square(command[:, :2] - actual[:, :2]), dim=1)
+        error += torch.square(actual[:, 2])
+        return torch.exp(-error / std**2)
+
+    reward_term = SimpleNamespace(func=native_tracker, weight=2.0)
+    rewards = {"track_linear_velocity": reward_term}
+    bundle = SimpleNamespace(
+        manifest=SimpleNamespace(task_shared={
+            "goal": {"type": "waypoint_sequence"},
+            "event_sequence": {"phases": [
+                {"id": "route"}, {"id": "jump"}, {"id": "hold"},
+            ]},
+        }),
+        runtime_adjustments=(
+            "command:velocity→goal-conditioned waypoint traversal",
+        ),
+    )
+
+    assert _install_authored_event_jump_linear_tracking(rewards, bundle)
+    reward = reward_term.func(env, std=0.5, command_name="twist")
+    native = native_tracker(env, std=0.5, command_name="twist")
+
+    # ROUTE and HOLD remain exactly native. Valid JUMP keeps only the XY
+    # tracking error, so vertical takeoff is no longer punished. A violated
+    # JUMP sequence fails closed to the native reward.
+    assert reward[0].item() == pytest.approx(native[0].item())
+    assert reward[1].item() == pytest.approx(
+        torch.exp(torch.tensor(-0.01 / 0.25)).item())
+    assert reward[2].item() == pytest.approx(native[2].item())
+    assert reward[3].item() == pytest.approx(native[3].item())
+
+    # Typed event truth is authoritative; malformed shapes abort instead of
+    # silently reinstating a contradictory grounded-motion reward.
+    command_term.event_phase = torch.tensor([0, 1])
+    with pytest.raises(RuntimeError, match="malformed phase"):
+        reward_term.func(env, std=0.5, command_name="twist")
+    command_term.event_phase = torch.tensor([0, 1, 2, 1])
+
+    # Re-installation is idempotent and a non-event world is untouched.
+    installed = reward_term.func
+    assert _install_authored_event_jump_linear_tracking(rewards, bundle)
+    assert reward_term.func is installed
+    bundle.manifest.task_shared.pop("event_sequence")
+    plain = SimpleNamespace(func=native_tracker, weight=2.0)
+    assert not _install_authored_event_jump_linear_tracking(
+        {"track_linear_velocity": plain}, bundle)
+    assert plain.func is native_tracker
+
+    # The broader firewall masks only grounded-gait priors. Contact/safety
+    # terms and landing bookkeeping remain native.
+    def ones(env):
+        return torch.ones(env.num_envs)
+
+    split_rewards = {
+        name: SimpleNamespace(func=ones, weight=1.0)
+        for name in (
+            "track_linear_velocity",
+            "track_angular_velocity",
+            "upright",
+            "pose",
+            "foot_clearance",
+            "foot_swing_height",
+            "body_ang_vel",
+            "angular_momentum",
+            "foot_slip",
+            "soft_landing",
+            "dof_pos_limits",
+            "action_rate_l2",
+            "self_collisions",
+        )
+    }
+    split_rewards["track_linear_velocity"].func = native_tracker
+    masked = _install_authored_event_jump_realism_firewall(
+        split_rewards, SimpleNamespace(
+            manifest=SimpleNamespace(task_shared={
+                "goal": {"type": "waypoint_sequence"},
+                "event_sequence": {"phases": [
+                    {"id": "route"}, {"id": "jump"}, {"id": "hold"},
+                ]},
+            }),
+            runtime_adjustments=(
+                "command:velocity→goal-conditioned waypoint traversal",
+            ),
+        ),
+    )
+    assert masked == (
+        "angular_momentum",
+        "body_ang_vel",
+        "foot_clearance",
+        "foot_swing_height",
+        "pose",
+    )
+    for name in masked:
+        assert getattr(
+            split_rewards[name].func,
+            "_sculptor_event_jump_masked",
+            False,
+        )
+    for name in (
+        "track_angular_velocity", "upright", "foot_slip", "soft_landing",
+        "dof_pos_limits", "action_rate_l2", "self_collisions",
+    ):
+        assert split_rewards[name].func is ones
+
+    # Class-backed terms keep native call/reset behavior; masking happens only
+    # after the stateful callable has updated its internal bookkeeping.
+    class StatefulTerm:
+        def __init__(self, cfg, env):
+            self.calls = 0
+            self.reset_ids = None
+
+        def __call__(self, env):
+            self.calls += 1
+            return torch.ones(env.num_envs)
+
+        def reset(self, env_ids):
+            self.reset_ids = env_ids
+
+    WrappedStateful = _build_event_jump_masked_reward_term(StatefulTerm)
+    stateful = WrappedStateful(None, env)
+    stateful_reward = stateful(env)
+    assert stateful.calls == 1
+    assert stateful_reward.tolist() == [1.0, 0.0, 1.0, 1.0]
+    stateful.reset(torch.tensor([1]))
+    assert stateful.reset_ids.tolist() == [1]
+
+
 def test_authored_terminal_standing_requires_installed_dwell_command() -> None:
     from sculptor.adapters._mjlab_runner import (
         _authored_terminal_standing_enabled,

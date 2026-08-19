@@ -3217,6 +3217,52 @@ def _horizon_aware_terminal_brake_radius(
     return min(upper, max(lower, scheduled_radius_m))
 
 
+def _reconcile_task_termination(
+    env_cfg: Any, manifest: Any,
+) -> tuple[str, ...]:
+    """Apply the immutable authored episode horizon to the simulator config.
+
+    Command scheduling and physical termination must consume the same frozen
+    TaskSpec value.  Merely using the authored horizon to tune cruise speed can
+    leave MjLab's registered default in control of ``max_episode_length``,
+    producing a shorter rollout than the success proof requires.  A declared
+    horizon is therefore authoritative and fail-closed on environments that
+    cannot expose the compatible config surface.
+    """
+    task_shared = getattr(manifest, "task_shared", {})
+    termination = (
+        task_shared.get("termination", {})
+        if isinstance(task_shared, Mapping)
+        else {}
+    )
+    if not isinstance(termination, Mapping) \
+            or "episode_length_s" not in termination:
+        return ()
+    try:
+        episode_length_s = float(termination["episode_length_s"])
+    except (TypeError, ValueError) as exc:
+        raise WorldCompileError(
+            "authored task episode_length_s is not numeric") from exc
+    if not math.isfinite(episode_length_s) or episode_length_s <= 0.0:
+        raise WorldCompileError(
+            "authored task episode_length_s must be finite and positive")
+    if not hasattr(env_cfg, "episode_length_s"):
+        raise WorldCompileError(
+            "runtime environment cannot apply the authored episode horizon")
+    try:
+        current = float(env_cfg.episode_length_s)
+        if math.isclose(current, episode_length_s, rel_tol=0.0, abs_tol=1e-9):
+            return ()
+        env_cfg.episode_length_s = episode_length_s
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise WorldCompileError(
+            "runtime environment rejected the authored episode horizon") from exc
+    return (
+        f"termination:episode_length_s→{episode_length_s:g} "
+        "(authoritative TaskSpec)",
+    )
+
+
 def _reconcile_waypoint_course(
     env_cfg: Any,
     manifest: ResolvedEvaluation,
@@ -3689,6 +3735,10 @@ def apply_world_selection(
         train=train,
     ))
     runtime_adjustments = (
+        # Task termination is immutable evaluation semantics, not merely a
+        # controller-planning hint. Apply it before the route scheduler reads
+        # the same value so simulator and command horizons cannot diverge.
+        *_reconcile_task_termination(env_cfg, manifest),
         # First: the env grid pitch. A pitch narrower than the course buries
         # every robot in a neighbour's geometry, which manufactures most of the
         # contact pressure the budget below absorbs. Fix the cause, then size
