@@ -340,6 +340,98 @@ def export_policy_bundle(
     return ExportResult(bundle_path=out, manifest=manifest, warnings=warnings)
 
 
+def _portable_iteration_policy_contract(
+    project: Path,
+    *,
+    runs_root: Path | str | None,
+    iter_index: int,
+    observed_network: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """Attest the policy interface against the iteration-owned world tuple.
+
+    Historical checkpoints must never inherit a newly promoted project world.
+    The iteration's artifact tuple is therefore required to match, byte for
+    canonical byte, the immutable ``selection_vN`` that it names before that
+    selection can define the portable policy contract.
+    """
+    from sculptor.policy_contract import (
+        build_project_policy_contract,
+        contract_fingerprint,
+    )
+    from sculptor.world.artifacts import (
+        WorldArtifactStore,
+        canonical_json_bytes,
+        file_sha256,
+    )
+
+    root = Path(runs_root).resolve() if runs_root else project / "runs"
+    tuple_path = root / f"iter_{iter_index}" / "artifact_tuple.json"
+    if not tuple_path.is_file():
+        raise ExportError(
+            "portable starting-skill export requires the iteration-owned "
+            f"artifact tuple: {tuple_path}"
+        )
+    try:
+        tuple_payload = json.loads(tuple_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ExportError(
+            f"iteration artifact tuple is unreadable: {tuple_path}"
+        ) from exc
+    if not isinstance(tuple_payload, dict):
+        raise ExportError("iteration artifact tuple must be a JSON object")
+    selection_version = tuple_payload.get("selection_version")
+    if (
+        not isinstance(selection_version, int)
+        or isinstance(selection_version, bool)
+        or selection_version <= 0
+    ):
+        raise ExportError(
+            "iteration artifact tuple has no valid selection_version"
+        )
+
+    selection_path = project / "env" / f"selection_v{selection_version}.json"
+    try:
+        selection = WorldArtifactStore(project).read_selection(selection_path)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise ExportError(
+            "portable starting-skill source selection failed verification: "
+            f"{exc}"
+        ) from exc
+    if selection is None:
+        raise ExportError(
+            f"immutable source selection is absent: {selection_path}"
+        )
+    if canonical_json_bytes(tuple_payload) != canonical_json_bytes(
+        selection.to_dict()
+    ):
+        raise ExportError(
+            "iteration artifact tuple does not exactly match its immutable "
+            "source selection"
+        )
+    try:
+        contract = build_project_policy_contract(
+            project,
+            observed_network=observed_network,
+            world_selection_path=selection_path,
+        )
+        contract_digest = contract_fingerprint(contract)
+    except Exception as exc:  # noqa: BLE001 - normalize researcher boundary
+        raise ExportError(
+            "iteration-owned policy compatibility contract is unavailable "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    receipt = {
+        "schema": 1,
+        "iter_index": iter_index,
+        "artifact_tuple_sha256": file_sha256(tuple_path),
+        "selection_version": selection.selection_version,
+        "selection_sha256": file_sha256(selection_path),
+        "tuple_hash": selection.tuple_hash,
+        "compatibility_contract_digest": contract_digest,
+    }
+    return contract, contract_digest, receipt
+
+
 def export_starting_skill_bundle(
     project_dir: Path | str,
     *,
@@ -358,32 +450,21 @@ def export_starting_skill_bundle(
     complete portable manifest.
     """
     project = Path(project_dir).resolve()
-    metadata_robot_slug: Optional[str] = None
-    metadata_path = project / "metadata.json"
-    if metadata_path.is_file():
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            robot_source = metadata.get("robot_source") or {}
-            if isinstance(robot_source, dict):
-                raw_robot = (
-                    robot_source.get("library_slug")
-                    or robot_source.get("library_name")
-                )
-                if isinstance(raw_robot, str) and raw_robot.strip():
-                    metadata_robot_slug = raw_robot.strip()
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            metadata_robot_slug = None
-    if robot_slug and metadata_robot_slug and robot_slug != metadata_robot_slug:
+    try:
+        from sculptor.project_robot import resolve_project_reference_robot
+
+        project_robot = resolve_project_reference_robot(project)
+    except (OSError, TypeError, ValueError) as exc:
         raise ExportError(
-            "portable robot identity conflicts with project metadata "
-            f"({robot_slug!r} != {metadata_robot_slug!r})"
-        )
-    resolved_robot_slug = robot_slug or metadata_robot_slug
-    if not resolved_robot_slug:
+            "portable starting-skill export requires the project's exact "
+            f"reference robot namespace: {exc}"
+        ) from exc
+    if robot_slug and robot_slug != project_robot:
         raise ExportError(
-            "portable starting-skill export requires an exact robot identity; "
-            "configure the project from the robot library or pass robot_slug"
+            "portable robot identity conflicts with the project's canonical "
+            f"reference robot namespace ({robot_slug!r} != {project_robot!r})"
         )
+    resolved_robot_slug = project_robot
     with tempfile.TemporaryDirectory(prefix="rs_portable_export_") as td:
         stage = Path(td)
         deployment_result = export_policy_bundle(
@@ -395,14 +476,20 @@ def export_starting_skill_bundle(
         source_manifest = deployment_result.manifest
         source_network = source_manifest.get("network") or {}
         trainable = source_network.get("trainable_checkpoint")
-        contract = source_manifest.get("compatibility_contract")
-        contract_digest = source_manifest.get("compatibility_contract_digest")
-        if not isinstance(trainable, dict) or not isinstance(contract, dict):
+        if not isinstance(trainable, dict):
             raise ExportError(
                 "iteration cannot produce a portable starting skill: "
                 "canonical safetensors and an exact compatibility contract "
                 "are required"
             )
+        contract, contract_digest, source_tuple_receipt = (
+            _portable_iteration_policy_contract(
+                project,
+                runs_root=runs_root,
+                iter_index=int(source_manifest["iter_index"]),
+                observed_network=source_network,
+            )
+        )
         weights_name = trainable.get("file")
         roles = trainable.get("policy_roles")
         if (
@@ -467,6 +554,7 @@ def export_starting_skill_bundle(
             },
             "compatibility_contract": contract,
             "compatibility_contract_digest": contract_digest,
+            "source_artifact_tuple": source_tuple_receipt,
             "warnings": portable_warnings,
             "files": [{
                 "path": weights_name,

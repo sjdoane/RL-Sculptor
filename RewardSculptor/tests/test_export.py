@@ -39,6 +39,7 @@ from sculptor.skill_bundle import (
     StartingSkillBundleImporter,
 )
 from sculptor.skill_library import SkillLibrary
+from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GO1_CKPT = FIXTURES / "go1_smoke_checkpoint.pt"
@@ -69,6 +70,13 @@ def _make_project(
     if task_id:
         cfg += f'config = {{ task_id = "{task_id}" }}\n'
     (project / "config.toml").write_text(cfg, encoding="utf-8")
+    (project / "metadata.json").write_text(json.dumps({
+        "robot_source": {
+            "kind": "library",
+            "library_slug": "unitree_go1",
+            "reference_robot": "go1",
+        },
+    }), encoding="utf-8")
     env_spec = {
         "env_spec_version": 1,
         "meta": {"version": "v2"},
@@ -90,6 +98,33 @@ def _make_project(
             json.dumps({"metrics": {"mean_return": 10.0 + i}}))
         if with_iter_env:
             (it / "env_spec.json").write_text(json.dumps(env_spec))
+    if iters:
+        store = WorldArtifactStore(project)
+        env_version = project / "env" / "v1.json"
+        env_version.write_text(json.dumps(env_spec), encoding="utf-8")
+        refs = {
+            "reward": ArtifactRef.from_path(
+                "reward", reward_version, rewards / f"{reward_version}.py",
+                base=project,
+            ),
+            "env_spec": ArtifactRef.from_path(
+                "env_spec", "v1", env_version, base=project,
+            ),
+            "world": store.write_json("world", {"shared": {}}),
+            "task": store.write_json("task", {"shared": {}}),
+            "resolved_eval": store.write_json("resolved_eval", {}),
+            "channel_catalog": store.write_json("channel_catalog", {}),
+            "clarifications": store.write_json("clarifications", {}),
+        }
+        selection = store.promote(refs, evaluation_lineage="test-source")
+        selection_path = project / "env" / (
+            f"selection_v{selection.selection_version}.json"
+        )
+        for i in iters:
+            shutil.copyfile(
+                selection_path,
+                project / "runs" / f"iter_{i}" / "artifact_tuple.json",
+            )
     return project
 
 
@@ -262,14 +297,103 @@ def test_portable_export_requires_rskill_extension(tmp_path):
 def test_portable_export_derives_and_cross_checks_project_robot(tmp_path):
     project = _make_project(tmp_path)
     (project / "metadata.json").write_text(json.dumps({
-        "robot_source": {"kind": "library", "library_slug": "go1"},
+        # Catalog identity and policy/reference identity are deliberately
+        # different for this legacy G1 project.
+        "robot_source": {
+            "kind": "library", "library_slug": "unitree_g1",
+        },
     }))
 
     result = export_starting_skill_bundle(project)
-    assert result.manifest["starting_skill"]["robot_slug"] == "go1"
-    assert result.manifest["deployment"]["robot_slug"] == "go1"
-    with pytest.raises(ExportError, match="conflicts with project metadata"):
-        export_starting_skill_bundle(project, robot_slug="g1")
+    assert result.manifest["starting_skill"]["robot_slug"] == "g1"
+    assert result.manifest["deployment"]["robot_slug"] == "g1"
+    identity = result.manifest["compatibility_contract"]["identity"]
+    imported = StartingSkillBundleImporter(
+        SkillLibrary(tmp_path / "g1-portable-library")
+    ).import_archive(
+        result.bundle_path,
+        target=ImportTarget(
+            adapter_class=identity["adapter_class"],
+            task_id=identity["task_id"],
+            robot_slug="g1",
+            compatibility_contract=result.manifest["compatibility_contract"],
+        ),
+    )
+    assert imported.receipt["selectable"] is True
+    assert imported.record.robot_slug == "g1"
+
+    export_starting_skill_bundle(project, robot_slug="g1")
+    with pytest.raises(ExportError, match="canonical reference robot"):
+        export_starting_skill_bundle(project, robot_slug="unitree_g1")
+
+
+def test_portable_export_contract_is_owned_by_iteration_tuple(
+    tmp_path, monkeypatch,
+):
+    project = _make_project(tmp_path)
+    store = WorldArtifactStore(project)
+    source = store.read_selection()
+    assert source is not None
+    source_path = project / "env" / (
+        f"selection_v{source.selection_version}.json"
+    )
+
+    # Promote a different current tuple after the checkpoint already owns its
+    # immutable source tuple. The portable contract must still be built from
+    # the historical selection, never this mutable current pointer.
+    current_refs = dict(source.refs)
+    current_refs["task"] = store.write_json(
+        "task", {"shared": {"marker": "new-current-world"}},
+    )
+    current = store.promote(
+        current_refs, evaluation_lineage="test-new-current",
+    )
+    current_path = project / "env" / (
+        f"selection_v{current.selection_version}.json"
+    )
+
+    def fake_contract(
+        _project, *, observed_network=None, world_selection_path=None,
+    ):
+        selected = (
+            Path(world_selection_path)
+            if world_selection_path is not None
+            else current_path
+        )
+        return {
+            "schema": 2,
+            "identity": {
+                "adapter_class": "sculptor.adapters.mjlab.MjlabAdapter",
+                "task_id": "Mjlab-Velocity-Flat-Unitree-Go1",
+            },
+            "source_selection": selected.name,
+        }
+
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        fake_contract,
+    )
+    result = export_starting_skill_bundle(project, iter_index=0)
+
+    assert result.manifest["compatibility_contract"][
+        "source_selection"
+    ] == source_path.name
+    receipt = result.manifest["source_artifact_tuple"]
+    assert receipt["selection_version"] == source.selection_version
+    assert receipt["tuple_hash"] == source.tuple_hash
+    assert len(receipt["artifact_tuple_sha256"]) == 64
+    assert len(receipt["selection_sha256"]) == 64
+    assert receipt["compatibility_contract_digest"] == (
+        result.manifest["compatibility_contract_digest"]
+    )
+
+
+def test_portable_export_rejects_missing_iteration_tuple(tmp_path):
+    project = _make_project(tmp_path)
+    (project / "runs" / "iter_0" / "artifact_tuple.json").unlink()
+
+    with pytest.raises(ExportError, match="iteration-owned artifact tuple"):
+        export_starting_skill_bundle(project, iter_index=0)
 
 
 def test_reference_starting_skill_round_trips_through_importer(
