@@ -74,6 +74,12 @@ bakes in "forward + upright + two feet" silently false-rejects them.
                                             never behavioral evidence
   arrays["joint_pos"]            (T, E, J)  joint angles over time/envs
   arrays["joint_vel"]            (T, E, J)  joint velocities
+  arrays.get("default_pose_rms") (T, E)     ordered-joint RMS deviation from
+                                            the instantiated robot's own
+                                            default pose; use this instead of
+                                            inventing joint-angle targets when
+                                            the goal requests default-like
+                                            terminal posture
   arrays["projected_gravity_b"]  (T, E, 3)  gravity in body frame; z < -0.85
                                             ≈ upright (yaw is NOT observable)
   arrays["root_link_pos_w"]      (T, E, 3)  base world position (x,y forward/
@@ -206,6 +212,11 @@ quiet gate.
    amplitude, terminal stillness/hold, posture, and sustained (not one-frame)
    state. A kick, jump, or oscillation performed in place must not pass a
    navigation/slalom metric merely because an authored flag says complete.
+   When the catalog exposes an `event__...__violation` channel for a one-shot
+   event sequence, reference that exact literal and require it to remain false.
+   It is authoritative evidence that an early, asymmetric/one-foot, or repeated
+   event attempt invalidated the episode; a later clean-looking cycle cannot
+   erase it.
 
 7. **METRIC ≠ REWARD (no style regularizers here).** The metric is a pass/fail
    competence gate. Do NOT put smoothness / action-rate / jerk / energy

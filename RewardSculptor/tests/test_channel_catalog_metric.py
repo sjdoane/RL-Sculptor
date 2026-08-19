@@ -75,6 +75,100 @@ def test_competent_route_fixture_visits_regions_in_order_and_holds_finish():
     assert np.all(finish_distance[-100:] < 0.75)
 
 
+def test_compound_event_catalog_exposes_phase_local_shaping_with_provenance():
+    draft = author_environment(
+        "Slalom around four boxes, then jump at the finish and hold still "
+        "for 2 seconds.",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    by_name = catalog.by_name()
+    expected = {
+        "event__route_jump_hold__phase": "event_phase_state",
+        "event__route_jump_hold__phase_height_delta": (
+            "event_phase_height_delta"),
+        "event__route_jump_hold__base_vertical_velocity": (
+            "event_phase_vertical_velocity"),
+    }
+    for name, producer in expected.items():
+        spec = by_name[name]
+        assert spec.access == "shared_shaping"
+        assert spec.producer == producer
+        assert spec.source["event_sequence"] == "route_jump_hold"
+        assert spec.source["phase_ids"] == ["route", "jump", "hold"]
+        assert spec.source["event_program"]["phases"][1]["until"][
+            "min_height_delta_m"
+        ] == 0.18
+    violation = by_name["event__route_jump_hold__violation"]
+    assert violation.access == "metric_only"
+    assert violation.producer == "event_sequence_violation"
+    assert violation.source["event_program"]["phases"][2][
+        "minimum_hold_s"
+    ] == 2.0
+    adversarial = catalog_fixture_arrays(
+        catalog, time_steps=180, num_envs=1, case="event_violation")
+    assert adversarial[violation.name][-1, 0]
+    assert violation.name not in catalog.names(reward=True)
+    supports = [
+        by_name[f"event__route_jump_hold__support__{index}"]
+        for index in range(2)
+    ]
+    assert [spec.source["support_selector"] for spec in supports] == [
+        ["robot:left_foot", "world:terrain"],
+        ["robot:right_foot", "world:terrain"],
+    ]
+    assert all(spec.access == "metric_only" for spec in supports)
+    assert all(spec.name not in catalog.names(reward=True) for spec in supports)
+
+
+def test_event_violation_fixture_must_fail_completion_gate(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Slalom around four boxes, then jump at the finish and hold still "
+        "for 2 seconds.",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    source = '''
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {"phases": [
+    "move_forward", "jump", "land", "dwell",
+]}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays["first_episode_valid_mask"]
+    success = arrays["goal__complete_slalom_and_stop__success"]
+    violation = arrays["event__route_jump_hold__violation"]
+    completed = bool(np.any(success & valid))
+    invalid = bool(np.any(violation & valid))
+    score = 0.6 if (completed and invalid) else (0.9 if completed else 0.0)
+    return {"spec_score": score, "completion_gate": score}
+'''
+    path = _write_metric(tmp_path, source, "soft_violation.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "navigate through four boxes, jump exactly once after the route, "
+            "land bilaterally, and hold still for 2 seconds"
+        ),
+        channel_catalog=catalog,
+    )
+    assert result["archetype_scores"]["catalog_competent"] == pytest.approx(
+        0.9
+    )
+    assert result["archetype_scores"][
+        "catalog_event_violation"
+    ] == pytest.approx(0.6)
+    assert not result["gates"]["catalog_event_violation_fail_zero"]
+    assert any(
+        "invalid event attempts must fail" in reason
+        for reason in result["reasons"]
+    )
+
+
 def _catalog() -> ChannelCatalog:
     world = {
         "shared": {

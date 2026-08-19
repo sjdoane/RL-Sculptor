@@ -136,6 +136,32 @@ def test_no_secrets_in_env_section(tmp_path: Path, monkeypatch) -> None:
     assert "SCULPTOR_REMOTE_KEY_PATH" in ctx["env"]["sculptor_vars_set"]
 
 
+def test_capture_persists_full_warm_start_policy_contract_receipt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    receipt = {
+        "schema": 1,
+        "source": {"contract_sha256": "a" * 64},
+        "target": {"contract_sha256": "b" * 64},
+        "compatibility": {"type": "exact_policy_contract"},
+    }
+    encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    monkeypatch.setenv(
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        encoded,
+    )
+    proj = _write_minimal_project(tmp_path)
+
+    captured = capture_run_context(proj)
+
+    admitted = captured["warm_start_policy_contract"]
+    assert admitted["receipt"] == receipt
+    assert admitted["receipt_sha256"] == hashlib.sha256(
+        encoded.encode("utf-8")
+    ).hexdigest()
+
+
 def test_write_run_context_round_trip(tmp_path: Path) -> None:
     proj = _write_minimal_project(tmp_path)
     ctx = capture_run_context(proj, proj / "config.toml", base_seed=42)

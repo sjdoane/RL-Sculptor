@@ -7,6 +7,7 @@ every field fail-closed.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -14,10 +15,11 @@ import re
 import tomllib
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 
 CONTRACT_SCHEMA = 2
+EVENT_CONTRACT_SCHEMA = 3
 
 
 def contract_fingerprint(contract: dict[str, Any]) -> str:
@@ -61,6 +63,25 @@ def _shape_for_observation_term(
         cls = type(cfg).__name__.lower() if cfg is not None else ""
         if "velocitycommand" in cls:
             return [3]
+    if source == "authored_event_phase_observation":
+        phase_count = params.get("phase_count")
+        if isinstance(phase_count, int) and not isinstance(
+                phase_count, bool) and phase_count > 0:
+            return [int(phase_count)]
+    if source == "authored_region_relative_observation":
+        center = params.get("center_m")
+        if (
+            isinstance(center, (list, tuple))
+            and len(center) == 3
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in center
+            )
+        ):
+            return [3]
+        return None
     sensor_shape = _shape_from_sensor_cfg(
         source=source,
         sensor_name=params.get("sensor_name"),
@@ -68,6 +89,10 @@ def _shape_for_observation_term(
     )
     if sensor_shape is not None:
         return sensor_shape
+    if params.get("sensor_name") is not None:
+        # A named sensor is structural evidence, not a hint. Unknown sensor
+        # geometry fails closed instead of being masked by token fallbacks.
+        return None
     if any(token in source for token in ("height", "clock", "phase")):
         return [1]
     # A shape hint on a custom term is the generic extension point.
@@ -97,6 +122,34 @@ def _shape_from_sensor_cfg(
     )
     if sensor is None:
         return None
+    if source == "height_scan":
+        pattern = getattr(sensor, "pattern", None)
+        size = getattr(pattern, "size", None)
+        resolution = getattr(pattern, "resolution", None)
+        if (
+            not isinstance(size, (list, tuple))
+            or len(size) != 2
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) > 0.0
+                for value in size
+            )
+            or not isinstance(resolution, (int, float))
+            or isinstance(resolution, bool)
+            or not math.isfinite(float(resolution))
+            or float(resolution) <= 0.0
+        ):
+            return None
+        counts: list[int] = []
+        for extent in size:
+            intervals = float(extent) / float(resolution)
+            rounded = round(intervals)
+            if abs(intervals - rounded) > 1e-6:
+                return None
+            counts.append(int(rounded) + 1)
+        return [math.prod(counts)]
     if source == "foot_height":
         frames = getattr(sensor, "frame", ())
         frame_count = len(frames) if isinstance(frames, (list, tuple)) else 1
@@ -161,6 +214,7 @@ def build_project_policy_contract(
     project_dir: Path,
     *,
     observed_network: Optional[dict[str, Any]] = None,
+    world_selection_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build the current project's complete warm-start target contract.
 
@@ -185,6 +239,49 @@ def build_project_policy_contract(
         raise ValueError(f"no ordered joint contract for task {task_id!r}")
     joints = [str(name) for name in joints]
     env_cfg = load_env_cfg(task_id)
+    event_observation: dict[str, Any] | None = None
+    selection_path = (
+        Path(world_selection_path)
+        if world_selection_path is not None
+        else project_dir / "env" / "selection_current.json"
+    )
+    if selection_path.is_file():
+        from sculptor.world.artifacts import WorldArtifactStore
+
+        store = WorldArtifactStore(selection_path.parent.parent)
+        selection = store.read_selection(selection_path)
+        if selection is None:
+            raise ValueError(
+                f"world selection is unreadable: {selection_path}")
+        task_path = store.resolve_ref(selection.refs["task"])
+        selected_task = json.loads(task_path.read_text(encoding="utf-8"))
+        # Every verified authored selection may change the effective policy
+        # interface (for example route-command observations), not only event
+        # programs. Apply it before enumerating ordered observations/actions.
+        from sculptor.world.compiler import apply_world_selection
+
+        apply_world_selection(
+            env_cfg,
+            selection_path,
+            train=False,
+            runtime_task_id=task_id,
+        )
+        event_sequence = selected_task.get("shared", {}).get(
+            "event_sequence")
+        # Preserve the schema-2 contract byte-for-byte for legacy selected
+        # worlds. Schema 3 is an explicit migration used only when the selected
+        # manifest adds the event-phase observation this function must
+        # fingerprint.
+        if isinstance(event_sequence, dict):
+            event_observation = {
+                "schema": 1,
+                "term_name": "authored_event_phase",
+                "encoding": "one_hot",
+                "ordered_phase_ids": [
+                    str(phase["id"])
+                    for phase in event_sequence["phases"]
+                ],
+            }
     rl_cfg = load_rl_cfg(task_id)
     actions = getattr(env_cfg, "actions", None) or {}
     action_names = list(actions.keys()) if hasattr(actions, "keys") else []
@@ -274,8 +371,16 @@ def build_project_policy_contract(
     actor_normalizer = bool(getattr(actor_cfg, "obs_normalization", False))
     critic_normalizer = bool(getattr(critic_cfg, "obs_normalization", False))
     return {
-        "schema": CONTRACT_SCHEMA,
+        "schema": (
+            EVENT_CONTRACT_SCHEMA if event_observation is not None
+            else CONTRACT_SCHEMA
+        ),
         "identity": {"adapter_class": adapter_class, "task_id": task_id},
+        **(
+            {"event_observation": event_observation}
+            if event_observation is not None
+            else {}
+        ),
         "joints": {"ordered_names": joints},
         "observations": {
             "ordered_terms": obs_rows,
@@ -344,8 +449,11 @@ def compare_policy_contracts(
         return ["source bundle is missing compatibility_contract"]
     if not isinstance(target, dict):
         return ["project target compatibility contract is unavailable"]
+    if policy_contract_migration(source, target) is not None:
+        return []
     reasons: list[str] = []
     required_paths = (
+        ("schema",),
         ("identity", "adapter_class"), ("identity", "task_id"),
         ("joints", "ordered_names"),
         ("observations", "ordered_terms"), ("observations", "shape"),
@@ -376,9 +484,301 @@ def compare_policy_contracts(
     return [] if source == target else ["compatibility contract differs"]
 
 
+def policy_contract_migration(
+    source: Optional[dict[str, Any]],
+    target: Optional[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Admit the sole structural schema-2 -> schema-3 migration.
+
+    The target must be the exact legacy contract plus one final, three-wide
+    one-hot event-phase term for both actor and critic.  Observation dimensions
+    and normalizer dimensions may grow by exactly that width; every other byte
+    of structural compatibility remains exact.  This is policy initialization,
+    never an optimizer/full-state resume.
+    """
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        return None
+    if source.get("schema") != CONTRACT_SCHEMA \
+            or target.get("schema") != EVENT_CONTRACT_SCHEMA:
+        return None
+    interface = target.get("event_observation")
+    if not isinstance(interface, dict) or interface != {
+        "schema": 1,
+        "term_name": "authored_event_phase",
+        "encoding": "one_hot",
+        "ordered_phase_ids": ["route", "jump", "hold"],
+    }:
+        return None
+    width = len(interface["ordered_phase_ids"])
+    projected = copy.deepcopy(target)
+    projected["schema"] = CONTRACT_SCHEMA
+    projected.pop("event_observation", None)
+    observations = projected.get("observations")
+    if not isinstance(observations, dict):
+        return None
+    expected_term = {
+        "name": "authored_event_phase",
+        "source": "authored_event_phase_observation",
+        "shape": [width],
+    }
+    for rows_key, shape_key in (
+        ("ordered_terms", "shape"),
+        ("critic_ordered_terms", "critic_shape"),
+    ):
+        rows = observations.get(rows_key)
+        shape = observations.get(shape_key)
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or rows[-1] != expected_term
+            or not isinstance(shape, list)
+            or len(shape) != 1
+            or not isinstance(shape[0], int)
+            or shape[0] < width
+        ):
+            return None
+        observations[rows_key] = rows[:-1]
+        observations[shape_key] = [shape[0] - width]
+    normalizer = projected.get("policy", {}).get("normalizer")
+    if not isinstance(normalizer, dict):
+        return None
+    for present_key, shape_key in (
+        ("actor_present", "actor_shape"),
+        ("critic_present", "critic_shape"),
+    ):
+        present = normalizer.get(present_key)
+        shape = normalizer.get(shape_key)
+        if present:
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 1
+                or not isinstance(shape[0], int)
+                or shape[0] < width
+            ):
+                return None
+            normalizer[shape_key] = [shape[0] - width]
+        elif shape is not None:
+            return None
+    if projected != source:
+        return None
+    return {
+        "type": "zero_initialized_event_phase_observation",
+        "from_schema": CONTRACT_SCHEMA,
+        "to_schema": EVENT_CONTRACT_SCHEMA,
+        "observation_term": "authored_event_phase",
+        "extension_width": width,
+        "ordered_phase_ids": list(interface["ordered_phase_ids"]),
+        "optimizer_resume": False,
+    }
+
+
+def build_iteration_warm_start_contract_receipt(
+    project_dir: Path,
+    iteration: int,
+    *,
+    target_selection_path: Path,
+) -> dict[str, Any]:
+    """Attest an iteration's source tuple against one immutable target.
+
+    The iteration-owned ``artifact_tuple.json`` is the authority for what the
+    source checkpoint executed in.  It must be byte-equivalent as canonical
+    JSON to the immutable ``selection_vN`` it names, whose every component is
+    then hash-verified by ``WorldArtifactStore``.  Compatibility is admitted
+    only for an exact contract or the single explicit schema-2 -> schema-3
+    event-observation migration above.
+    """
+    from sculptor.world.artifacts import (
+        WorldArtifactStore,
+        canonical_json_bytes,
+        file_sha256,
+    )
+
+    if (
+        not isinstance(iteration, int)
+        or isinstance(iteration, bool)
+        or iteration < 0
+    ):
+        raise ValueError("warm-start iteration must be a non-negative integer")
+    project_dir = Path(project_dir).expanduser().resolve()
+    tuple_path = project_dir / "runs" / f"iter_{iteration}" / "artifact_tuple.json"
+    if not tuple_path.is_file():
+        raise FileNotFoundError(
+            f"warm-start artifact tuple is absent: {tuple_path}"
+        )
+    try:
+        tuple_payload = json.loads(tuple_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"warm-start artifact tuple is unreadable: {tuple_path}"
+        ) from exc
+    if not isinstance(tuple_payload, Mapping):
+        raise ValueError("warm-start artifact tuple must be a JSON object")
+    selection_version = tuple_payload.get("selection_version")
+    if (
+        not isinstance(selection_version, int)
+        or isinstance(selection_version, bool)
+        or selection_version <= 0
+    ):
+        raise ValueError(
+            "warm-start artifact tuple has no valid selection_version"
+        )
+
+    store = WorldArtifactStore(project_dir)
+    source_selection_path = (
+        project_dir / "env" / f"selection_v{selection_version}.json"
+    )
+    source_selection = store.read_selection(source_selection_path)
+    if source_selection is None:
+        raise FileNotFoundError(
+            f"immutable source selection is absent: {source_selection_path}"
+        )
+    if canonical_json_bytes(dict(tuple_payload)) != canonical_json_bytes(
+        source_selection.to_dict()
+    ):
+        raise ValueError(
+            "warm-start artifact tuple does not exactly match its immutable "
+            "source selection"
+        )
+
+    target_selection_path = Path(target_selection_path).expanduser().resolve()
+    target_selection = store.read_selection(target_selection_path)
+    if target_selection is None:
+        raise FileNotFoundError(
+            f"immutable target selection is absent: {target_selection_path}"
+        )
+    source_contract = build_project_policy_contract(
+        project_dir,
+        world_selection_path=source_selection_path,
+    )
+    target_contract = build_project_policy_contract(
+        project_dir,
+        world_selection_path=target_selection_path,
+    )
+    migration = policy_contract_migration(source_contract, target_contract)
+    if source_contract == target_contract:
+        compatibility = {
+            "type": "exact_policy_contract",
+            "from_schema": source_contract.get("schema"),
+            "to_schema": target_contract.get("schema"),
+            "optimizer_resume": False,
+        }
+    elif migration is not None:
+        compatibility = migration
+    else:
+        reasons = compare_policy_contracts(source_contract, target_contract)
+        raise ValueError(
+            "warm-start policy contract is incompatible with the immutable "
+            f"target selection: {'; '.join(reasons)}"
+        )
+
+    return {
+        "schema": 1,
+        "iteration": int(iteration),
+        "source": {
+            "artifact_tuple_path": str(tuple_path),
+            "artifact_tuple_sha256": file_sha256(tuple_path),
+            "selection_path": str(source_selection_path),
+            "selection_sha256": file_sha256(source_selection_path),
+            "selection_version": source_selection.selection_version,
+            "tuple_hash": source_selection.tuple_hash,
+            "contract": source_contract,
+            "contract_sha256": contract_fingerprint(source_contract),
+        },
+        "target": {
+            "selection_path": str(target_selection_path),
+            "selection_sha256": file_sha256(target_selection_path),
+            "selection_version": target_selection.selection_version,
+            "tuple_hash": target_selection.tuple_hash,
+            "contract": target_contract,
+            "contract_sha256": contract_fingerprint(target_contract),
+        },
+        "compatibility": compatibility,
+    }
+
+
+def build_skill_warm_start_contract_receipt(
+    *,
+    skill_id: str,
+    manifest_digest: str,
+    checkpoint_sha256: str,
+    tensor_signature_sha256: str | None,
+    source_contract: Mapping[str, Any],
+    target_contract: Mapping[str, Any],
+    target_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one re-attestable imported/local skill initialization receipt."""
+    source = dict(source_contract)
+    target = dict(target_contract)
+    migration = policy_contract_migration(source, target)
+    if source == target:
+        compatibility = {
+            "type": "exact_policy_contract",
+            "from_schema": source.get("schema"),
+            "to_schema": target.get("schema"),
+            "optimizer_resume": False,
+        }
+    elif migration is not None:
+        compatibility = migration
+    else:
+        reasons = compare_policy_contracts(source, target)
+        raise ValueError(
+            "starting-skill policy contract is incompatible with the target: "
+            + "; ".join(reasons)
+        )
+    if not isinstance(skill_id, str) or not re.fullmatch(
+        r"[0-9a-f]{12}", skill_id
+    ):
+        raise ValueError("starting-skill skill_id is not canonical")
+    for label, value in (
+        ("manifest_digest", manifest_digest),
+        ("checkpoint_sha256", checkpoint_sha256),
+        ("tensor_signature_sha256", tensor_signature_sha256),
+    ):
+        if value is None and label == "tensor_signature_sha256":
+            continue
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", value
+        ):
+            raise ValueError(
+                f"starting-skill {label} is not a canonical SHA-256"
+            )
+    target_contract_sha256 = contract_fingerprint(target)
+    if (
+        target_receipt.get("policy_contract_required") is not True
+        or target_receipt.get("policy_contract_sha256")
+        != target_contract_sha256
+    ):
+        raise ValueError(
+            "starting-skill compact target receipt contradicts the full "
+            "policy contract"
+        )
+    return {
+        "schema": 1,
+        "kind": "starting_skill",
+        "source": {
+            "skill_id": skill_id,
+            "manifest_digest": manifest_digest,
+            "checkpoint_sha256": checkpoint_sha256,
+            "tensor_signature_sha256": tensor_signature_sha256,
+            "contract": source,
+            "contract_sha256": contract_fingerprint(source),
+        },
+        "target": {
+            **dict(target_receipt),
+            "contract": target,
+            "contract_sha256": target_contract_sha256,
+        },
+        "compatibility": compatibility,
+    }
+
+
 __all__ = [
     "CONTRACT_SCHEMA",
+    "EVENT_CONTRACT_SCHEMA",
     "build_project_policy_contract",
+    "build_iteration_warm_start_contract_receipt",
+    "build_skill_warm_start_contract_receipt",
     "compare_policy_contracts",
     "contract_fingerprint",
+    "policy_contract_migration",
 ]

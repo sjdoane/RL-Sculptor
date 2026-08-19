@@ -63,6 +63,10 @@ from backend.services.run_manager import (
 )
 from sculptor.skill_bundle import ImportTarget, compatibility_for
 from sculptor.skill_library import SkillLibrary, SkillLibraryError
+from sculptor.policy_contract import (
+    build_iteration_warm_start_contract_receipt,
+    build_skill_warm_start_contract_receipt,
+)
 from sculptor.reference_authority import (
     ActiveReferenceAuthorityError,
     resolve_active_reference_authority,
@@ -605,6 +609,7 @@ def launch_run(
 
     selected_skill = None
     starting_skill_target_receipt: Optional[dict[str, Any]] = None
+    warm_start_policy_contract_receipt: dict[str, Any] | None = None
     selected_mode = body.initialization_mode or "actor_only"
     resolved_reference_clip_id = body.reference_clip_id
     resolved_reference_robot = body.reference_robot
@@ -713,12 +718,38 @@ def launch_run(
         if selected_mode != "reference_only":
             try:
                 library.checkpoint_path_for(selected_skill)
+                warm_start_policy_contract_receipt = (
+                    build_skill_warm_start_contract_receipt(
+                        skill_id=selected_skill.skill_id,
+                        manifest_digest=str(selected_skill.manifest_digest),
+                        checkpoint_sha256=selected_skill.checkpoint_sha256,
+                        tensor_signature_sha256=(
+                            selected_skill.tensor_signature_sha256
+                        ),
+                        source_contract=(
+                            selected_skill.compatibility_contract or {}
+                        ),
+                        target_contract=(
+                            target_payload["compatibility_contract"] or {}
+                        ),
+                        target_receipt=(
+                            starting_skill_target_receipt or {}
+                        ),
+                    )
+                )
             except SkillLibraryError as exc:
                 return _problem(
                     status.HTTP_412_PRECONDITION_FAILED,
                     "starting skill failed its integrity check",
                     detail=str(exc),
                     type_="/problems/starting-skill-integrity",
+                )
+            except (TypeError, ValueError) as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill policy receipt is unavailable",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-project-contract",
                 )
         if (
             selected_mode == "reference_only"
@@ -832,6 +863,28 @@ def launch_run(
                 detail=f"{type(exc).__name__}: {exc}",
                 type_="/problems/warm-start",
             )
+        if authored_world_receipt is not None:
+            try:
+                target_selection = (
+                    project_dir / "env" / (
+                        "selection_v"
+                        f"{int(authored_world_receipt['selection_version'])}.json"
+                    )
+                )
+                warm_start_policy_contract_receipt = (
+                    build_iteration_warm_start_contract_receipt(
+                        project_dir,
+                        int(body.warm_start_iteration),
+                        target_selection_path=target_selection,
+                    )
+                )
+            except Exception as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "warm-start policy contract is unavailable",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    type_="/problems/warm-start-policy-contract",
+                )
     if bool(resolved_reference_clip_id) != bool(resolved_reference_robot):
         return _problem(
             status.HTTP_412_PRECONDITION_FAILED,
@@ -982,6 +1035,9 @@ def launch_run(
     run_params["active_reference_authority"] = active_reference_receipt
     run_params["starting_skill_target_receipt"] = (
         starting_skill_target_receipt
+    )
+    run_params["warm_start_policy_contract_receipt"] = (
+        warm_start_policy_contract_receipt
     )
     # Pin the admitted world tuple separately from the request. The worker
     # re-attests this receipt immediately before subprocess creation so a

@@ -125,6 +125,9 @@ _LEGACY_ALLOWED_ARRAYS = (
     "first_episode_valid_mask",
     "joint_pos",
     "joint_vel",
+    # Ordered-joint RMS deviation from the environment-owned default pose.
+    # Optional for legacy rollouts; metrics must guard it with arrays.get.
+    "default_pose_rms",
     "projected_gravity_b",
     "root_link_pos_w",
     "root_link_ang_vel_b",

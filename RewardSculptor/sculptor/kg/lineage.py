@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from sculptor.kg.schema import (
     ArtifactAttestation,
@@ -497,6 +497,8 @@ def record_policy_loaded(
     transfer_mode: str,
     checkpoint_sha256: str,
     load_cfg_keys: Iterable[str],
+    derived_from_policy: PolicyArtifact | None = None,
+    derivation_data: Mapping[str, Any] | None = None,
 ) -> None:
     """Earn INITIALIZED_FROM after the runtime confirms a successful load."""
     if kg is None:
@@ -521,6 +523,23 @@ def record_policy_loaded(
             },
         ),
     )
+    if (
+        derived_from_policy is not None
+        and derived_from_policy.id != policy.id
+    ):
+        _add_immutable(kg, derived_from_policy)
+        _add_edge_once(
+            kg,
+            Edge(
+                policy.id,
+                derived_from_policy.id,
+                Relation.DERIVED_FROM,
+                data={
+                    "authority": "warm_start_loaded_derived_checkpoint",
+                    **dict(derivation_data or {}),
+                },
+            ),
+        )
 
 
 def record_run_output(

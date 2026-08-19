@@ -272,6 +272,42 @@ def authored_end_effector_relative_observation(
     return _root_body_relative(env, target)
 
 
+def authored_event_phase_observation(
+    env: Any, *, event_sequence_id: str, phase_count: int,
+) -> Any:
+    """One-hot state from the command term that owns event-phase truth.
+
+    The phase is appended as an explicit task observation rather than encoded
+    into a velocity-command component.  That keeps command semantics intact
+    and makes the policy input change visible to structural checkpoint
+    compatibility checks.
+    """
+    import torch
+
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        raise WorldCompileError(
+            "event-phase observation requires a command manager")
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+        except (AttributeError, KeyError, RuntimeError):
+            continue
+        if str(getattr(term, "event_sequence_id", "")) != event_sequence_id:
+            continue
+        phase = getattr(term, "event_phase", None)
+        if not torch.is_tensor(phase) or tuple(phase.shape) != (
+                int(env.num_envs),):
+            raise WorldCompileError(
+                "event command exposes an invalid phase tensor")
+        return torch.nn.functional.one_hot(
+            phase.to(device=env.device, dtype=torch.long),
+            num_classes=int(phase_count),
+        ).to(dtype=torch.float32)
+    raise WorldCompileError(
+        f"event command {event_sequence_id!r} is not active")
+
+
 def _install_task_observations(
     env_cfg: Any,
     runtime: TaskRuntimePlan,
@@ -339,6 +375,17 @@ def _install_task_observations(
             params={"sensor_name": str(height["sensor"])},
             clip=(-5.0, 5.0),
             scale=0.2,
+        )
+
+    event_sequence = bindings.get("event_sequence")
+    if isinstance(event_sequence, Mapping):
+        phases = event_sequence.get("phases", ())
+        terms["authored_event_phase"] = ObservationTermCfg(
+            func=authored_event_phase_observation,
+            params={
+                "event_sequence_id": str(event_sequence["id"]),
+                "phase_count": len(phases),
+            },
         )
 
     if not terms:
@@ -471,12 +518,76 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 self.num_envs, device=self.device, dtype=torch.long)
             self._terminal_settle_complete = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.bool)
+            self.event_sequence_id = str(cfg.event_sequence_id)
+            self.event_phase = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.long)
+            self.event_phase_height_delta = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self.event_phase_vertical_velocity = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self.event_sequence_violation = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self.event_support_contacts = torch.zeros(
+                (self.num_envs, 2), device=self.device, dtype=torch.bool)
+            self._event_phase_height_anchor = torch.full(
+                (self.num_envs,),
+                float("nan"),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._event_takeoff_height_anchor = torch.full(
+                (self.num_envs,),
+                float("nan"),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._event_air_elapsed_s = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_max_height_delta = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_asymmetric_elapsed_s = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_asymmetric_max_height = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_flight_seen = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self._event_support_seen = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self._event_route_support_seen = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self._event_route_support_height = torch.full(
+                (self.num_envs,), float("nan"), device=self.device,
+                dtype=torch.float32)
+            self._event_route_air_active = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self._event_route_air_elapsed_s = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_route_air_max_height = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_hold_support_seen = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self._event_hold_support_height = torch.full(
+                (self.num_envs,), float("nan"), device=self.device,
+                dtype=torch.float32)
+            self._event_hold_air_elapsed_s = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_hold_air_max_height = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_hold_asymmetric_elapsed_s = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
+            self._event_hold_asymmetric_max_height = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32)
             raw_starts = getattr(
                 env, "_sculptor_waypoint_start_index", None)
             if raw_starts is not None:
                 self._waypoint_index.copy_(
                     raw_starts.to(device=self.device, dtype=torch.long).clamp(
-                        min=0, max=self._waypoints.shape[0] - 1))
+                        min=0, max=self._waypoints.shape[0]))
+            raw_phases = getattr(env, "_sculptor_event_phase_start", None)
+            if self.event_sequence_id and raw_phases is not None:
+                self.event_phase.copy_(
+                    raw_phases.to(device=self.device, dtype=torch.long).clamp(
+                        min=0, max=2))
 
         def _resample_command(self, env_ids: Any) -> None:
             # The configured timer exceeds the episode horizon, so this path is
@@ -490,7 +601,37 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             else:
                 self._waypoint_index[env_ids] = raw_starts[env_ids].to(
                     device=self.device, dtype=torch.long).clamp(
-                        min=0, max=self._waypoints.shape[0] - 1)
+                        min=0, max=self._waypoints.shape[0])
+            raw_phases = getattr(
+                self._env, "_sculptor_event_phase_start", None)
+            if not self.event_sequence_id or raw_phases is None:
+                self.event_phase[env_ids] = 0
+            else:
+                self.event_phase[env_ids] = raw_phases[env_ids].to(
+                    device=self.device, dtype=torch.long).clamp(min=0, max=2)
+            self._event_phase_height_anchor[env_ids] = float("nan")
+            self._event_takeoff_height_anchor[env_ids] = float("nan")
+            self.event_phase_height_delta[env_ids] = 0.0
+            self.event_phase_vertical_velocity[env_ids] = 0.0
+            self.event_sequence_violation[env_ids] = False
+            self.event_support_contacts[env_ids] = False
+            self._event_air_elapsed_s[env_ids] = 0.0
+            self._event_max_height_delta[env_ids] = 0.0
+            self._event_asymmetric_elapsed_s[env_ids] = 0.0
+            self._event_asymmetric_max_height[env_ids] = 0.0
+            self._event_flight_seen[env_ids] = False
+            self._event_support_seen[env_ids] = False
+            self._event_route_support_seen[env_ids] = False
+            self._event_route_support_height[env_ids] = float("nan")
+            self._event_route_air_active[env_ids] = False
+            self._event_route_air_elapsed_s[env_ids] = 0.0
+            self._event_route_air_max_height[env_ids] = 0.0
+            self._event_hold_support_seen[env_ids] = False
+            self._event_hold_support_height[env_ids] = float("nan")
+            self._event_hold_air_elapsed_s[env_ids] = 0.0
+            self._event_hold_air_max_height[env_ids] = 0.0
+            self._event_hold_asymmetric_elapsed_s[env_ids] = 0.0
+            self._event_hold_asymmetric_max_height[env_ids] = 0.0
             self._clearance_stage_complete[env_ids] = False
             self._clearance_followthrough_pending[env_ids] = False
             self._clearance_followthrough_index[env_ids] = 0
@@ -502,8 +643,37 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             self.is_world_env[env_ids] = False
             self.is_forward_env[env_ids] = False
 
+        def _event_support_contacts(self) -> Any:
+            if not self.event_sequence_id:
+                return None
+            contacts: list[Any] = []
+            for sensor_name in self.cfg.event_support_sensor_names:
+                try:
+                    found = self._env.scene[sensor_name].data.found
+                except (KeyError, TypeError, AttributeError) as exc:
+                    raise WorldCompileError(
+                        f"event support sensor is absent: {sensor_name}"
+                    ) from exc
+                if found.ndim > 1:
+                    found = torch.any(
+                        found > 0,
+                        dim=tuple(range(1, found.ndim)),
+                    )
+                contacts.append(found.to(device=self.device, dtype=torch.bool))
+            if len(contacts) != 2:
+                raise WorldCompileError(
+                    "bilateral support cycle requires exactly two sensors")
+            return torch.stack(contacts, dim=-1)
+
         def _update_command(self) -> None:
             root_pos = self.robot.data.root_link_pos_w
+            root_height = root_pos[:, 2].to(dtype=torch.float32)
+            missing_anchor = torch.isnan(self._event_phase_height_anchor)
+            self._event_phase_height_anchor = torch.where(
+                missing_anchor,
+                root_height,
+                self._event_phase_height_anchor,
+            )
             raw_origins = getattr(self._env.scene, "env_origins", None)
             origins = (
                 torch.zeros_like(root_pos)
@@ -587,6 +757,311 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             )
             route_complete = (
                 self._waypoint_index >= self._waypoints.shape[0])
+            if self.event_sequence_id:
+                previous_phase = self.event_phase.clone()
+                entering_jump = (self.event_phase == 0) & route_complete
+                self.event_phase = torch.where(
+                    entering_jump,
+                    torch.ones_like(self.event_phase),
+                    self.event_phase,
+                )
+                self._event_phase_height_anchor = torch.where(
+                    entering_jump,
+                    root_height,
+                    self._event_phase_height_anchor,
+                )
+                self._event_max_height_delta = torch.where(
+                    entering_jump,
+                    torch.zeros_like(self._event_max_height_delta),
+                    self._event_max_height_delta,
+                )
+                support = self._event_support_contacts()
+                if support is None:  # defensive; schema requires two sensors
+                    raise WorldCompileError(
+                        "event sequence has no support-contact state")
+                self.event_support_contacts.copy_(support)
+                in_jump = self.event_phase == 1
+                bilateral_air = ~torch.any(support, dim=-1)
+                bilateral_support = torch.all(support, dim=-1)
+                asymmetric_support = (
+                    torch.any(support, dim=-1) & ~bilateral_support
+                )
+                was_route = previous_phase == 0
+                self._event_route_support_seen |= (
+                    was_route & bilateral_support
+                )
+                route_support = was_route & bilateral_support
+                self._event_route_support_height = torch.where(
+                    route_support,
+                    root_height,
+                    self._event_route_support_height,
+                )
+                route_air_begins = (
+                    was_route & ~route_complete
+                    & self._event_route_support_seen & bilateral_air
+                )
+                self._event_route_air_active = torch.where(
+                    bilateral_air,
+                    self._event_route_air_active | route_air_begins,
+                    torch.zeros_like(self._event_route_air_active),
+                )
+                route_air_evidence = (
+                    self._event_route_air_active
+                    & bilateral_air
+                    & torch.isfinite(self._event_route_support_height)
+                )
+                self._event_route_air_elapsed_s = torch.where(
+                    route_air_evidence,
+                    self._event_route_air_elapsed_s
+                    + float(self._env.step_dt),
+                    torch.zeros_like(self._event_route_air_elapsed_s),
+                )
+                self._event_route_air_max_height = torch.where(
+                    route_air_evidence,
+                    torch.maximum(
+                        self._event_route_air_max_height,
+                        root_height - self._event_route_support_height,
+                    ),
+                    torch.zeros_like(self._event_route_air_max_height),
+                )
+                # A reset/contact flicker or running flight blip is not a jump.
+                # Early-jump invalidation requires the same persistent flight
+                # and phase-relative apex evidence as the admitted JUMP event.
+                early_jump = (
+                    route_air_evidence
+                    & (
+                        self._event_route_air_elapsed_s + 1e-7
+                        >= float(self.cfg.event_min_air_time_s)
+                    )
+                    & (
+                        self._event_route_air_max_height + 1e-7
+                        >= float(self.cfg.event_min_height_delta_m)
+                    )
+                )
+                self._event_support_seen |= in_jump & bilateral_support
+                interval_qualified = (
+                    in_jump
+                    & self._event_flight_seen
+                    & (
+                        self._event_max_height_delta + 1e-7
+                        >= float(self.cfg.event_min_height_delta_m)
+                    )
+                )
+                reset_unqualified_interval = (
+                    in_jump & ~bilateral_air & ~interval_qualified
+                )
+                # Air time and apex must belong to one continuous bilateral
+                # flight.  Discard an incomplete interval on support return so
+                # a brief high hop and a later long shallow hop cannot combine
+                # their independent evidence into a successful jump.
+                self._event_air_elapsed_s = torch.where(
+                    reset_unqualified_interval,
+                    torch.zeros_like(self._event_air_elapsed_s),
+                    self._event_air_elapsed_s,
+                )
+                self._event_flight_seen = torch.where(
+                    reset_unqualified_interval,
+                    torch.zeros_like(self._event_flight_seen),
+                    self._event_flight_seen,
+                )
+                self._event_max_height_delta = torch.where(
+                    reset_unqualified_interval,
+                    torch.zeros_like(self._event_max_height_delta),
+                    self._event_max_height_delta,
+                )
+                # Latch the last bilateral-support height before the admitted
+                # flight.  Route completion can occur in a crouch, so the
+                # route/JUMP boundary height is not a valid jump baseline.
+                takeoff_support = (
+                    in_jump
+                    & bilateral_support
+                    & ~self._event_flight_seen
+                )
+                self._event_takeoff_height_anchor = torch.where(
+                    takeoff_support,
+                    root_height,
+                    self._event_takeoff_height_anchor,
+                )
+                self._event_air_elapsed_s = torch.where(
+                    in_jump & self._event_support_seen & bilateral_air,
+                    self._event_air_elapsed_s + float(self._env.step_dt),
+                    torch.zeros_like(self._event_air_elapsed_s),
+                )
+                self._event_flight_seen |= (
+                    in_jump
+                    & self._event_support_seen
+                    & (
+                        self._event_air_elapsed_s + 1e-7
+                        >= float(self.cfg.event_min_air_time_s)
+                    )
+                )
+                has_takeoff_anchor = torch.isfinite(
+                    self._event_takeoff_height_anchor)
+                phase_height_delta = torch.where(
+                    has_takeoff_anchor,
+                    root_height - self._event_takeoff_height_anchor,
+                    torch.zeros_like(root_height),
+                )
+                self.event_phase_height_delta = phase_height_delta
+                # Apex evidence is a property of the admitted bilateral
+                # flight relative to the final supported takeoff height, not
+                # of standing taller after entering JUMP.  Accumulating from
+                # the route-completion height would let a squat-to-stand
+                # followed by a low hop satisfy the jump predicate.
+                admitted_flight_height = (
+                    in_jump
+                    & self._event_support_seen
+                    & bilateral_air
+                    & has_takeoff_anchor
+                )
+                self._event_max_height_delta = torch.where(
+                    admitted_flight_height,
+                    torch.maximum(
+                        self._event_max_height_delta,
+                        phase_height_delta,
+                    ),
+                    self._event_max_height_delta,
+                )
+                asymmetric_attempt = (
+                    in_jump
+                    & self._event_support_seen
+                    & asymmetric_support
+                )
+                self._event_asymmetric_elapsed_s = torch.where(
+                    asymmetric_attempt,
+                    self._event_asymmetric_elapsed_s
+                    + float(self._env.step_dt),
+                    torch.zeros_like(self._event_asymmetric_elapsed_s),
+                )
+                self._event_asymmetric_max_height = torch.where(
+                    asymmetric_attempt,
+                    torch.maximum(
+                        self._event_asymmetric_max_height,
+                        phase_height_delta,
+                    ),
+                    torch.zeros_like(self._event_asymmetric_max_height),
+                )
+                # Contact sensors routinely disagree for one or two frames at
+                # an otherwise bilateral takeoff.  A one-foot attempt is
+                # therefore evidence-qualified: asymmetric-only support loss
+                # must itself last the admitted flight duration and reach the
+                # admitted apex. This applies both before takeoff and after a
+                # bilateral flight so a sustained unilateral touchdown/rehop
+                # cannot be laundered into a valid bilateral landing.
+                one_foot_jump = (
+                    asymmetric_attempt
+                    & (
+                        self._event_asymmetric_elapsed_s + 1e-7
+                        >= float(self.cfg.event_min_air_time_s)
+                    )
+                    & (
+                        self._event_asymmetric_max_height + 1e-7
+                        >= float(self.cfg.event_min_height_delta_m)
+                    )
+                )
+                entering_hold = (
+                    in_jump
+                    & ~self.event_sequence_violation
+                    & self._event_flight_seen
+                    & bilateral_support
+                    & (
+                        self._event_max_height_delta + 1e-7
+                        >= float(self.cfg.event_min_height_delta_m)
+                    )
+                )
+                self.event_phase = torch.where(
+                    entering_hold,
+                    torch.full_like(self.event_phase, 2),
+                    self.event_phase,
+                )
+                in_hold = self.event_phase == 2
+                self._event_hold_support_seen |= in_hold & bilateral_support
+                self._event_hold_support_height = torch.where(
+                    in_hold & bilateral_support,
+                    root_height,
+                    self._event_hold_support_height,
+                )
+                hold_air_evidence = (
+                    in_hold
+                    & self._event_hold_support_seen
+                    & bilateral_air
+                    & torch.isfinite(self._event_hold_support_height)
+                )
+                self._event_hold_air_elapsed_s = torch.where(
+                    hold_air_evidence,
+                    self._event_hold_air_elapsed_s
+                    + float(self._env.step_dt),
+                    torch.zeros_like(self._event_hold_air_elapsed_s),
+                )
+                self._event_hold_air_max_height = torch.where(
+                    hold_air_evidence,
+                    torch.maximum(
+                        self._event_hold_air_max_height,
+                        root_height - self._event_hold_support_height,
+                    ),
+                    torch.zeros_like(self._event_hold_air_max_height),
+                )
+                hold_asymmetric_evidence = (
+                    in_hold
+                    & self._event_hold_support_seen
+                    & asymmetric_support
+                    & torch.isfinite(self._event_hold_support_height)
+                )
+                self._event_hold_asymmetric_elapsed_s = torch.where(
+                    hold_asymmetric_evidence,
+                    self._event_hold_asymmetric_elapsed_s
+                    + float(self._env.step_dt),
+                    torch.zeros_like(
+                        self._event_hold_asymmetric_elapsed_s),
+                )
+                self._event_hold_asymmetric_max_height = torch.where(
+                    hold_asymmetric_evidence,
+                    torch.maximum(
+                        self._event_hold_asymmetric_max_height,
+                        root_height - self._event_hold_support_height,
+                    ),
+                    torch.zeros_like(
+                        self._event_hold_asymmetric_max_height),
+                )
+                repeated_bilateral_jump = (
+                    hold_air_evidence
+                    & (
+                        self._event_hold_air_elapsed_s + 1e-7
+                        >= float(self.cfg.event_min_air_time_s)
+                    )
+                    & (
+                        self._event_hold_air_max_height + 1e-7
+                        >= float(self.cfg.event_min_height_delta_m)
+                    )
+                )
+                repeated_one_foot_jump = (
+                    hold_asymmetric_evidence
+                    & (
+                        self._event_hold_asymmetric_elapsed_s + 1e-7
+                        >= float(self.cfg.event_min_air_time_s)
+                    )
+                    & (
+                        self._event_hold_asymmetric_max_height + 1e-7
+                        >= float(self.cfg.event_min_height_delta_m)
+                    )
+                )
+                # HOLD is terminal and one-shot.  After bilateral landing, a
+                # second bilateral or one-foot attempt must independently meet
+                # the admitted flight-duration and apex evidence thresholds;
+                # brief landing/contact skew remains harmless.
+                repeated_jump = (
+                    repeated_bilateral_jump | repeated_one_foot_jump
+                )
+                self.event_sequence_violation |= (
+                    early_jump | one_foot_jump | repeated_jump
+                )
+                lin_vel_w = getattr(
+                    self.robot.data, "root_link_lin_vel_w", None)
+                if lin_vel_w is None:
+                    raise WorldCompileError(
+                        "event sequence requires world-frame root velocity")
+                self.event_phase_vertical_velocity = lin_vel_w[:, 2].to(
+                    device=self.device, dtype=torch.float32)
 
             followthrough_index = torch.clamp(
                 self._clearance_followthrough_index, max=last)
@@ -782,7 +1257,13 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             # dwell instead of losing part of its training window.  Consumers
             # that only use the command tensor remain unchanged; zero velocity
             # still waits for command_complete.
-            self.is_standing_env[:] = route_complete
+            if self.event_sequence_id:
+                self.is_standing_env[:] = (
+                    (self.event_phase == 2)
+                    & ~self.event_sequence_violation
+                )
+            else:
+                self.is_standing_env[:] = route_complete
 
     @dataclass(kw_only=True)
     class WaypointVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -806,6 +1287,10 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         terminal_stop_at_predicate_boundary: bool = False
         turn_gain: float = 2.0
         max_yaw_rate: float = 1.5
+        event_sequence_id: str = ""
+        event_support_sensor_names: tuple[str, ...] = ()
+        event_min_air_time_s: float = 0.06
+        event_min_height_delta_m: float = 0.18
 
         def build(self, env: Any) -> WaypointVelocityCommand:
             return WaypointVelocityCommand(self, env)
@@ -1374,6 +1859,30 @@ def compile_task_runtime(
                 selectors=(str(pair[0]), str(pair[1])),
                 resolved=(primary_meta, secondary_meta)))
 
+    event_sequence = task["shared"].get("event_sequence")
+    if isinstance(event_sequence, Mapping):
+        jump_until = event_sequence["phases"][1]["until"]
+        for index, pair in enumerate(jump_until["support_contacts"]):
+            primary, primary_meta = _contact_match(pair[0], world, robot)
+            secondary, secondary_meta = _contact_match(pair[1], world, robot)
+            name = (
+                f"authored_event__{event_sequence['id']}__support__{index}"
+            )
+            sensors.append(ContactSensorCfg(
+                name=name,
+                primary=primary,
+                secondary=secondary,
+                fields=("found", "force", "dist"),
+                reduce="maxforce",
+                secondary_policy="first",
+            ))
+            contacts.append(RuntimeContactBinding(
+                sensor_name=name,
+                group="event_support",
+                selectors=(str(pair[0]), str(pair[1])),
+                resolved=(primary_meta, secondary_meta),
+            ))
+
     observations = copy.deepcopy(task["shared"].get("observations", {}))
     terrain_kind = world["shared"]["terrain"]["kind"]
     height_scan = observations.get("height_scan", "auto")
@@ -1403,6 +1912,7 @@ def compile_task_runtime(
         "object_relative": list(observations.get("object_relative", ())),
         "region_relative": list(observations.get("region_relative", ())),
         "end_effector_relative": end_effectors,
+        "event_sequence": copy.deepcopy(event_sequence),
     }
     reset_bindings = tuple(copy.deepcopy(
         task.get("train", {}).get("goal_sampling", ())))
@@ -2144,6 +2654,7 @@ def reset_robot_along_waypoint_route(
     lateral_jitter_m: float,
     support_boxes_m: tuple[tuple[float, ...], ...] = (),
     asset_name: str = "robot",
+    event_phase_sampling: tuple[float, float, float] = (1.0, 0.0, 0.0),
 ) -> None:
     """Train-only route RSI in the same local frame as authored geometry.
 
@@ -2175,13 +2686,88 @@ def reset_robot_along_waypoint_route(
             int(env.num_envs), device=env.device, dtype=torch.long)
         env._sculptor_waypoint_start_index = starts
     starts[env_ids] = 0
+    phase_starts = getattr(env, "_sculptor_event_phase_start", None)
+    if phase_starts is None or tuple(phase_starts.shape) != (
+            int(env.num_envs),):
+        phase_starts = torch.zeros(
+            int(env.num_envs), device=env.device, dtype=torch.long)
+        env._sculptor_event_phase_start = phase_starts
+    phase_starts[env_ids] = 0
 
     points = torch.as_tensor(
         waypoints_m, device=env.device, dtype=torch.float32)
     if points.shape[0] <= 1 or env_ids.numel() == 0:
         return
+    phase_probabilities = torch.as_tensor(
+        event_phase_sampling, device=env.device, dtype=torch.float32)
+    if tuple(phase_probabilities.shape) != (3,):
+        raise WorldCompileError(
+            "event phase sampling must contain route, jump, hold")
+    if torch.any(phase_probabilities < 0.0) or not torch.isclose(
+            phase_probabilities.sum(), torch.tensor(1.0, device=env.device),
+            atol=1e-6, rtol=0.0):
+        raise WorldCompileError(
+            "event phase sampling must be non-negative and sum to one")
+    if tuple(float(value) for value in event_phase_sampling) == (
+        1.0, 0.0, 0.0
+    ):
+        # Preserve the legacy waypoint-RSI random stream exactly.  Drawing a
+        # phase sample for a route-only task shifts every subsequent reset and
+        # makes an unrelated optional feature change training reproducibility.
+        sampled_phases = torch.zeros(
+            env_ids.numel(), device=env.device, dtype=torch.long)
+    else:
+        phase_draw = torch.rand(env_ids.numel(), device=env.device)
+        jump_boundary = phase_probabilities[0]
+        hold_boundary = jump_boundary + phase_probabilities[1]
+        sampled_phases = torch.where(
+            phase_draw < jump_boundary,
+            torch.zeros_like(phase_draw, dtype=torch.long),
+            torch.where(
+                phase_draw < hold_boundary,
+                torch.ones_like(phase_draw, dtype=torch.long),
+                torch.full_like(phase_draw, 2, dtype=torch.long),
+            ),
+        )
+    phase_starts[env_ids] = sampled_phases
+    terminal_env_ids = env_ids[sampled_phases > 0]
+    if terminal_env_ids.numel() > 0:
+        robot = env.scene[asset_name]
+        if bool(getattr(robot, "is_fixed_base", False)):
+            starts[terminal_env_ids] = 0
+            phase_starts[terminal_env_ids] = 0
+        else:
+            terminal_local_xy = points[-1, :2].expand(
+                terminal_env_ids.numel(), -1).clone()
+            if lateral_jitter_m > 0.0:
+                terminal_local_xy[:, 1] += (
+                    2.0 * torch.rand(
+                        terminal_env_ids.numel(), device=env.device) - 1.0
+                ) * min(float(lateral_jitter_m), 0.05)
+            root_state = robot.data.default_root_state[
+                terminal_env_ids].clone()
+            root_state[:, :2] = (
+                terminal_local_xy
+                + env.scene.env_origins[terminal_env_ids, :2]
+            )
+            root_state[:, 2] = root_state[:, 2] + _surface_height_at(
+                terminal_local_xy, support_boxes_m)
+            terminal_direction = points[-1, :2] - points[-2, :2]
+            terminal_yaw = torch.atan2(
+                terminal_direction[1], terminal_direction[0])
+            yaw = terminal_yaw.expand(terminal_env_ids.numel())
+            zeros = torch.zeros_like(yaw)
+            root_state[:, 3:7] = quat_mul(
+                root_state[:, 3:7],
+                quat_from_euler_xyz(zeros, zeros, yaw),
+            )
+            root_state[:, 7:13] = 0.0
+            starts[terminal_env_ids] = points.shape[0]
+            robot.write_root_state_to_sim(
+                root_state, env_ids=terminal_env_ids)
     use_midroute = torch.rand(
         env_ids.numel(), device=env.device) < float(midroute_probability)
+    use_midroute &= sampled_phases == 0
     selected_env_ids = env_ids[use_midroute]
     if selected_env_ids.numel() == 0:
         return
@@ -2614,6 +3200,7 @@ def _reconcile_waypoint_course(
     *,
     train: bool,
     robot: RobotCapability | None = None,
+    task_train: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
     """Align resets and velocity commands with an authored waypoint course.
 
@@ -2655,6 +3242,25 @@ def _reconcile_waypoint_course(
         goal_tolerance = 0.25
     termination = manifest.task_shared.get("termination", {})
     success = goal.get("success", {})
+    event_sequence = manifest.task_shared.get("event_sequence")
+    event_sequence = (
+        event_sequence if isinstance(event_sequence, Mapping) else None
+    )
+    event_sequence_id = (
+        str(event_sequence["id"]) if event_sequence is not None else ""
+    )
+    event_support_sensor_names: tuple[str, ...] = ()
+    event_min_air_time_s = 0.06
+    event_min_height_delta_m = 0.18
+    if event_sequence is not None:
+        jump_until = event_sequence["phases"][1]["until"]
+        event_support_sensor_names = tuple(
+            f"authored_event__{event_sequence_id}__support__{index}"
+            for index, _pair in enumerate(jump_until["support_contacts"])
+        )
+        event_min_air_time_s = float(jump_until["min_air_time_s"])
+        event_min_height_delta_m = float(
+            jump_until["min_height_delta_m"])
     try:
         episode_length_s = float(
             termination.get("episode_length_s", 20.0))
@@ -2664,6 +3270,13 @@ def _reconcile_waypoint_course(
         hold_s = float(success.get("hold_s", 0.0))
     except (AttributeError, TypeError, ValueError):
         hold_s = 0.0
+    event_hold_s = (
+        float(event_sequence["phases"][2]["minimum_hold_s"])
+        if event_sequence is not None
+        else 0.0
+    )
+    terminal_hold_s = max(hold_s, event_hold_s)
+    has_terminal_objective = terminal_hold_s > 0.0
     clearance_stage_outside_margin_m = 0.10
     clearance_transition_slack_m = 0.025
     terminal_retention_depth_m = min(0.10, 0.5 * goal_tolerance)
@@ -2718,14 +3331,31 @@ def _reconcile_waypoint_course(
         if train:
             from mjlab.managers.event_manager import EventTermCfg
 
+            raw_phase_sampling = (
+                dict((task_train or {}).get("event_phase_sampling", {}))
+                if event_sequence is not None
+                else {}
+            )
+            event_phase_sampling = (
+                (
+                    float(raw_phase_sampling["route"]),
+                    float(raw_phase_sampling["jump"]),
+                    float(raw_phase_sampling["hold"]),
+                )
+                if raw_phase_sampling
+                else (1.0, 0.0, 0.0)
+            )
+
             events["world_route_state_initialization"] = EventTermCfg(
                 mode="reset",
                 func=reset_robot_along_waypoint_route,
                 params={
                     "waypoints_m": staging_waypoints,
-                    "midroute_probability": 0.5,
+                    "midroute_probability": (
+                        0.0 if event_sequence is not None else 0.5
+                    ),
                     "terminal_fraction_within_midroute": (
-                        0.5 if hold_s > 0.0 else 0.0
+                        0.5 if has_terminal_objective else 0.0
                     ),
                     "approach_distance_m": (0.25, 0.55),
                     "lateral_jitter_m": 0.12,
@@ -2740,9 +3370,18 @@ def _reconcile_waypoint_course(
                         for primitive in manifest.course
                     ),
                     "asset_name": "robot",
+                    "event_phase_sampling": event_phase_sampling,
                 },
             )
-            if hold_s > 0.0:
+            if event_sequence is not None:
+                adjustments.append(
+                    "event:world_route_state_initialization→"
+                    f"{100 * event_phase_sampling[0]:g}% full route / "
+                    f"{100 * event_phase_sampling[1]:g}% prelaunch / "
+                    f"{100 * event_phase_sampling[2]:g}% postlanding hold "
+                    "starts (train only; evaluation always ROUTE)"
+                )
+            elif has_terminal_objective:
                 adjustments.append(
                     "event:world_route_state_initialization→50% entrance / "
                     "25% collision-local interior / 25% terminal-approach "
@@ -2778,7 +3417,7 @@ def _reconcile_waypoint_course(
                     predicate_waypoints,
                     clearance_staging_shifts,
                     episode_length_s=episode_length_s,
-                    hold_s=hold_s,
+                    hold_s=terminal_hold_s,
                     max_speed_mps=linear_command_cap_mps,
                 )
             )
@@ -2793,7 +3432,7 @@ def _reconcile_waypoint_course(
                     cruise_speed_mps=cruise_speed_mps,
                     command_segment_count=command_segment_count,
                 )
-                if hold_s > 0.0
+                if has_terminal_objective
                 else 2.0
             )
             terminal_entry_speed_mps = 0.10
@@ -2828,12 +3467,16 @@ def _reconcile_waypoint_course(
                         terminal_entry_speed_mps
                         / max(cruise_speed_mps, 1e-6),
                     )
-                    if hold_s > 0.0
+                    if has_terminal_objective
                     else 0.35
                 ),
                 terminal_retention_radius_m=(
                     terminal_retention_radius_m),
-                terminal_stop_at_predicate_boundary=hold_s > 0.0,
+                terminal_stop_at_predicate_boundary=has_terminal_objective,
+                event_sequence_id=event_sequence_id,
+                event_support_sensor_names=event_support_sensor_names,
+                event_min_air_time_s=event_min_air_time_s,
+                event_min_height_delta_m=event_min_height_delta_m,
             )
             adjustments.append(
                 f"command:{name}→goal-conditioned waypoint traversal "
@@ -2843,9 +3486,9 @@ def _reconcile_waypoint_course(
                 f"{cruise_speed_mps:.3f} m/s for {path_length_m:.3f} m "
                 f"command path in {traversal_window_s:.3f} s traversal "
                 f"window (episode {episode_length_s:.3f} s, terminal hold "
-                f"{hold_s:.3f} s, command cap "
+                f"{terminal_hold_s:.3f} s, command cap "
                 f"{linear_command_cap_mps:.3f} m/s)")
-            if hold_s > 0.0:
+            if has_terminal_objective:
                 adjustments.append(
                     f"command:{name}→terminal boundary braking "
                     f"(entry command ≤{terminal_entry_speed_mps:.3f} m/s, "
@@ -2853,6 +3496,15 @@ def _reconcile_waypoint_course(
                     f"constant-deceleration span) then "
                     f"{terminal_retention_depth_m:.3f} m in-disk retention "
                     "before standing"
+                )
+            if event_sequence is not None:
+                adjustments.append(
+                    f"command:{name}→event sequence {event_sequence_id} "
+                    "ROUTE→JUMP on authoritative goal completion, then "
+                    "JUMP→HOLD after support→bilateral flight→support "
+                    f"({event_min_air_time_s:.3f} s minimum flight, "
+                    f"{event_min_height_delta_m:.3f} m minimum phase-relative "
+                    "root-height apex)"
                 )
 
     curriculum = getattr(env_cfg, "curriculum", None)
@@ -2998,7 +3650,12 @@ def apply_world_selection(
         *_reconcile_constraint_budget(env_cfg),
         *_reconcile_terrain_curriculum(env_cfg),
         *_reconcile_waypoint_course(
-            env_cfg, manifest, train=train, robot=robot),
+            env_cfg,
+            manifest,
+            train=train,
+            robot=robot,
+            task_train=task.get("train", {}),
+        ),
         *(f"physical scene alignment → {msg}"
           for msg in object_placement_applied),
         *(f"per-episode domain randomization → {msg}"

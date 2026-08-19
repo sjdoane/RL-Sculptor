@@ -894,10 +894,24 @@ def _authored_terminal_hold_s(world_bundle: Any | None) -> float:
     task_shared = getattr(manifest, "task_shared", {})
     goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
     success = goal.get("success", {}) if isinstance(goal, Mapping) else {}
+    event_sequence = (
+        task_shared.get("event_sequence")
+        if isinstance(task_shared, Mapping)
+        else None
+    )
     try:
         hold_s = float(success.get("hold_s", 0.0))
     except (TypeError, ValueError):
-        return 0.0
+        hold_s = 0.0
+    if isinstance(event_sequence, Mapping):
+        try:
+            phases = event_sequence["phases"]
+            hold_s = max(
+                hold_s,
+                float(phases[2]["minimum_hold_s"]),
+            )
+        except (KeyError, IndexError, TypeError, ValueError):
+            return 0.0
     return hold_s if hold_s > 0.0 else 0.0
 
 
@@ -1172,6 +1186,29 @@ def _authored_terminal_stillness_state(
         try:
             term = manager.get_term(name)
         except (KeyError, AttributeError):
+            continue
+        event_sequence_id = getattr(term, "event_sequence_id", "")
+        event_phase = getattr(term, "event_phase", None)
+        if event_sequence_id:
+            # Event-authored tasks earn terminal supervision only in their
+            # immutable HOLD phase.  Do not trust a generic standing flag for
+            # this path: it may also be true during route-retention command
+            # completion, which is intentionally distinct from phase truth.
+            violation = getattr(term, "event_sequence_violation", None)
+            if (
+                not torch.is_tensor(event_phase)
+                or tuple(event_phase.shape) != tuple(standing.shape)
+                or not torch.is_tensor(violation)
+                or tuple(violation.shape) != tuple(standing.shape)
+            ):
+                raise RuntimeError(
+                    "event terminal stillness requires shape-validated "
+                    "phase and sequence-violation truth"
+                )
+            standing |= (
+                (event_phase.to(device=env.device, dtype=torch.long) == 2)
+                & ~violation.to(device=env.device, dtype=torch.bool)
+            )
             continue
         flag = getattr(term, "is_standing_env", None)
         if flag is not None and tuple(flag.shape) == tuple(standing.shape):
@@ -2438,6 +2475,503 @@ def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
     return handle
 
 
+def _event_observation_extension_width(world_bundle: Any | None) -> int:
+    """Width of the manifest-declared event phase observation, or zero."""
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    event_sequence = (
+        task_shared.get("event_sequence")
+        if isinstance(task_shared, Mapping)
+        else None
+    )
+    phases = (
+        event_sequence.get("phases")
+        if isinstance(event_sequence, Mapping)
+        else None
+    )
+    return len(phases) if isinstance(phases, list) else 0
+
+
+def _zero_extend_observation_state_dict(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    extension_width: int,
+    role: str,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Explicitly migrate one feed-forward observation interface.
+
+    Only the first MLP input columns and matching normalizer vectors may grow,
+    and only by the manifest-declared event observation width.  Every key and
+    every other tensor shape remains exact.  New network columns are zero, so
+    the inherited policy is behaviorally identical until PPO learns to consume
+    the phase; normalizer defaults are mean=0, std/variance=1.
+    """
+    import torch
+
+    if extension_width <= 0:
+        raise RuntimeError("observation extension width must be positive")
+    if set(source) != set(target):
+        raise RuntimeError(
+            f"{role} checkpoint keys differ from the effective policy contract"
+        )
+    adapted = dict(source)
+    changed: list[str] = []
+    input_key = "mlp.0.weight"
+    normalizer_padding = {
+        "obs_normalizer._mean": 0.0,
+        "obs_normalizer._std": 1.0,
+        "obs_normalizer._var": 1.0,
+    }
+    for key in source:
+        source_value = source[key]
+        target_value = target[key]
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        if source_shape == target_shape:
+            continue
+        if key == input_key and (
+            len(source_shape) == 2
+            and len(target_shape) == 2
+            and source_shape[0] == target_shape[0]
+            and target_shape[1] == source_shape[1] + extension_width
+        ):
+            padding = torch.zeros(
+                (source_shape[0], extension_width),
+                device=source_value.device,
+                dtype=source_value.dtype,
+            )
+            adapted[key] = torch.cat((source_value, padding), dim=1)
+            changed.append(key)
+            continue
+        if key in normalizer_padding and (
+            len(source_shape) in (1, 2)
+            and len(target_shape) == len(source_shape)
+            and source_shape[:-1] == target_shape[:-1]
+            and target_shape[-1] == source_shape[-1] + extension_width
+        ):
+            padding_shape = source_shape[:-1] + (extension_width,)
+            padding = torch.full(
+                padding_shape,
+                normalizer_padding[key],
+                device=source_value.device,
+                dtype=source_value.dtype,
+            )
+            adapted[key] = torch.cat((source_value, padding), dim=-1)
+            changed.append(key)
+            continue
+        raise RuntimeError(
+            f"{role} tensor {key!r} shape {source_shape} cannot satisfy "
+            f"effective target shape {target_shape}"
+        )
+    if input_key not in changed:
+        raise RuntimeError(
+            f"{role} warm start did not require the declared "
+            f"{extension_width}-column event observation extension"
+        )
+    for key, value in adapted.items():
+        if tuple(getattr(value, "shape", ())) != tuple(
+                getattr(target[key], "shape", ())):
+            raise RuntimeError(
+                f"{role} adapted tensor {key!r} still violates target shape"
+            )
+    return adapted, tuple(changed)
+
+
+def _prepare_event_observation_warm_start(
+    runner: Any,
+    checkpoint: Path,
+    *,
+    output_dir: Path,
+    extension_width: int,
+    load_role: str,
+) -> tuple[Path, dict[str, Any]]:
+    """Materialize and hash a provenance-bearing compatible checkpoint."""
+    import hashlib
+    import torch
+
+    loaded = torch.load(checkpoint, weights_only=False, map_location="cpu")
+    if not isinstance(loaded, dict):
+        raise RuntimeError("warm-start checkpoint is not a state dictionary")
+    algorithm = getattr(runner, "alg", None)
+    role_models = {
+        "actor": getattr(algorithm, "actor", None),
+        "critic": getattr(algorithm, "critic", None),
+    }
+    requested_roles = (
+        ("actor",) if load_role == "actor_only" else ("actor", "critic")
+    )
+    needs_extension: list[bool] = []
+    for role in requested_roles:
+        model = role_models[role]
+        source_state = loaded.get(f"{role}_state_dict")
+        if model is None or not isinstance(source_state, Mapping):
+            raise RuntimeError(f"checkpoint/runner has no {role} state")
+        source_input = source_state.get("mlp.0.weight")
+        target_input = model.state_dict().get("mlp.0.weight")
+        source_shape = tuple(getattr(source_input, "shape", ()))
+        target_shape = tuple(getattr(target_input, "shape", ()))
+        needs_extension.append(source_shape != target_shape)
+    if not any(needs_extension):
+        for role in requested_roles:
+            source_state = loaded[f"{role}_state_dict"]
+            target_state = role_models[role].state_dict()
+            if set(source_state) != set(target_state) or any(
+                tuple(getattr(source_state[key], "shape", ()))
+                != tuple(getattr(target_state[key], "shape", ()))
+                for key in source_state
+            ):
+                raise RuntimeError(
+                    f"{role} differs from the effective event policy contract"
+                )
+        return checkpoint, {
+            "adapted": False,
+            "extension_width": int(extension_width),
+            "observation_term": "authored_event_phase",
+        }
+    if not all(needs_extension):
+        raise RuntimeError(
+            "actor and critic disagree about the event observation extension"
+        )
+    adapted_checkpoint = dict(loaded)
+    changed: dict[str, list[str]] = {}
+    for role in requested_roles:
+        model = role_models[role]
+        if model is None:
+            raise RuntimeError(f"runner has no {role} model")
+        state_key = f"{role}_state_dict"
+        source_state = loaded.get(state_key)
+        if not isinstance(source_state, Mapping):
+            raise RuntimeError(f"checkpoint has no {state_key}")
+        adapted_state, changed_keys = _zero_extend_observation_state_dict(
+            source_state,
+            model.state_dict(),
+            extension_width=extension_width,
+            role=role,
+        )
+        adapted_checkpoint[state_key] = adapted_state
+        changed[role] = list(changed_keys)
+
+    adapted_path = output_dir / "warm_start_event_observation.pt"
+    torch.save(adapted_checkpoint, adapted_path)
+    digest = hashlib.sha256(adapted_path.read_bytes()).hexdigest()
+    return adapted_path, {
+        "adapted": True,
+        "adapted_checkpoint": str(adapted_path),
+        "adapted_checkpoint_sha256": digest,
+        "extension_width": int(extension_width),
+        "observation_term": "authored_event_phase",
+        "padding": {
+            "input_columns": 0.0,
+            "normalizer_mean": 0.0,
+            "normalizer_std": 1.0,
+            "normalizer_variance": 1.0,
+        },
+        "changed_tensors": changed,
+    }
+
+
+def _event_policy_contract_admission_kind(
+    admitted_migration: Mapping[str, Any],
+    effective_contract: Mapping[str, Any],
+    *,
+    extension_width: int,
+) -> str:
+    """Classify the two admitted event warm-start contract relations.
+
+    A schema-3 checkpoint may load directly when its source and target
+    contracts are exact.  A schema-2 checkpoint may cross the event interface
+    boundary only through the one explicit zero-column migration.  Keeping
+    this decision pure makes the remote runner fail closed before inspecting
+    or adapting checkpoint tensors.
+    """
+    expected_migration = {
+        "type": "zero_initialized_event_phase_observation",
+        "from_schema": 2,
+        "to_schema": 3,
+        "observation_term": "authored_event_phase",
+        "extension_width": int(extension_width),
+        "ordered_phase_ids": ["route", "jump", "hold"],
+        "optimizer_resume": False,
+    }
+    if dict(admitted_migration) == expected_migration:
+        return "zero_initialized_event_phase_observation"
+
+    effective_schema = effective_contract.get("schema")
+    expected_exact = {
+        "type": "exact_policy_contract",
+        "from_schema": effective_schema,
+        "to_schema": effective_schema,
+        "optimizer_resume": False,
+    }
+    if dict(admitted_migration) == expected_exact:
+        return "exact_policy_contract"
+
+    raise RuntimeError(
+        "runner received an unrecognized event-observation "
+        "policy-contract migration"
+    )
+
+
+def _attest_warm_start_policy_contract(
+    *,
+    world_selection: str | Path,
+    extension_width: int,
+    source_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Rebuild and attest every UI-pinned warm-start policy contract.
+
+    Contract admission is independent of whether checkpoint tensors need an
+    event-observation extension.  In particular, an exact schema-2 load still
+    has to prove its source receipt, immutable target selection, and declared
+    exact migration before ``runner.load`` sees the checkpoint.
+    """
+    from sculptor.policy_contract import (
+        build_project_policy_contract,
+        contract_fingerprint,
+        policy_contract_migration,
+    )
+
+    pin_names = (
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON",
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256",
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256",
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON",
+    )
+    pins = {name: os.environ.get(name) for name in pin_names}
+    contract_pin_present = any(pins.values())
+    if contract_pin_present and not all(pins.values()):
+        raise RuntimeError("warm-start policy-contract pin is incomplete")
+    if not contract_pin_present and extension_width > 0:
+        raise RuntimeError(
+            "event-interface warm start requires a full immutable source/"
+            "target policy-contract receipt; target-only CLI adaptation is "
+            "not an admitted compatibility proof"
+        )
+    if not contract_pin_present:
+        return {
+            "active": False,
+            "contract_pin_present": False,
+            "effective_contract": None,
+            "effective_contract_sha256": None,
+            "admitted_migration": None,
+            "admitted_contract_receipt": None,
+            "admission_kind": None,
+        }
+
+    selection_path = Path(world_selection).expanduser().resolve()
+    if not selection_path.is_file():
+        raise RuntimeError(
+            "warm-start policy-contract attestation requires the immutable "
+            f"world selection: {selection_path}"
+        )
+    project_dir = selection_path.parent.parent
+    try:
+        actual_contract = build_project_policy_contract(
+            project_dir,
+            world_selection_path=selection_path,
+        )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "failed to rebuild the effective policy contract from the "
+            "immutable world selection"
+        ) from exc
+    actual_contract_sha256 = contract_fingerprint(actual_contract)
+
+    if contract_pin_present:
+        try:
+            effective_contract = json.loads(str(
+                pins["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON"]
+            ))
+            admitted_migration = json.loads(str(
+                pins["SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON"]
+            ))
+            admitted_contract_receipt = json.loads(str(
+                pins[
+                    "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+                ]
+            ))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "warm-start policy-contract pin is invalid JSON"
+            ) from exc
+        if not isinstance(effective_contract, dict) or not isinstance(
+            admitted_migration, dict
+        ):
+            raise RuntimeError(
+                "warm-start policy-contract pin must contain objects"
+            )
+        if (
+            not isinstance(admitted_contract_receipt, dict)
+            or admitted_contract_receipt.get("schema") != 1
+            or not isinstance(admitted_contract_receipt.get("source"), dict)
+            or not isinstance(admitted_contract_receipt.get("target"), dict)
+        ):
+            raise RuntimeError(
+                "warm-start policy-contract receipt is malformed"
+            )
+        pinned_contract_sha256 = str(
+            pins["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256"]
+        )
+        source_contract_sha256 = str(
+            pins["SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256"]
+        )
+        if (
+            contract_fingerprint(effective_contract)
+            != pinned_contract_sha256
+        ):
+            raise RuntimeError(
+                "effective policy-contract JSON disagrees with its "
+                "immutable fingerprint pin"
+            )
+        if (
+            actual_contract != effective_contract
+            or actual_contract_sha256 != pinned_contract_sha256
+        ):
+            raise RuntimeError(
+                "effective policy contract rebuilt from the immutable world "
+                "selection differs from the pre-queue launch pin"
+            )
+        admission_kind = _event_policy_contract_admission_kind(
+            admitted_migration,
+            effective_contract,
+            extension_width=extension_width,
+        )
+        receipt_source = admitted_contract_receipt["source"]
+        receipt_target = admitted_contract_receipt["target"]
+        receipt_source_contract = receipt_source.get("contract")
+        receipt_checkpoint_sha256 = receipt_source.get("checkpoint_sha256")
+        if isinstance(receipt_source_contract, dict):
+            recomputed_migration = policy_contract_migration(
+                receipt_source_contract,
+                actual_contract,
+            )
+            if receipt_source_contract == actual_contract:
+                recomputed_compatibility: dict[str, Any] | None = {
+                    "type": "exact_policy_contract",
+                    "from_schema": receipt_source_contract.get("schema"),
+                    "to_schema": actual_contract.get("schema"),
+                    "optimizer_resume": False,
+                }
+            else:
+                recomputed_compatibility = recomputed_migration
+        else:
+            recomputed_compatibility = None
+        if (
+            not isinstance(receipt_source_contract, dict)
+            or recomputed_compatibility is None
+            or recomputed_compatibility != admitted_migration
+            or contract_fingerprint(receipt_source_contract)
+            != source_contract_sha256
+            or receipt_source.get("contract_sha256")
+            != source_contract_sha256
+            or receipt_target.get("contract") != effective_contract
+            or receipt_target.get("contract_sha256")
+            != actual_contract_sha256
+            or admitted_contract_receipt.get("compatibility")
+            != admitted_migration
+            or (
+                receipt_checkpoint_sha256 is not None
+                and receipt_checkpoint_sha256
+                != source_checkpoint_sha256
+            )
+        ):
+            raise RuntimeError(
+                "warm-start policy-contract receipt disagrees with the "
+                "admitted runner pins or checkpoint"
+            )
+    interface = effective_contract.get("event_observation")
+    interface_phases = (
+        interface.get("ordered_phase_ids")
+        if isinstance(interface, dict)
+        else None
+    )
+    if extension_width > 0:
+        if (
+            interface_phases != ["route", "jump", "hold"]
+            or len(interface_phases) != extension_width
+        ):
+            raise RuntimeError(
+                "effective policy contract lacks the runtime event "
+                "observation interface"
+            )
+    elif interface is not None:
+        raise RuntimeError(
+            "pinned policy contract declares an event observation, but the "
+            "applied runtime world has no event interface"
+        )
+
+    return {
+        "active": True,
+        "contract_pin_present": contract_pin_present,
+        "effective_contract": effective_contract,
+        "effective_contract_sha256": actual_contract_sha256,
+        "source_contract_sha256": source_contract_sha256,
+        "admitted_migration": admitted_migration,
+        "admitted_contract_receipt": admitted_contract_receipt,
+        "admission_kind": admission_kind,
+    }
+
+
+def _warm_start_loaded_receipt(
+    *,
+    requested_source: Path,
+    requested_sha256: str,
+    loaded_checkpoint: Path,
+    loaded_sha256: str,
+    load_cfg: Mapping[str, bool],
+    effective_policy_contract_sha256: str | None,
+    extension_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Earned initialization receipt for the exact bytes runner.load used."""
+    adapted = bool(extension_receipt.get("adapted"))
+    return {
+        "type": "warm_start_loaded",
+        # Backwards-readable aliases keep denoting requested source intent.
+        "source": str(requested_source),
+        "source_sha256": requested_sha256,
+        "source_sha8": requested_sha256[:8],
+        "requested_source": str(requested_source),
+        "requested_source_sha256": requested_sha256,
+        "loaded_checkpoint": str(loaded_checkpoint),
+        "loaded_checkpoint_sha256": loaded_sha256,
+        "loaded_checkpoint_sha8": loaded_sha256[:8],
+        "adapted": adapted,
+        "derived_from": (
+            {
+                "source": str(requested_source),
+                "source_sha256": requested_sha256,
+            }
+            if adapted
+            else None
+        ),
+        "policy_contract_migration": (
+            "zero_initialized_event_phase_observation"
+            if adapted
+            else None
+        ),
+        "effective_policy_contract_sha256": (
+            effective_policy_contract_sha256
+        ),
+        "source_policy_contract_sha256": extension_receipt.get(
+            "source_policy_contract_sha256"
+        ),
+        "admitted_policy_contract_migration": extension_receipt.get(
+            "admitted_policy_contract_migration"
+        ),
+        "policy_contract_receipt": extension_receipt.get(
+            "policy_contract_receipt"
+        ),
+        "policy_contract_receipt_sha256": extension_receipt.get(
+            "policy_contract_receipt_sha256"
+        ),
+        "load_cfg_keys": sorted(
+            key for key, value in load_cfg.items() if value
+        ),
+    }
+
+
 def _cmd_train(args: argparse.Namespace) -> None:
     # Lazy heavy imports — stay out of the module top.
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -2701,8 +3235,312 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 "starting-skill launch pin: expected "
                 f"{expected_source_sha256}, got {source_sha256}"
             )
+        load_path = ckpt
+        effective_contract_sha256: str | None = None
+        extension_receipt: dict[str, Any] = {"adapted": False}
+        extension_width = _event_observation_extension_width(world_bundle)
+        contract_attestation = _attest_warm_start_policy_contract(
+            world_selection=getattr(args, "world_selection", ""),
+            extension_width=extension_width,
+            source_checkpoint_sha256=source_sha256,
+        )
+        # Exact schema-2 warm starts have no tensor extension, but they still
+        # carry the same immutable receipt/selection attestation as event
+        # migrations.  Persist that proof before runner.load rather than
+        # silently skipping all contract checks when extension_width == 0.
+        if contract_attestation["active"] and extension_width == 0:
+            effective_contract = contract_attestation[
+                "effective_contract"
+            ]
+            effective_contract_sha256 = contract_attestation[
+                "effective_contract_sha256"
+            ]
+            admitted_migration = contract_attestation[
+                "admitted_migration"
+            ]
+            admitted_contract_receipt = contract_attestation[
+                "admitted_contract_receipt"
+            ]
+            effective_contract_path = (
+                output_dir / "warm_start_effective_policy_contract.json"
+            )
+            effective_contract_path.write_text(
+                json.dumps(
+                    effective_contract,
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            receipt_artifact_path: Path | None = None
+            receipt_artifact_sha256: str | None = None
+            if admitted_contract_receipt is not None:
+                receipt_artifact_path = (
+                    output_dir / "warm_start_policy_contract_receipt.json"
+                )
+                receipt_artifact_path.write_text(
+                    json.dumps(
+                        admitted_contract_receipt,
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                receipt_artifact_sha256 = _hashlib.sha256(
+                    receipt_artifact_path.read_bytes()
+                ).hexdigest()
+            extension_receipt.update({
+                "extension_width": 0,
+                "observation_term": None,
+                "source_policy_contract_sha256": contract_attestation[
+                    "source_contract_sha256"
+                ],
+                "admitted_policy_contract_migration": admitted_migration,
+                "policy_contract_receipt": (
+                    str(receipt_artifact_path)
+                    if receipt_artifact_path is not None
+                    else None
+                ),
+                "policy_contract_receipt_sha256": (
+                    receipt_artifact_sha256
+                ),
+            })
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "warm_start_observation_contract_verified",
+                    "source": str(ckpt),
+                    "source_sha256": source_sha256,
+                    "effective_policy_contract": str(
+                        effective_contract_path),
+                    "effective_policy_contract_sha256": (
+                        effective_contract_sha256),
+                    "effective_policy_contract_schema": (
+                        effective_contract.get("schema")),
+                    **extension_receipt,
+                }),
+                flush=True,
+            )
+        if extension_width > 0:
+            from sculptor.policy_contract import (
+                build_project_policy_contract,
+                contract_fingerprint,
+            )
+
+            pinned_contract_json = os.environ.get(
+                "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON"
+            )
+            pinned_contract_sha256 = os.environ.get(
+                "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256"
+            )
+            source_contract_sha256 = os.environ.get(
+                "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256"
+            )
+            pinned_migration_json = os.environ.get(
+                "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON"
+            )
+            pinned_receipt_json = os.environ.get(
+                "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+            )
+            contract_pin_present = any((
+                pinned_receipt_json,
+                pinned_contract_json,
+                pinned_contract_sha256,
+                source_contract_sha256,
+                pinned_migration_json,
+            ))
+            if contract_pin_present and not all((
+                pinned_receipt_json,
+                pinned_contract_json,
+                pinned_contract_sha256,
+                source_contract_sha256,
+                pinned_migration_json,
+            )):
+                raise RuntimeError(
+                    "warm-start policy-contract pin is incomplete"
+                )
+            if contract_pin_present:
+                try:
+                    effective_contract = json.loads(
+                        str(pinned_contract_json)
+                    )
+                    admitted_migration = json.loads(
+                        str(pinned_migration_json)
+                    )
+                    admitted_contract_receipt = json.loads(
+                        str(pinned_receipt_json)
+                    )
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "warm-start policy-contract pin is invalid JSON"
+                    ) from exc
+                if not isinstance(effective_contract, dict) or not isinstance(
+                    admitted_migration, dict
+                ):
+                    raise RuntimeError(
+                        "warm-start policy-contract pin must contain objects"
+                    )
+                if (
+                    not isinstance(admitted_contract_receipt, dict)
+                    or admitted_contract_receipt.get("schema") != 1
+                    or not isinstance(
+                        admitted_contract_receipt.get("source"), dict
+                    )
+                    or not isinstance(
+                        admitted_contract_receipt.get("target"), dict
+                    )
+                ):
+                    raise RuntimeError(
+                        "warm-start policy-contract receipt is malformed"
+                    )
+                admission_kind = _event_policy_contract_admission_kind(
+                    admitted_migration,
+                    effective_contract,
+                    extension_width=extension_width,
+                )
+            else:
+                # Direct local CLI use retains deterministic contract building.
+                # UI/remote launches always carry the pre-queue immutable pin
+                # above and therefore never trust an unsynced config rebuild.
+                selection_path = Path(args.world_selection).resolve()
+                project_dir = selection_path.parent.parent
+                effective_contract = build_project_policy_contract(
+                    project_dir,
+                    world_selection_path=selection_path,
+                )
+                admitted_migration = None
+                admitted_contract_receipt = None
+                admission_kind = None
+            effective_contract_sha256 = contract_fingerprint(
+                effective_contract)
+            if (
+                pinned_contract_sha256
+                and effective_contract_sha256 != pinned_contract_sha256
+            ):
+                raise RuntimeError(
+                    "effective policy contract differs from the immutable "
+                    "pre-queue launch pin"
+                )
+            if admitted_contract_receipt is not None:
+                receipt_source = admitted_contract_receipt["source"]
+                receipt_target = admitted_contract_receipt["target"]
+                receipt_source_contract = receipt_source.get("contract")
+                if (
+                    not isinstance(receipt_source_contract, dict)
+                    or contract_fingerprint(receipt_source_contract)
+                    != source_contract_sha256
+                    or receipt_target.get("contract") != effective_contract
+                    or receipt_target.get("contract_sha256")
+                    != effective_contract_sha256
+                    or receipt_source.get("contract_sha256")
+                    != source_contract_sha256
+                    or admitted_contract_receipt.get("compatibility")
+                    != admitted_migration
+                ):
+                    raise RuntimeError(
+                        "warm-start policy-contract receipt disagrees with "
+                        "the admitted runner pins"
+                    )
+            interface = effective_contract.get("event_observation")
+            if not isinstance(interface, dict) or interface.get(
+                "ordered_phase_ids"
+            ) != ["route", "jump", "hold"]:
+                raise RuntimeError(
+                    "effective policy contract lacks the admitted event "
+                    "observation interface"
+                )
+            effective_contract_path = (
+                output_dir / "warm_start_effective_policy_contract.json"
+            )
+            effective_contract_path.write_text(
+                json.dumps(
+                    effective_contract,
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            receipt_artifact_path: Path | None = None
+            receipt_artifact_sha256: str | None = None
+            if admitted_contract_receipt is not None:
+                receipt_artifact_path = (
+                    output_dir / "warm_start_policy_contract_receipt.json"
+                )
+                receipt_artifact_path.write_text(
+                    json.dumps(
+                        admitted_contract_receipt,
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                receipt_artifact_sha256 = _hashlib.sha256(
+                    receipt_artifact_path.read_bytes()
+                ).hexdigest()
+            load_path, extension_receipt = (
+                _prepare_event_observation_warm_start(
+                    runner,
+                    ckpt,
+                    output_dir=output_dir,
+                    extension_width=extension_width,
+                    load_role=load_role,
+                )
+            )
+            if contract_pin_present:
+                adapted = bool(extension_receipt.get("adapted"))
+                if admission_kind == "exact_policy_contract" and adapted:
+                    raise RuntimeError(
+                        "exact policy-contract warm start unexpectedly "
+                        "required an event-observation migration"
+                    )
+                if (
+                    admission_kind
+                    == "zero_initialized_event_phase_observation"
+                    and not adapted
+                ):
+                    raise RuntimeError(
+                        "declared event-observation migration did not change "
+                        "the checkpoint interface"
+                    )
+            extension_receipt.update({
+                "source_policy_contract_sha256": source_contract_sha256,
+                "admitted_policy_contract_migration": admitted_migration,
+                "policy_contract_receipt": (
+                    str(receipt_artifact_path)
+                    if receipt_artifact_path is not None
+                    else None
+                ),
+                "policy_contract_receipt_sha256": (
+                    receipt_artifact_sha256
+                ),
+            })
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": (
+                        "warm_start_observation_extended"
+                        if extension_receipt.get("adapted")
+                        else "warm_start_observation_contract_verified"
+                    ),
+                    "source": str(ckpt),
+                    "source_sha256": source_sha256,
+                    "effective_policy_contract": str(
+                        effective_contract_path),
+                    "effective_policy_contract_sha256": (
+                        effective_contract_sha256),
+                    "effective_policy_contract_schema": (
+                        effective_contract.get("schema")),
+                    **extension_receipt,
+                }),
+                flush=True,
+            )
+        loaded_digest = _hashlib.sha256()
+        with load_path.open("rb") as checkpoint_stream:
+            for chunk in iter(
+                lambda: checkpoint_stream.read(1 << 20), b""
+            ):
+                loaded_digest.update(chunk)
+        loaded_sha256 = loaded_digest.hexdigest()
         try:
-            _ = runner.load(str(ckpt), load_cfg=load_cfg)
+            _ = runner.load(str(load_path), load_cfg=load_cfg)
         except (RuntimeError, OSError, EOFError, Exception) as e:
             # Broaden beyond RuntimeError per Ship-15 audit — torch.load
             # can raise UnpicklingError (corrupt file), OSError (bad
@@ -2723,17 +3561,18 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 "the checkpoint has drifted from the one loading it."
             ) from e
         print(
-            "[SCULPT-EVENT] " + json.dumps({
-                "type": "warm_start_loaded",
-                "source": str(ckpt),
-                "source_sha256": source_sha256,
-                # Retained for older log consumers; authority uses the full
-                # digest above.
-                "source_sha8": source_sha256[:8],
-                "load_cfg_keys": sorted(
-                    k for k, v in load_cfg.items() if v
-                ),
-            }),
+            "[SCULPT-EVENT] " + json.dumps(
+                _warm_start_loaded_receipt(
+                    requested_source=ckpt,
+                    requested_sha256=source_sha256,
+                    loaded_checkpoint=load_path,
+                    loaded_sha256=loaded_sha256,
+                    load_cfg=load_cfg,
+                    effective_policy_contract_sha256=(
+                        effective_contract_sha256),
+                    extension_receipt=extension_receipt,
+                )
+            ),
             flush=True,
         )
         # The actor weights just loaded include the learned exploration std,
@@ -3579,6 +4418,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # policy is exploiting.
     joint_pos_buf: list[np.ndarray] = []
     joint_vel_buf: list[np.ndarray] = []
+    default_pose_rms_buf: list[np.ndarray] = []
     action_buf: list[np.ndarray] = []
     actuator_force_buf: list[np.ndarray] = []
     # §reports: torque in JOINT space (qfrc_actuator) — aligned with joint_vel/names,
@@ -3743,6 +4583,13 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             jp = _tensor_to_np(getattr(d, "joint_pos", None))
             if jp is not None:
                 joint_pos_buf.append(jp)
+                default_jp = _tensor_to_np(
+                    getattr(d, "default_joint_pos", None)
+                )
+                if default_jp is not None and default_jp.shape == jp.shape:
+                    default_pose_rms_buf.append(np.sqrt(np.mean(
+                        np.square(jp - default_jp), axis=-1,
+                    )).astype(np.float32, copy=False))
             jv = _tensor_to_np(getattr(d, "joint_vel", None))
             if jv is not None:
                 joint_vel_buf.append(jv)
@@ -3953,6 +4800,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     for key, buf in (
         ("joint_pos", joint_pos_buf),
         ("joint_vel", joint_vel_buf),
+        ("default_pose_rms", default_pose_rms_buf),
         ("joint_torque", joint_torque_buf),
         ("action", action_buf),
         ("actuator_force", actuator_force_buf),
@@ -4045,6 +4893,31 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "step_dt": float(getattr(env, "step_dt", 0.0) or 0.0),
         "max_episode_steps": int(max_steps),
         "rollout_num_envs": int(num_envs),
+    }
+    import hashlib as _behavior_hashlib
+
+    ordered_joint_names = list(limits_snapshot.get("joint_names") or [])
+    ordered_joint_names_sha256 = _behavior_hashlib.sha256(
+        json.dumps(
+            ordered_joint_names,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    behavior["terminal_proof_contract"] = {
+        "minimum_hold_s": float(_authored_terminal_hold_s(world_bundle)),
+        "minimum_hold_frames": int(round(
+            _authored_terminal_hold_s(world_bundle)
+            / max(float(getattr(env, "step_dt", 0.02) or 0.02), 1e-9)
+        )),
+        "horizontal_speed_m_s": 0.12,
+        "angular_speed_rad_s": 0.5,
+        "joint_speed_rms_rad_s": 1.0,
+        "upright_gravity_z_max": -0.7,
+        "default_pose_rms_rad": 0.6,
+        "default_pose_channel": "default_pose_rms",
+        "ordered_joint_names_sha256": ordered_joint_names_sha256,
+        "ordered_joint_count": len(ordered_joint_names),
     }
     if world_bundle is not None:
         shaping_evidence = _reward_visible_rollout_evidence(

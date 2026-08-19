@@ -29,6 +29,10 @@ BASE_METRIC_ARRAYS = (
     "first_episode_valid_mask",
     "joint_pos",
     "joint_vel",
+    # Self-contained, ordered-joint RMS deviation from the instantiated
+    # articulation's own default pose.  This proves terminal "default-like"
+    # posture without reconstructing a potentially drifted environment config.
+    "default_pose_rms",
     "projected_gravity_b",
     "root_link_pos_w",
     # Prefer the simulator-recorded physical channel for base-angular
@@ -392,6 +396,50 @@ def compile_channel_catalog(
                 "success_hold", "metric_only", "completion", source,
                 dtype="bool"),
         ])
+    event_sequence = task.get("shared", {}).get("event_sequence")
+    if isinstance(event_sequence, Mapping):
+        event_id = str(event_sequence["id"])
+        source = {
+            "event_sequence": event_id,
+            # Preserve the complete admitted automaton (including flight and
+            # apex thresholds) in each channel receipt.  Runtime lookup still
+            # keys on the immutable id; this copy is evidence, not authority.
+            "event_program": json.loads(json.dumps(event_sequence)),
+            "phase_ids": [
+                str(phase["id"])
+                for phase in event_sequence.get("phases", ())
+            ],
+        }
+        channels.extend([
+            _channel(
+                f"event__{event_id}__phase", ("T", "N"),
+                "event_phase_state", "shared_shaping", "state", source,
+                dtype="int32"),
+            _channel(
+                f"event__{event_id}__phase_height_delta", ("T", "N"),
+                "event_phase_height_delta", "shared_shaping", "progress",
+                source),
+            _channel(
+                f"event__{event_id}__base_vertical_velocity", ("T", "N"),
+                "event_phase_vertical_velocity", "shared_shaping", "state",
+                source),
+            _channel(
+                f"event__{event_id}__violation", ("T", "N"),
+                "event_sequence_violation", "metric_only", "safety",
+                source, dtype="bool"),
+        ])
+        jump_until = event_sequence["phases"][1]["until"]
+        for index, selector in enumerate(jump_until["support_contacts"]):
+            support_source = {
+                **source,
+                "support_index": index,
+                "support_selector": json.loads(json.dumps(selector)),
+            }
+            channels.append(_channel(
+                f"event__{event_id}__support__{index}", ("T", "N"),
+                "event_support_contact", "metric_only", "state",
+                support_source, dtype="bool",
+            ))
     contacts = task.get("shared", {}).get("contacts", {})
     for group in ("desired", "forbidden", "terminate_on"):
         for index, pair in enumerate(contacts.get(group, [])):
@@ -535,7 +583,7 @@ def catalog_fixture_arrays(
     num_envs: int,
     case: Literal[
         "far_idle", "edge_camping", "contact_flicker",
-        "forbidden_contact", "competent",
+        "forbidden_contact", "event_violation", "competent",
     ],
     competent_route_start_step: int | None = None,
     competent_route_completion_step: int | None = None,
@@ -553,6 +601,7 @@ def catalog_fixture_arrays(
     if time_steps <= 0 or num_envs <= 0:
         raise ValueError("fixture dimensions must be positive")
     out: dict[str, Any] = {}
+    competent_like = case in {"competent", "event_violation"}
     shape_values = {"T": time_steps, "N": num_envs, "J": 1}
 
     # Ordered route fixtures must be temporal traces, not a set of regions all
@@ -682,7 +731,7 @@ def catalog_fixture_arrays(
                 arr[..., 0] = 1.0
             elif spec.name.endswith("__pos_w") and arr.shape[-1:] == (3,):
                 arr[..., 0] = 1.0 if case == "far_idle" else 0.0
-            elif "vel" in spec.name and case == "competent":
+            elif "vel" in spec.name and competent_like:
                 # The object is settled after task completion; velocity is not
                 # a proxy for success.
                 arr[...] = 0
@@ -707,7 +756,7 @@ def catalog_fixture_arrays(
                 if index == len(route_regions) - 1:
                     trace[center:] = 0.0
                 arr[..., 0] = trace[:, None]
-        elif producer == "waypoint_distance" and case == "competent":
+        elif producer == "waypoint_distance" and competent_like:
             # Distance to the active waypoint falls to zero, then resets when
             # the ordered state advances.  This matches the waypoint-index
             # trace instead of claiming zero distance before route motion.
@@ -728,6 +777,7 @@ def catalog_fixture_arrays(
                 "edge_camping": 0.005,
                 "contact_flicker": 0.0,
                 "forbidden_contact": 0.4,
+                "event_violation": 0.0,
                 "competent": 0.0,
             }[case]
             if arr.ndim >= 3:
@@ -735,25 +785,25 @@ def catalog_fixture_arrays(
             else:
                 arr[...] = distance
         elif producer in {"object_region_predicate", "robot_region_predicate"}:
-            if case == "competent":
+            if competent_like:
                 arr[...] = True
             elif case == "contact_flicker":
                 arr[::2] = True
         elif producer == "success_hold":
-            if case == "competent":
+            if competent_like:
                 # Persisted success is the compiler's hold-qualified predicate.
                 arr[...] = True
         elif producer == "contact_pair":
             group = str(spec.source.get("group", ""))
             if group == "desired":
-                if case == "competent":
+                if competent_like:
                     arr[...] = True
                 elif case == "contact_flicker":
                     arr[::2] = True
             elif group in {"forbidden", "terminate_on"}:
                 if case == "forbidden_contact":
                     arr[...] = True
-        elif producer == "waypoint_state" and case == "competent":
+        elif producer == "waypoint_state" and competent_like:
             # A competent sequence is a TRACE, not a constant terminal marker.
             # Metrics are expected to reject teleportation/skipped waypoints and
             # commonly inspect ordered plateaus.  The old ``int.max`` at every
@@ -768,7 +818,48 @@ def catalog_fixture_arrays(
             for index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
                 arr[start:end, ...] = index
             arr[progression_end:, ...] = waypoint_count
-        elif role == "completion" and case == "competent":
+        elif producer == "event_phase_state" and competent_like:
+            jump_start = terminal_start
+            hold_start = min(
+                time_steps - 1,
+                jump_start + max(4, int(round(0.10 * time_steps))),
+            )
+            arr[jump_start:hold_start, ...] = 1
+            arr[hold_start:, ...] = 2
+        elif producer == "event_phase_height_delta" and competent_like:
+            jump_start = terminal_start
+            hold_start = min(
+                time_steps - 1,
+                jump_start + max(4, int(round(0.10 * time_steps))),
+            )
+            jump_steps = max(1, hold_start - jump_start)
+            phase = np.linspace(0.0, np.pi, jump_steps, endpoint=True)
+            arr[jump_start:hold_start, ...] = (
+                0.24 * np.sin(phase)
+            ).reshape((jump_steps,) + (1,) * (arr.ndim - 1))
+        elif producer == "event_phase_vertical_velocity" and competent_like:
+            jump_start = terminal_start
+            hold_start = min(
+                time_steps - 1,
+                jump_start + max(4, int(round(0.10 * time_steps))),
+            )
+            midpoint = jump_start + max(1, (hold_start - jump_start) // 2)
+            arr[jump_start:midpoint, ...] = 1.0
+            arr[midpoint:hold_start, ...] = -1.0
+        elif producer == "event_sequence_violation":
+            if case == "event_violation":
+                arr[min(time_steps - 1, terminal_start + 1):, ...] = True
+        elif producer == "event_support_contact" and competent_like:
+            jump_start = terminal_start
+            hold_start = min(
+                time_steps - 1,
+                jump_start + max(4, int(round(0.10 * time_steps))),
+            )
+            arr[...] = True
+            air_start = min(hold_start, jump_start + 1)
+            air_end = max(air_start, hold_start - 1)
+            arr[air_start:air_end, ...] = False
+        elif role == "completion" and competent_like:
             arr[...] = True
         out[spec.name] = arr
     return out

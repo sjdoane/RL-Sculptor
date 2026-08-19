@@ -344,6 +344,72 @@ def test_run_lineage_uses_observed_load_and_new_checkpoint_only(
         assert produced[0][1] == outputs[0].id
 
 
+def test_migrated_warm_start_initializes_from_loaded_bytes_and_records_source(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    kg_path = tmp_path / "lineage.db"
+    monkeypatch.setenv("RS_KG_PATH", str(kg_path))
+    project = tmp_path / "project"
+    _seed_world(project)
+    source = project / "runs" / "iter_0" / "checkpoint.pt"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"schema-2-policy")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    loaded = project / "runs" / "iter_1" / "warm_start_event_observation.pt"
+    loaded.parent.mkdir(parents=True)
+    loaded.write_bytes(b"schema-3-derived-policy")
+    loaded_sha = hashlib.sha256(loaded.read_bytes()).hexdigest()
+
+    session = _lineage_session(project, "job-migrated-load")
+    session.record_started()
+    migration = {
+        "type": "zero_initialized_event_phase_observation",
+        "from_schema": 2,
+        "to_schema": 3,
+        "extension_width": 3,
+    }
+    session.observe_event({
+        "type": "warm_start_loaded",
+        "source": str(source),
+        "source_sha256": source_sha,
+        "loaded_checkpoint": str(loaded),
+        "loaded_checkpoint_sha256": loaded_sha,
+        "adapted": True,
+        "derived_from": {
+            "source": str(source),
+            "source_sha256": source_sha,
+        },
+        "policy_contract_migration": (
+            "zero_initialized_event_phase_observation"
+        ),
+        "admitted_policy_contract_migration": migration,
+        "source_policy_contract_sha256": "a" * 64,
+        "effective_policy_contract_sha256": "b" * 64,
+        "load_cfg_keys": ["actor", "critic"],
+    })
+
+    with SculptorKG(kg_path) as kg:
+        run = kg.find_nodes(kind="TrainingRun")[0]
+        policies = {
+            policy.sha256: policy
+            for policy in kg.find_nodes(kind="PolicyArtifact")
+        }
+        assert source_sha in policies
+        assert loaded_sha in policies
+        initialized = kg.neighbors(
+            run.id, relation=Relation.INITIALIZED_FROM,
+        )
+        assert initialized[0][1] == policies[loaded_sha].id
+        derived = kg.neighbors(
+            policies[loaded_sha].id, relation=Relation.DERIVED_FROM,
+        )
+        edge, target_id = derived[0]
+        assert target_id == policies[source_sha].id
+        assert edge.data["migration"] == migration
+        assert edge.data["source_policy_contract_sha256"] == "a" * 64
+        assert edge.data["effective_policy_contract_sha256"] == "b" * 64
+
+
 def test_reference_tracks_rejects_missing_or_untrusted_tierd_receipt(
     tmp_path: Path, monkeypatch,
 ) -> None:

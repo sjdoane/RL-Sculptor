@@ -1024,6 +1024,7 @@ def _install_reference(prepared: _PreparedReference) -> _ReferenceRegistration:
 
 def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
     policy_reasons: list[str] = []
+    policy_migration: dict[str, Any] | None = None
     reason_codes: list[str] = []
     if target.robot_contract_error:
         policy_reasons.append(target.robot_contract_error)
@@ -1060,8 +1061,15 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
                 "contract is unavailable"
             )
         else:
-            from sculptor.policy_contract import compare_policy_contracts
+            from sculptor.policy_contract import (
+                compare_policy_contracts,
+                policy_contract_migration,
+            )
 
+            policy_migration = policy_contract_migration(
+                record.compatibility_contract,
+                target.compatibility_contract,
+            )
             policy_reasons.extend(compare_policy_contracts(
                 record.compatibility_contract, target.compatibility_contract,
             ))
@@ -1086,9 +1094,17 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
     mode_reasons: dict[str, list[str]] = {}
     allowed: list[str] = []
     for mode in record.initialization_modes:
-        failures = (
+        failures = list(
             reference_reasons if mode == "reference_only" else policy_reasons
         )
+        if (
+            policy_migration is not None
+            and mode not in {"actor_only", "actor_critic", "reference_only"}
+        ):
+            failures.append(
+                "event-phase observation migration supports actor or "
+                "actor+critic initialization only, not full resume"
+            )
         mode_reasons[mode] = list(dict.fromkeys(failures))
         if not failures:
             allowed.append(mode)
@@ -1110,6 +1126,7 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
         "reasons": reasons,
         "reason_codes": list(dict.fromkeys(reason_codes)) if reasons else [],
         "mode_reasons": mode_reasons,
+        "policy_contract_migration": policy_migration,
     }
 
 
@@ -1132,12 +1149,24 @@ def _authorization_for(
                 "re-attest the server-owned checkpoint full SHA-256",
                 "observe warm_start_loaded with the exact digest and actor role",
             ]
+            if compatibility.get("policy_contract_migration"):
+                mode_gates[mode].insert(
+                    1,
+                    "materialize the declared zero-initialized event-phase "
+                    "observation extension and record its digest",
+                )
         elif mode == "actor_critic":
             mode_gates[mode] = [
                 "revalidate the current project policy contract at launch",
                 "re-attest the server-owned checkpoint full SHA-256",
                 "observe warm_start_loaded with exact actor and critic roles",
             ]
+            if compatibility.get("policy_contract_migration"):
+                mode_gates[mode].insert(
+                    1,
+                    "materialize the declared zero-initialized event-phase "
+                    "observation extension and record its digest",
+                )
         elif mode == "full_resume":
             mode_gates[mode] = [
                 "verify an exact optimizer and complete run-state resume contract",

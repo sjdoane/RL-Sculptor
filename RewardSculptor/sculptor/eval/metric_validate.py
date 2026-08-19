@@ -1427,6 +1427,7 @@ def _abstract_objective_probe(
             (probe_steps, E), dtype=bool),
         "joint_pos": joints,
         "joint_vel": np.gradient(joints, axis=0) / 0.02,
+        "default_pose_rms": np.sqrt(np.mean(joints ** 2, axis=-1)),
         "projected_gravity_b": gravity,
         "root_link_pos_w": root,
         "root_link_ang_vel_b": np.zeros(
@@ -1457,6 +1458,9 @@ def _archetypes() -> dict[str, dict]:
                 (time_steps, num_envs), dtype=bool),
             "joint_pos": joint_pos,
             "joint_vel": joint_vel,
+            "default_pose_rms": np.sqrt(
+                np.mean(np.asarray(joint_pos) ** 2, axis=-1)
+            ),
             "projected_gravity_b": gravity,
             "root_link_pos_w": root,
             "root_link_ang_vel_b": np.zeros(
@@ -1737,6 +1741,17 @@ def _with_official_base_channels(arrays: dict[str, Any]) -> dict[str, Any]:
         "root_link_ang_vel_b",
         np.zeros((time_steps, num_envs, 3), dtype=np.float64),
     )
+    joint_pos = arrays.get("joint_pos")
+    if isinstance(joint_pos, np.ndarray) and joint_pos.ndim >= 3:
+        arrays.setdefault(
+            "default_pose_rms",
+            np.sqrt(np.mean(joint_pos.astype(np.float64) ** 2, axis=-1)),
+        )
+    else:
+        arrays.setdefault(
+            "default_pose_rms",
+            np.zeros((time_steps, num_envs), dtype=np.float64),
+        )
     return arrays
 
 
@@ -2550,6 +2565,7 @@ def validate_generated_metric(
             "references": [],
             "channel_catalog_hash": None,
         }
+    event_violation_names: set[str] = set()
     if catalog is not None:
         gates["channel_catalog"] = True
     family = resolve_behavior_family(behavior_goal, robot_hint)
@@ -2623,6 +2639,21 @@ def validate_generated_metric(
             reasons.append(
                 "[channel-catalog] metric does not reference a hold-qualified "
                 f"success channel; expected one of {sorted(success_names)}")
+        event_violation_names = {
+            channel.name for channel in catalog.channels
+            if channel.producer == "event_sequence_violation"
+        }
+        event_violation_ok = (
+            not event_violation_names
+            or bool(referenced_keys & event_violation_names)
+        )
+        gates["catalog_event_violation_channel"] = event_violation_ok
+        if not event_violation_ok:
+            reasons.append(
+                "[channel-catalog] one-shot event metrics must reference the "
+                "compiler-latched violation channel; expected one of "
+                f"{sorted(event_violation_names)}"
+            )
         dynamic_access = _catalog_array_access_violations(source)
         gates["catalog_literal_array_access"] = not dynamic_access
         reasons.extend(
@@ -2790,6 +2821,8 @@ def validate_generated_metric(
             "catalog_forbidden_contact": "forbidden_contact",
             "catalog_competent": "competent",
         }
+        if event_violation_names:
+            catalog_cases["catalog_event_violation"] = "event_violation"
         # Base archetypes keep their physical diversity while carrying a
         # deterministic task state.  Positives represent a completed authored
         # task; negatives represent no progress.  The named catalog fixtures
@@ -2827,7 +2860,9 @@ def validate_generated_metric(
             # that conjunctively required motion and waypoint success score zero.
             competent_base = (
                 arche["prompt_competent"]
-                if name == "catalog_competent" and abstract_is_prompt_native
+                if name in {
+                    "catalog_competent", "catalog_event_violation",
+                } and abstract_is_prompt_native
                 else arche["still"]
             )
             fixture_base = {
@@ -2842,13 +2877,17 @@ def validate_generated_metric(
                 case=case,
                 competent_route_start_step=(
                     abstract_catalog_route_window[0]
-                    if name == "catalog_competent"
+                    if name in {
+                        "catalog_competent", "catalog_event_violation",
+                    }
                     and abstract_catalog_route_window is not None
                     else None
                 ),
                 competent_route_completion_step=(
                     abstract_catalog_route_window[1]
-                    if name == "catalog_competent"
+                    if name in {
+                        "catalog_competent", "catalog_event_violation",
+                    }
                     and abstract_catalog_route_window is not None
                     else None
                 ),
@@ -3256,6 +3295,10 @@ def validate_generated_metric(
         for name in (
             "catalog_far_idle", "catalog_edge_camping",
             "catalog_contact_flicker", "catalog_forbidden_contact",
+            *(
+                ("catalog_event_violation",)
+                if event_violation_names else ()
+            ),
         ):
             degenerate_score = scores.get(name, float("nan"))
             if (not np.isfinite(degenerate_score)
@@ -3266,6 +3309,23 @@ def validate_generated_metric(
                     f"vs competent {competent_score:.3f}; require separation "
                     f">= {spread_min:.3f}")
         gates["catalog_degenerate_fixtures"] = catalog_degenerate_ok
+        if event_violation_names:
+            violation_score = scores.get(
+                "catalog_event_violation", float("nan")
+            )
+            violation_ceiling = min(float(distractor_ceiling), 0.05)
+            event_violation_ok = (
+                np.isfinite(violation_score)
+                and violation_score <= violation_ceiling
+            )
+            gates["catalog_event_violation_fail_zero"] = event_violation_ok
+            if not event_violation_ok:
+                reasons.append(
+                    "[event-sequence] an otherwise competent episode with "
+                    "the authoritative one-shot violation bit set scored "
+                    f"{violation_score:.3f}; invalid event attempts must fail "
+                    f"the completion gate (required <= {violation_ceiling:.3f})"
+                )
         if _requires_uninterrupted_hold(behavior_goal):
             interrupted_score = scores.get(
                 "catalog_interrupted_hold", float("nan"))

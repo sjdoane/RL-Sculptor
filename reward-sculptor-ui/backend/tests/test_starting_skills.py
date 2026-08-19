@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import zipfile
@@ -14,6 +15,7 @@ from safetensors.torch import save_file
 
 from sculptor.policy_contract import (
     build_project_policy_contract,
+    build_skill_warm_start_contract_receipt,
     contract_fingerprint,
 )
 from sculptor.reference import save_clip
@@ -88,8 +90,40 @@ def _state_tensors(contract: dict) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _bundle(tmp_path: Path, project_dir: Path) -> Path:
-    contract = build_project_policy_contract(project_dir)
+def _event_contract(source: dict) -> dict:
+    target = copy.deepcopy(source)
+    target["schema"] = 3
+    target["event_observation"] = {
+        "schema": 1,
+        "term_name": "authored_event_phase",
+        "encoding": "one_hot",
+        "ordered_phase_ids": ["route", "jump", "hold"],
+    }
+    phase = {
+        "name": "authored_event_phase",
+        "source": "authored_event_phase_observation",
+        "shape": [3],
+    }
+    observations = target["observations"]
+    observations["ordered_terms"].append(copy.deepcopy(phase))
+    observations["critic_ordered_terms"].append(copy.deepcopy(phase))
+    observations["shape"][0] += 3
+    observations["critic_shape"][0] += 3
+    normalizer = target["policy"]["normalizer"]
+    if normalizer["actor_present"]:
+        normalizer["actor_shape"][0] += 3
+    if normalizer["critic_present"]:
+        normalizer["critic_shape"][0] += 3
+    return target
+
+
+def _bundle(
+    tmp_path: Path,
+    project_dir: Path,
+    *,
+    contract: dict | None = None,
+) -> Path:
+    contract = contract or build_project_policy_contract(project_dir)
     weights = tmp_path / "weights.safetensors"
     save_file(
         _state_tensors(contract), str(weights),
@@ -760,6 +794,80 @@ def test_worker_rechecks_target_contract_after_queueing_before_subprocess(
     assert event["source"] == "worker_launch"
 
 
+def test_exact_schema3_skill_without_full_receipt_blocks_before_subprocess(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    monkeypatch.setenv(ENV_LIBRARY_ROOT, str(tmp_path / "skills"))
+    slug, project_dir = _project(client)
+    contract = _event_contract(build_project_policy_contract(project_dir))
+    bundle = _bundle(tmp_path, project_dir, contract=contract)
+    with bundle.open("rb") as handle:
+        imported = client.post(
+            f"/projects/{slug}/starting-skills",
+            files={"bundle": ("g1.rskill", handle, "application/zip")},
+        ).json()
+    record = SkillLibrary().load(imported["skill"]["skill_id"])
+    assert record is not None
+    target_payload = {
+        "adapter_class": ADAPTER,
+        "task_id": TASK,
+        "robot_slug": "g1",
+        "compatibility_contract": contract,
+    }
+    target_receipt = {
+        "schema": 1,
+        "adapter_class": ADAPTER,
+        "task_id": TASK,
+        "robot_slug": "g1",
+        "policy_contract_required": True,
+        "policy_contract_sha256": contract_fingerprint(contract),
+    }
+    monkeypatch.setattr(
+        run_manager,
+        "resolve_starting_skill_target",
+        lambda *_args, **_kwargs: (target_payload, target_receipt),
+    )
+    subprocess_called = False
+
+    async def _must_not_spawn(*_args, **_kwargs):
+        nonlocal subprocess_called
+        subprocess_called = True
+        raise AssertionError("subprocess crossed the policy receipt boundary")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _must_not_spawn)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "extend an event-conditioned G1 policy",
+            "iterations": 1,
+            "dry_run": True,
+            "starting_skill_id": record.skill_id,
+            "expected_starting_skill_manifest_digest": record.manifest_digest,
+            "starting_skill_target_receipt": target_receipt,
+            "initialization_mode": "actor_critic",
+        },
+    )
+    job = Job(
+        job_id="missing_exact_schema3_receipt",
+        kind="sculpt_run",
+        project_slug=slug,
+        status="running",
+    )
+    with pytest.raises(RuntimeError, match="receipt changed after"):
+        asyncio.run(runner(job, asyncio.Event()))
+
+    assert subprocess_called is False
+    assert any(
+        event.get("type") == "warm_start_policy_contract_failed"
+        for event in job.events
+    )
+
+
 def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
     client: TestClient, tmp_path: Path, monkeypatch,
 ) -> None:
@@ -785,6 +893,15 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
         project_dir, require_policy_contract=True,
     )
     assert target_payload["task_id"] == TASK
+    policy_receipt = build_skill_warm_start_contract_receipt(
+        skill_id=record.skill_id,
+        manifest_digest=str(record.manifest_digest),
+        checkpoint_sha256=record.checkpoint_sha256,
+        tensor_signature_sha256=record.tensor_signature_sha256,
+        source_contract=record.compatibility_contract or {},
+        target_contract=target_payload["compatibility_contract"] or {},
+        target_receipt=target_receipt,
+    )
 
     # Import admission alone never claims the policy was loaded by a worker.
     with SculptorKG(tmp_path / "lineage.db") as kg:
@@ -796,6 +913,12 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
         "source_sha256": record.checkpoint_sha256,
         "source_sha8": record.checkpoint_sha256[:8],
         "load_cfg_keys": ["actor", "critic"],
+        "source_policy_contract_sha256": policy_receipt["source"][
+            "contract_sha256"
+        ],
+        "admitted_policy_contract_migration": policy_receipt[
+            "compatibility"
+        ],
     }
 
     class _Stdout:
@@ -852,6 +975,7 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
             "starting_skill_id": record.skill_id,
             "expected_starting_skill_manifest_digest": record.manifest_digest,
             "starting_skill_target_receipt": target_receipt,
+            "warm_start_policy_contract_receipt": policy_receipt,
             "initialization_mode": "actor_critic",
         },
     )
@@ -880,6 +1004,18 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
     assert env["SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"] == (
         record.checkpoint_sha256
     )
+    assert json.loads(
+        env["SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"]
+    ) == policy_receipt
+    assert json.loads(env["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON"]) == (
+        policy_receipt["target"]["contract"]
+    )
+    assert json.loads(env["SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON"]) == (
+        policy_receipt["compatibility"]
+    )
+    assert env["SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256"] == (
+        policy_receipt["source"]["contract_sha256"]
+    )
     assert any(event.get("type") == "starting_skill_resolved" for event in job.events)
     assert any(event.get("type") == "warm_start_loaded" for event in job.events)
 
@@ -906,8 +1042,17 @@ def test_selected_imported_policy_requires_runtime_load_receipt_even_on_rc_zero(
     assert response.status_code == 201, response.text
     record = SkillLibrary().load(response.json()["skill"]["skill_id"])
     assert record is not None
-    _target, target_receipt = run_manager.resolve_starting_skill_target(
+    target_payload, target_receipt = run_manager.resolve_starting_skill_target(
         project_dir, require_policy_contract=True,
+    )
+    policy_receipt = build_skill_warm_start_contract_receipt(
+        skill_id=record.skill_id,
+        manifest_digest=str(record.manifest_digest),
+        checkpoint_sha256=record.checkpoint_sha256,
+        tensor_signature_sha256=record.tensor_signature_sha256,
+        source_contract=record.compatibility_contract or {},
+        target_contract=target_payload["compatibility_contract"] or {},
+        target_receipt=target_receipt,
     )
 
     class _Stdout:
@@ -959,6 +1104,7 @@ def test_selected_imported_policy_requires_runtime_load_receipt_even_on_rc_zero(
             "starting_skill_id": record.skill_id,
             "expected_starting_skill_manifest_digest": record.manifest_digest,
             "starting_skill_target_receipt": target_receipt,
+            "warm_start_policy_contract_receipt": policy_receipt,
             "initialization_mode": "actor_only",
         },
     )

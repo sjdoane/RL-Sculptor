@@ -1061,13 +1061,56 @@ class RunLineageSession:
                 "warm_start_loaded source is outside project runs and the "
                 "admitted starting skill"
             )
-        policy = policy_artifact_from_checkpoint(
+        source_policy = policy_artifact_from_checkpoint(
             source, record=self.starting_skill_record,
         )
         source_sha256 = event.get("source_sha256")
-        if source_sha256 != policy.sha256:
+        if source_sha256 != source_policy.sha256:
             raise LineageObservationError(
                 "warm_start_loaded full digest does not match checkpoint bytes"
+            )
+        raw_loaded = event.get("loaded_checkpoint", raw_source)
+        if not isinstance(raw_loaded, str) or not raw_loaded:
+            raise LineageObservationError(
+                "warm_start_loaded has no actual loaded checkpoint path"
+            )
+        loaded = Path(raw_loaded).expanduser().resolve(strict=True)
+        try:
+            loaded.relative_to(project_runs)
+            loaded_allowed = True
+        except ValueError:
+            loaded_allowed = loaded == source
+        if not loaded_allowed:
+            raise LineageObservationError(
+                "warm_start_loaded actual checkpoint is outside project runs"
+            )
+        loaded_policy = (
+            source_policy
+            if loaded == source
+            else policy_artifact_from_checkpoint(loaded)
+        )
+        loaded_sha256 = event.get(
+            "loaded_checkpoint_sha256", source_sha256,
+        )
+        if loaded_sha256 != loaded_policy.sha256:
+            raise LineageObservationError(
+                "warm_start_loaded actual digest does not match loaded bytes"
+            )
+        is_derived = loaded_policy.id != source_policy.id
+        derived_from = event.get("derived_from")
+        if is_derived and (
+            event.get("adapted") is not True
+            or not isinstance(derived_from, dict)
+            or derived_from.get("source_sha256") != source_policy.sha256
+            or event.get("policy_contract_migration")
+            != "zero_initialized_event_phase_observation"
+        ):
+            raise LineageObservationError(
+                "derived warm-start checkpoint lacks exact migration lineage"
+            )
+        if not is_derived and event.get("adapted") is True:
+            raise LineageObservationError(
+                "warm_start_loaded claims adaptation without derived bytes"
             )
         raw_keys = event.get("load_cfg_keys")
         if not isinstance(raw_keys, list) or not all(
@@ -1095,12 +1138,32 @@ class RunLineageSession:
             record_policy_loaded(
                 kg,
                 run=self._run,
-                policy=policy,
+                policy=loaded_policy,
                 transfer_mode=transfer_mode,
-                checkpoint_sha256=policy.sha256,
+                checkpoint_sha256=loaded_policy.sha256,
                 load_cfg_keys=keys,
+                derived_from_policy=(
+                    source_policy if is_derived else None
+                ),
+                derivation_data=(
+                    {
+                        "migration": event.get(
+                            "admitted_policy_contract_migration"
+                        ),
+                        "source_policy_contract_sha256": event.get(
+                            "source_policy_contract_sha256"
+                        ),
+                        "effective_policy_contract_sha256": event.get(
+                            "effective_policy_contract_sha256"
+                        ),
+                        "source_checkpoint_sha256": source_policy.sha256,
+                        "loaded_checkpoint_sha256": loaded_policy.sha256,
+                    }
+                    if is_derived
+                    else None
+                ),
             )
-        self._input_policy = policy
+        self._input_policy = loaded_policy
 
     def record_outputs(self) -> list[PolicyArtifact]:
         """Record only checkpoints absent from or changed since pre-spawn."""

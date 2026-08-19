@@ -230,6 +230,23 @@ def _require_warm_start_loaded(
         )
     return receipt
 
+
+def _guard_remote_policy_contract_warm_start(
+    init_policy_path: str | Path | None,
+) -> None:
+    """Fail closed until remote derived-load receipts are locally attestable."""
+    if (
+        init_policy_path is not None
+        and os.environ.get(
+            "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+        )
+    ):
+        raise RuntimeError(
+            "remote trainable policy-contract warm starts are blocked until "
+            "remote mirror paths and any derived checkpoint bytes can be "
+            "canonicalized and re-verified against the local artifact store"
+        )
+
 # State schema per task family (MJLAB_PIVOT_DESIGN §1.4). Velocity and
 # tracking share the locomotion schema; Yam manipulation extends.
 _VELOCITY_STATE_SCHEMA: dict[str, tuple[int, ...]] = {
@@ -570,6 +587,21 @@ class MjlabAdapter(SculptorAdapter):
         ever created). Provisioning installs the glvnd front-end
         (libegl1) the EGL path needs."""
         env = {"MUJOCO_GL": "egl"}
+        # These server-admitted, content-addressed contracts must reach the
+        # remote runner verbatim.  Rebuilding them from a merely synced local
+        # config would let an unsynced or changed config select a different
+        # observation interface than the UI admitted before queueing.
+        for key in (
+            "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256",
+            "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+            "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON",
+            "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256",
+            "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256",
+            "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON",
+        ):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
         if device.startswith("cuda") and ":" in device:
             env["CUDA_VISIBLE_DEVICES"] = device.split(":")[1]
             return env, "cuda:0"
@@ -875,6 +907,7 @@ class MjlabAdapter(SculptorAdapter):
 
         executor = self._remote_executor()
         if executor is not None:
+            _guard_remote_policy_contract_warm_start(init_policy_path)
             # §Ship 23: dispatch the runner to the rented GPU. The
             # executor syncs artifacts back into the same local
             # `output_dir` (checkpoint.pt promoted LAST), so everything

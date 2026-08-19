@@ -57,6 +57,74 @@ def test_offline_acceptance_drafts_are_strict_and_valid(
     assert draft.world_spec["meta"]["parameter_provenance"]
 
 
+def test_offline_slalom_jump_authors_exact_one_shot_event_program() -> None:
+    prompt = (
+        "Have the G1 slalom around four boxes without touching them, then "
+        "jump at the finish and hold still for 2 seconds."
+    )
+    draft = author_environment(
+        prompt,
+        robot_capability_id="unitree_g1:base",
+    )
+
+    task = draft.task_spec
+    event = task["shared"]["event_sequence"]
+    assert [phase["id"] for phase in event["phases"]] == [
+        "route", "jump", "hold",
+    ]
+    assert event["phases"][0]["until"] == {"event": "goal_complete"}
+    assert event["phases"][1]["until"]["event"] \
+        == "bilateral_support_cycle"
+    assert event["phases"][1]["until"]["support_contacts"] == [
+        ["robot:left_foot", "world:terrain"],
+        ["robot:right_foot", "world:terrain"],
+    ]
+    assert event["phases"][1]["until"]["min_height_delta_m"] == 0.18
+    assert event["phases"][2] == {
+        "id": "hold", "terminal": True, "minimum_hold_s": 2.0,
+    }
+    assert task["shared"]["goal"]["success"]["hold_s"] == 0.0
+    assert {
+        float(zone["radius_m"])
+        for zone in draft.world_spec["shared"]["zones"].values()
+    } == {0.35}
+    assert task["shared"]["termination"]["episode_length_s"] >= 24.0
+    assert task["train"]["event_phase_sampling"] == {
+        "route": 0.5, "jump": 0.4, "hold": 0.1,
+    }
+    assert validate_task_spec(task, world=draft.world_spec) == []
+
+    too_short = copy.deepcopy(task)
+    too_short["shared"]["event_sequence"]["phases"][2][
+        "minimum_hold_s"
+    ] = 1.99
+    errors = validate_task_spec(too_short, world=draft.world_spec)
+    assert any("minimum_hold_s" in error and "below 2" in error
+               for error in errors)
+
+    wrong_sampling = copy.deepcopy(task)
+    wrong_sampling["train"]["event_phase_sampling"] = {
+        "route": 0.6, "jump": 0.4, "hold": 0.1,
+    }
+    errors = validate_task_spec(wrong_sampling, world=draft.world_spec)
+    assert any("probabilities must sum to 1" in error for error in errors)
+
+    duplicate_support = copy.deepcopy(task)
+    supports = duplicate_support["shared"]["event_sequence"]["phases"][1][
+        "until"
+    ]["support_contacts"]
+    supports[1] = list(supports[0])
+    errors = validate_task_spec(duplicate_support, world=draft.world_spec)
+    assert any("distinct bodies" in error for error in errors)
+
+    early_termination = copy.deepcopy(task)
+    early_termination["shared"]["termination"][
+        "success_ends_episode"
+    ] = True
+    errors = validate_task_spec(early_termination, world=draft.world_spec)
+    assert any("event sequences require false" in error for error in errors)
+
+
 def test_gripper_resolution_is_generic_and_impossible_requests_are_precise() -> None:
     # The unique installed grasp-capable descriptor is selected from declared
     # capabilities; the author contains no G1/task-name special case.

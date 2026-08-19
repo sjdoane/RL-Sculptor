@@ -6,6 +6,7 @@ in tests/test_mjlab_gpu.py behind `@pytest.mark.gpu`.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -132,6 +133,484 @@ def test_authored_terminal_stillness_balances_command_supervision() -> None:
         {"track_linear_velocity": SimpleNamespace(weight="bad")},
         authored_terms,
     ) == 1.0
+
+
+def test_event_terminal_stillness_is_hold_phase_only() -> None:
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_hold_s,
+        _authored_terminal_stillness_reward,
+        _authored_terminal_stillness_state,
+    )
+
+    command = SimpleNamespace(
+        event_sequence_id="route_jump_hold",
+        event_phase=torch.tensor([1, 2]),
+        event_sequence_violation=torch.tensor([False, False]),
+        # This deliberately lies for the JUMP lane; event phase must win.
+        is_standing_env=torch.tensor([True, True]),
+    )
+
+    class Manager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(_name):
+            return command
+
+    robot = SimpleNamespace(data=SimpleNamespace(
+        root_link_lin_vel_b=torch.zeros((2, 3)),
+        root_link_ang_vel_b=torch.zeros((2, 3)),
+        joint_vel=torch.zeros((2, 4)),
+    ))
+    env = SimpleNamespace(
+        num_envs=2,
+        device="cpu",
+        command_manager=Manager(),
+        scene={"robot": robot},
+    )
+    standing, _score, _speed, _quiet = _authored_terminal_stillness_state(
+        env, lin_std=0.12, ang_std=0.15, joint_std=0.12,
+    )
+    assert standing.tolist() == [False, True]
+
+    command.event_sequence_violation[1] = True
+    standing, _score, _speed, _quiet = _authored_terminal_stillness_state(
+        env, lin_std=0.12, ang_std=0.15, joint_std=0.12,
+    )
+    assert standing.tolist() == [False, False]
+    reward = _authored_terminal_stillness_reward(
+        env, lin_std=0.12, ang_std=0.15, joint_std=0.12,
+    )
+    assert reward.tolist() == [0.0, 0.0]
+
+    del command.event_sequence_violation
+    with pytest.raises(RuntimeError, match="sequence-violation truth"):
+        _authored_terminal_stillness_state(
+            env, lin_std=0.12, ang_std=0.15, joint_std=0.12,
+        )
+
+    bundle = SimpleNamespace(
+        runtime_adjustments=(
+            "installed goal-conditioned waypoint traversal command",
+        ),
+        manifest=SimpleNamespace(task_shared={
+        "goal": {
+            "type": "waypoint_sequence",
+            "success": {"hold_s": 0.0},
+        },
+        "event_sequence": {"phases": [
+            {"id": "route"},
+            {"id": "jump"},
+            {"id": "hold", "minimum_hold_s": 2.0},
+        ]},
+    }))
+    assert _authored_terminal_hold_s(bundle) == 2.0
+
+
+def test_event_observation_extension_supports_real_batched_normalizers() -> None:
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _zero_extend_observation_state_dict,
+    )
+
+    source = {
+        "mlp.0.weight": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        "obs_normalizer._mean": torch.full((1, 4), 3.0),
+        "obs_normalizer._var": torch.full((1, 4), 4.0),
+        "obs_normalizer._std": torch.full((1, 4), 2.0),
+        "obs_normalizer.count": torch.tensor(17.0),
+        "mlp.0.bias": torch.zeros(2),
+    }
+    target = {
+        **source,
+        "mlp.0.weight": torch.zeros((2, 7)),
+        "obs_normalizer._mean": torch.zeros((1, 7)),
+        "obs_normalizer._var": torch.zeros((1, 7)),
+        "obs_normalizer._std": torch.zeros((1, 7)),
+    }
+    adapted, changed = _zero_extend_observation_state_dict(
+        source, target, extension_width=3, role="actor",
+    )
+
+    torch.testing.assert_close(
+        adapted["mlp.0.weight"][:, :4], source["mlp.0.weight"])
+    assert torch.all(adapted["mlp.0.weight"][:, 4:] == 0.0)
+    assert torch.all(adapted["obs_normalizer._mean"][:, 4:] == 0.0)
+    assert torch.all(adapted["obs_normalizer._var"][:, 4:] == 1.0)
+    assert torch.all(adapted["obs_normalizer._std"][:, 4:] == 1.0)
+    assert adapted["obs_normalizer.count"].shape == torch.Size([])
+    assert set(changed) == {
+        "mlp.0.weight",
+        "obs_normalizer._mean",
+        "obs_normalizer._var",
+        "obs_normalizer._std",
+    }
+
+    invalid = dict(target)
+    invalid["mlp.0.bias"] = torch.zeros(3)
+    with pytest.raises(RuntimeError, match="cannot satisfy"):
+        _zero_extend_observation_state_dict(
+            source, invalid, extension_width=3, role="actor",
+        )
+
+
+def test_warm_start_loaded_receipt_names_exact_loaded_bytes(tmp_path: Path) -> None:
+    from sculptor.adapters._mjlab_runner import _warm_start_loaded_receipt
+
+    source = tmp_path / "source.pt"
+    derived = tmp_path / "warm_start_event_observation.pt"
+    receipt = _warm_start_loaded_receipt(
+        requested_source=source,
+        requested_sha256="a" * 64,
+        loaded_checkpoint=derived,
+        loaded_sha256="b" * 64,
+        load_cfg={
+            "actor": True, "critic": True, "optimizer": False,
+        },
+        effective_policy_contract_sha256="c" * 64,
+        extension_receipt={
+            "adapted": True,
+            "source_policy_contract_sha256": "d" * 64,
+            "admitted_policy_contract_migration": {
+                "type": "zero_initialized_event_phase_observation",
+            },
+        },
+    )
+
+    assert receipt["requested_source"] == str(source)
+    assert receipt["requested_source_sha256"] == "a" * 64
+    assert receipt["loaded_checkpoint"] == str(derived)
+    assert receipt["loaded_checkpoint_sha256"] == "b" * 64
+    assert receipt["policy_contract_migration"] \
+        == "zero_initialized_event_phase_observation"
+    assert receipt["derived_from"]["source_sha256"] == "a" * 64
+    assert receipt["source_policy_contract_sha256"] == "d" * 64
+    assert receipt["admitted_policy_contract_migration"] == {
+        "type": "zero_initialized_event_phase_observation",
+    }
+    assert receipt["load_cfg_keys"] == ["actor", "critic"]
+
+
+def test_event_policy_contract_admits_exact_schema3_direct_load() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _event_policy_contract_admission_kind,
+    )
+
+    exact = {
+        "type": "exact_policy_contract",
+        "from_schema": 3,
+        "to_schema": 3,
+        "optimizer_resume": False,
+    }
+    effective = {
+        "schema": 3,
+        "event_observation": {
+            "ordered_phase_ids": ["route", "jump", "hold"],
+        },
+    }
+    assert _event_policy_contract_admission_kind(
+        exact,
+        effective,
+        extension_width=3,
+    ) == "exact_policy_contract"
+
+    with pytest.raises(RuntimeError, match="unrecognized"):
+        _event_policy_contract_admission_kind(
+            {**exact, "optimizer_resume": True},
+            effective,
+            extension_width=3,
+        )
+
+
+def test_runner_attests_exact_schema2_pins_without_observation_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sculptor.policy_contract as policy_contract
+    from sculptor.adapters._mjlab_runner import (
+        _attest_warm_start_policy_contract,
+    )
+
+    project = tmp_path / "project"
+    selection = project / "env" / "selection_v1.json"
+    selection.parent.mkdir(parents=True)
+    selection.write_text("{}\n", encoding="utf-8")
+    contract = {
+        "schema": 2,
+        "identity": {"adapter_class": "MjlabAdapter", "task_id": "g1"},
+    }
+    contract_sha256 = policy_contract.contract_fingerprint(contract)
+    checkpoint_sha256 = "c" * 64
+    compatibility = {
+        "type": "exact_policy_contract",
+        "from_schema": 2,
+        "to_schema": 2,
+        "optimizer_resume": False,
+    }
+    receipt = {
+        "schema": 1,
+        "kind": "starting_skill",
+        "source": {
+            "checkpoint_sha256": checkpoint_sha256,
+            "contract": contract,
+            "contract_sha256": contract_sha256,
+        },
+        "target": {
+            "contract": contract,
+            "contract_sha256": contract_sha256,
+        },
+        "compatibility": compatibility,
+    }
+    pins = {
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON": json.dumps(
+            receipt, sort_keys=True),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON": json.dumps(
+            contract, sort_keys=True),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256": contract_sha256,
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256": contract_sha256,
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON": json.dumps(
+            compatibility, sort_keys=True),
+    }
+    for name, value in pins.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        policy_contract,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+
+    admitted = _attest_warm_start_policy_contract(
+        world_selection=selection,
+        extension_width=0,
+        source_checkpoint_sha256=checkpoint_sha256,
+    )
+    assert admitted["active"]
+    assert admitted["admission_kind"] == "exact_policy_contract"
+    assert admitted["effective_contract_sha256"] == contract_sha256
+
+    monkeypatch.setenv(
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256", "d" * 64,
+    )
+    with pytest.raises(RuntimeError, match="receipt disagrees"):
+        _attest_warm_start_policy_contract(
+            world_selection=selection,
+            extension_width=0,
+            source_checkpoint_sha256=checkpoint_sha256,
+        )
+
+
+def test_runner_rejects_target_only_cli_event_adaptation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _attest_warm_start_policy_contract,
+    )
+
+    for name in (
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON",
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256",
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256",
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="target-only CLI adaptation"):
+        _attest_warm_start_policy_contract(
+            world_selection=tmp_path / "missing.json",
+            extension_width=3,
+            source_checkpoint_sha256="c" * 64,
+        )
+
+
+def test_runner_rejects_pinned_target_or_runtime_interface_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sculptor.policy_contract as policy_contract
+    from sculptor.adapters._mjlab_runner import (
+        _attest_warm_start_policy_contract,
+    )
+
+    project = tmp_path / "project"
+    selection = project / "env" / "selection_v1.json"
+    selection.parent.mkdir(parents=True)
+    selection.write_text("{}\n", encoding="utf-8")
+    event_contract = {
+        "schema": 3,
+        "identity": {"adapter_class": "MjlabAdapter", "task_id": "g1"},
+        "event_observation": {
+            "ordered_phase_ids": ["route", "jump", "hold"],
+        },
+    }
+    event_sha256 = policy_contract.contract_fingerprint(event_contract)
+    compatibility = {
+        "type": "exact_policy_contract",
+        "from_schema": 3,
+        "to_schema": 3,
+        "optimizer_resume": False,
+    }
+    receipt = {
+        "schema": 1,
+        "source": {
+            "contract": event_contract,
+            "contract_sha256": event_sha256,
+        },
+        "target": {
+            "contract": event_contract,
+            "contract_sha256": event_sha256,
+        },
+        "compatibility": compatibility,
+    }
+    for name, value in {
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON": json.dumps(
+            receipt, sort_keys=True),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON": json.dumps(
+            event_contract, sort_keys=True),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256": event_sha256,
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256": event_sha256,
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON": json.dumps(
+            compatibility, sort_keys=True),
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    drifted_contract = {**event_contract, "schema": 2}
+    monkeypatch.setattr(
+        policy_contract,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: drifted_contract,
+    )
+    with pytest.raises(RuntimeError, match="differs from the pre-queue"):
+        _attest_warm_start_policy_contract(
+            world_selection=selection,
+            extension_width=0,
+            source_checkpoint_sha256="c" * 64,
+        )
+
+    monkeypatch.setattr(
+        policy_contract,
+        "build_project_policy_contract",
+        lambda *_args, **_kwargs: event_contract,
+    )
+    with pytest.raises(RuntimeError, match="runtime world has no event"):
+        _attest_warm_start_policy_contract(
+            world_selection=selection,
+            extension_width=0,
+            source_checkpoint_sha256="c" * 64,
+        )
+
+    unequal_source = {
+        **event_contract,
+        "identity": {
+            "adapter_class": "MjlabAdapter",
+            "task_id": "different-task",
+        },
+    }
+    unequal_source_sha = policy_contract.contract_fingerprint(unequal_source)
+    receipt["source"] = {
+        "contract": unequal_source,
+        "contract_sha256": unequal_source_sha,
+    }
+    monkeypatch.setenv(
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        json.dumps(receipt, sort_keys=True),
+    )
+    monkeypatch.setenv(
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256", unequal_source_sha,
+    )
+    with pytest.raises(RuntimeError, match="receipt disagrees"):
+        _attest_warm_start_policy_contract(
+            world_selection=selection,
+            extension_width=3,
+            source_checkpoint_sha256="c" * 64,
+        )
+
+    non_prefix_source = {
+        "schema": 2,
+        "identity": {
+            "adapter_class": "MjlabAdapter",
+            "task_id": "g1",
+        },
+    }
+    non_prefix_sha = policy_contract.contract_fingerprint(non_prefix_source)
+    declared_migration = {
+        "type": "zero_initialized_event_phase_observation",
+        "from_schema": 2,
+        "to_schema": 3,
+        "observation_term": "authored_event_phase",
+        "extension_width": 3,
+        "ordered_phase_ids": ["route", "jump", "hold"],
+        "optimizer_resume": False,
+    }
+    receipt["source"] = {
+        "contract": non_prefix_source,
+        "contract_sha256": non_prefix_sha,
+    }
+    receipt["compatibility"] = declared_migration
+    monkeypatch.setenv(
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        json.dumps(receipt, sort_keys=True),
+    )
+    monkeypatch.setenv(
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256", non_prefix_sha,
+    )
+    monkeypatch.setenv(
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON",
+        json.dumps(declared_migration, sort_keys=True),
+    )
+    with pytest.raises(RuntimeError, match="receipt disagrees"):
+        _attest_warm_start_policy_contract(
+            world_selection=selection,
+            extension_width=3,
+            source_checkpoint_sha256="c" * 64,
+        )
+
+
+def test_remote_device_env_forwards_policy_contract_pins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.adapters.mjlab import MjlabAdapter
+
+    pins = {
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256": "c" * 64,
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON": (
+            '{"schema":1}'
+        ),
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON": '{"schema":3}',
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256": "a" * 64,
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256": "b" * 64,
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON": (
+            '{"type":"exact_policy_contract"}'
+        ),
+    }
+    for key, value in pins.items():
+        monkeypatch.setenv(key, value)
+
+    remote_env, runner_device = MjlabAdapter._remote_device_env("cuda:2")
+
+    assert runner_device == "cuda:0"
+    assert remote_env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert {key: remote_env[key] for key in pins} == pins
+
+
+def test_remote_policy_contract_warm_start_is_explicitly_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.adapters.mjlab import (
+        _guard_remote_policy_contract_warm_start,
+    )
+
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"policy")
+    monkeypatch.setenv(
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        '{"schema":1}',
+    )
+    with pytest.raises(RuntimeError, match="remote mirror paths"):
+        _guard_remote_policy_contract_warm_start(checkpoint)
+    _guard_remote_policy_contract_warm_start(None)
 
 
 def test_authored_forbidden_contact_supervision_uses_compiled_sensors() -> None:

@@ -260,6 +260,41 @@ def _sculptor_env() -> dict[str, Any]:
     }
 
 
+def _warm_start_policy_contract_receipt() -> dict[str, Any] | None:
+    """Capture the worker-admitted warm-start receipt, not just env names."""
+    raw = os.environ.get(
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+    )
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "warm-start policy-contract receipt is invalid JSON"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != 1
+        or not isinstance(payload.get("source"), dict)
+        or not isinstance(payload.get("target"), dict)
+        or not isinstance(payload.get("compatibility"), dict)
+    ):
+        raise ValueError(
+            "warm-start policy-contract receipt has an invalid structure"
+        )
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return {
+        "receipt": payload,
+        "receipt_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -338,6 +373,9 @@ def capture_run_context(
             }
             if os.environ.get("SCULPTOR_STARTING_SKILL_ID")
             else None
+        ),
+        "warm_start_policy_contract": (
+            _warm_start_policy_contract_receipt()
         ),
         "code_git": _git_info(
             _code_repo_dir(), must_track=_code_repo_dir() / "__init__.py",

@@ -424,6 +424,19 @@ def _parse_count(prompt: str, *, default: int, lo: int = 1, hi: int = 12) -> int
     return max(lo, min(hi, n))
 
 
+def _requests_post_route_jump(prompt: str) -> bool:
+    """Whether the prompt orders one jump after the navigation route."""
+    text = prompt.casefold()
+    requests_jump = bool(re.search(
+        r"\b(?:jump|leap|hop)(?:s|ed|ing)?\b", text
+    ))
+    return requests_jump and bool(re.search(
+        r"\b(?:then|after|afterward|once|followed\s+by|at\s+(?:the\s+)?"
+        r"(?:finish|end))\b",
+        text,
+    ))
+
+
 def _intent(prompt: str) -> str:
     text = prompt.casefold()
     is_object = (
@@ -691,7 +704,12 @@ def _author_parkour(
 
 
 def _author_slalom(
-    world: dict[str, Any], task: dict[str, Any], *, count: int = 4,
+    world: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    count: int = 4,
+    compound_jump: bool = False,
+    cap: RobotCapability | None = None,
 ) -> None:
     """Author a planar weave without coupling to a robot or task name.
 
@@ -772,6 +790,57 @@ def _author_slalom(
         "height_scan": True,
         "region_relative": waypoints,
     })
+    if compound_jump:
+        if cap is None:
+            raise AuthoringError(
+                "post-route jump authoring requires a robot capability"
+            )
+        try:
+            cap.resolve_role("left_foot")
+            cap.resolve_role("right_foot")
+        except CapabilityError as exc:
+            raise AuthoringError(
+                f"{cap.capability_id}: post-route jump requires declared "
+                "left_foot and right_foot support roles"
+            ) from exc
+        # The compound showcase freezes every route predicate, including the
+        # finish, at the explicitly authored 0.35 m radius.  Do not let the
+        # broad route-only fallback disks silently change task truth.
+        for zone in zones.values():
+            zone["radius_m"] = 0.35
+        task["shared"]["goal"]["success"]["hold_s"] = 0.0
+        task["shared"]["termination"]["episode_length_s"] = max(
+            24.0,
+            float(task["shared"]["termination"]["episode_length_s"]),
+        )
+        task["shared"]["event_sequence"] = {
+            "id": "route_jump_hold",
+            "phases": [
+                {"id": "route", "until": {"event": "goal_complete"}},
+                {
+                    "id": "jump",
+                    "until": {
+                        "event": "bilateral_support_cycle",
+                        "support_contacts": [
+                            ["robot:left_foot", "world:terrain"],
+                            ["robot:right_foot", "world:terrain"],
+                        ],
+                        "min_air_time_s": 0.06,
+                        "min_height_delta_m": 0.18,
+                    },
+                },
+                {
+                    "id": "hold",
+                    "terminal": True,
+                    "minimum_hold_s": 2.0,
+                },
+            ],
+        }
+        task["train"]["event_phase_sampling"] = {
+            "route": 0.5,
+            "jump": 0.4,
+            "hold": 0.1,
+        }
 
 
 def _grasp_contact_role(cap: RobotCapability) -> str:
@@ -945,7 +1014,13 @@ def _offline_author(
     if intent == "uneven_terrain":
         _author_uneven(world, task)
     elif intent == "slalom":
-        _author_slalom(world, task, count=_parse_count(prompt, default=4))
+        _author_slalom(
+            world,
+            task,
+            count=_parse_count(prompt, default=4),
+            compound_jump=_requests_post_route_jump(prompt),
+            cap=cap,
+        )
     elif intent == "parkour":
         _author_parkour(world, task, cap, count=_parse_count(prompt, default=3))
     elif intent == "object_to_region":
@@ -974,6 +1049,9 @@ def _offline_author(
         # the requested waypoint/contact task invalid and leaves no valid
         # clarification alternative.
         provenance["/world/shared/objects"] = "prompt"
+        if _requests_post_route_jump(prompt):
+            provenance["/task/shared/event_sequence"] = "prompt"
+            provenance["/task/train/event_phase_sampling"] = "prompt"
         text = prompt.casefold()
         explicit_size = "0.45" in text and "0.75" in text
         explicit_positions = (
@@ -1474,9 +1552,10 @@ def _raise_prompt_semantic_drift(
     Structural validators can prove that three platforms are safe and
     buildable; they cannot prove that three satisfies an explicit request for
     four.  Keep this gate deliberately narrow and deterministic: explicit
-    obstacle cardinality is enforced for parkour and planar slalom prompts.
-    That gives the hybrid author a clean rejection signal and lets it fall back
-    to the exact-count offline compiler instead of silently promoting drift.
+    obstacle cardinality is enforced for parkour and planar slalom prompts,
+    and an explicitly ordered post-route jump must retain its authored event
+    program.  That gives the hybrid author a clean rejection signal and lets
+    it fall back instead of silently promoting drift.
     """
     try:
         intent = _intent(prompt)
@@ -1525,9 +1604,56 @@ def _raise_prompt_semantic_drift(
                 "terminal waypoint"
             )
         prompt_text = prompt.casefold()
+        requests_jump = bool(re.search(
+            r"\b(?:jump|leap|hop)(?:s|ed|ing)?\b", prompt_text
+        ))
+        orders_jump_after_route = requests_jump and bool(re.search(
+            r"\b(?:then|after|afterward|once|followed\s+by|at\s+(?:the\s+)?"
+            r"(?:finish|end))\b",
+            prompt_text,
+        ))
+        event_sequence = task_shared.get("event_sequence") \
+            if isinstance(task_shared, Mapping) else None
+        if orders_jump_after_route:
+            phases = event_sequence.get("phases") \
+                if isinstance(event_sequence, Mapping) else None
+            event_program_preserved = (
+                isinstance(phases, list)
+                and [
+                    phase.get("id") if isinstance(phase, Mapping) else None
+                    for phase in phases
+                ] == ["route", "jump", "hold"]
+                and isinstance(phases[0].get("until"), Mapping)
+                and phases[0]["until"].get("event") == "goal_complete"
+                and isinstance(phases[1].get("until"), Mapping)
+                and phases[1]["until"].get("event")
+                == "bilateral_support_cycle"
+                and isinstance(
+                    phases[1]["until"].get("min_height_delta_m"),
+                    (int, float),
+                )
+                and not isinstance(
+                    phases[1]["until"].get("min_height_delta_m"), bool
+                )
+                and phases[1]["until"]["min_height_delta_m"] >= 0.18
+                and phases[2].get("terminal") is True
+            )
+            if not event_program_preserved:
+                raise AuthoringError(
+                    "author model dropped the requested post-route jump "
+                    "event sequence"
+                )
         dwell = re.search(
             r"\b(\d+(?:\.\d+)?)\s*(?:s|sec|second)", prompt_text)
-        if dwell and float(success.get("hold_s", 0.0)) < float(dwell.group(1)):
+        authored_hold_s = float(success.get("hold_s", 0.0))
+        if orders_jump_after_route and isinstance(event_sequence, Mapping):
+            try:
+                authored_hold_s = float(
+                    event_sequence["phases"][2]["minimum_hold_s"]
+                )
+            except (KeyError, IndexError, TypeError, ValueError):
+                authored_hold_s = 0.0
+        if dwell and authored_hold_s < float(dwell.group(1)):
             raise AuthoringError(
                 "author model shortened the requested terminal dwell"
             )

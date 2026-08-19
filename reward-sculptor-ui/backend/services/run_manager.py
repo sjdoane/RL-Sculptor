@@ -713,6 +713,9 @@ def run_sculpt_job(
     expected_authored_world_receipt = run_params.get(
         "authored_world_receipt"
     )
+    expected_warm_start_policy_contract_receipt = run_params.get(
+        "warm_start_policy_contract_receipt"
+    )
     blind_contract_present = "acknowledge_blind_fitness" in run_params
     acknowledge_blind_fitness = bool(
         run_params.get("acknowledge_blind_fitness", False)
@@ -759,6 +762,9 @@ def run_sculpt_job(
             )
         warm_start_checkpoint: Optional[Path] = None
         warm_start_sha256: Optional[str] = None
+        verified_warm_start_policy_contract_receipt: Optional[
+            dict[str, Any]
+        ] = None
         if warm_start_iteration is not None:
             try:
                 warm_start_checkpoint = await asyncio.to_thread(
@@ -787,6 +793,87 @@ def run_sculpt_job(
                 "checkpoint": str(warm_start_checkpoint),
                 "checkpoint_sha256": warm_start_sha256,
             })
+            if (
+                expected_authored_world_receipt is not None
+                and not isinstance(
+                    expected_warm_start_policy_contract_receipt, dict
+                )
+            ):
+                raise RuntimeError(
+                    "authored-world warm start has no immutable policy-contract "
+                    "receipt; the sculpt subprocess was not started"
+                )
+            if isinstance(
+                expected_warm_start_policy_contract_receipt, dict
+            ):
+                try:
+                    from sculptor.policy_contract import (
+                        build_iteration_warm_start_contract_receipt,
+                    )
+
+                    target_payload = (
+                        expected_warm_start_policy_contract_receipt["target"]
+                    )
+                    target_selection_path = Path(
+                        target_payload["selection_path"]
+                    )
+                    verified_warm_start_policy_contract_receipt = (
+                        await asyncio.to_thread(
+                            build_iteration_warm_start_contract_receipt,
+                            project_dir,
+                            int(warm_start_iteration),
+                            target_selection_path=target_selection_path,
+                        )
+                    )
+                except Exception as exc:
+                    job.emit({
+                        "type": "warm_start_policy_contract_failed",
+                        "source": "worker_launch",
+                        "iteration": int(warm_start_iteration),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    raise RuntimeError(
+                        "could not re-attest the warm-start source/target "
+                        "policy contracts; the sculpt subprocess was not "
+                        "started"
+                    ) from exc
+                if (
+                    verified_warm_start_policy_contract_receipt
+                    != expected_warm_start_policy_contract_receipt
+                ):
+                    job.emit({
+                        "type": "warm_start_policy_contract_failed",
+                        "source": "worker_launch",
+                        "iteration": int(warm_start_iteration),
+                        "reason": "receipt_changed_after_admission",
+                    })
+                    raise RuntimeError(
+                        "warm-start policy-contract receipt changed after route "
+                        "admission; the sculpt subprocess was not started"
+                    )
+                job.params[
+                    "warm_start_policy_contract_receipt_revalidated"
+                ] = verified_warm_start_policy_contract_receipt
+                job.emit({
+                    "type": "warm_start_policy_contract_verified",
+                    "source": "worker_launch",
+                    "iteration": int(warm_start_iteration),
+                    "source_contract_sha256": (
+                        verified_warm_start_policy_contract_receipt[
+                            "source"
+                        ]["contract_sha256"]
+                    ),
+                    "target_contract_sha256": (
+                        verified_warm_start_policy_contract_receipt[
+                            "target"
+                        ]["contract_sha256"]
+                    ),
+                    "compatibility": (
+                        verified_warm_start_policy_contract_receipt[
+                            "compatibility"
+                        ]
+                    ),
+                })
         starting_skill_record = None
         if starting_skill_id is not None:
             from sculptor.skill_library import SkillLibrary, SkillLibraryError
@@ -911,6 +998,88 @@ def run_sculpt_job(
                         "starting skill failed its launch-time integrity check"
                     ) from exc
                 warm_start_sha256 = starting_skill_record.checkpoint_sha256
+                try:
+                    from sculptor.policy_contract import (
+                        build_skill_warm_start_contract_receipt,
+                    )
+
+                    current_policy_receipt = (
+                        build_skill_warm_start_contract_receipt(
+                            skill_id=starting_skill_record.skill_id,
+                            manifest_digest=str(
+                                starting_skill_record.manifest_digest
+                            ),
+                            checkpoint_sha256=(
+                                starting_skill_record.checkpoint_sha256
+                            ),
+                            tensor_signature_sha256=(
+                                starting_skill_record.tensor_signature_sha256
+                            ),
+                            source_contract=(
+                                starting_skill_record.compatibility_contract
+                                or {}
+                            ),
+                            target_contract=(
+                                current_target_payload[
+                                    "compatibility_contract"
+                                ] or {}
+                            ),
+                            target_receipt=current_target_receipt,
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "could not re-attest the starting-skill policy "
+                        "contract receipt; the sculpt subprocess was not "
+                        "started"
+                    ) from exc
+                receipt_supplied = isinstance(
+                    expected_warm_start_policy_contract_receipt, dict
+                )
+                if (
+                    not receipt_supplied
+                    or current_policy_receipt
+                    != expected_warm_start_policy_contract_receipt
+                ):
+                    job.emit({
+                        "type": "warm_start_policy_contract_failed",
+                        "source": "worker_launch",
+                        "starting_skill_id": str(starting_skill_id),
+                        "reason": "receipt_changed_after_admission",
+                    })
+                    raise RuntimeError(
+                        "starting-skill policy-contract receipt changed after "
+                        "route admission; the sculpt subprocess was not "
+                        "started"
+                    )
+                if (
+                    current_policy_receipt is not None
+                    and verified_warm_start_policy_contract_receipt is not None
+                ):
+                    raise RuntimeError(
+                        "multiple policy warm-start receipts were admitted"
+                    )
+                if current_policy_receipt is not None:
+                    verified_warm_start_policy_contract_receipt = (
+                        current_policy_receipt
+                    )
+                    job.params[
+                        "warm_start_policy_contract_receipt_revalidated"
+                    ] = current_policy_receipt
+                    job.emit({
+                        "type": "warm_start_policy_contract_verified",
+                        "source": "worker_launch",
+                        "starting_skill_id": str(starting_skill_id),
+                        "source_contract_sha256": current_policy_receipt[
+                            "source"
+                        ]["contract_sha256"],
+                        "target_contract_sha256": current_policy_receipt[
+                            "target"
+                        ]["contract_sha256"],
+                        "compatibility": current_policy_receipt[
+                            "compatibility"
+                        ],
+                    })
             else:
                 from sculptor.refs import library as reference_library
 
@@ -1312,6 +1481,35 @@ def run_sculpt_job(
         env = {k: v for k, v in os.environ.items() if v or k != "ANTHROPIC_API_KEY"}
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        if warm_start_sha256:
+            env["SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"] = str(
+                warm_start_sha256
+            )
+        if verified_warm_start_policy_contract_receipt is not None:
+            verified_contract = verified_warm_start_policy_contract_receipt
+            env[
+                "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+            ] = json.dumps(
+                verified_contract,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            env["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON"] = json.dumps(
+                verified_contract["target"]["contract"],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            env["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256"] = str(
+                verified_contract["target"]["contract_sha256"]
+            )
+            env["SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256"] = str(
+                verified_contract["source"]["contract_sha256"]
+            )
+            env["SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON"] = json.dumps(
+                verified_contract["compatibility"],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         if starting_skill_record is not None:
             env["SCULPTOR_STARTING_SKILL_ID"] = str(starting_skill_record.skill_id)
             env["SCULPTOR_STARTING_SKILL_INIT_MODE"] = str(initialization_mode)

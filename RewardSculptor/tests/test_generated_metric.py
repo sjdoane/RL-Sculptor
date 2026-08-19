@@ -28,6 +28,21 @@ def compute_spec(arrays, behavior, meta):
     return {"spec_score": float(np.clip(speed * up, 0.0, 1.0)), "disp": disp, "up": up}
 '''
 
+GOOD_WITH_DEFAULT_POSE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    grav = arrays.get("projected_gravity_b")
+    default = arrays.get("default_pose_rms")
+    if root is None or grav is None or default is None:
+        return {"spec_score": 0.0}
+    disp = float(np.linalg.norm(
+        root[-1, :, :2].mean(0) - root[0, :, :2].mean(0)))
+    up = float(np.mean(grav[..., 2] < -0.85))
+    terminal = float(np.exp(-np.mean(default[-10:]) / 0.5))
+    speed = 1.0 - float(np.exp(-disp / 2.0))
+    return {"spec_score": float(np.clip(speed * up * terminal, 0.0, 1.0))}
+'''
+
 BAD_IMPORT = '''import os
 import numpy as np
 def compute_spec(arrays, behavior, meta):
@@ -229,6 +244,12 @@ def test_validate_good_metric_passes(tmp_path):
     # active archetype must outscore still/fallen.
     s = v["archetype_scores"]
     assert s["active"] > s["still"] and s["active"] > s["fallen"]
+
+
+def test_validator_fixtures_supply_default_pose_rms(tmp_path):
+    p = _write(tmp_path, "good_default_pose.py", GOOD_WITH_DEFAULT_POSE)
+    validated = validate_generated_metric(GOOD_WITH_DEFAULT_POSE, p)
+    assert validated["ok"], validated["reasons"]
 
 
 def test_validate_rejects_forbidden_import(tmp_path):
@@ -1158,8 +1179,6 @@ def test_graded_discrimination_ranks_and_is_deterministic():
     """The offline selector: a SHARP, smoothly-grading metric out-scores a COARSE
     binary one and a degenerate one, and is byte-deterministic across calls (it must
     add no nondeterminism to selection)."""
-    import numpy as np
-
     from sculptor.eval.generated_metric import inject_joint_roles
     from sculptor.eval.metric_validate import _NAMES_12, graded_discrimination
 
@@ -1188,8 +1207,6 @@ def test_graded_discrimination_is_amplitude_invariant():
     metric (a binary gate returning 5.0) saturates to [1,1,1] and CANNOT out-rank a
     smooth monotone grader on raw output scale — amplitude is an author artifact, not
     discrimination (the review's confirmed mis-rank)."""
-    import numpy as np
-
     from sculptor.eval.generated_metric import inject_joint_roles
     from sculptor.eval.metric_validate import _NAMES_12, graded_discrimination
 

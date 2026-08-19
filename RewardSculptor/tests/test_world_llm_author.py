@@ -173,6 +173,33 @@ def test_hybrid_rejects_slalom_that_drops_ordered_terminal_goal():
     assert draft.task_spec["shared"]["goal"]["waypoints"][-1] == "finish"
 
 
+def test_hybrid_rejects_slalom_that_drops_post_route_jump_program() -> None:
+    prompt = (
+        "Run a slalom around four boxes without touching them, then jump at "
+        "the finish and hold still for 2 seconds."
+    )
+    seed = author_environment(prompt, robot_capability_id="unitree_g1:base")
+    wrong_task = copy.deepcopy(seed.task_spec)
+    wrong_task["shared"].pop("event_sequence")
+    wrong_task["train"].pop("event_phase_sampling")
+    wrong_task["shared"]["goal"]["success"]["hold_s"] = 2.0
+    client = _FakeClient(json.dumps({
+        "world_spec": seed.world_spec,
+        "task_spec": wrong_task,
+        "parameter_provenance": seed.world_spec[
+            "meta"
+        ]["parameter_provenance"],
+    }))
+
+    draft = hybrid_author_environment(
+        prompt, client=client, robot_capability_id="unitree_g1:base")
+
+    assert client.calls == 1
+    assert draft.task_spec["shared"]["event_sequence"]["id"] \
+        == "route_jump_hold"
+    assert draft.task_spec["shared"]["goal"]["success"]["hold_s"] == 0.0
+
+
 def test_hybrid_falls_back_when_client_errors():
     client = _FakeClient(RuntimeError("api down"))
     draft = hybrid_author_environment(

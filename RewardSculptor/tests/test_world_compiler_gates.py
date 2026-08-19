@@ -817,6 +817,418 @@ def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
     assert torch.linalg.norm(term.command[1]) > 0
 
 
+def test_event_command_requires_support_air_support_before_hold() -> None:
+    """No-contact reset prefixes cannot masquerade as a completed jump."""
+    import torch
+
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5), heading=None,
+    )
+    env_cfg = SimpleNamespace(
+        events={},
+        commands={"twist": SimpleNamespace(
+            ranges=ranges, entity_name="robot", debug_vis=False,
+        )},
+        curriculum={},
+    )
+    event = {
+        "id": "route_jump_hold",
+        "phases": [
+            {"id": "route", "until": {"event": "goal_complete"}},
+            {"id": "jump", "until": {
+                "event": "bilateral_support_cycle",
+                "support_contacts": [
+                    ["robot:left_foot", "world:terrain"],
+                    ["robot:right_foot", "world:terrain"],
+                ],
+                "min_air_time_s": 0.06,
+                "min_height_delta_m": 0.18,
+            }},
+            {"id": "hold", "terminal": True, "minimum_hold_s": 2.0},
+        ],
+    }
+    manifest = SimpleNamespace(
+        task_shared={
+            "goal": {
+                "type": "waypoint_sequence", "waypoints": ["finish"],
+                "success": {"tolerance_m": 0.2, "hold_s": 0.0},
+            },
+            "event_sequence": event,
+            "termination": {"episode_length_s": 24.0},
+        },
+        course=(),
+        zones={
+            "finish": {
+                "kind": "disk", "center_m": [1.0, 0.0], "radius_m": 0.2,
+            },
+        },
+    )
+    _reconcile_waypoint_course(
+        env_cfg,
+        manifest,
+        train=False,
+        task_train={},
+    )
+    cfg = env_cfg.commands["twist"]
+    names = cfg.event_support_sensor_names
+
+    robot = SimpleNamespace(data=SimpleNamespace(
+        root_link_pos_w=torch.tensor([[0.0, 0.0, 0.8]]),
+        root_link_lin_vel_w=torch.zeros((1, 3)),
+        root_link_lin_vel_b=torch.zeros((1, 3)),
+        root_link_ang_vel_b=torch.zeros((1, 3)),
+        heading_w=torch.zeros(1),
+    ))
+
+    class FakeScene(dict):
+        pass
+
+    scene = FakeScene({
+        "robot": robot,
+        names[0]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([True]))),
+        names[1]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([True]))),
+    })
+    scene.env_origins = torch.zeros((1, 3))
+    env = SimpleNamespace(
+        num_envs=1, device="cpu", scene=scene, step_dt=0.02,
+    )
+    term = cfg.build(env)
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([1.0, 0.0])
+    term._update_command()
+    assert term.event_phase.item() == 1
+    assert term._event_support_seen.item()
+    assert term.event_support_contacts.tolist() == [[True, True]]
+    assert not term.is_standing_env.item()
+
+    # One or two staggered liftoff frames are ordinary sensor/takeoff
+    # asynchrony, not evidence of a one-foot jump.
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    robot.data.root_link_lin_vel_w[0, 2] = 1.2
+    for _ in range(2):
+        term._update_command()
+    scene[names[1]].data.found[:] = False
+    for _ in range(3):
+        term._update_command()
+    assert term.event_phase.item() == 1
+    assert term._event_flight_seen.item()
+    assert term.event_phase_height_delta.item() == pytest.approx(0.25)
+    assert term.event_phase_vertical_velocity.item() == pytest.approx(1.2)
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    term._update_command()
+    assert term.event_phase.item() == 2
+    assert term.is_standing_env.item()
+    assert not term.event_sequence_violation.item()
+
+    # A JUMP-phase RSI can begin with sensors transiently reporting no contact.
+    # That prefix must not arm flight before support has first been observed.
+    env._sculptor_waypoint_start_index = torch.tensor([1])
+    env._sculptor_event_phase_start = torch.tensor([1])
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    fresh = cfg.build(env)
+    for _ in range(4):
+        fresh._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    fresh._update_command()
+    assert fresh.event_phase.item() == 1
+    assert fresh._event_support_seen.item()
+    assert not fresh._event_flight_seen.item()
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.10
+    for _ in range(3):
+        fresh._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    fresh._update_command()
+    assert fresh.event_phase.item() == 1
+    assert not fresh._event_flight_seen.item()
+    assert fresh._event_max_height_delta.item() == 0.0
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.30
+    for _ in range(3):
+        fresh._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    fresh._update_command()
+    assert fresh.event_phase.item() == 2
+
+    # Route completion can occur while crouched.  A supported stand-up may
+    # exceed the apex threshold, but a subsequent low flight must be measured
+    # from the last bilateral-support takeoff height and cannot enter HOLD.
+    env._sculptor_event_phase_start = torch.tensor([1])
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    supported_rise = cfg.build(env)
+    supported_rise._update_command()
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    supported_rise._update_command()
+    assert supported_rise._event_max_height_delta.item() == 0.0
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.12
+    for _ in range(3):
+        supported_rise._update_command()
+    assert supported_rise._event_flight_seen.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    supported_rise._update_command()
+    assert supported_rise.event_phase.item() == 1
+    assert supported_rise._event_max_height_delta.item() == 0.0
+
+    # Apex and airtime are conjunctive evidence from one continuous flight.
+    # A brief high hop followed by a long shallow hop cannot splice the two.
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    disjoint = cfg.build(env)
+    disjoint._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        disjoint._update_command()
+    assert not disjoint._event_flight_seen.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    disjoint._update_command()
+    assert disjoint._event_max_height_delta.item() == 0.0
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.90
+    for _ in range(3):
+        disjoint._update_command()
+    assert disjoint._event_flight_seen.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    disjoint._update_command()
+    assert disjoint.event_phase.item() == 1
+    assert disjoint._event_max_height_delta.item() == 0.0
+
+    # An asymmetric contact is also a continuity break.  Sensor skew may be
+    # too brief to count as a one-foot jump, but it cannot join airtime/apex
+    # evidence from the bilateral-air intervals on either side.
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    asymmetric_break = cfg.build(env)
+    asymmetric_break._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        asymmetric_break._update_command()
+    scene[names[0]].data.found[:] = True
+    asymmetric_break._update_command()
+    assert not asymmetric_break._event_flight_seen.item()
+    assert asymmetric_break._event_max_height_delta.item() == 0.0
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.90
+    for _ in range(3):
+        asymmetric_break._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    asymmetric_break._update_command()
+    assert asymmetric_break.event_phase.item() == 1
+    assert not asymmetric_break.event_sequence_violation.item()
+
+    # A persistent, apex-qualified asymmetric attempt is a real one-foot hop
+    # and permanently invalidates this episode even if a later bilateral
+    # flight/landing would otherwise satisfy the phase latch.
+    env._sculptor_event_phase_start = torch.tensor([1])
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    one_foot = cfg.build(env)
+    one_foot._update_command()
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(3):
+        one_foot._update_command()
+    assert one_foot.event_sequence_violation.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    for _ in range(3):
+        one_foot._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    one_foot._update_command()
+    assert one_foot.event_phase.item() == 1
+
+    # Bilateral flight followed by a sustained unilateral touchdown/rehop is
+    # still a one-foot violation. One or two skew frames remain tolerated,
+    # but three evidence-qualified frames cannot later enter HOLD.
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    postflight_one_foot = cfg.build(env)
+    postflight_one_foot._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(3):
+        postflight_one_foot._update_command()
+    assert postflight_one_foot._event_flight_seen.item()
+    scene[names[0]].data.found[:] = True
+    for _ in range(3):
+        postflight_one_foot._update_command()
+    assert postflight_one_foot.event_sequence_violation.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    postflight_one_foot._update_command()
+    assert postflight_one_foot.event_phase.item() == 1
+
+    # A flight blip before raw route completion is ignored; an early hop with
+    # the admitted duration and apex is latched and cannot later earn HOLD.
+    env._sculptor_waypoint_start_index = torch.tensor([0])
+    env._sculptor_event_phase_start = torch.tensor([0])
+    robot.data.root_link_pos_w[0] = torch.tensor([0.0, 0.0, 0.8])
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    early = cfg.build(env)
+    early._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.82
+    early._update_command()
+    assert not early.event_sequence_violation.item()
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        early._update_command()
+    assert early.event_sequence_violation.item()
+
+    # Likewise, an apex-qualified second bilateral flight after landing makes
+    # the one-shot HOLD invalid; a single contact flicker would not.
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    for _ in range(2):
+        term._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.82
+    term._update_command()
+    assert not term.event_sequence_violation.item()
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        term._update_command()
+    assert term.event_sequence_violation.item()
+    assert term.event_phase.item() == 2
+    assert not term.is_standing_env.item()
+
+    env._sculptor_event_phase_start = torch.tensor([2])
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    repeat_one_foot = cfg.build(env)
+    repeat_one_foot._update_command()
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(3):
+        repeat_one_foot._update_command()
+    assert repeat_one_foot.event_sequence_violation.item()
+    assert not repeat_one_foot.is_standing_env.item()
+
+
+def test_route_only_rsi_preserves_legacy_random_stream() -> None:
+    import torch
+
+    num_envs = 5
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            raise AssertionError("midroute_probability=0 must not write state")
+
+    class FakeScene(dict):
+        pass
+
+    scene = FakeScene(robot=FakeRobot())
+    scene.env_origins = torch.zeros((num_envs, 3))
+    env = SimpleNamespace(num_envs=num_envs, device="cpu", scene=scene)
+    kwargs = {
+        "waypoints_m": ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        "midroute_probability": 0.0,
+        "approach_distance_m": (0.2, 0.4),
+        "lateral_jitter_m": 0.0,
+    }
+
+    torch.manual_seed(123)
+    torch.rand(num_envs)  # the legacy use_midroute draw
+    expected_next = torch.rand(1)
+    torch.manual_seed(123)
+    reset_robot_along_waypoint_route(env, None, **kwargs)
+    actual_next = torch.rand(1)
+
+    torch.testing.assert_close(actual_next, expected_next)
+    assert torch.all(env._sculptor_event_phase_start == 0)
+
+
+def test_event_phase_rsi_is_train_only_and_uses_terminal_start() -> None:
+    import torch
+
+    num_envs = 4
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            self.written = root_state.clone()
+            self.written_ids = env_ids.clone()
+
+    class FakeScene(dict):
+        pass
+
+    robot = FakeRobot()
+    scene = FakeScene(robot=robot)
+    scene.env_origins = torch.zeros((num_envs, 3))
+    env = SimpleNamespace(num_envs=num_envs, device="cpu", scene=scene)
+    waypoints = ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0))
+
+    reset_robot_along_waypoint_route(
+        env,
+        None,
+        waypoints_m=waypoints,
+        midroute_probability=0.0,
+        approach_distance_m=(0.2, 0.4),
+        lateral_jitter_m=0.0,
+        event_phase_sampling=(0.0, 1.0, 0.0),
+    )
+
+    assert torch.all(env._sculptor_event_phase_start == 1)
+    assert torch.all(env._sculptor_waypoint_start_index == len(waypoints))
+    torch.testing.assert_close(
+        robot.written[:, :2],
+        torch.tensor(waypoints[-1][:2]).expand(num_envs, -1),
+    )
+
+
 def test_materialized_terrain_replays_exact_heightfield(tmp_path: Path) -> None:
     root = tmp_path / "eval_assets"
     compiled = compile_world(
