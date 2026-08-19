@@ -14,6 +14,15 @@ from filelock import FileLock
 from safetensors.torch import save_file
 
 import sculptor.skill_bundle as skill_bundle
+from sculptor.compatibility_provenance import (
+    LEGACY_RECONSTRUCTED,
+    ORIGIN_CONTRACT_MEMBER,
+    ORIGIN_PERSISTED,
+    CompatibilityProvenanceError,
+    build_launch_acknowledgement_receipt,
+    build_origin_persisted_provenance,
+    provenance_fingerprint,
+)
 from sculptor.policy_contract import contract_fingerprint
 from sculptor.reference import save_clip
 from sculptor.refs import library as reference_library
@@ -99,8 +108,17 @@ def _bundle(
 ) -> Path:
     weights = tmp_path / "weights.safetensors"
     _safe_weights(weights, tensors=tensors)
-    payloads = {"policy/weights.safetensors": weights.read_bytes(), **(members or {})}
     contract = contract or _contract()
+    contract_bytes = json.dumps(contract, sort_keys=True).encode("utf-8")
+    payloads = {
+        "policy/weights.safetensors": weights.read_bytes(),
+        ORIGIN_CONTRACT_MEMBER: contract_bytes,
+        **(members or {}),
+    }
+    contract_provenance = build_origin_persisted_provenance(
+        contract_bytes=contract_bytes,
+        policy_roles=["actor", "critic"],
+    )
     files = []
     for name, body in payloads.items():
         digest = hashlib.sha256(body).hexdigest()
@@ -123,6 +141,10 @@ def _bundle(
         "deployment": {"task_id": "T"},
         "compatibility_contract": contract,
         "compatibility_contract_digest": contract_fingerprint(contract),
+        "compatibility_contract_provenance": contract_provenance,
+        "compatibility_contract_provenance_digest": provenance_fingerprint(
+            contract_provenance
+        ),
         "files": files,
     }
     path = tmp_path / "skill.rskill"
@@ -272,6 +294,157 @@ def test_safe_bundle_round_trip(tmp_path: Path) -> None:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     assert set(payload) >= {"actor_state_dict", "critic_state_dict"}
     assert record.compatibility_contract_digest == contract_fingerprint(_contract())
+
+
+def test_trainable_bundle_without_contract_origin_evidence_fails_closed(
+    tmp_path: Path,
+) -> None:
+    archive = _bundle(tmp_path)
+    with zipfile.ZipFile(archive, "r") as source:
+        manifest = json.loads(source.read("manifest.json"))
+        members = {
+            info.filename: source.read(info)
+            for info in source.infolist()
+            if info.filename not in {"manifest.json", ORIGIN_CONTRACT_MEMBER}
+        }
+    manifest.pop("compatibility_contract_provenance")
+    manifest.pop("compatibility_contract_provenance_digest")
+    manifest["files"] = [
+        row for row in manifest["files"]
+        if row["path"] != ORIGIN_CONTRACT_MEMBER
+    ]
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.writestr("manifest.json", json.dumps(manifest))
+        for name, body in members.items():
+            output.writestr(name, body)
+
+    with pytest.raises(SkillBundleError) as rejected:
+        StartingSkillBundleImporter(
+            SkillLibrary(tmp_path / "library")
+        ).import_archive(archive, target=_target())
+    assert rejected.value.code == "compatibility_contract_provenance_required"
+
+
+def test_origin_contract_provenance_is_rederived_from_retained_bytes(
+    tmp_path: Path,
+) -> None:
+    archive = _bundle(tmp_path)
+    with zipfile.ZipFile(archive, "r") as source:
+        manifest = json.loads(source.read("manifest.json"))
+        members = {
+            info.filename: source.read(info)
+            for info in source.infolist()
+            if info.filename != "manifest.json"
+        }
+    provenance = manifest["compatibility_contract_provenance"]
+    provenance["evidence"]["origin_policy_contract"]["sha256"] = "0" * 64
+    manifest["compatibility_contract_provenance_digest"] = (
+        provenance_fingerprint(provenance)
+    )
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.writestr("manifest.json", json.dumps(manifest))
+        for name, body in members.items():
+            output.writestr(name, body)
+
+    with pytest.raises(
+        SkillBundleError, match="provenance descriptor mismatch",
+    ) as rejected:
+        StartingSkillBundleImporter(
+            SkillLibrary(tmp_path / "library")
+        ).import_archive(archive, target=_target())
+    assert rejected.value.code == "compatibility_contract_provenance_invalid"
+
+
+def test_origin_contract_evidence_rejects_duplicate_json_keys(
+    tmp_path: Path,
+) -> None:
+    archive = _bundle(tmp_path)
+    with zipfile.ZipFile(archive, "r") as source:
+        manifest = json.loads(source.read("manifest.json"))
+        members = {
+            info.filename: source.read(info)
+            for info in source.infolist()
+            if info.filename != "manifest.json"
+        }
+    original = members[ORIGIN_CONTRACT_MEMBER]
+    duplicate = b'{"schema":1,' + original[1:]
+    members[ORIGIN_CONTRACT_MEMBER] = duplicate
+    evidence = manifest["compatibility_contract_provenance"]["evidence"][
+        "origin_policy_contract"
+    ]
+    evidence.update({
+        "sha256": hashlib.sha256(duplicate).hexdigest(),
+        "bytes": len(duplicate),
+    })
+    manifest["compatibility_contract_provenance_digest"] = provenance_fingerprint(
+        manifest["compatibility_contract_provenance"]
+    )
+    for descriptor in manifest["files"]:
+        if descriptor["path"] == ORIGIN_CONTRACT_MEMBER:
+            descriptor.update({
+                "sha256": hashlib.sha256(duplicate).hexdigest(),
+                "bytes": len(duplicate),
+            })
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.writestr("manifest.json", json.dumps(manifest))
+        for name, body in members.items():
+            output.writestr(name, body)
+
+    with pytest.raises(
+        SkillBundleError, match="duplicate JSON key 'schema'",
+    ) as rejected:
+        StartingSkillBundleImporter(
+            SkillLibrary(tmp_path / "library")
+        ).import_archive(archive, target=_target())
+    assert rejected.value.code == "compatibility_contract_provenance_invalid"
+
+
+def test_legacy_reconstructed_launch_requires_scoped_acknowledgement() -> None:
+    digest = "a" * 64
+    with pytest.raises(
+        CompatibilityProvenanceError, match="explicit acknowledgement",
+    ):
+        build_launch_acknowledgement_receipt(
+            status=LEGACY_RECONSTRUCTED,
+            provenance_digest=digest,
+            acknowledged=False,
+            initialization_mode="actor_critic",
+        )
+
+    receipt = build_launch_acknowledgement_receipt(
+        status=LEGACY_RECONSTRUCTED,
+        provenance_digest=digest,
+        acknowledged=True,
+        initialization_mode="actor_critic",
+    )
+    assert receipt == {
+        "schema": 1,
+        "status": LEGACY_RECONSTRUCTED,
+        "provenance_digest": digest,
+        "acknowledged": True,
+        "initialization_mode": "actor_critic",
+        "optimizer_resume": False,
+        "exact_resume": False,
+    }
+
+    with pytest.raises(
+        CompatibilityProvenanceError, match="origin-persisted",
+    ):
+        build_launch_acknowledgement_receipt(
+            status=ORIGIN_PERSISTED,
+            provenance_digest=digest,
+            acknowledged=True,
+            initialization_mode="actor_only",
+        )
+    with pytest.raises(
+        CompatibilityProvenanceError, match="actor/critic initialization only",
+    ):
+        build_launch_acknowledgement_receipt(
+            status=LEGACY_RECONSTRUCTED,
+            provenance_digest=digest,
+            acknowledged=True,
+            initialization_mode="full_resume",
+        )
 
 
 def test_trainable_bundle_cannot_inherit_robot_identity_from_target(

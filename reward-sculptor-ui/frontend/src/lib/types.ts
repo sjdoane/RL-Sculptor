@@ -398,6 +398,7 @@ export interface RunParamsPayload {
    * boundaries so a stale picker cannot launch different bytes. */
   expected_starting_skill_manifest_digest?: string | null;
   initialization_mode?: StartingSkillInitializationMode | null;
+  acknowledge_legacy_reconstructed_initialization?: boolean;
   // Optional pre-existing motion. The exact robot namespace is paired with
   // the clip id so the backend never resolves from a fallback embodiment.
   reference_clip_id?: string | null;
@@ -708,6 +709,26 @@ export interface StartingSkillRecord {
   controller_sha256?: string | null;
   compatibility_contract?: Record<string, unknown> | null;
   compatibility_contract_digest?: string | null;
+  compatibility_contract_provenance?: {
+    schema: number;
+    status: "origin_persisted" | "legacy_reconstructed";
+    capabilities: {
+      initialization_modes: StartingSkillInitializationMode[];
+      optimizer_resume: false;
+      exact_resume: false;
+    };
+    evidence: Record<string, {
+      path: string;
+      sha256: string;
+      bytes: number;
+    }>;
+    reconstruction?: Record<string, unknown>;
+  } | null;
+  compatibility_contract_provenance_digest?: string | null;
+  compatibility_contract_provenance_status?:
+    | "origin_persisted"
+    | "legacy_reconstructed"
+    | null;
   tensor_contract_verified?: boolean;
   tensor_signature_sha256?: string | null;
   initialization_modes: StartingSkillInitializationMode[];
@@ -838,6 +859,11 @@ export interface StartingPointSelection {
   reference_clip_id: string | null;
   reference_robot: string | null;
   import_manifest_digest: string | null;
+  compatibility_contract_provenance_status:
+    | "origin_persisted"
+    | "legacy_reconstructed"
+    | null;
+  acknowledge_legacy_reconstructed_initialization: boolean;
   /** Copied from the selected import's compatibility receipt so the launch
    *  review can disclose it. Direct project checkpoints leave this null and
    *  are verified only by the launch path. */

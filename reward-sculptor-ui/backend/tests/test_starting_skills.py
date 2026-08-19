@@ -13,6 +13,17 @@ import torch
 from fastapi.testclient import TestClient
 from safetensors.torch import save_file
 
+from sculptor.compatibility_provenance import (
+    LEGACY_CONFIG_MEMBER,
+    LEGACY_LOG_MEMBER,
+    LEGACY_OBSERVED_SELECTION_MEMBER,
+    LEGACY_SOURCE_SELECTION_MEMBER,
+    ORIGIN_CONTRACT_MEMBER,
+    build_legacy_reconstructed_provenance,
+    build_launch_acknowledgement_receipt,
+    build_origin_persisted_provenance,
+    provenance_fingerprint,
+)
 from sculptor.policy_contract import (
     build_project_policy_contract,
     build_skill_warm_start_contract_receipt,
@@ -90,6 +101,126 @@ def _state_tensors(contract: dict) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _legacy_contract_provenance(
+    project_dir: Path, contract: dict,
+) -> tuple[dict, dict[str, bytes]]:
+    """Build immutable historical evidence for the route/worker test fixture."""
+    config = (project_dir / "config.toml").read_bytes()
+    tuple_hash = "c" * 64
+    selection_base = {
+        "tuple_hash": tuple_hash,
+        "evaluation_lineage": "legacy-test-source",
+        "refs": {
+            "reward": {"version": "v20", "sha256": "1" * 64},
+            "env_spec": {"version": "v21", "sha256": "2" * 64},
+        },
+    }
+    source_selection = json.dumps({
+        **selection_base, "selection_version": 47,
+    }, sort_keys=True).encode("utf-8")
+    observed_selection = json.dumps({
+        **selection_base, "selection_version": 48,
+    }, sort_keys=True).encode("utf-8")
+
+    def shape_text(shape: list[int]) -> str:
+        return "(" + ", ".join(str(value) for value in shape) + (
+            ",)" if len(shape) == 1 else ")"
+        )
+
+    observations = contract["observations"]
+    actions = contract["actions"]
+    timing = contract["timing"]
+    lines = [
+        f"| Physics step-size | {timing['sim_timestep_s']} |",
+        f"| Environment step-size | {timing['control_dt_s']} |",
+        f"Active Action Terms (shape: {actions['shape'][0]})",
+    ]
+    lines.extend(
+        f"| {index} | {name} | {shape_text(actions['shape'])} |"
+        for index, name in enumerate(actions["term_names"])
+    )
+    lines.append("+---+---+---+")
+    for role, terms_key, shape_key in (
+        ("actor", "ordered_terms", "shape"),
+        ("critic", "critic_ordered_terms", "critic_shape"),
+    ):
+        lines.append(
+            "Active Observation Terms in Group: "
+            f"'{role}' (shape: {shape_text(observations[shape_key])})"
+        )
+        lines.extend(
+            f"| {index} | {term['name']} | {shape_text(term['shape'])} |"
+            for index, term in enumerate(observations[terms_key])
+        )
+        lines.append("+---+---+---+")
+    activation_names = {
+        "elu": "ELU", "gelu": "GELU", "leaky_relu": "LeakyReLU",
+        "relu": "ReLU", "selu": "SELU", "silu": "SiLU", "tanh": "Tanh",
+    }
+    normalizer = contract["policy"]["normalizer"]
+    for role, output_dim in (("actor", actions["shape"][0]), ("critic", 1)):
+        declared = contract["policy"][role]
+        dims = [
+            observations["shape" if role == "actor" else "critic_shape"][0],
+            *declared["hidden_dims"],
+            output_dim,
+        ]
+        lines.append(f"{role.title()} Model:")
+        if normalizer[f"{role}_present"]:
+            lines.append("  EmpiricalNormalization()")
+        for index, (width_in, width_out) in enumerate(zip(dims, dims[1:])):
+            lines.append(
+                f"  ({index * 2}): Linear(in_features={width_in}, "
+                f"out_features={width_out}, bias=True)"
+            )
+            if index < len(dims) - 2:
+                lines.append(
+                    f"  ({index * 2 + 1}): "
+                    f"{activation_names[declared['activation']]}()"
+                )
+    events = [
+        {
+            "type": "run_context_captured",
+            "config_sha256": hashlib.sha256(config).hexdigest(),
+            "code_sha": "6" * 40,
+            "code_dirty": False,
+        },
+        {
+            "type": "authored_world_pinned",
+            "selection": "selection_v47.json",
+            "tuple_hash": tuple_hash,
+        },
+        {
+            "type": "artifact_tuple_pinned",
+            "iter": 1,
+            "selection": "selection_v48.json",
+            "tuple_hash": tuple_hash,
+        },
+        {"type": "iter_started", "iter": 1},
+    ]
+    lines.extend(
+        "[SCULPT-EVENT] " + json.dumps(event, sort_keys=True)
+        for event in events
+    )
+    origin_log = ("\n".join(lines) + "\n").encode("utf-8")
+    members = {
+        LEGACY_LOG_MEMBER: origin_log,
+        LEGACY_CONFIG_MEMBER: config,
+        LEGACY_SOURCE_SELECTION_MEMBER: source_selection,
+        LEGACY_OBSERVED_SELECTION_MEMBER: observed_selection,
+    }
+    provenance = build_legacy_reconstructed_provenance(
+        origin_log=origin_log,
+        source_config=config,
+        source_selection=source_selection,
+        observed_selection=observed_selection,
+        contract=contract,
+        policy_roles=["actor", "critic"],
+        iter_index=1,
+    )
+    return provenance, members
+
+
 def _event_contract(source: dict) -> dict:
     target = copy.deepcopy(source)
     target["schema"] = 3
@@ -122,16 +253,32 @@ def _bundle(
     project_dir: Path,
     *,
     contract: dict | None = None,
+    legacy_reconstructed: bool = False,
 ) -> Path:
     contract = contract or build_project_policy_contract(project_dir)
+    contract_bytes = json.dumps(
+        contract, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
     weights = tmp_path / "weights.safetensors"
     save_file(
         _state_tensors(contract), str(weights),
         metadata={"format": "reward-sculptor-rsl-rl-v1"},
     )
+    contract_provenance, provenance_members = (
+        _legacy_contract_provenance(project_dir, contract)
+        if legacy_reconstructed
+        else (
+            build_origin_persisted_provenance(
+                contract_bytes=contract_bytes,
+                policy_roles=["actor", "critic"],
+            ),
+            {ORIGIN_CONTRACT_MEMBER: contract_bytes},
+        )
+    )
     members = {
         "policy/weights.safetensors": weights.read_bytes(),
         "world/manifest.json": b'{"kind":"staged-only"}',
+        **provenance_members,
     }
     files = [
         {
@@ -145,6 +292,7 @@ def _bundle(
         "schema_version": 2,
         "kind": BUNDLE_KIND,
         "project": "outside-lab-g1",
+        "iter_index": 1,
         "starting_skill": {
             "name": "G1 complex motion seed",
             "weights_file": "policy/weights.safetensors",
@@ -156,6 +304,10 @@ def _bundle(
         "deployment": {"task_id": TASK, "robot_slug": "g1"},
         "compatibility_contract": contract,
         "compatibility_contract_digest": contract_fingerprint(contract),
+        "compatibility_contract_provenance": contract_provenance,
+        "compatibility_contract_provenance_digest": provenance_fingerprint(
+            contract_provenance
+        ),
         "files": files,
     }
     path = tmp_path / "g1.rskill"
@@ -212,6 +364,15 @@ def _reference_only_bundle(tmp_path: Path) -> Path:
         for name, body in members.items():
             archive.writestr(name, body)
     return path
+
+
+def _policy_provenance_receipt(record, initialization_mode: str) -> dict:
+    return build_launch_acknowledgement_receipt(
+        status=record.compatibility_contract_provenance_status,
+        provenance_digest=record.compatibility_contract_provenance_digest,
+        acknowledged=False,
+        initialization_mode=initialization_mode,
+    )
 
 
 def test_import_list_receipt_and_world_stays_inactive(
@@ -452,6 +613,64 @@ def test_full_resume_is_not_claimed_for_sanitized_import(
     )
     assert response.status_code == 412
     assert response.json()["type"] == "/problems/starting-skill-mode"
+
+
+def test_legacy_reconstructed_policy_requires_and_pins_route_acknowledgement(
+    client: TestClient, tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_LIBRARY_ROOT, str(tmp_path / "skills"))
+    slug, project_dir = _project(client)
+    bundle = _bundle(tmp_path, project_dir, legacy_reconstructed=True)
+    with bundle.open("rb") as handle:
+        imported = client.post(
+            f"/projects/{slug}/starting-skills",
+            files={"bundle": ("iter38.rskill", handle, "application/zip")},
+        )
+    assert imported.status_code == 201, imported.text
+    receipt = imported.json()
+    skill = receipt["skill"]
+    assert skill["compatibility_contract_provenance_status"] == (
+        "legacy_reconstructed"
+    )
+    assert len(skill["compatibility_contract_provenance_digest"]) == 64
+
+    request = {
+        "behavior_goal": "extend the attested historical policy",
+        "iterations": 1,
+        "dry_run": True,
+        "starting_skill_id": skill["skill_id"],
+        "expected_starting_skill_manifest_digest": skill["manifest_digest"],
+        "initialization_mode": "actor_critic",
+    }
+    blocked = client.post(f"/projects/{slug}/runs", json=request)
+    assert blocked.status_code == 412, blocked.text
+    assert blocked.json()["type"] == "/problems/starting-skill-provenance"
+    assert "explicit acknowledgement" in blocked.json()["detail"]
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+    launched = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            **request,
+            "acknowledge_legacy_reconstructed_initialization": True,
+        },
+    )
+    assert launched.status_code == 202, launched.text
+    job = client.app.state.job_manager.get(launched.json()["run_id"])
+    assert job is not None
+    assert job.params["compatibility_contract_provenance_receipt"] == {
+        "schema": 1,
+        "status": "legacy_reconstructed",
+        "provenance_digest": (
+            skill["compatibility_contract_provenance_digest"]
+        ),
+        "acknowledged": True,
+        "initialization_mode": "actor_critic",
+        "optimizer_resume": False,
+        "exact_resume": False,
+    }
 
 
 @pytest.mark.parametrize("reference_only", [False, True])
@@ -742,6 +961,8 @@ def test_worker_rechecks_target_contract_after_queueing_before_subprocess(
             f"/projects/{slug}/starting-skills",
             files={"bundle": ("g1.rskill", handle, "application/zip")},
         ).json()
+    record = SkillLibrary().load(receipt["skill"]["skill_id"])
+    assert record is not None
 
     _target, target_receipt = run_manager.resolve_starting_skill_target(
         project_dir, require_policy_contract=True,
@@ -773,6 +994,9 @@ def test_worker_rechecks_target_contract_after_queueing_before_subprocess(
             ),
             "starting_skill_target_receipt": target_receipt,
             "initialization_mode": "actor_critic",
+            "compatibility_contract_provenance_receipt": (
+                _policy_provenance_receipt(record, "actor_critic")
+            ),
         },
     )
     job = Job(
@@ -850,6 +1074,9 @@ def test_exact_schema3_skill_without_full_receipt_blocks_before_subprocess(
             "expected_starting_skill_manifest_digest": record.manifest_digest,
             "starting_skill_target_receipt": target_receipt,
             "initialization_mode": "actor_critic",
+            "compatibility_contract_provenance_receipt": (
+                _policy_provenance_receipt(record, "actor_critic")
+            ),
         },
     )
     job = Job(
@@ -977,6 +1204,9 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
             "starting_skill_target_receipt": target_receipt,
             "warm_start_policy_contract_receipt": policy_receipt,
             "initialization_mode": "actor_critic",
+            "compatibility_contract_provenance_receipt": (
+                _policy_provenance_receipt(record, "actor_critic")
+            ),
         },
     )
     job = Job(
@@ -1106,6 +1336,9 @@ def test_selected_imported_policy_requires_runtime_load_receipt_even_on_rc_zero(
             "starting_skill_target_receipt": target_receipt,
             "warm_start_policy_contract_receipt": policy_receipt,
             "initialization_mode": "actor_only",
+            "compatibility_contract_provenance_receipt": (
+                _policy_provenance_receipt(record, "actor_only")
+            ),
         },
     )
     job = Job(

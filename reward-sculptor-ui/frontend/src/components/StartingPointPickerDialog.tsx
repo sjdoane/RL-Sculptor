@@ -55,6 +55,8 @@ const DEFAULT_SELECTION: StartingPointSelection = {
   reference_clip_id: null,
   reference_robot: null,
   import_manifest_digest: null,
+  compatibility_contract_provenance_status: null,
+  acknowledge_legacy_reconstructed_initialization: false,
   policy_contract_migration: null,
 };
 
@@ -565,6 +567,11 @@ function ReceiptSummary({
           <dd style={{ margin: 0 }}>{contractSummary(receipt.skill.compatibility_contract)}</dd>
           <dt className="rs-sub">Contract digest</dt>
           <dd style={{ margin: 0 }}><DigestValue value={receipt.skill.compatibility_contract_digest} /></dd>
+          <dt className="rs-sub">Contract origin</dt>
+          <dd style={{ margin: 0 }}>
+            {humanize(receipt.skill.compatibility_contract_provenance_status)}
+            {" · "}<DigestValue value={receipt.skill.compatibility_contract_provenance_digest} />
+          </dd>
           <dt className="rs-sub">Tensor contract</dt>
           <dd
             aria-label={`Tensor contract ${receipt.skill.tensor_contract_verified ? "verified" : "not verified"}`}
@@ -742,6 +749,9 @@ export function StartingPointPickerDialog({
           ? receipt.components.reference?.robot ?? null
           : null,
         import_manifest_digest: receipt.skill.manifest_digest,
+        compatibility_contract_provenance_status:
+          receipt.skill.compatibility_contract_provenance_status ?? null,
+        acknowledge_legacy_reconstructed_initialization: false,
         policy_contract_migration:
           receipt.compatibility.policy_contract_migration ?? null,
       });
@@ -815,6 +825,9 @@ export function StartingPointPickerDialog({
         ? choice?.components.reference?.robot ?? null
         : null,
       import_manifest_digest: choice?.skill.manifest_digest ?? null,
+      compatibility_contract_provenance_status:
+        choice?.skill.compatibility_contract_provenance_status ?? null,
+      acknowledge_legacy_reconstructed_initialization: false,
       policy_contract_migration:
         choice?.compatibility.policy_contract_migration ?? null,
     });
@@ -835,6 +848,9 @@ export function StartingPointPickerDialog({
         ? receipt.components.reference?.robot ?? null
         : null,
       import_manifest_digest: receipt.skill.manifest_digest,
+      compatibility_contract_provenance_status:
+        receipt.skill.compatibility_contract_provenance_status ?? null,
+      acknowledge_legacy_reconstructed_initialization: false,
       policy_contract_migration:
         receipt.compatibility.policy_contract_migration ?? null,
     });
@@ -848,12 +864,21 @@ export function StartingPointPickerDialog({
       draft.reference_clip_id === selectedReceipt?.components.reference?.clip_id
       && draft.reference_robot === selectedReceipt?.components.reference?.robot
     );
+  const legacyReconstructedPolicy = (
+    selectedReceipt?.skill.compatibility_contract_provenance_status
+      === "legacy_reconstructed"
+    && draft.initialization_mode !== "reference_only"
+  );
   const sharedSkillValid = selectedReceipt?.selectable === true
     && isAdmittedTrust(selectedReceipt, draft.initialization_mode)
     && hasImmutableManifest(selectedReceipt)
     && draft.initialization_mode != null
     && selectedReceipt.compatibility.allowed_initialization_modes.includes(draft.initialization_mode)
-    && requiredReferenceValid;
+    && requiredReferenceValid
+    && (
+      !legacyReconstructedPolicy
+      || draft.acknowledge_legacy_reconstructed_initialization
+    );
   const canApply = draft.kind === "scratch"
     || (draft.kind === "project_checkpoint" && checkpointValid)
     || (draft.kind === "shared_skill" && sharedSkillValid);
@@ -1131,7 +1156,11 @@ export function StartingPointPickerDialog({
                             {receipt.skill.alias || receipt.skill.skill_id}
                           </span>
                           <span className={`rs-badge ${receipt.selectable && isAdmittedTrust(receipt) && hasImmutableManifest(receipt) ? "amber" : "rose"}`}>
-                            {receipt.selectable && isAdmittedTrust(receipt) && hasImmutableManifest(receipt) ? "candidate" : "blocked"}
+                            {receipt.selectable && isAdmittedTrust(receipt) && hasImmutableManifest(receipt)
+                              ? receipt.skill.compatibility_contract_provenance_status === "legacy_reconstructed"
+                                ? "legacy reconstructed"
+                                : "candidate"
+                              : "blocked"}
                           </span>
                         </span>
                         <span className="rs-sub" style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 4, fontSize: 10.5 }}>
@@ -1165,6 +1194,7 @@ export function StartingPointPickerDialog({
                         onChange={(mode) => setDraft((current) => ({
                           ...current,
                           initialization_mode: mode,
+                          acknowledge_legacy_reconstructed_initialization: false,
                           reference_clip_id: mode === "reference_only"
                             ? selectedReceipt.components.reference?.clip_id ?? null
                             : current.reference_clip_id,
@@ -1173,6 +1203,45 @@ export function StartingPointPickerDialog({
                             : current.reference_robot,
                         }))}
                       />
+                      {legacyReconstructedPolicy && (
+                        <div
+                          role="note"
+                          style={{
+                            display: "grid",
+                            gap: 9,
+                            padding: "11px 12px",
+                            border: "1px solid var(--st-amber-fg)",
+                            borderRadius: "var(--radius-md)",
+                            background: "var(--st-amber-bg)",
+                            color: "var(--ink)",
+                          }}
+                        >
+                          <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                            <Icon name="alert-triangle" size={15} />
+                            <div style={{ display: "grid", gap: 3 }}>
+                              <strong style={{ fontSize: 11.5 }}>Historical contract reconstruction</strong>
+                              <span style={{ fontSize: 11, lineHeight: 1.45 }}>
+                                Reconstructed from immutable historical evidence. Suitable only for actor/critic initialization—not exact resume or optimizer restoration.
+                              </span>
+                            </div>
+                          </div>
+                          <label
+                            htmlFor="legacy-reconstructed-initialization-ack"
+                            style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 11, lineHeight: 1.4, cursor: "pointer" }}
+                          >
+                            <input
+                              id="legacy-reconstructed-initialization-ack"
+                              type="checkbox"
+                              checked={draft.acknowledge_legacy_reconstructed_initialization}
+                              onChange={(event) => setDraft((current) => ({
+                                ...current,
+                                acknowledge_legacy_reconstructed_initialization: event.target.checked,
+                              }))}
+                            />
+                            <span>I understand this compatibility contract was reconstructed after training from retained evidence.</span>
+                          </label>
+                        </div>
+                      )}
                       {selectedReceipt.components.reference && (
                         <label
                           style={{

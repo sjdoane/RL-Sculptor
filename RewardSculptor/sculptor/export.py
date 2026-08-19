@@ -439,6 +439,9 @@ def export_starting_skill_bundle(
     runs_root: Path | str | None = None,
     out_path: Path | str | None = None,
     robot_slug: Optional[str] = None,
+    legacy_origin_job_log: Path | str | None = None,
+    legacy_source_selection: Path | str | None = None,
+    legacy_observed_selection: Path | str | None = None,
 ) -> ExportResult:
     """Build a strict data-only `.rskill` policy-transfer artifact.
 
@@ -519,6 +522,95 @@ def export_starting_skill_bundle(
                 "deployment conversion did not produce readable safetensors"
             ) from exc
         weights_sha = hashlib.sha256(weights).hexdigest()
+        from sculptor.compatibility_provenance import (
+            LEGACY_CONFIG_MEMBER,
+            LEGACY_LOG_MEMBER,
+            LEGACY_OBSERVED_SELECTION_MEMBER,
+            LEGACY_SOURCE_SELECTION_MEMBER,
+            ORIGIN_CONTRACT_MEMBER,
+            build_legacy_reconstructed_provenance,
+            build_origin_persisted_provenance,
+            canonical_json_bytes,
+            evidence_member_paths,
+            provenance_fingerprint,
+        )
+
+        legacy_paths = (
+            legacy_origin_job_log,
+            legacy_source_selection,
+            legacy_observed_selection,
+        )
+        if any(path is not None for path in legacy_paths) and not all(
+            path is not None for path in legacy_paths
+        ):
+            raise ExportError(
+                "legacy contract reconstruction requires --legacy-origin-job-log, "
+                "--legacy-source-selection, and --legacy-observed-selection together"
+            )
+        provenance_payloads: dict[str, bytes]
+        if all(path is not None for path in legacy_paths):
+            try:
+                origin_log = Path(legacy_origin_job_log).resolve().read_bytes()
+                source_config = (project / "config.toml").read_bytes()
+                source_selection = Path(legacy_source_selection).resolve().read_bytes()
+                observed_selection = Path(
+                    legacy_observed_selection
+                ).resolve().read_bytes()
+                contract_provenance = build_legacy_reconstructed_provenance(
+                    origin_log=origin_log,
+                    source_config=source_config,
+                    source_selection=source_selection,
+                    observed_selection=observed_selection,
+                    contract=contract,
+                    policy_roles=list(roles),
+                    iter_index=int(source_manifest["iter_index"]),
+                )
+            except (OSError, ValueError) as exc:
+                raise ExportError(
+                    "legacy compatibility-contract evidence failed verification: "
+                    f"{exc}"
+                ) from exc
+            provenance_payloads = {
+                LEGACY_LOG_MEMBER: origin_log,
+                LEGACY_CONFIG_MEMBER: source_config,
+                LEGACY_SOURCE_SELECTION_MEMBER: source_selection,
+                LEGACY_OBSERVED_SELECTION_MEMBER: observed_selection,
+            }
+        else:
+            root = Path(runs_root).resolve() if runs_root else project / "runs"
+            origin_contract_path = (
+                root
+                / f"iter_{int(source_manifest['iter_index'])}"
+                / "warm_start_effective_policy_contract.json"
+            )
+            if not origin_contract_path.is_file():
+                raise ExportError(
+                    "portable policy export requires the contract sidecar persisted "
+                    "when training ran. This historical iteration has no origin "
+                    "sidecar; use all three explicit --legacy-* evidence options "
+                    "to request a visibly disclosed actor/critic-only reconstruction."
+                )
+            try:
+                origin_contract_bytes = origin_contract_path.read_bytes()
+                origin_contract = json.loads(origin_contract_bytes.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ExportError(
+                    "origin policy-contract sidecar is unreadable"
+                ) from exc
+            if (
+                not isinstance(origin_contract, dict)
+                or canonical_json_bytes(origin_contract) != canonical_json_bytes(contract)
+            ):
+                raise ExportError(
+                    "origin policy-contract sidecar does not match the exported "
+                    "compatibility contract"
+                )
+            contract_provenance = build_origin_persisted_provenance(
+                contract_bytes=origin_contract_bytes,
+                policy_roles=list(roles),
+            )
+            provenance_payloads = {ORIGIN_CONTRACT_MEMBER: origin_contract_bytes}
+        contract_provenance_digest = provenance_fingerprint(contract_provenance)
         portable_warnings = [
             "Portable transfer excludes the raw checkpoint, optimizer state, "
             "reward/environment source, Python, ONNX, and TorchScript; use the "
@@ -556,13 +648,29 @@ def export_starting_skill_bundle(
             },
             "compatibility_contract": contract,
             "compatibility_contract_digest": contract_digest,
+            "compatibility_contract_provenance": contract_provenance,
+            "compatibility_contract_provenance_digest": (
+                contract_provenance_digest
+            ),
             "source_artifact_tuple": source_tuple_receipt,
             "warnings": portable_warnings,
-            "files": [{
-                "path": weights_name,
-                "sha256": weights_sha,
-                "bytes": len(weights),
-            }],
+            "files": [
+                {
+                    "path": weights_name,
+                    "sha256": weights_sha,
+                    "bytes": len(weights),
+                },
+                *[
+                    {
+                        "path": member_name,
+                        "sha256": hashlib.sha256(
+                            provenance_payloads[member_name]
+                        ).hexdigest(),
+                        "bytes": len(provenance_payloads[member_name]),
+                    }
+                    for member_name in evidence_member_paths(contract_provenance)
+                ],
+            ],
         }
 
         if out_path is None:
@@ -583,6 +691,8 @@ def export_starting_skill_bundle(
         with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(manifest_path, "manifest.json")
             archive.writestr(weights_name, weights)
+            for member_name in evidence_member_paths(contract_provenance):
+                archive.writestr(member_name, provenance_payloads[member_name])
         shutil.move(str(pending), str(out))
     return ExportResult(
         bundle_path=out,

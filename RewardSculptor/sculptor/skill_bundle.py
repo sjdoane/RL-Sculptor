@@ -83,9 +83,14 @@ _PORTABLE_MEMBER_LIMITS = {
     "reference/provenance.json": MAX_MANIFEST_BYTES,
     "controller/controller.json": 256 * 1024,
     "world/manifest.json": MAX_MANIFEST_BYTES,
+    "provenance/origin_policy_contract.json": MAX_MANIFEST_BYTES,
+    "provenance/origin_job.log": 256 * 1024**2,
+    "provenance/source_config.toml": MAX_MANIFEST_BYTES,
+    "provenance/selection_source.json": MAX_MANIFEST_BYTES,
+    "provenance/selection_observed.json": MAX_MANIFEST_BYTES,
 }
 _PORTABLE_DIRECTORIES = {
-    "policy", "motion", "reference", "controller", "world",
+    "policy", "motion", "reference", "controller", "world", "provenance",
 }
 
 
@@ -1238,6 +1243,15 @@ def receipt_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
             "controller_sha256": record.controller_sha256,
             "compatibility_contract": record.compatibility_contract,
             "compatibility_contract_digest": record.compatibility_contract_digest,
+            "compatibility_contract_provenance": (
+                record.compatibility_contract_provenance
+            ),
+            "compatibility_contract_provenance_digest": (
+                record.compatibility_contract_provenance_digest
+            ),
+            "compatibility_contract_provenance_status": (
+                record.compatibility_contract_provenance_status
+            ),
             "tensor_contract_verified": record.tensor_contract_verified,
             "tensor_signature_sha256": record.tensor_signature_sha256,
             "initialization_modes": list(record.initialization_modes),
@@ -1270,6 +1284,12 @@ def receipt_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
             "checkpoint_format": record.checkpoint_format,
             "manifest_digest": record.manifest_digest,
             "compatibility_contract_digest": record.compatibility_contract_digest,
+            "compatibility_contract_provenance_digest": (
+                record.compatibility_contract_provenance_digest
+            ),
+            "compatibility_contract_provenance_status": (
+                record.compatibility_contract_provenance_status
+            ),
             "tensor_contract_verified": record.tensor_contract_verified,
             "tensor_signature_sha256": record.tensor_signature_sha256,
             "checkpoint_sha256": record.checkpoint_sha256,
@@ -1469,6 +1489,14 @@ class StartingSkillBundleImporter:
 
             source_contract = manifest.get("compatibility_contract")
             source_contract_digest = manifest.get("compatibility_contract_digest")
+            source_contract_provenance = manifest.get(
+                "compatibility_contract_provenance"
+            )
+            source_contract_provenance_digest = manifest.get(
+                "compatibility_contract_provenance_digest"
+            )
+            contract_provenance_status: Optional[str] = None
+            compatibility_provenance_sources: dict[str, Path] = {}
             workdir = Path(td)
             member_names = set(infos)
             has_trainable_policy = _declares_trainable_policy(
@@ -1537,6 +1565,82 @@ class StartingSkillBundleImporter:
                     raise SkillBundleError(
                         "declared policy_roles do not match safetensors contents"
                     )
+                raw_provenance_iter = manifest.get("iter_index")
+                if (
+                    isinstance(raw_provenance_iter, bool)
+                    or not isinstance(raw_provenance_iter, int)
+                    or raw_provenance_iter < 0
+                ):
+                    raise SkillBundleError(
+                        "trainable bundle requires a non-negative source iter_index"
+                    )
+                from sculptor.compatibility_provenance import (
+                    CompatibilityProvenanceError,
+                    provenance_fingerprint,
+                    validate_compatibility_contract_provenance,
+                )
+
+                if not isinstance(source_contract_provenance, dict):
+                    raise SkillBundleError(
+                        "trainable bundle is missing "
+                        "compatibility_contract_provenance; a generated contract "
+                        "without attributable origin evidence cannot initialize "
+                        "training",
+                        code="compatibility_contract_provenance_required",
+                    )
+                actual_provenance_digest = provenance_fingerprint(
+                    source_contract_provenance
+                )
+                if source_contract_provenance_digest != actual_provenance_digest:
+                    raise SkillBundleError(
+                        "compatibility_contract_provenance_digest mismatch",
+                        code="descriptor_mismatch",
+                    )
+
+                def _read_provenance_member(member_name: str) -> bytes:
+                    info = infos.get(member_name)
+                    if info is None:
+                        raise KeyError(member_name)
+                    return _read_member_limited(
+                        archive,
+                        info,
+                        _PORTABLE_MEMBER_LIMITS[member_name],
+                    )
+
+                try:
+                    contract_provenance_status = (
+                        validate_compatibility_contract_provenance(
+                            source_contract_provenance,
+                            contract=source_contract,
+                            policy_roles=list(actual_roles),
+                            iter_index=raw_provenance_iter,
+                            read_member=_read_provenance_member,
+                        )
+                    )
+                except (CompatibilityProvenanceError, KeyError) as exc:
+                    raise SkillBundleError(
+                        "compatibility contract provenance failed verification: "
+                        f"{exc}",
+                        code="compatibility_contract_provenance_invalid",
+                    ) from exc
+                for evidence_role, row in (
+                    source_contract_provenance.get("evidence") or {}
+                ).items():
+                    member_name = row["path"]
+                    source_path = (
+                        workdir
+                        / "retained-contract-provenance"
+                        / Path(member_name).name
+                    )
+                    sha, size = descriptors[member_name]
+                    _copy_member_verified(
+                        archive,
+                        infos[member_name],
+                        source_path,
+                        expected_sha256=sha,
+                        expected_size=size,
+                    )
+                    compatibility_provenance_sources[evidence_role] = source_path
             elif source_contract is not None or source_contract_digest is not None:
                 if not isinstance(source_contract, dict):
                     raise SkillBundleError(
@@ -1547,6 +1651,13 @@ class StartingSkillBundleImporter:
                     raise SkillBundleError(
                         "compatibility_contract_digest mismatch",
                         code="descriptor_mismatch",
+                    )
+                if (
+                    source_contract_provenance is not None
+                    or source_contract_provenance_digest is not None
+                ):
+                    raise SkillBundleError(
+                        "reference-only bundles cannot claim policy-contract provenance"
                     )
 
             deployment = manifest.get("deployment") or {}
@@ -1764,6 +1875,22 @@ class StartingSkillBundleImporter:
                         world_bundle_sha256=world_bundle_sha256,
                         compatibility_contract=source_contract,
                         compatibility_contract_digest=actual_contract_digest,
+                        compatibility_contract_provenance=(
+                            source_contract_provenance
+                            if has_trainable_policy
+                            else None
+                        ),
+                        compatibility_contract_provenance_digest=(
+                            source_contract_provenance_digest
+                            if has_trainable_policy
+                            else None
+                        ),
+                        compatibility_contract_provenance_status=(
+                            contract_provenance_status
+                        ),
+                        compatibility_provenance_sources=(
+                            compatibility_provenance_sources
+                        ),
                         tensor_contract_verified=bool(actual_roles),
                         tensor_signature_sha256=tensor_signature_sha256,
                         compatibility_status=status,

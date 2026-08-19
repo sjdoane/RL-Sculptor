@@ -3680,3 +3680,60 @@ This is the first fresh, precommitted, aligned, contact-free physical proof
 that satisfies the complete showcase conjunction. Preserve iter 36 as the
 accepted checkpoint and evidence baseline. No further recovery run is
 required.
+
+## Iter 38 historical policy admission for the visible continuation demo (2026-08-18)
+
+The original iter 38 portable bundle now fails closed, as it should: that
+historical run predates the training-time
+`warm_start_effective_policy_contract.json` sidecar, so its generated contract
+has no origin-persisted authority. Do not weaken this check and do not label
+the source an exact resume.
+
+A narrow `legacy_reconstructed` path now admits only actor/critic
+initialization after re-deriving the contract from retained immutable
+evidence. Export/import verifies the exact evidence descriptors, the runtime
+actor/critic observation rows, action rows, actor/critic MLP topology,
+normalizers and controller cadence, the source config adapter/task identity,
+and the material selection alias from v47 to v48. The source/observed
+selections must retain identical tuple hash, evaluation lineage, and refs.
+Safetensors keys, dtypes, ranks, shapes, tensor signature, contract
+fingerprint, and archive descriptors remain independently rechecked.
+
+The researcher-facing picker marks this contract **legacy reconstructed** and
+keeps **Use this starting point** disabled until the user checks the explicit
+historical-reconstruction acknowledgement. Only `actor_only` and
+`actor_critic` are possible. Optimizer restore, full resume, and exact resume
+remain false. The run route pins the status, digest, acknowledgement and mode;
+the worker reloads the server-owned record and must reproduce the same receipt
+before subprocess creation. Import remains a structurally selectable
+candidate (`training_authorized: false`) until the worker emits exact load
+proof.
+
+Rebuild the attested iter 38 artifact with:
+
+```bash
+cd /home/samjd/projects/RewardSculptor
+.venv/bin/python -m sculptor.cli export \
+  --config /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/config.toml \
+  --iter 38 --portable --robot g1 \
+  --out /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/exports/skill_g1-lab-showcase-weave-and-stop_iter38_legacy-reconstructed.rskill \
+  --legacy-origin-job-log /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/runs/_run_job_9e2fc89751dcf75b.log \
+  --legacy-source-selection /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/env/selection_v47.json \
+  --legacy-observed-selection /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/env/selection_v48.json
+```
+
+Current rebuilt artifact SHA-256 is
+`d24f398af4270924b6cdee1aa4a2af83f8054fe4115827e5dc43317641d7e9a9`.
+Its contract digest is
+`dceda370cd66209943f3549a7f949a5f74ce2945a7f3f6cebc602b40cdc825a7`;
+provenance digest is
+`1c0ef86cdb3aefda0273568702c2f117b2563d287c8baa9cab29fb6e5f6713e4`;
+and the re-derived runtime-interface digest is
+`44e5e73070458a4a0fcd0261e9371fa3cf993ff75e8ceea52013d0a5adbe44b1`.
+A clean import produces manifest digest
+`92ef68202a88bc422d5cbefd58c26edfd6f5e7bd0dd9626a7f92fd3d5e44a81d`,
+tensor signature
+`b96ae7f14ec239da1d56b4f945c2f7c66a2d611373aac91e6e5fb9adafd601ff`,
+`provenance_status: legacy_reconstructed`, allowed modes
+`[actor_only, actor_critic]`, `selectable: true`, `compatible: true`, and
+`training_authorized: false` pending route/worker proof.

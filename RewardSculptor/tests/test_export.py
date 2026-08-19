@@ -198,6 +198,40 @@ def _use_base_policy_contract_for_synthetic_world(
     )
 
 
+def _persist_origin_policy_contract(
+    project: Path,
+    *,
+    iter_index: int = 0,
+):
+    """Model the training-time sidecar required by portable policy export."""
+    from sculptor.policy_contract import build_project_policy_contract
+
+    deployment = export_policy_bundle(project, iter_index=iter_index)
+    tuple_payload = json.loads(
+        (project / "runs" / f"iter_{iter_index}" / "artifact_tuple.json")
+        .read_text(encoding="utf-8")
+    )
+    selection_path = project / "env" / (
+        f"selection_v{int(tuple_payload['selection_version'])}.json"
+    )
+    contract = build_project_policy_contract(
+        project,
+        observed_network=deployment.manifest["network"],
+        world_selection_path=selection_path,
+    )
+    sidecar = (
+        project
+        / "runs"
+        / f"iter_{iter_index}"
+        / "warm_start_effective_policy_contract.json"
+    )
+    sidecar.write_text(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return deployment
+
+
 # ── discovery ──────────────────────────────────────────────────────────────
 
 def test_list_exportable_iters_empty_and_missing(tmp_path):
@@ -271,7 +305,7 @@ def test_portable_starting_skill_is_data_only_and_importable(
 ):
     project = _make_project(tmp_path)
     _use_base_policy_contract_for_synthetic_world(monkeypatch, project)
-    deployment = export_policy_bundle(project)
+    deployment = _persist_origin_policy_contract(project)
     portable = export_starting_skill_bundle(
         project, robot_slug="go1",
     )
@@ -282,7 +316,11 @@ def test_portable_starting_skill_is_data_only_and_importable(
     with zipfile.ZipFile(portable.bundle_path) as archive:
         names = set(archive.namelist())
         manifest = json.loads(archive.read("manifest.json"))
-    assert names == {"manifest.json", "policy/weights.safetensors"}
+    assert names == {
+        "manifest.json",
+        "policy/weights.safetensors",
+        "provenance/origin_policy_contract.json",
+    }
     assert manifest["checkpoint"]["included"] is False
     assert {
         "checkpoint.pt", "policy_ts.pt", "policy.onnx", "inference.py",
@@ -322,6 +360,19 @@ def test_portable_starting_skill_is_data_only_and_importable(
     assert imported.record.original_checkpoint_sha256 == (
         deployment.manifest["checkpoint"]["sha256"]
     )
+    assert imported.record.compatibility_contract_provenance_status == (
+        "origin_persisted"
+    )
+
+
+def test_portable_export_fails_closed_without_origin_contract_sidecar(
+    tmp_path, monkeypatch,
+):
+    project = _make_project(tmp_path)
+    _use_base_policy_contract_for_synthetic_world(monkeypatch, project)
+
+    with pytest.raises(ExportError, match="persisted when training ran"):
+        export_starting_skill_bundle(project, robot_slug="go1")
 
 
 def test_portable_export_requires_rskill_extension(tmp_path):
@@ -344,6 +395,8 @@ def test_portable_export_derives_and_cross_checks_project_robot(
             "kind": "library", "library_slug": "unitree_g1",
         },
     }))
+
+    _persist_origin_policy_contract(project)
 
     result = export_starting_skill_bundle(project)
     assert result.manifest["starting_skill"]["robot_slug"] == "g1"
@@ -414,6 +467,7 @@ def test_portable_export_contract_is_owned_by_iteration_tuple(
         "sculptor.policy_contract.build_project_policy_contract",
         fake_contract,
     )
+    _persist_origin_policy_contract(project, iter_index=0)
     result = export_starting_skill_bundle(project, iter_index=0)
 
     assert result.manifest["compatibility_contract"][

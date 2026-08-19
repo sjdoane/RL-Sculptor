@@ -17,6 +17,8 @@ const selection = (
   reference_clip_id: referenceClipId,
   reference_robot: referenceRobot,
   import_manifest_digest: "b".repeat(64),
+  compatibility_contract_provenance_status: "origin_persisted",
+  acknowledge_legacy_reconstructed_initialization: false,
 });
 
 const priorBundle: MotionSelection = {

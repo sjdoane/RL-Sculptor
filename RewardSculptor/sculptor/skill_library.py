@@ -260,6 +260,9 @@ class SkillRecord:
     mode_reuse_supported: bool = False
     compatibility_contract: Optional[dict[str, Any]] = None
     compatibility_contract_digest: Optional[str] = None
+    compatibility_contract_provenance: Optional[dict[str, Any]] = None
+    compatibility_contract_provenance_digest: Optional[str] = None
+    compatibility_contract_provenance_status: Optional[str] = None
     # A compatibility contract describes the claimed interface. Imported
     # trainable skills additionally record that the actual safetensors keys
     # and shapes were checked against that contract before the server-owned
@@ -328,6 +331,12 @@ def _import_identity_digest(record: SkillRecord) -> str:
         "world_bundle_sha256": record.world_bundle_sha256,
         "controller_sha256": record.controller_sha256,
         "compatibility_contract_digest": record.compatibility_contract_digest,
+        "compatibility_contract_provenance_digest": (
+            record.compatibility_contract_provenance_digest
+        ),
+        "compatibility_contract_provenance_status": (
+            record.compatibility_contract_provenance_status
+        ),
         "tensor_signature_sha256": record.tensor_signature_sha256,
         "compatibility_status": record.compatibility_status,
         "initialization_modes": record.initialization_modes,
@@ -573,6 +582,41 @@ def _validate_skill_record(
         if record.compatibility_contract_digest != actual_contract_digest:
             raise SkillLibraryError("compatibility contract digest mismatch")
 
+    if record.compatibility_contract_provenance is None:
+        if (
+            record.compatibility_contract_provenance_digest is not None
+            or record.compatibility_contract_provenance_status is not None
+        ):
+            raise SkillLibraryError(
+                "compatibility contract provenance metadata is incomplete"
+            )
+    else:
+        if not isinstance(record.compatibility_contract_provenance, dict):
+            raise SkillLibraryError(
+                "compatibility_contract_provenance must be an object"
+            )
+        from sculptor.compatibility_provenance import (
+            LEGACY_RECONSTRUCTED,
+            ORIGIN_PERSISTED,
+            provenance_fingerprint,
+        )
+
+        if (
+            record.compatibility_contract_provenance_digest
+            != provenance_fingerprint(record.compatibility_contract_provenance)
+        ):
+            raise SkillLibraryError(
+                "compatibility contract provenance digest mismatch"
+            )
+        status = record.compatibility_contract_provenance.get("status")
+        if (
+            status not in {ORIGIN_PERSISTED, LEGACY_RECONSTRUCTED}
+            or record.compatibility_contract_provenance_status != status
+        ):
+            raise SkillLibraryError(
+                "compatibility contract provenance status is invalid"
+            )
+
     if (
         not isinstance(record.execution_model, str)
         or record.execution_model not in _ALLOWED_EXECUTION_MODELS
@@ -588,6 +632,22 @@ def _validate_skill_record(
             "only the policy checkpoint may initialize a new run"
         )
     provenance_files = _validate_provenance_files(record.provenance_files)
+    if record.compatibility_contract_provenance is not None:
+        evidence = record.compatibility_contract_provenance.get("evidence") or {}
+        expected_roles = {
+            f"compatibility_contract:{role}": row.get("sha256")
+            for role, row in evidence.items()
+            if isinstance(row, dict)
+        }
+        retained_roles = {
+            role: descriptor["sha256"]
+            for role, descriptor in provenance_files.items()
+            if role.startswith("compatibility_contract:")
+        }
+        if retained_roles != expected_roles:
+            raise SkillLibraryError(
+                "compatibility contract evidence has no exact retained byte set"
+            )
     for field_name in (
         "reference_dynamics_certificate_sha256",
         "reference_rollout_sha256",
@@ -722,6 +782,7 @@ def _validate_skill_record(
                 or record.source_format != "safetensors"
                 or not record.tensor_contract_verified
                 or record.compatibility_contract is None
+                or record.compatibility_contract_provenance is None
                 or not _is_sha256(record.tensor_signature_sha256)
             ):
                 raise SkillLibraryError(
@@ -1376,6 +1437,10 @@ class SkillLibrary:
         world_bundle_sha256: Optional[str],
         compatibility_contract: Optional[dict[str, Any]],
         compatibility_contract_digest: Optional[str],
+        compatibility_contract_provenance: Optional[dict[str, Any]] = None,
+        compatibility_contract_provenance_digest: Optional[str] = None,
+        compatibility_contract_provenance_status: Optional[str] = None,
+        compatibility_provenance_sources: Optional[dict[str, Path]] = None,
         tensor_contract_verified: bool = False,
         tensor_signature_sha256: Optional[str] = None,
         compatibility_status: str,
@@ -1421,6 +1486,12 @@ class SkillLibrary:
             "world_bundle_sha256": world_bundle_sha256,
             "controller_sha256": controller_sha256,
             "compatibility_contract_digest": compatibility_contract_digest,
+            "compatibility_contract_provenance_digest": (
+                compatibility_contract_provenance_digest
+            ),
+            "compatibility_contract_provenance_status": (
+                compatibility_contract_provenance_status
+            ),
             "tensor_signature_sha256": tensor_signature_sha256,
             "compatibility_status": compatibility_status,
             "initialization_modes": initialization_modes,
@@ -1482,6 +1553,20 @@ class SkillLibrary:
                     dst = stage_dir / ckpt_filename
                     if checkpoint_path is not None:
                         _atomic_copy(checkpoint_path, dst)
+                    retained_provenance: dict[str, dict[str, str]] = {}
+                    for role, source_path in sorted(
+                        (compatibility_provenance_sources or {}).items()
+                    ):
+                        safe_role = re.sub(r"[^A-Za-z0-9_.-]+", "_", role)
+                        suffix = source_path.suffix or ".bin"
+                        filename = f"contract_provenance_{safe_role}{suffix}"
+                        _atomic_copy(source_path, stage_dir / filename)
+                        retained_provenance[
+                            f"compatibility_contract:{role}"
+                        ] = {
+                            "filename": filename,
+                            "sha256": _file_sha256(stage_dir / filename),
+                        }
                     rec = SkillRecord(
                         schema_version=SCHEMA_VERSION,
                         skill_id=skill_id,
@@ -1530,6 +1615,18 @@ class SkillLibrary:
                             else None
                         ),
                         compatibility_contract_digest=compatibility_contract_digest,
+                        compatibility_contract_provenance=(
+                            dict(compatibility_contract_provenance)
+                            if compatibility_contract_provenance is not None
+                            else None
+                        ),
+                        compatibility_contract_provenance_digest=(
+                            compatibility_contract_provenance_digest
+                        ),
+                        compatibility_contract_provenance_status=(
+                            compatibility_contract_provenance_status
+                        ),
+                        provenance_files=retained_provenance,
                         tensor_contract_verified=bool(tensor_contract_verified),
                         tensor_signature_sha256=tensor_signature_sha256,
                         compatibility_status=compatibility_status,

@@ -56,6 +56,8 @@ const SCRATCH_STARTING_POINT: StartingPointSelection = {
   reference_clip_id: null,
   reference_robot: null,
   import_manifest_digest: null,
+  compatibility_contract_provenance_status: null,
+  acknowledge_legacy_reconstructed_initialization: false,
   policy_contract_migration: null,
 };
 
@@ -769,6 +771,10 @@ export function NewRunDialog({
         startingPoint.kind === "shared_skill"
           ? startingPoint.initialization_mode
           : null,
+      acknowledge_legacy_reconstructed_initialization:
+        startingPoint.kind === "shared_skill"
+          ? startingPoint.acknowledge_legacy_reconstructed_initialization
+          : false,
       reference_clip_id: referenceClipId,
       reference_robot: referenceClipId ? selectedReferenceRobot : null,
     };
@@ -857,6 +863,11 @@ export function NewRunDialog({
         || !/^[a-f0-9]{64}$/.test(startingPoint.import_manifest_digest ?? ""))
       ? "Re-select the imported skill so its immutable manifest can be pinned."
       : null,
+    startingPoint.kind === "shared_skill"
+      && startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed"
+      && !startingPoint.acknowledge_legacy_reconstructed_initialization
+      ? "Acknowledge the historical compatibility-contract reconstruction before launch."
+      : null,
     !dryRun && fitnessMetric === null && !allowBlindFitness
       ? "Choose an objective fitness metric, or explicitly acknowledge a blind ablation."
       : null,
@@ -887,7 +898,7 @@ export function NewRunDialog({
     ? "Initialize new actor and critic networks. Add a motion below if you want reference-guided exploration."
     : startingPoint.kind === "project_checkpoint"
       ? "Transfer this project's actor and critic into a fresh training run; optimizer state and counters reset."
-      : `${(startingPoint.initialization_mode ?? "unselected").replaceAll("_", " ")} · manifest-pinned import receipt${startingPoint.import_manifest_digest ? ` · ${startingPoint.import_manifest_digest.slice(0, 10)}…` : ""}`;
+      : `${(startingPoint.initialization_mode ?? "unselected").replaceAll("_", " ")} · ${startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed" ? "legacy-reconstructed contract acknowledged" : "origin-persisted contract"} · manifest-pinned import receipt${startingPoint.import_manifest_digest ? ` · ${startingPoint.import_manifest_digest.slice(0, 10)}…` : ""}`;
 
   return (
     <>

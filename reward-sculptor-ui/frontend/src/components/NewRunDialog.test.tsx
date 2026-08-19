@@ -50,6 +50,8 @@ const checkpoint: StartingPointSelection = {
   reference_clip_id: null,
   reference_robot: null,
   import_manifest_digest: null,
+  compatibility_contract_provenance_status: null,
+  acknowledge_legacy_reconstructed_initialization: false,
   policy_contract_migration: null,
 };
 
@@ -84,6 +86,8 @@ test("shows the verified migration type from an imported skill receipt", () => {
     reference_clip_id: null,
     reference_robot: null,
     import_manifest_digest: "a".repeat(64),
+    compatibility_contract_provenance_status: "origin_persisted",
+    acknowledge_legacy_reconstructed_initialization: false,
     policy_contract_migration: {
       type: "zero_initialized_event_phase_observation",
       from_schema: 2,

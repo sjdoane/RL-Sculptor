@@ -698,6 +698,12 @@ def run_sculpt_job(
     expected_starting_skill_manifest_digest = run_params.get(
         "expected_starting_skill_manifest_digest"
     )
+    expected_contract_provenance_receipt = run_params.get(
+        "compatibility_contract_provenance_receipt"
+    )
+    acknowledge_legacy_reconstructed_initialization = bool(
+        run_params.get("acknowledge_legacy_reconstructed_initialization", False)
+    )
     initialization_mode = run_params.get("initialization_mode") or (
         "actor_critic" if warm_start_iteration is not None else "actor_only"
     )
@@ -916,6 +922,72 @@ def run_sculpt_job(
                 raise RuntimeError(
                     f"initialization mode {initialization_mode!r} is not admitted "
                     f"for skill {starting_skill_id}"
+                )
+            if initialization_mode != "reference_only":
+                from sculptor.compatibility_provenance import (
+                    CompatibilityProvenanceError,
+                    build_launch_acknowledgement_receipt,
+                )
+
+                try:
+                    current_contract_provenance_receipt = (
+                        build_launch_acknowledgement_receipt(
+                            status=(
+                                starting_skill_record
+                                .compatibility_contract_provenance_status
+                            ),
+                            provenance_digest=(
+                                starting_skill_record
+                                .compatibility_contract_provenance_digest
+                            ),
+                            acknowledged=(
+                                acknowledge_legacy_reconstructed_initialization
+                            ),
+                            initialization_mode=str(initialization_mode),
+                        )
+                    )
+                except CompatibilityProvenanceError as exc:
+                    job.emit({
+                        "type": "starting_skill_provenance_failed",
+                        "source": "worker_launch",
+                        "starting_skill_id": str(starting_skill_id),
+                        "error": str(exc),
+                    })
+                    raise RuntimeError(
+                        "starting-skill compatibility provenance could not be "
+                        "revalidated; the sculpt subprocess was not started"
+                    ) from exc
+                if (
+                    current_contract_provenance_receipt
+                    != expected_contract_provenance_receipt
+                ):
+                    job.emit({
+                        "type": "starting_skill_provenance_failed",
+                        "source": "worker_launch",
+                        "starting_skill_id": str(starting_skill_id),
+                        "reason": "receipt_changed_after_admission",
+                    })
+                    raise RuntimeError(
+                        "starting-skill compatibility provenance receipt changed "
+                        "after route admission; the sculpt subprocess was not "
+                        "started"
+                    )
+                job.params[
+                    "compatibility_contract_provenance_receipt_revalidated"
+                ] = current_contract_provenance_receipt
+                job.emit({
+                    "type": "starting_skill_provenance_verified",
+                    "source": "worker_launch",
+                    "starting_skill_id": str(starting_skill_id),
+                    **current_contract_provenance_receipt,
+                })
+            elif (
+                expected_contract_provenance_receipt is not None
+                or acknowledge_legacy_reconstructed_initialization
+            ):
+                raise RuntimeError(
+                    "reference-only initialization cannot carry a policy "
+                    "compatibility-provenance acknowledgement"
                 )
             try:
                 from sculptor.skill_bundle import ImportTarget, compatibility_for
@@ -1521,6 +1593,17 @@ def run_sculpt_job(
                 env["SCULPTOR_STARTING_SKILL_CONTRACT_DIGEST"] = str(
                     starting_skill_record.compatibility_contract_digest
                 )
+            if starting_skill_record.compatibility_contract_provenance_status:
+                env["SCULPTOR_STARTING_SKILL_CONTRACT_PROVENANCE_STATUS"] = str(
+                    starting_skill_record.compatibility_contract_provenance_status
+                )
+            if starting_skill_record.compatibility_contract_provenance_digest:
+                env["SCULPTOR_STARTING_SKILL_CONTRACT_PROVENANCE_DIGEST"] = str(
+                    starting_skill_record.compatibility_contract_provenance_digest
+                )
+            env["SCULPTOR_STARTING_SKILL_LEGACY_ACKNOWLEDGED"] = (
+                "1" if acknowledge_legacy_reconstructed_initialization else "0"
+            )
             if starting_skill_record.tensor_signature_sha256:
                 env["SCULPTOR_STARTING_SKILL_TENSOR_SIGNATURE"] = str(
                     starting_skill_record.tensor_signature_sha256
@@ -1813,6 +1896,14 @@ def run_sculpt_job(
             job.params.setdefault(
                 "starting_skill_compatibility_contract_digest",
                 starting_skill_record.compatibility_contract_digest,
+            )
+            job.params.setdefault(
+                "starting_skill_compatibility_contract_provenance_status",
+                starting_skill_record.compatibility_contract_provenance_status,
+            )
+            job.params.setdefault(
+                "starting_skill_compatibility_contract_provenance_digest",
+                starting_skill_record.compatibility_contract_provenance_digest,
             )
             job.params.setdefault(
                 "starting_skill_tensor_signature_sha256",

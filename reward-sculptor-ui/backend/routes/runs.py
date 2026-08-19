@@ -63,6 +63,10 @@ from backend.services.run_manager import (
 )
 from sculptor.skill_bundle import ImportTarget, compatibility_for
 from sculptor.skill_library import SkillLibrary, SkillLibraryError
+from sculptor.compatibility_provenance import (
+    CompatibilityProvenanceError,
+    build_launch_acknowledgement_receipt,
+)
 from sculptor.policy_contract import (
     build_iteration_warm_start_contract_receipt,
     build_skill_warm_start_contract_receipt,
@@ -572,6 +576,19 @@ def launch_run(
             type_="/problems/starting-skill",
         )
     if (
+        body.acknowledge_legacy_reconstructed_initialization
+        and body.starting_skill_id is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "legacy reconstruction acknowledgement has no starting skill",
+            detail=(
+                "select the disclosed legacy-reconstructed policy, or clear "
+                "the acknowledgement"
+            ),
+            type_="/problems/starting-skill-provenance",
+        )
+    if (
         body.expected_starting_skill_manifest_digest is not None
         and body.starting_skill_id is None
     ):
@@ -610,6 +627,7 @@ def launch_run(
     selected_skill = None
     starting_skill_target_receipt: Optional[dict[str, Any]] = None
     warm_start_policy_contract_receipt: dict[str, Any] | None = None
+    contract_provenance_launch_receipt: dict[str, Any] | None = None
     selected_mode = body.initialization_mode or "actor_only"
     resolved_reference_clip_id = body.reference_clip_id
     resolved_reference_robot = body.reference_robot
@@ -717,6 +735,31 @@ def launch_run(
             )
         if selected_mode != "reference_only":
             try:
+                contract_provenance_launch_receipt = (
+                    build_launch_acknowledgement_receipt(
+                        status=(
+                            selected_skill.compatibility_contract_provenance_status
+                        ),
+                        provenance_digest=(
+                            selected_skill.compatibility_contract_provenance_digest
+                        ),
+                        acknowledged=bool(
+                            body.acknowledge_legacy_reconstructed_initialization
+                        ),
+                        initialization_mode=selected_mode,
+                    )
+                )
+            except CompatibilityProvenanceError as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting-skill provenance acknowledgement is required",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-provenance",
+                    provenance_status=(
+                        selected_skill.compatibility_contract_provenance_status
+                    ),
+                )
+            try:
                 library.checkpoint_path_for(selected_skill)
                 warm_start_policy_contract_receipt = (
                     build_skill_warm_start_contract_receipt(
@@ -751,6 +794,16 @@ def launch_run(
                     detail=str(exc),
                     type_="/problems/starting-skill-project-contract",
                 )
+        elif body.acknowledge_legacy_reconstructed_initialization:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "legacy acknowledgement is not valid for reference-only mode",
+                detail=(
+                    "the acknowledgement applies only to actor/critic policy "
+                    "initialization from a reconstructed compatibility contract"
+                ),
+                type_="/problems/starting-skill-provenance",
+            )
         if (
             selected_mode == "reference_only"
             and selected_skill.reference_clip_id
@@ -1038,6 +1091,9 @@ def launch_run(
     )
     run_params["warm_start_policy_contract_receipt"] = (
         warm_start_policy_contract_receipt
+    )
+    run_params["compatibility_contract_provenance_receipt"] = (
+        contract_provenance_launch_receipt
     )
     # Pin the admitted world tuple separately from the request. The worker
     # re-attests this receipt immediately before subprocess creation so a

@@ -48,6 +48,24 @@ const receipt: StartingSkillReceipt = {
       policy: { actor: { hidden_dims: [512, 256] } },
     },
     compatibility_contract_digest: "3".repeat(64),
+    compatibility_contract_provenance: {
+      schema: 1,
+      status: "origin_persisted",
+      capabilities: {
+        initialization_modes: ["actor_only", "actor_critic"],
+        optimizer_resume: false,
+        exact_resume: false,
+      },
+      evidence: {
+        origin_policy_contract: {
+          path: "provenance/origin_policy_contract.json",
+          sha256: "5".repeat(64),
+          bytes: 4096,
+        },
+      },
+    },
+    compatibility_contract_provenance_digest: "6".repeat(64),
+    compatibility_contract_provenance_status: "origin_persisted",
     tensor_contract_verified: true,
     tensor_signature_sha256: "4".repeat(64),
     initialization_modes: ["actor_only", "reference_only"],
@@ -173,6 +191,8 @@ const scratch: StartingPointSelection = {
   reference_clip_id: null,
   reference_robot: null,
   import_manifest_digest: null,
+  compatibility_contract_provenance_status: null,
+  acknowledge_legacy_reconstructed_initialization: false,
 };
 
 function renderPicker(
@@ -259,6 +279,50 @@ test("fails legacy receipts closed without crashing the picker", async () => {
     .toBeInTheDocument();
   expect(screen.getByRole("button", { name: /Use this starting point/i }))
     .toBeDisabled();
+});
+
+test("requires explicit acknowledgement for a reconstructed policy contract", async () => {
+  const reconstructedReceipt: StartingSkillReceipt = {
+    ...receipt,
+    skill: {
+      ...receipt.skill,
+      skill_id: "iter38-reconstructed",
+      alias: "Iter 38 reconstructed policy",
+      compatibility_contract_provenance: {
+        ...receipt.skill.compatibility_contract_provenance!,
+        status: "legacy_reconstructed",
+      },
+      compatibility_contract_provenance_digest: "7".repeat(64),
+      compatibility_contract_provenance_status: "legacy_reconstructed",
+    },
+  };
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [reconstructedReceipt] });
+  const user = userEvent.setup();
+  const onChange = renderPicker();
+
+  await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
+  await user.click(await screen.findByRole("radio", {
+    name: /Iter 38 reconstructed policy/i,
+  }));
+
+  expect(screen.getByText("Historical contract reconstruction")).toBeInTheDocument();
+  expect(screen.getByText(/not exact resume or optimizer restoration/i))
+    .toBeInTheDocument();
+  const apply = screen.getByRole("button", { name: /Use this starting point/i });
+  expect(apply).toBeDisabled();
+
+  await user.click(screen.getByRole("checkbox", {
+    name: /reconstructed after training from retained evidence/i,
+  }));
+  expect(apply).toBeEnabled();
+  await user.click(apply);
+
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+    starting_skill_id: "iter38-reconstructed",
+    initialization_mode: "actor_only",
+    compatibility_contract_provenance_status: "legacy_reconstructed",
+    acknowledge_legacy_reconstructed_initialization: true,
+  }));
 });
 
 test.each(["controller.pt", "deployment.zip"])(

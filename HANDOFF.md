@@ -1615,3 +1615,31 @@ point near where the robot ought to be).
 Tests: 6 in `tests/test_world_compiler_gates.py` — surface lookup incl.
 overlapping boxes and off-course points, full-clearance-on-every-platform,
 plane resets NOT lifted, back-compat with no course, and the install wiring.
+
+## 2026-08-18: fail-closed admission for the historical iter 38 policy
+
+Portable policy export now requires an exact compatibility-contract sidecar
+persisted when training ran. Iter 38 predates that sidecar, so its original
+bundle correctly fails. A narrow explicit `legacy_reconstructed` export path
+can instead retain and re-derive the contract from the origin job log, source
+config, and material-equivalent source/observed selection files. It verifies
+runtime actor/critic/action interfaces, policy topology, timing, config
+identity, selection alias, contract fingerprint and safetensors signature.
+
+The historical status admits only `actor_only` or `actor_critic`; optimizer,
+full and exact resume are always false. The UI discloses the status and blocks
+Apply until a dedicated acknowledgement is checked. The run route pins that
+status/digest/ack/mode receipt and the worker must reproduce it from the
+server-owned skill before launch.
+
+The attested demonstration artifact is:
+
+`/home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/exports/skill_g1-lab-showcase-weave-and-stop_iter38_legacy-reconstructed.rskill`
+
+Artifact SHA-256 is
+`d24f398af4270924b6cdee1aa4a2af83f8054fe4115827e5dc43317641d7e9a9`;
+provenance status/digest are `legacy_reconstructed` /
+`1c0ef86cdb3aefda0273568702c2f117b2563d287c8baa9cab29fb6e5f6713e4`.
+The exact rebuild command and full import receipt are in
+`CODEX_TO_CLAUDE_HANDOFF.md` and
+`reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`.

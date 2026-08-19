@@ -358,6 +358,17 @@ def capture_run_context(
                 "compatibility_contract_digest": os.environ.get(
                     "SCULPTOR_STARTING_SKILL_CONTRACT_DIGEST"
                 ),
+                "compatibility_contract_provenance_status": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_CONTRACT_PROVENANCE_STATUS"
+                ),
+                "compatibility_contract_provenance_digest": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_CONTRACT_PROVENANCE_DIGEST"
+                ),
+                "legacy_reconstructed_acknowledged": (
+                    os.environ.get(
+                        "SCULPTOR_STARTING_SKILL_LEGACY_ACKNOWLEDGED"
+                    ) == "1"
+                ),
                 "tensor_signature_sha256": os.environ.get(
                     "SCULPTOR_STARTING_SKILL_TENSOR_SIGNATURE"
                 ),

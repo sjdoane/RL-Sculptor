@@ -204,6 +204,11 @@ class RunParams(BaseModel):
     actor+critic transfer; full_resume is reserved for exact optimizer/run-state
     compatible records and is rejected unless the record explicitly allows it."""
 
+    acknowledge_legacy_reconstructed_initialization: bool = False
+    """Required only for a policy whose compatibility contract was rebuilt
+    from retained historical evidence. It never authorizes optimizer/full or
+    exact resume and is rejected for origin-persisted policy contracts."""
+
     reference_clip_id: Optional[
         Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
     ] = None

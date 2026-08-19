@@ -2196,6 +2196,21 @@ def export(
         help="Exact robot-library slug for a portable export (for example "
              "g1). Derived from project metadata when available; required "
              "otherwise. Ignored for deployment ZIPs."),
+    legacy_origin_job_log: Optional[Path] = typer.Option(
+        None, "--legacy-origin-job-log",
+        exists=True, readable=True,
+        help="Audited historical exception only: retained worker log used to "
+             "reconstruct a missing origin policy contract. Requires both "
+             "legacy selection options and permits actor/critic initialization "
+             "only, never optimizer or exact resume."),
+    legacy_source_selection: Optional[Path] = typer.Option(
+        None, "--legacy-source-selection",
+        exists=True, readable=True,
+        help="Immutable selection named when the historical run started."),
+    legacy_observed_selection: Optional[Path] = typer.Option(
+        None, "--legacy-observed-selection",
+        exists=True, readable=True,
+        help="Immutable selection pinned for the historical iteration."),
 ):
     """Export a deployment ZIP or a data-only portable starting skill.
 
@@ -2238,6 +2253,9 @@ def export(
                 runs_root=root,
                 out_path=out,
                 robot_slug=robot_slug,
+                legacy_origin_job_log=legacy_origin_job_log,
+                legacy_source_selection=legacy_source_selection,
+                legacy_observed_selection=legacy_observed_selection,
             )
         else:
             result = export_policy_bundle(

@@ -1532,3 +1532,58 @@ alternating traversal around the actual boxes and sustained upright stop.
 
 This satisfies the unchanged acceptance conjunction. Use iter 36 for the
 physical showcase; do not launch another recovery run.
+
+## Imported iter 38 continuation: historical-contract checklist (2026-08-18)
+
+Use this only for the visible policy-continuation demonstration. The original
+iter 38 `.rskill` is intentionally rejected because the run did not persist a
+policy-contract sidecar at training time. Rebuild the disclosed historical
+candidate from its immutable retained evidence:
+
+```bash
+cd /home/samjd/projects/RewardSculptor
+.venv/bin/python -m sculptor.cli export \
+  --config /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/config.toml \
+  --iter 38 --portable --robot g1 \
+  --out /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/exports/skill_g1-lab-showcase-weave-and-stop_iter38_legacy-reconstructed.rskill \
+  --legacy-origin-job-log /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/runs/_run_job_9e2fc89751dcf75b.log \
+  --legacy-source-selection /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/env/selection_v47.json \
+  --legacy-observed-selection /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/env/selection_v48.json
+```
+
+Expected immutable receipt:
+
+- artifact SHA-256:
+  `d24f398af4270924b6cdee1aa4a2af83f8054fe4115827e5dc43317641d7e9a9`;
+- contract digest:
+  `dceda370cd66209943f3549a7f949a5f74ce2945a7f3f6cebc602b40cdc825a7`;
+- provenance status/digest: `legacy_reconstructed` /
+  `1c0ef86cdb3aefda0273568702c2f117b2563d287c8baa9cab29fb6e5f6713e4`;
+- runtime-interface digest:
+  `44e5e73070458a4a0fcd0261e9371fa3cf993ff75e8ceea52013d0a5adbe44b1`;
+- import manifest digest:
+  `92ef68202a88bc422d5cbefd58c26edfd6f5e7bd0dd9626a7f92fd3d5e44a81d`;
+- tensor signature:
+  `b96ae7f14ec239da1d56b4f945c2f7c66a2d611373aac91e6e5fb9adafd601ff`;
+- admitted modes: `actor_only`, `actor_critic`; optimizer/full/exact resume:
+  **false**.
+
+UI sequence after restarting backend/frontend on the containing commit:
+
+1. Open **New Run** and choose **Starting point -> Imported skill**.
+2. Upload the `_legacy-reconstructed.rskill` above. Confirm the receipt says
+   **legacy reconstructed**, not origin persisted or exact resume.
+3. Choose **Actor + critic** (or actor only when deliberately testing it).
+4. Read and check the historical-contract acknowledgement. The Apply action
+   must remain disabled before this check and become enabled after it.
+5. Review the launch summary. It must say
+   `legacy-reconstructed contract acknowledged` and must not claim optimizer
+   restoration.
+6. Launch. In the visible event stream require
+   `starting_skill_provenance_verified`, followed by exact
+   `warm_start_loaded` role/digest proof. Import alone is only selectable; it
+   does not authorize training.
+
+Any change to the evidence bytes, source/observed selection material identity,
+runtime rows, contract fingerprint, safetensors signature, manifest digest,
+acknowledgement, or selected mode must block before subprocess creation.
