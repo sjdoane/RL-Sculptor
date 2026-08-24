@@ -24,7 +24,6 @@ land in Ships 15-18.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -897,9 +896,11 @@ def _attach_stage_references(
             if not clip_id:
                 continue
             # Retrieval confidence selects a candidate; it does not prove the
-            # motion is dynamically feasible.  Auto-attach only after the
-            # same Tier-D admission used by manual attach and launch, and pin
-            # the exact bytes/certificate that earned that decision.
+            # motion has compatible exact-schedule tracking evidence.
+            # Auto-attach only after the same narrow Tier-D admission used by
+            # manual attach and launch, and pin the exact bytes/certificate
+            # that earned that decision. Tier D does not certify contact,
+            # collision, or general dynamics feasibility.
             try:
                 from sculptor.refs.track import (
                     require_tierd_admission,
@@ -1359,7 +1360,6 @@ def redecompose_stage(
         failed_stage.name, suffix_len=len("__r1_") + 2,  # __r1_<digits>
     )
 
-    parent_chain = failed_stage.parent_stage
     expected_criterion = failed_stage.success_criterion.strip()
 
     for i, model_stage in enumerate(parsed.stages):

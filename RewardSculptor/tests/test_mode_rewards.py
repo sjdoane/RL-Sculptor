@@ -650,6 +650,8 @@ def test_the_prompt_asks_for_both_halves():
 def _tracking_clip(n=240, fps=120.0, j=6):
     t = np.arange(n, dtype=np.float64) / fps
     return {
+        "robot": "g1",
+        "clip_id": "tracking-test",
         "fps": fps,
         "joint_names": [f"joint_{i}" for i in range(j)],
         "joint_pos": (0.10 * np.sin(2 * np.pi * 0.5 * t)[:, None]
@@ -677,7 +679,7 @@ def test_the_backbone_makes_a_fresh_scaffold_trainable(tmp_path):
                                               clip=clip),
                 tmp_path, name="t1")
     assert mod.N_JOINTS == 6 and mod.N_PHASE == 32
-    assert mod.REFERENCE_DURATION_S == pytest.approx(2.0)
+    assert mod.REFERENCE_DURATION_S == pytest.approx(239 / 120)
 
     qpos = np.zeros(7 + mod.N_JOINTS)
     qpos[2] = 0.70
@@ -688,6 +690,65 @@ def test_the_backbone_makes_a_fresh_scaffold_trainable(tmp_path):
     assert {"joint_tracking", "root_tracking", "orientation_tracking"} <= set(comps)
     # The mode's own contribution is still zero — the backbone is not a mode.
     assert comps[f"{MODE_COMPONENT_PREFIX}launch"] == 0.0
+
+
+def test_mode_terminal_target_and_identity_include_exact_final_clip_sample(
+    tmp_path,
+):
+    clip = _tracking_clip()
+    changed = {
+        **clip,
+        "joint_pos": clip["joint_pos"].copy(),
+        "root_pos_z": clip["root_pos_z"].copy(),
+    }
+    changed["joint_pos"][-1] = np.linspace(-0.25, 0.25, 6)
+    changed["root_pos_z"][-1] = 0.83
+    graph = _graph(fps=120.0, span=80)
+
+    original = _load(
+        generate_mode_reward_scaffold(graph, clip=clip),
+        tmp_path,
+        name="terminal_endpoint_original",
+    )
+    terminal = _load(
+        generate_mode_reward_scaffold(graph, clip=changed),
+        tmp_path,
+        name="terminal_endpoint_changed",
+    )
+
+    np.testing.assert_allclose(
+        terminal.TARGET_JOINT_POS[-1], changed["joint_pos"][-1], atol=1e-5,
+    )
+    assert terminal.TARGET_ROOT_Z[-1] == pytest.approx(
+        changed["root_pos_z"][-1], abs=1e-5,
+    )
+    assert (
+        original.REWARD_SPEC["reference_clock"]["reference_target_sha256"]
+        != terminal.REWARD_SPEC["reference_clock"]["reference_target_sha256"]
+    )
+
+
+def test_endpoint_exclusive_mode_backbone_schema_is_stale() -> None:
+    from sculptor.mode_rewards import _rewrite_reward_spec, reward_spec_from_source
+
+    graph = _graph(fps=120.0, span=80)
+    source = generate_mode_reward_scaffold(graph, clip=_tracking_clip())
+    spec = reward_spec_from_source(source)
+    assert spec["tracking_backbone"]["schema"] == 3
+    spec["tracking_backbone"]["schema"] = 2
+    legacy = _rewrite_reward_spec(source, spec).replace(
+        "REFERENCE_TARGET_SAMPLING = 'nearest_frame_endpoint_inclusive'\n",
+        "",
+        1,
+    )
+
+    errors = validate_mode_reward_source(legacy, graph)
+
+    assert any(
+        "tracking backbone is invalid" in error
+        and "REFERENCE_TARGET_SAMPLING" in error
+        for error in errors
+    )
 
 
 def test_the_scalar_path_handles_a_joints_only_qpos(tmp_path):
@@ -719,11 +780,7 @@ def test_the_scalar_path_handles_a_joints_only_qpos(tmp_path):
 
 
 def test_the_two_paths_agree_on_the_terms_they_can_agree_on(tmp_path):
-    """`root_tracking` differs by construction — the scalar path compares
-    absolute root z while the batched path compares a delta from the
-    reference's first frame, because retargeting zeroes root translation and an
-    absolute comparison would saturate the kernel at zero for every frame. The
-    joint and orientation terms have no such excuse and must match."""
+    """Scalar authoring checks and batched training share one exact target."""
     clip = _tracking_clip()
     mod = _load(generate_mode_reward_scaffold(_graph(fps=120.0, span=80),
                                               clip=clip),
@@ -754,6 +811,60 @@ def test_the_two_paths_agree_on_the_terms_they_can_agree_on(tmp_path):
             float(b["joint_tracking"]), abs=1e-6)
         assert s["orientation_tracking"] == pytest.approx(
             float(b["orientation_tracking"]), abs=1e-6)
+        assert s["root_tracking"] == pytest.approx(
+            float(b["root_tracking"]), abs=1e-6)
+
+
+def test_origin_relative_root_tracking_matches_between_scalar_and_batch(
+    tmp_path,
+):
+    """An origin-relative clip tracks excursion, not absolute standing z."""
+    clip = _tracking_clip()
+    clip["root_frame"] = "origin_relative"
+    clip["root_pos_z"] = clip["root_pos_z"] - clip["root_pos_z"][0]
+    mod = _load(
+        generate_mode_reward_scaffold(_graph(fps=120.0, span=80), clip=clip),
+        tmp_path,
+        name="t2_origin_relative",
+    )
+    step = 55
+    joints = np.linspace(-0.1, 0.1, mod.N_JOINTS)
+    gravity = np.array([0.0, 0.0, -1.0])
+    scalar_info = {
+        "episode_length": step,
+        "step_dt": 0.02,
+        "base_height": 0.81,
+        "base_height_delta": 0.11,
+    }
+    qpos = np.zeros(7 + mod.N_JOINTS)
+    qpos[2] = scalar_info["base_height"]
+    qpos[7:] = joints
+    _, scalar = mod.compute_reward(
+        {}, None, {"qpos": qpos, "projected_gravity_b": gravity}, scalar_info,
+    )
+
+    _, batched = mod.compute_reward_batched(
+        {},
+        torch.zeros(1, mod.N_JOINTS),
+        {
+            "qpos": torch.tensor(qpos, dtype=torch.float32).reshape(1, -1),
+            "projected_gravity_b": torch.tensor(
+                gravity, dtype=torch.float32,
+            ).reshape(1, 3),
+        },
+        {
+            "episode_length": torch.tensor([float(step)]),
+            "step_dt": torch.tensor([0.02]),
+            "base_height": torch.tensor([scalar_info["base_height"]]),
+            "base_height_delta": torch.tensor([
+                scalar_info["base_height_delta"]
+            ]),
+        },
+    )
+
+    assert scalar["root_tracking"] == pytest.approx(
+        float(batched["root_tracking"]), abs=1e-6,
+    )
 
 
 def test_the_tracking_clock_spans_the_composite_not_the_mode(tmp_path):
@@ -908,7 +1019,7 @@ def test_the_authoring_twin_is_small_and_carries_no_tables(tmp_path):
     # must see the same shape it will see after grafting.
     mod = _load(twin, tmp_path, name="tw1")
     assert mod.N_JOINTS == 29
-    assert mod.REFERENCE_DURATION_S == pytest.approx(2.0)
+    assert mod.REFERENCE_DURATION_S == pytest.approx(239 / 120)
 
 
 def test_the_twin_is_state_dependent_so_edits_own_gate_accepts_it(tmp_path):
@@ -1206,7 +1317,7 @@ def test_tracking_duration_remains_certified_while_terminal_mode_holds(tmp_path)
     mod = _load(generate_mode_reward_scaffold(
         _graph(), behavior_goal="x", clip=_tracking_clip(n=90, fps=30.0),
         horizon_s=12.0), tmp_path, name="dur")
-    assert mod.REFERENCE_DURATION_S == pytest.approx(3.0)
+    assert mod.REFERENCE_DURATION_S == pytest.approx(89 / 30)
     assert mod.MODE_WINDOWS_S["land"][1] == pytest.approx(12.0)
     manifest = mod.REWARD_SPEC["mode_execution_manifest"]
     assert manifest["certified_clip_duration_s"] == pytest.approx(
@@ -1308,6 +1419,40 @@ def test_reward_spec_reports_whether_tracking_is_actually_present(tmp_path):
 
     assert tracked.REWARD_SPEC["tracking_enabled"] is True
     assert task_only.REWARD_SPEC["tracking_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        (
+            "    track_total, track_components = _tracking_batched(\n"
+            "        next_state, info, like)\n"
+            "    total = total + track_total\n"
+            "    components.update(track_components)\n",
+            "",
+        ),
+        (
+            "    past_end = t >= MODE_WINDOWS_S[MODE_ORDER[-1]][0]\n",
+            "    past_end = t < MODE_WINDOWS_S[MODE_ORDER[-1]][0]\n",
+        ),
+    ],
+    ids=("tracking-call-removed", "mode-schedule-inverted"),
+)
+def test_frozen_tracking_runtime_rejects_dispatch_tampering(
+    needle: str,
+    replacement: str,
+) -> None:
+    """The receipt must cover execution, not just unchanged target tables."""
+    graph = _graph()
+    source = generate_mode_reward_scaffold(
+        graph, clip=_tracking_clip(), behavior_goal="track and extend"
+    )
+    assert needle in source
+    tampered = source.replace(needle, replacement, 1)
+
+    errors = validate_mode_reward_source(tampered, graph)
+
+    assert any("tracking_backbone is stale" in error for error in errors)
 
 
 # ── mission brief ───────────────────────────────────────────────────────

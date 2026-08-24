@@ -366,6 +366,52 @@ def test_write_current_reexport_surfaces_compute_reward_batched(tmp_path: Path):
     assert "compute_reward_batched" in mod.__all__
 
 
+def test_write_current_reexport_is_transparent_to_reference_clock_surface(
+    tmp_path: Path,
+) -> None:
+    """The worker receives current.py, so conditioning helpers must survive it."""
+    import hashlib
+    import importlib.util
+
+    from sculptor.edit import _write_current_reexport
+
+    rewards_dir = tmp_path / "rewards"
+    rewards_dir.mkdir()
+    selected = rewards_dir / "v12.py"
+    selected.write_text(
+        "REWARD_SPEC = {'reference_clock': {'schema': 1}}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n"
+        "def compute_reward_batched(s, a, n, i): return a[:, 0], {}\n"
+        "def reference_clock_batched(step_count, device): return step_count\n"
+        "def reference_target_index_batched(step_count, device): "
+        "return step_count + 1\n",
+        encoding="utf-8",
+    )
+    _write_current_reexport(rewards_dir, selected)
+
+    spec = importlib.util.spec_from_file_location(
+        "reg_test_reference_current", str(rewards_dir / "current.py")
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    for name in (
+        "compute_reward_batched",
+        "reference_clock_batched",
+        "reference_target_index_batched",
+    ):
+        assert getattr(mod, name) is getattr(mod._mod, name)
+        assert name in mod.__all__
+    assert mod.reference_clock_batched(4, "cpu") == 4
+    assert mod.reference_target_index_batched(4, "cpu") == 5
+    assert mod.SCULPTOR_REWARD_SELECTOR == {
+        "schema": 1,
+        "filename": "v12.py",
+        "sha256": hashlib.sha256(selected.read_bytes()).hexdigest(),
+    }
+
+
 def test_write_current_reexport_skips_batched_for_scalar_only_module(
     tmp_path: Path,
 ):

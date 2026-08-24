@@ -43,6 +43,7 @@ import numpy as np
 #: `left_foot_contact`/`right_foot_contact` are separate keys, not part of
 #: `ALLOWED_ARRAYS`'s foot-pos naming, so listed explicitly here too).
 CONVERTED_ARRAY_KEYS = (
+    "first_episode_valid_mask",
     "joint_pos",
     "joint_vel",
     "projected_gravity_b",
@@ -206,6 +207,14 @@ def clip_to_arrays(
     T = int(z.shape[0])
     fps = float(clip["fps"])
     arrays: dict[str, np.ndarray] = {}
+    # A reference clip is one complete, reset-free episode.  Generated
+    # metrics use this same authority at runtime to exclude reset, settling,
+    # and padding samples, so the canonical reference conversion must expose
+    # the corresponding all-valid support rather than forcing reference
+    # scoring onto a weaker array contract.
+    arrays["first_episode_valid_mask"] = np.ones(
+        (T, int(n_envs)), dtype=bool,
+    )
 
     jp = clip.get("joint_pos")
     if jp is not None:

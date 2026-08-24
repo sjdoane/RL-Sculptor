@@ -8,10 +8,13 @@ the five immutable refs from a prior pinned selection as one tuple.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from sculptor.diagnose import (
     _GroundedModel,
@@ -174,6 +177,71 @@ def test_promote_iteration_selection_base_selection_reverts_world(
     assert reverted["evaluation_lineage"] == "eval-variation-test"
     # the adapter now points at the reverted pin for the next train step
     assert adapter.world_selection_path == str(reverted_pin.resolve())
+
+
+def test_core_uses_requested_immutable_selection_after_current_changes(
+    tmp_path,
+) -> None:
+    from sculptor.sculpt import (
+        _pin_authored_selection,
+        _verify_requested_authored_selection,
+    )
+    from sculptor.world.project import (
+        WorldVariationEdit,
+        apply_world_variation_edits,
+    )
+    from test_world_project import _admitted_with_variation
+
+    project, service, admitted = _admitted_with_variation(tmp_path)
+    version = admitted.promoted.selection.selection_version
+    requested_path = project / "env" / f"selection_v{version}.json"
+    expected_sha = hashlib.sha256(requested_path.read_bytes()).hexdigest()
+    expected_tuple = admitted.promoted.selection.tuple_hash
+
+    # Promote a different current selection before core initialization.
+    apply_world_variation_edits(
+        project,
+        [WorldVariationEdit(
+            variation_id="ball_mass",
+            new_distribution={"kind": "uniform", "low": 0.1, "high": 0.3},
+            rationale="new authoring after launch admission",
+        )],
+        service=service,
+    )
+
+    receipt = _verify_requested_authored_selection(
+        project,
+        selection_path=requested_path,
+        expected_selection_sha256=expected_sha,
+        expected_tuple_hash=expected_tuple,
+    )
+    assert receipt is not None
+    adapter = SimpleNamespace(
+        world_selection_path=str(project / "env" / "selection_current.json")
+    )
+    adapter.world_selection_path = receipt["selection_path"]
+
+    assert _pin_authored_selection(adapter, project) == expected_tuple
+    assert Path(adapter.world_selection_path).name == f"selection_v{version}.json"
+
+
+def test_core_rejects_changed_immutable_selection_bytes(tmp_path) -> None:
+    from sculptor.sculpt import _verify_requested_authored_selection
+    from test_world_project import _admitted_with_variation
+
+    project, _service, admitted = _admitted_with_variation(tmp_path)
+    version = admitted.promoted.selection.selection_version
+    requested_path = project / "env" / f"selection_v{version}.json"
+    expected_sha = hashlib.sha256(requested_path.read_bytes()).hexdigest()
+    requested_path.write_bytes(requested_path.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match="bytes changed"):
+        _verify_requested_authored_selection(
+            project,
+            selection_path=requested_path,
+            expected_selection_sha256=expected_sha,
+            expected_tuple_hash=admitted.promoted.selection.tuple_hash,
+        )
 
 
 def test_write_world_curriculum_stats_histogram_and_fail_soft(tmp_path) -> None:

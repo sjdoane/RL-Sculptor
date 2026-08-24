@@ -24,11 +24,18 @@ from __future__ import annotations
 
 import argparse
 from functools import wraps
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+from sculptor.runtime_inputs import (
+    capture_environment_artifacts,
+    capture_reward_module_artifact,
+    environment_artifacts_for_phase,
+)
 
 
 # ── Component capture sink (§7.1 / §7.2 — Eureka-style reward reflection) ──
@@ -60,6 +67,146 @@ _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE = 2.0
 # Command tracking, direct contact, survival, and native realism terms are
 # separate rewards and remain active.
 _CLEARANCE_STAGE_PRIMARY_SCALE = 0.0
+
+
+def _runtime_file_sha256(path: str | Path, *, label: str) -> str:
+    """Hash one runner input/output without interpreting its bytes."""
+    resolved = Path(path).expanduser().resolve()
+    try:
+        data = resolved.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {label} at {resolved}: {exc}") from exc
+    return hashlib.sha256(data).hexdigest()
+
+
+def _capture_runner_reward_artifact(
+    path: str | Path, *, label: str,
+) -> dict[str, Any]:
+    """Capture the loader+selected reward mapping as a fatal runner input."""
+    try:
+        return capture_reward_module_artifact(path)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {label}: {exc}") from exc
+
+
+def _validate_loaded_reward_artifact(
+    reward_module: Any,
+    artifact: Mapping[str, Any],
+) -> None:
+    """Prove a selector actually re-exported its admitted immutable module."""
+    if artifact.get("selection_kind") == "direct":
+        return
+    selected = artifact.get("selected")
+    selected_path = (
+        Path(str(selected.get("path"))).resolve()
+        if isinstance(selected, Mapping) else None
+    )
+    selected_module = getattr(reward_module, "_mod", None)
+    raw_selected_file = getattr(selected_module, "__file__", None)
+    if (
+        selected_path is None
+        or not isinstance(raw_selected_file, str)
+        or Path(raw_selected_file).resolve() != selected_path
+    ):
+        raise RuntimeError(
+            "reward selector did not load its admitted immutable module"
+        )
+    for name in (
+        "compute_reward",
+        "REWARD_SPEC",
+        "compute_reward_batched",
+        "reference_clock_batched",
+        "reference_target_index_batched",
+    ):
+        selected_value = getattr(selected_module, name, None)
+        loader_value = getattr(reward_module, name, None)
+        if selected_value is None:
+            if loader_value is not None:
+                raise RuntimeError(
+                    f"reward selector invents absent selected surface {name}"
+                )
+            continue
+        if loader_value is not selected_value:
+            raise RuntimeError(
+                f"reward selector does not exactly re-export selected {name}"
+            )
+
+
+def _load_explicit_eval_reset(path: str | Path) -> dict[str, Any]:
+    """Load an explicitly requested reset or fail closed.
+
+    Adapter construction validates this file once, but it remains an external
+    file until the rollout subprocess reads it.  A deletion, malformed rewrite,
+    or non-object replacement in that window must abort evaluation rather than
+    silently reverting to the task's default reset.
+    """
+    resolved = Path(path).expanduser().resolve()
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"explicit --eval-reset {resolved} is unreadable/invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"explicit --eval-reset {resolved} must contain a JSON object, "
+            f"got {type(payload).__name__}"
+        )
+    return payload
+
+
+def _apply_runtime_seed(
+    seed: int,
+    *,
+    env_cfg: Any = None,
+    rl_cfg: Any = None,
+) -> dict[str, Any]:
+    """Apply one seed to every runtime RNG before env/runner construction.
+
+    Core RNG failures are fatal: recording a requested integer while leaving a
+    generator unseeded is not reproducibility evidence.  Config objects are
+    marked applied only when they expose a writable ``seed`` field.
+    """
+    import random
+
+    import numpy as np
+    import torch
+
+    normalized = int(seed)
+    if not 0 <= normalized <= 2**32 - 1:
+        raise ValueError(
+            "runtime seed must be an integer in the shared Python/NumPy/"
+            "Torch domain 0..4294967295"
+        )
+    random.seed(normalized)
+    np.random.seed(normalized)
+    torch.manual_seed(normalized)
+
+    env_cfg_applied = False
+    if env_cfg is not None and hasattr(env_cfg, "seed"):
+        try:
+            env_cfg.seed = normalized
+        except Exception as exc:  # noqa: BLE001 - explicit seed must fail closed
+            raise RuntimeError(f"cannot apply seed to environment config: {exc}") from exc
+        env_cfg_applied = True
+
+    rl_cfg_applied = False
+    if rl_cfg is not None and hasattr(rl_cfg, "seed"):
+        try:
+            rl_cfg.seed = normalized
+        except Exception as exc:  # noqa: BLE001 - explicit seed must fail closed
+            raise RuntimeError(f"cannot apply seed to runner config: {exc}") from exc
+        rl_cfg_applied = True
+
+    return {
+        "schema": "reward-sculptor-seed-application-v1",
+        "applied_seed": normalized,
+        "python_random": True,
+        "numpy_global": True,
+        "torch_global": True,
+        "env_cfg": env_cfg_applied,
+        "rl_cfg": rl_cfg_applied,
+    }
 
 # Native locomotion-shaping terms that prescribe a grounded gait or suppress
 # the body dynamics needed for an authored vertical JUMP.  Hardware limits,
@@ -283,6 +430,98 @@ def _load_reward_module(path: str) -> Any:
     return mod
 
 
+def _build_reference_clock_observation_class(reward_module: Any):
+    """Bind the policy observation to the exact loaded reward module."""
+    import torch
+
+    from sculptor.reference_clock import (
+        REFERENCE_CLOCK_SOURCE,
+        reference_clock_from_module,
+    )
+
+    descriptor = reference_clock_from_module(reward_module)
+    if descriptor is None:
+        raise ValueError("reward module has no reference clock")
+
+    class ReferenceClockObservationTerm:
+        def __init__(self, cfg, env):  # type: ignore[no-untyped-def]
+            del cfg
+            self._env = env
+            self._module = reward_module
+
+        def __call__(self, env):  # type: ignore[no-untyped-def]
+            like = env.episode_length_buf.to(dtype=torch.float32)
+            step_dt = torch.full_like(like, float(env.step_dt))
+            value = self._module.reference_clock_batched(
+                {
+                    "episode_length": like,
+                    "step_dt": step_dt,
+                },
+                like,
+            )
+            if not torch.is_tensor(value) or tuple(value.shape) != (
+                int(env.num_envs), 1,
+            ):
+                raise RuntimeError(
+                    "reference clock observation must have shape (num_envs, 1)"
+                )
+            if not torch.isfinite(value).all():
+                raise RuntimeError("reference clock observation is non-finite")
+            return value.to(device=env.device, dtype=torch.float32)
+
+    # Policy-contract enumeration records callable names. Pin a stable public
+    # source name instead of a local factory class name.
+    ReferenceClockObservationTerm.__name__ = REFERENCE_CLOCK_SOURCE
+    return ReferenceClockObservationTerm, descriptor
+
+
+def _install_reference_clock_observation(
+    env_cfg: Any,
+    reward_module: Any,
+) -> dict[str, Any] | None:
+    """Append one shared reference phase column to actor and critic groups."""
+    from sculptor.reference_clock import (
+        REFERENCE_CLOCK_TERM,
+        reference_clock_from_module,
+    )
+
+    descriptor = reference_clock_from_module(reward_module)
+    if descriptor is None:
+        return None
+    observations = getattr(env_cfg, "observations", None)
+    if not isinstance(observations, dict):
+        raise RuntimeError(
+            "reference-conditioned policy requires observation groups"
+        )
+    from mjlab.managers.observation_manager import ObservationTermCfg
+
+    term_class, descriptor = _build_reference_clock_observation_class(
+        reward_module
+    )
+    installed = 0
+    seen_groups: set[int] = set()
+    for group_name in ("actor", "critic", "policy", "value"):
+        group = observations.get(group_name)
+        terms = getattr(group, "terms", None)
+        if not isinstance(terms, dict) or id(terms) in seen_groups:
+            continue
+        seen_groups.add(id(terms))
+        if REFERENCE_CLOCK_TERM in terms:
+            raise RuntimeError(
+                f"observation term {REFERENCE_CLOCK_TERM!r} already exists"
+            )
+        terms[REFERENCE_CLOCK_TERM] = ObservationTermCfg(
+            func=term_class,
+            params={},
+        )
+        installed += 1
+    if installed == 0:
+        raise RuntimeError(
+            "reference-conditioned policy has no actor/critic observations"
+        )
+    return descriptor
+
+
 def _cfg_to_dict(cfg: Any) -> dict[str, Any]:
     """Convert a rsl_rl / mjlab config dataclass to a plain dict.
 
@@ -378,6 +617,7 @@ def _motion_quality_info(
 def _build_sculptor_term_class(
     schema_keys: tuple[str, ...], robot_capability: Any | None = None,
     world_bundle: Any | None = None,
+    reward_module: Any | None = None,
 ):
     """Factory for the reward-term class. Kept inside the function so
     heavy imports (mjlab, torch) only happen when the runner is actually
@@ -400,7 +640,7 @@ def _build_sculptor_term_class(
             path = cfg.params["reward_module_path"]
             self._schema_keys = schema_keys
             self._robot_capability = robot_capability
-            mod = _load_reward_module(path)
+            mod = reward_module or _load_reward_module(path)
             if not hasattr(mod, "compute_reward_batched"):
                 raise AttributeError(
                     f"reward module {path!r} missing compute_reward_batched; "
@@ -1225,6 +1465,28 @@ def _reward_module_declares(reward_module_path: Any, key: str) -> bool:
         return False
 
 
+def _reward_spec_tracks_reference(spec: Any) -> bool:
+    """Return the one canonical reference-tracking capability verdict.
+
+    Flat reference rewards predate mode authoring and declare
+    ``reference_tracking``. Mode rewards declare ``tracking_enabled`` because
+    the same scaffold can intentionally be task-only. Those are two wire
+    formats for one runtime fact: an active immutable motion prior makes the
+    task's posture/gait defaults competitors rather than realism priors.
+    """
+    return bool(
+        isinstance(spec, Mapping)
+        and (spec.get("reference_tracking") or spec.get("tracking_enabled"))
+    )
+
+
+def _reward_module_tracks_reference(reward_module: Any) -> bool:
+    """Classify the exact module already loaded for this training run."""
+    return _reward_spec_tracks_reference(
+        getattr(reward_module, "REWARD_SPEC", None)
+    )
+
+
 def _authored_terminal_stillness_weight(
     rewards: Mapping[str, Any],
     authored_command_terms: frozenset[str],
@@ -1860,7 +2122,7 @@ _DEFAULT_PHYSICS_DR: dict[str, tuple[float, float]] = {
 
 
 def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
-                    train: bool = True, task_id: str = "") -> None:
+                    train: bool = True, task_id: str = "") -> dict[str, Any]:
     """§RL_SCULPTOR_AUDIT (env generalization, 2026-07-04): apply a
     validated env spec to the loaded task cfg, before the env is built.
     General successor to the retired jump-only `_apply_env_profile` —
@@ -1892,7 +2154,14 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         # spec still gets the always-on physics DR below — the "in any case"
         # guarantee that every training run/stage is domain-randomized.
         if not train:
-            return
+            return {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "rollout",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            }
         spec = {}
     import math
 
@@ -1910,8 +2179,10 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         for _k, _v in _DEFAULT_PHYSICS_DR.items():
             train_sec.setdefault(_k, _v)
     applied: list[str] = []
+    application_errors: list[str] = []
 
     def _skip(what: str, e: Exception) -> None:
+        application_errors.append(f"{what}: {type(e).__name__}: {e}")
         print(f"[runner] env-spec: {what} skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
@@ -2355,10 +2626,18 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     print(f"[runner] env-spec applied (train={train}): {applied}"
           + (f"; NOT APPLICABLE on this task cfg: {dead}" if dead else ""),
           file=sys.stderr, flush=True)
+    return {
+        "schema": "reward-sculptor-env-spec-application-v1",
+        "phase": "train" if train else "rollout",
+        "requested": sorted(requested),
+        "applied": list(applied),
+        "dead": sorted(dead),
+        "errors": list(application_errors),
+    }
 
 
 def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
-                       task_id: str = "") -> None:
+                       task_id: str = "", strict: bool = False) -> dict[str, Any]:
     """§D17: apply a stage-FIXED eval-rollout reset override — a small
     ALLOWLISTED subset of `sculptor.reference.derive_eval_reset`'s
     payload (single deterministic values, not train-iterable ranges).
@@ -2381,9 +2660,20 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
     rollout. Announces what it actually wrote so the runner log makes a
     reference-derived lying-start eval visible, not silent."""
     if not payload:
-        return
+        return {
+            "schema": "reward-sculptor-eval-reset-application-v1",
+            "requested": [],
+            "applied": [],
+            "dead": [],
+            "errors": [],
+        }
+
+    requested = sorted(str(key) for key in payload)
+    applied_fields: list[str] = []
+    application_errors: list[str] = []
 
     def _skip(what: str, e: Exception) -> None:
+        application_errors.append(f"{what}: {type(e).__name__}: {e}")
         print(f"[runner] eval-reset: {what} skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
@@ -2404,12 +2694,15 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
                     if z is not None:
                         pose_range["z"] = (float(z), float(z))
                         wrote.append("z")
+                        applied_fields.append("reset_height_offset_m")
                     if pitch is not None:
                         pose_range["pitch"] = (float(pitch), float(pitch))
                         wrote.append("pitch")
+                        applied_fields.append("reset_pitch_offset_rad")
                     if roll is not None:
                         pose_range["roll"] = (float(roll), float(roll))
                         wrote.append("roll")
+                        applied_fields.append("reset_roll_offset_rad")
                 if vz is not None:
                     vr = params.get("velocity_range")
                     if not isinstance(vr, dict):
@@ -2417,6 +2710,7 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
                         params["velocity_range"] = vr
                     vr["z"] = (float(vz), float(vz))
                     wrote.append("vz")
+                    applied_fields.append("reset_vertical_velocity_mps")
                 if wrote:
                     applied.append(f"reset_base→eval_reset({','.join(wrote)})")
         except Exception as e:  # noqa: BLE001
@@ -2457,19 +2751,46 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
                 applied.append(
                     f"events:+reset_robot_joints_to_reference"
                     f"({len(jpt)} joints)")
+                applied_fields.append("reset_joint_pos_target")
+                if jpt_noise is not None:
+                    applied_fields.append("reset_joint_pos_noise_rad")
         except Exception as e:  # noqa: BLE001
             _skip("eval reference joint-posture reset", e)
 
     if payload.get("fell_over_termination") is False:
         try:
             terms = getattr(env_cfg, "terminations", None)
-            if isinstance(terms, dict) and terms.pop("fell_over", None) is not None:
-                applied.append("terminations:fell_over→removed")
+            if not isinstance(terms, dict):
+                raise TypeError("task cfg exposes no termination mapping")
+            marker = object()
+            removed = terms.pop("fell_over", marker)
+            if "fell_over" in terms:  # defensive for exotic mappings
+                raise RuntimeError("fell_over termination remained enabled")
+            applied_fields.append("fell_over_termination")
+            applied.append(
+                "terminations:fell_over→removed"
+                if removed is not marker
+                else "terminations:fell_over→already_absent"
+            )
         except Exception as e:  # noqa: BLE001
             _skip("eval fell_over removal", e)
 
     print(f"[runner] eval reset: reference-derived lying start "
           f"(stage-fixed): {applied}", file=sys.stderr, flush=True)
+    dead = sorted(set(requested) - set(applied_fields))
+    receipt = {
+        "schema": "reward-sculptor-eval-reset-application-v1",
+        "requested": requested,
+        "applied": sorted(set(applied_fields)),
+        "dead": dead,
+        "errors": application_errors,
+    }
+    if strict and (dead or application_errors):
+        raise RuntimeError(
+            "explicit evaluation reset was not applied exactly: "
+            f"dead={dead}, errors={application_errors}"
+        )
+    return receipt
 
 
 def _apply_rl_spec(rl_cfg: Any, spec: "dict | None") -> None:
@@ -2787,7 +3108,7 @@ def _zero_extend_observation_state_dict(
     """Explicitly migrate one feed-forward observation interface.
 
     Only the first MLP input columns and matching normalizer vectors may grow,
-    and only by the manifest-declared event observation width.  Every key and
+    and only by the admitted observation-extension width.  Every key and
     every other tensor shape remains exact.  New network columns are zero, so
     the inherited policy is behaviorally identical until PPO learns to consume
     the phase; normalizer defaults are mean=0, std/variance=1.
@@ -2852,7 +3173,7 @@ def _zero_extend_observation_state_dict(
     if input_key not in changed:
         raise RuntimeError(
             f"{role} warm start did not require the declared "
-            f"{extension_width}-column event observation extension"
+            f"{extension_width}-column observation extension"
         )
     for key, value in adapted.items():
         if tuple(getattr(value, "shape", ())) != tuple(
@@ -2870,8 +3191,14 @@ def _prepare_event_observation_warm_start(
     output_dir: Path,
     extension_width: int,
     load_role: str,
+    observation_terms: tuple[str, ...] = ("authored_event_phase",),
 ) -> tuple[Path, dict[str, Any]]:
-    """Materialize and hash a provenance-bearing compatible checkpoint."""
+    """Materialize and hash a provenance-bearing compatible checkpoint.
+
+    The function name is retained for compatibility; ``observation_terms``
+    records whether the admitted zero columns represent authored event phase,
+    reference phase, or their explicitly composed migration.
+    """
     import hashlib
     import torch
 
@@ -2907,16 +3234,19 @@ def _prepare_event_observation_warm_start(
                 for key in source_state
             ):
                 raise RuntimeError(
-                    f"{role} differs from the effective event policy contract"
+                    f"{role} differs from the effective observation contract"
                 )
-        return checkpoint, {
+        exact_receipt: dict[str, Any] = {
             "adapted": False,
             "extension_width": int(extension_width),
-            "observation_term": "authored_event_phase",
+            "observation_terms": list(observation_terms),
         }
+        if len(observation_terms) == 1:
+            exact_receipt["observation_term"] = observation_terms[0]
+        return checkpoint, exact_receipt
     if not all(needs_extension):
         raise RuntimeError(
-            "actor and critic disagree about the event observation extension"
+            "actor and critic disagree about the observation extension"
         )
     adapted_checkpoint = dict(loaded)
     changed: dict[str, list[str]] = {}
@@ -2937,15 +3267,20 @@ def _prepare_event_observation_warm_start(
         adapted_checkpoint[state_key] = adapted_state
         changed[role] = list(changed_keys)
 
-    adapted_path = output_dir / "warm_start_event_observation.pt"
+    adapted_name = (
+        "warm_start_event_observation.pt"
+        if observation_terms == ("authored_event_phase",)
+        else "warm_start_observation_extension.pt"
+    )
+    adapted_path = output_dir / adapted_name
     torch.save(adapted_checkpoint, adapted_path)
     digest = hashlib.sha256(adapted_path.read_bytes()).hexdigest()
-    return adapted_path, {
+    extension_receipt: dict[str, Any] = {
         "adapted": True,
         "adapted_checkpoint": str(adapted_path),
         "adapted_checkpoint_sha256": digest,
         "extension_width": int(extension_width),
-        "observation_term": "authored_event_phase",
+        "observation_terms": list(observation_terms),
         "padding": {
             "input_columns": 0.0,
             "normalizer_mean": 0.0,
@@ -2954,6 +3289,9 @@ def _prepare_event_observation_warm_start(
         },
         "changed_tensors": changed,
     }
+    if len(observation_terms) == 1:
+        extension_receipt["observation_term"] = observation_terms[0]
+    return adapted_path, extension_receipt
 
 
 def _event_policy_contract_admission_kind(
@@ -2962,13 +3300,13 @@ def _event_policy_contract_admission_kind(
     *,
     extension_width: int,
 ) -> str:
-    """Classify the two admitted event warm-start contract relations.
+    """Classify an admitted observation-interface warm-start relation.
 
-    A schema-3 checkpoint may load directly when its source and target
-    contracts are exact.  A schema-2 checkpoint may cross the event interface
-    boundary only through the one explicit zero-column migration.  Keeping
-    this decision pure makes the remote runner fail closed before inspecting
-    or adapting checkpoint tensors.
+    The historical function name remains as a compatibility seam for focused
+    tests and callers.  The classifier now also admits the reference-clock
+    extension (alone or after the authored event extension).  Every accepted
+    mapping is byte-for-byte the receipt that ``policy_contract_migration``
+    emits; arbitrary tensor padding never becomes an implicit migration.
     """
     expected_migration = {
         "type": "zero_initialized_event_phase_observation",
@@ -2982,6 +3320,60 @@ def _event_policy_contract_admission_kind(
     if dict(admitted_migration) == expected_migration:
         return "zero_initialized_event_phase_observation"
 
+    if effective_contract.get("schema") == 4:
+        from sculptor.policy_contract import contract_fingerprint
+        from sculptor.reference_clock import validate_reference_clock
+
+        try:
+            clock = validate_reference_clock(
+                effective_contract.get("reference_clock")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "effective policy contract has an invalid reference clock"
+            ) from exc
+        clock_width = int(clock["shape"][0])
+        clock_migration = {
+            "type": "zero_initialized_reference_clock_observation",
+            "from_schema": (
+                3 if effective_contract.get("event_observation") is not None
+                else 2
+            ),
+            "to_schema": 4,
+            "observation_term": clock["term_name"],
+            "extension_width": clock_width,
+            "reference_clock_sha256": contract_fingerprint(clock),
+            "optimizer_resume": False,
+        }
+        if dict(admitted_migration) == clock_migration:
+            return "zero_initialized_reference_clock_observation"
+
+        event_interface = effective_contract.get("event_observation")
+        event_width = (
+            len(event_interface.get("ordered_phase_ids", ()))
+            if isinstance(event_interface, Mapping)
+            else 0
+        )
+        combined_migration = {
+            "type": "zero_initialized_observation_extensions",
+            "from_schema": 2,
+            "to_schema": 4,
+            "extension_width": event_width + clock_width,
+            "extensions": [
+                {
+                    **expected_migration,
+                    "extension_width": event_width,
+                },
+                clock_migration,
+            ],
+            "optimizer_resume": False,
+        }
+        if (
+            event_width > 0
+            and dict(admitted_migration) == combined_migration
+        ):
+            return "zero_initialized_observation_extensions"
+
     effective_schema = effective_contract.get("schema")
     expected_exact = {
         "type": "exact_policy_contract",
@@ -2993,9 +3385,48 @@ def _event_policy_contract_admission_kind(
         return "exact_policy_contract"
 
     raise RuntimeError(
-        "runner received an unrecognized event-observation "
+        "runner received an unrecognized observation-interface "
         "policy-contract migration"
     )
+
+
+def _observation_terms_for_contract_admission(
+    admitted_migration: Mapping[str, Any],
+    effective_contract: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return the ordered observation columns named by an admission receipt."""
+    migration_type = admitted_migration.get("type")
+    if migration_type == "exact_policy_contract":
+        terms: list[str] = []
+        event = effective_contract.get("event_observation")
+        if isinstance(event, Mapping):
+            term = event.get("term_name", "authored_event_phase")
+            if isinstance(term, str) and term:
+                terms.append(term)
+        clock = effective_contract.get("reference_clock")
+        if isinstance(clock, Mapping):
+            term = clock.get("term_name")
+            if isinstance(term, str) and term:
+                terms.append(term)
+        return tuple(terms)
+    if migration_type == "zero_initialized_observation_extensions":
+        extensions = admitted_migration.get("extensions")
+        if not isinstance(extensions, list):
+            raise RuntimeError("combined observation migration has no extensions")
+        terms = tuple(
+            str(item.get("observation_term"))
+            for item in extensions
+            if isinstance(item, Mapping) and item.get("observation_term")
+        )
+        if len(terms) != len(extensions):
+            raise RuntimeError(
+                "combined observation migration has an unnamed extension"
+            )
+        return terms
+    term = admitted_migration.get("observation_term")
+    if isinstance(term, str) and term:
+        return (term,)
+    raise RuntimeError("observation migration has no named observation term")
 
 
 def _expected_warm_start_checkpoint_sha256() -> str | None:
@@ -3042,11 +3473,82 @@ def _verify_warm_start_checkpoint_sha256(actual_sha256: str) -> str | None:
     return expected
 
 
+def _policy_contract_sidecar_path(checkpoint: Path) -> Path:
+    """Server-owned exact-interface receipt for a locally trained checkpoint."""
+    return Path(str(Path(checkpoint)) + ".policy_contract.json")
+
+
+def _read_local_checkpoint_policy_contract(
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Read one exact local checkpoint contract, rejecting stale sidecars."""
+    from sculptor.policy_contract import contract_fingerprint
+
+    path = _policy_contract_sidecar_path(checkpoint)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "direct observation-interface warm start requires the exact local "
+            f"checkpoint policy-contract sidecar at {path}"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema", "checkpoint_sha256", "policy_contract",
+        "policy_contract_sha256",
+    }:
+        raise RuntimeError("checkpoint policy-contract sidecar is malformed")
+    contract = payload.get("policy_contract")
+    if (
+        payload.get("schema") != 1
+        or payload.get("checkpoint_sha256") != checkpoint_sha256
+        or not isinstance(contract, dict)
+        or payload.get("policy_contract_sha256")
+        != contract_fingerprint(contract)
+    ):
+        raise RuntimeError(
+            "checkpoint policy-contract sidecar disagrees with the exact "
+            "checkpoint bytes or contract"
+        )
+    return contract
+
+
+def _write_local_checkpoint_policy_contract(
+    checkpoint: Path,
+    policy_contract: Mapping[str, Any],
+) -> Path:
+    """Atomically bind a completed local checkpoint to its exact interface."""
+    import hashlib
+
+    from sculptor.policy_contract import contract_fingerprint
+
+    checkpoint = Path(checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    payload = {
+        "schema": 1,
+        "checkpoint_sha256": digest,
+        "policy_contract": dict(policy_contract),
+        "policy_contract_sha256": contract_fingerprint(dict(policy_contract)),
+    }
+    path = _policy_contract_sidecar_path(checkpoint)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    return path
+
+
 def _attest_warm_start_policy_contract(
     *,
     world_selection: str | Path,
     extension_width: int,
     source_checkpoint_sha256: str,
+    reference_clock: Mapping[str, Any] | None = None,
+    source_checkpoint_path: Path | None = None,
+    project_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Rebuild and attest every UI-pinned warm-start policy contract.
 
@@ -3073,11 +3575,82 @@ def _attest_warm_start_policy_contract(
     if contract_pin_present and not all(pins.values()):
         raise RuntimeError("warm-start policy-contract pin is incomplete")
     if not contract_pin_present and extension_width > 0:
-        raise RuntimeError(
-            "event-interface warm start requires a full immutable source/"
-            "target policy-contract receipt; target-only CLI adaptation is "
-            "not an admitted compatibility proof"
+        # The only unpinned local admission is an exact chained checkpoint
+        # produced by this runner.  It is not a migration: the sidecar binds
+        # the source bytes to the same schema-4 reference interface rebuilt
+        # from the exact generated reward. Event or shape extension still
+        # requires the pre-queue immutable migration receipt.
+        if reference_clock is None or source_checkpoint_path is None:
+            raise RuntimeError(
+                "observation-interface warm start requires a full immutable "
+                "policy-contract receipt"
+            )
+        from sculptor.reference_clock import validate_reference_clock
+
+        canonical_clock = validate_reference_clock(reference_clock)
+        clock_width = int(canonical_clock["shape"][0])
+        if int(extension_width) != clock_width or project_dir is None:
+            raise RuntimeError(
+                "direct local warm starts admit only an exact reference-clock "
+                "interface; event or arbitrary extensions require launch pins"
+            )
+        source_contract = _read_local_checkpoint_policy_contract(
+            Path(source_checkpoint_path),
+            checkpoint_sha256=source_checkpoint_sha256,
         )
+        selection_path = Path(world_selection).expanduser().resolve()
+        contract_kwargs: dict[str, Any] = {
+            "reference_clock": canonical_clock,
+        }
+        if selection_path.is_file():
+            contract_kwargs["world_selection_path"] = selection_path
+        try:
+            effective_contract = build_project_policy_contract(
+                Path(project_dir).expanduser().resolve(),
+                **contract_kwargs,
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "failed to rebuild the direct local reference policy contract"
+            ) from exc
+        if source_contract != effective_contract:
+            raise RuntimeError(
+                "direct local checkpoint policy contract differs from the "
+                "exact runtime reference interface"
+            )
+        effective_sha = contract_fingerprint(effective_contract)
+        exact = {
+            "type": "exact_policy_contract",
+            "from_schema": effective_contract.get("schema"),
+            "to_schema": effective_contract.get("schema"),
+            "optimizer_resume": False,
+        }
+        admission_kind = _event_policy_contract_admission_kind(
+            exact, effective_contract, extension_width=extension_width,
+        )
+        receipt = {
+            "schema": 1,
+            "source": {
+                "checkpoint_sha256": source_checkpoint_sha256,
+                "contract": source_contract,
+                "contract_sha256": effective_sha,
+            },
+            "target": {
+                "contract": effective_contract,
+                "contract_sha256": effective_sha,
+            },
+            "compatibility": exact,
+        }
+        return {
+            "active": True,
+            "contract_pin_present": False,
+            "effective_contract": effective_contract,
+            "effective_contract_sha256": effective_sha,
+            "source_contract_sha256": effective_sha,
+            "admitted_migration": exact,
+            "admitted_contract_receipt": receipt,
+            "admission_kind": admission_kind,
+        }
     if not contract_pin_present:
         return {
             "active": False,
@@ -3097,9 +3670,14 @@ def _attest_warm_start_policy_contract(
         )
     project_dir = selection_path.parent.parent
     try:
+        contract_kwargs: dict[str, Any] = {
+            "world_selection_path": selection_path,
+        }
+        if reference_clock is not None:
+            contract_kwargs["reference_clock"] = reference_clock
         actual_contract = build_project_policy_contract(
             project_dir,
-            world_selection_path=selection_path,
+            **contract_kwargs,
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RuntimeError(
@@ -3210,25 +3788,54 @@ def _attest_warm_start_policy_contract(
                 "warm-start policy-contract receipt disagrees with the "
                 "admitted runner pins or checkpoint"
             )
-    interface = effective_contract.get("event_observation")
+    event_interface = effective_contract.get("event_observation")
     interface_phases = (
-        interface.get("ordered_phase_ids")
-        if isinstance(interface, dict)
+        event_interface.get("ordered_phase_ids")
+        if isinstance(event_interface, dict)
         else None
     )
-    if extension_width > 0:
+    runtime_clock_width = 0
+    canonical_runtime_clock: dict[str, Any] | None = None
+    if reference_clock is not None:
+        from sculptor.reference_clock import validate_reference_clock
+
+        try:
+            canonical_runtime_clock = validate_reference_clock(reference_clock)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("runtime reference clock is invalid") from exc
+        runtime_clock_width = int(canonical_runtime_clock["shape"][0])
+    runtime_event_width = int(extension_width) - runtime_clock_width
+    if runtime_event_width < 0:
+        raise RuntimeError(
+            "runtime observation extension width is smaller than the "
+            "reference-clock interface"
+        )
+    if runtime_event_width > 0:
         if (
             interface_phases != ["route", "jump", "hold"]
-            or len(interface_phases) != extension_width
+            or len(interface_phases) != runtime_event_width
         ):
             raise RuntimeError(
                 "effective policy contract lacks the runtime event "
                 "observation interface"
             )
-    elif interface is not None:
+    elif event_interface is not None:
         raise RuntimeError(
             "pinned policy contract declares an event observation, but the "
             "applied runtime world has no event interface"
+        )
+
+    pinned_clock = effective_contract.get("reference_clock")
+    if canonical_runtime_clock is None:
+        if pinned_clock is not None:
+            raise RuntimeError(
+                "pinned policy contract declares a reference clock, but the "
+                "runtime reward has no reference clock"
+            )
+    elif pinned_clock != canonical_runtime_clock:
+        raise RuntimeError(
+            "pinned policy contract reference clock differs from the exact "
+            "runtime reward module"
         )
 
     return {
@@ -3276,9 +3883,18 @@ def _warm_start_loaded_receipt(
             else None
         ),
         "policy_contract_migration": (
-            "zero_initialized_event_phase_observation"
-            if adapted
-            else None
+            (
+                extension_receipt.get(
+                    "admitted_policy_contract_migration", {}
+                ).get("type")
+                if isinstance(
+                    extension_receipt.get(
+                        "admitted_policy_contract_migration"
+                    ), Mapping,
+                )
+                else None
+            )
+            if adapted else None
         ),
         "effective_policy_contract_sha256": (
             effective_policy_contract_sha256
@@ -3309,7 +3925,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    train_environment_artifacts = environment_artifacts_for_phase(
+        capture_environment_artifacts(
+            env_spec_path=getattr(args, "env_spec", "") or None,
+            world_selection_path=(
+                getattr(args, "world_selection", "") or None
+            ),
+        ),
+        "train",
+    )
+
     env_cfg = load_env_cfg(args.task_id)
+    rl_cfg = load_rl_cfg(args.task_id)
+    train_seed_application = _apply_runtime_seed(
+        int(args.seed), env_cfg=env_cfg, rl_cfg=rl_cfg,
+    )
     env_cfg.scene.num_envs = args.num_envs
     # Authored geometry/task semantics are applied first. Legacy EnvSpec then
     # overlays only its separate reset/randomization/optimizer surface.
@@ -3320,13 +3950,47 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # a named --env-profile preset; neither → task defaults, no-op).
     # train=True additionally applies the train-only curricula section.
     env_spec = _resolve_env_spec(args)
-    _apply_env_spec(env_cfg, env_spec, train=True, task_id=args.task_id)
+    train_env_spec_application = _apply_env_spec(
+        env_cfg, env_spec, train=True, task_id=args.task_id,
+    )
     _reassert_authored_task_termination(env_cfg, world_bundle)
     # Authored worlds already carry their admitted actuator profile. Only a
     # legacy registered task may receive the environment-gated compatibility
     # transform, and it must receive it in both training and rollout.
     if world_bundle is None:
         _enforce_actuator_limits(env_cfg)
+
+    reward_module = None
+    reference_clock = None
+    train_reward_sha256 = None
+    train_reward_artifact = None
+    train_input_checkpoint_requested_sha256 = None
+    train_input_checkpoint_loaded_sha256 = None
+    train_input_checkpoint_load_completed = False
+    if args.reward_module_path:
+        train_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="training reward module",
+        )
+        train_reward_sha256 = train_reward_artifact["selected"]["sha256"]
+        reward_module = _load_reward_module(args.reward_module_path)
+        _validate_loaded_reward_artifact(reward_module, train_reward_artifact)
+        if _capture_runner_reward_artifact(
+            args.reward_module_path, label="training reward module",
+        ) != train_reward_artifact:
+            raise RuntimeError(
+                "training reward module changed while it was being loaded"
+            )
+        reference_clock = _install_reference_clock_observation(
+            env_cfg, reward_module,
+        )
+        if reference_clock is not None:
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "reference_clock_observation_installed",
+                    "reference_clock": reference_clock,
+                }, sort_keys=True),
+                flush=True,
+            )
 
     # Reward injection (optional).
     if args.reward_module_path:
@@ -3371,8 +4035,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
         # `_install_sculptor_termination_economics` below (survival guard +
         # explicit non-timeout termination penalty), which is why dropping
         # `upright` here does not reopen the fall-immediately failure mode.
-        tracking = _reward_module_declares(args.reward_module_path,
-                                           "reference_tracking")
+        # Use the exact module already loaded and byte-attested above. A
+        # second path import can disagree under mutation, and checking only
+        # the legacy flat-reward flag misclassifies mode tracking rewards.
+        tracking = _reward_module_tracks_reference(reward_module)
         if isinstance(existing, dict):
             kept, dropped = [], []
             for k in list(existing.keys()):
@@ -3451,6 +4117,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             _load_authored_robot_capability(
                 getattr(args, "world_selection", "")),
             world_bundle,
+            reward_module,
         )
         env_cfg.rewards["sculptor_primary"] = RewardTermCfg(
             func=SculptorRewardTerm,
@@ -3533,7 +4200,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
     from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
     from mjlab.tasks.registry import load_runner_cls
 
-    rl_cfg = load_rl_cfg(args.task_id)
     rl_cfg.max_iterations = args.max_iterations
     # PPO exploration from the env spec's train section (e.g.
     # entropy_coef_scale). Train-time only — rollout never optimizes.
@@ -3586,11 +4252,23 @@ def _cmd_train(args: argparse.Namespace) -> None:
         load_path = ckpt
         effective_contract_sha256: str | None = None
         extension_receipt: dict[str, Any] = {"adapted": False}
-        extension_width = _event_observation_extension_width(world_bundle)
+        event_extension_width = _event_observation_extension_width(world_bundle)
+        reference_extension_width = (
+            int(reference_clock["shape"][0])
+            if isinstance(reference_clock, Mapping)
+            else 0
+        )
+        extension_width = event_extension_width + reference_extension_width
         contract_attestation = _attest_warm_start_policy_contract(
             world_selection=getattr(args, "world_selection", ""),
             extension_width=extension_width,
             source_checkpoint_sha256=source_sha256,
+            reference_clock=reference_clock,
+            source_checkpoint_path=ckpt,
+            project_dir=(
+                Path(args.reward_module_path).expanduser().resolve().parent.parent
+                if args.reward_module_path else None
+            ),
         )
         # Exact schema-2 warm starts have no tensor extension, but they still
         # carry the same immutable receipt/selection attestation as event
@@ -3669,95 +4347,28 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 flush=True,
             )
         if extension_width > 0:
-            from sculptor.policy_contract import (
-                build_project_policy_contract,
-                contract_fingerprint,
-            )
+            from sculptor.policy_contract import contract_fingerprint
 
-            pinned_contract_json = os.environ.get(
-                "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON"
-            )
             pinned_contract_sha256 = os.environ.get(
                 "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256"
             )
-            source_contract_sha256 = os.environ.get(
-                "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256"
-            )
-            pinned_migration_json = os.environ.get(
-                "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON"
-            )
-            pinned_receipt_json = os.environ.get(
-                "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
-            )
-            contract_pin_present = any((
-                pinned_receipt_json,
-                pinned_contract_json,
-                pinned_contract_sha256,
-                source_contract_sha256,
-                pinned_migration_json,
-            ))
-            if contract_pin_present and not all((
-                pinned_receipt_json,
-                pinned_contract_json,
-                pinned_contract_sha256,
-                source_contract_sha256,
-                pinned_migration_json,
-            )):
+            if not contract_attestation["active"]:
                 raise RuntimeError(
-                    "warm-start policy-contract pin is incomplete"
+                    "observation-interface warm start has no admitted policy "
+                    "contract"
                 )
-            if contract_pin_present:
-                try:
-                    effective_contract = json.loads(
-                        str(pinned_contract_json)
-                    )
-                    admitted_migration = json.loads(
-                        str(pinned_migration_json)
-                    )
-                    admitted_contract_receipt = json.loads(
-                        str(pinned_receipt_json)
-                    )
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        "warm-start policy-contract pin is invalid JSON"
-                    ) from exc
-                if not isinstance(effective_contract, dict) or not isinstance(
-                    admitted_migration, dict
-                ):
-                    raise RuntimeError(
-                        "warm-start policy-contract pin must contain objects"
-                    )
-                if (
-                    not isinstance(admitted_contract_receipt, dict)
-                    or admitted_contract_receipt.get("schema") != 1
-                    or not isinstance(
-                        admitted_contract_receipt.get("source"), dict
-                    )
-                    or not isinstance(
-                        admitted_contract_receipt.get("target"), dict
-                    )
-                ):
-                    raise RuntimeError(
-                        "warm-start policy-contract receipt is malformed"
-                    )
-                admission_kind = _event_policy_contract_admission_kind(
-                    admitted_migration,
-                    effective_contract,
-                    extension_width=extension_width,
-                )
-            else:
-                # Direct local CLI use retains deterministic contract building.
-                # UI/remote launches always carry the pre-queue immutable pin
-                # above and therefore never trust an unsynced config rebuild.
-                selection_path = Path(args.world_selection).resolve()
-                project_dir = selection_path.parent.parent
-                effective_contract = build_project_policy_contract(
-                    project_dir,
-                    world_selection_path=selection_path,
-                )
-                admitted_migration = None
-                admitted_contract_receipt = None
-                admission_kind = None
+            contract_pin_present = bool(
+                contract_attestation["contract_pin_present"]
+            )
+            effective_contract = contract_attestation["effective_contract"]
+            admitted_migration = contract_attestation["admitted_migration"]
+            admitted_contract_receipt = contract_attestation[
+                "admitted_contract_receipt"
+            ]
+            admission_kind = contract_attestation["admission_kind"]
+            source_contract_sha256 = contract_attestation[
+                "source_contract_sha256"
+            ]
             effective_contract_sha256 = contract_fingerprint(
                 effective_contract)
             if (
@@ -3788,13 +4399,28 @@ def _cmd_train(args: argparse.Namespace) -> None:
                         "warm-start policy-contract receipt disagrees with "
                         "the admitted runner pins"
                     )
-            interface = effective_contract.get("event_observation")
-            if not isinstance(interface, dict) or interface.get(
-                "ordered_phase_ids"
-            ) != ["route", "jump", "hold"]:
+            event_interface = effective_contract.get("event_observation")
+            if event_extension_width:
+                if (
+                    not isinstance(event_interface, dict)
+                    or event_interface.get("ordered_phase_ids")
+                    != ["route", "jump", "hold"]
+                ):
+                    raise RuntimeError(
+                        "effective policy contract lacks the admitted event "
+                        "observation interface"
+                    )
+            pinned_reference_clock = effective_contract.get("reference_clock")
+            if reference_extension_width:
+                if pinned_reference_clock != reference_clock:
+                    raise RuntimeError(
+                        "effective policy contract lacks the exact runtime "
+                        "reference-clock observation interface"
+                    )
+            elif pinned_reference_clock is not None:
                 raise RuntimeError(
-                    "effective policy contract lacks the admitted event "
-                    "observation interface"
+                    "effective policy contract declares a reference clock, "
+                    "but the runtime reward has none"
                 )
             effective_contract_path = (
                 output_dir / "warm_start_effective_policy_contract.json"
@@ -3824,13 +4450,23 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 receipt_artifact_sha256 = _hashlib.sha256(
                     receipt_artifact_path.read_bytes()
                 ).hexdigest()
+            adaptation_width = (
+                0
+                if admission_kind == "exact_policy_contract"
+                else int(admitted_migration.get("extension_width", 0))
+            )
+            observation_terms = _observation_terms_for_contract_admission(
+                admitted_migration,
+                effective_contract,
+            )
             load_path, extension_receipt = (
                 _prepare_event_observation_warm_start(
                     runner,
                     ckpt,
                     output_dir=output_dir,
-                    extension_width=extension_width,
+                    extension_width=adaptation_width,
                     load_role=load_role,
+                    observation_terms=observation_terms,
                 )
             )
             if contract_pin_present:
@@ -3838,15 +4474,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 if admission_kind == "exact_policy_contract" and adapted:
                     raise RuntimeError(
                         "exact policy-contract warm start unexpectedly "
-                        "required an event-observation migration"
+                        "required an observation migration"
                     )
-                if (
-                    admission_kind
-                    == "zero_initialized_event_phase_observation"
-                    and not adapted
-                ):
+                if admission_kind != "exact_policy_contract" and not adapted:
                     raise RuntimeError(
-                        "declared event-observation migration did not change "
+                        "declared observation migration did not change "
                         "the checkpoint interface"
                     )
             extension_receipt.update({
@@ -3908,6 +4540,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 "or truncated, or (c) the rsl_rl version that wrote "
                 "the checkpoint has drifted from the one loading it."
             ) from e
+        train_input_checkpoint_requested_sha256 = source_sha256
+        train_input_checkpoint_loaded_sha256 = loaded_sha256
+        train_input_checkpoint_load_completed = True
         print(
             "[SCULPT-EVENT] " + json.dumps(
                 _warm_start_loaded_receipt(
@@ -4134,6 +4769,45 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 file=sys.stderr, flush=True,
             )
 
+    policy_contract_sidecar: Path | None = None
+    output_policy_contract_sha256: str | None = None
+    output_policy_contract_sidecar_sha256: str | None = None
+    if reference_clock is not None:
+        from sculptor.policy_contract import build_project_policy_contract
+
+        if not args.reward_module_path:
+            raise RuntimeError(
+                "reference-conditioned checkpoint has no exact reward project"
+            )
+        reward_project_dir = (
+            Path(args.reward_module_path).expanduser().resolve().parent.parent
+        )
+        contract_kwargs: dict[str, Any] = {
+            "reference_clock": reference_clock,
+        }
+        selection_path = Path(
+            getattr(args, "world_selection", "") or ""
+        ).expanduser().resolve()
+        if selection_path.is_file():
+            contract_kwargs["world_selection_path"] = selection_path
+        effective_checkpoint_contract = build_project_policy_contract(
+            reward_project_dir,
+            **contract_kwargs,
+        )
+        policy_contract_sidecar = _write_local_checkpoint_policy_contract(
+            ckpt_path,
+            effective_checkpoint_contract,
+        )
+        from sculptor.policy_contract import contract_fingerprint
+
+        output_policy_contract_sha256 = contract_fingerprint(
+            effective_checkpoint_contract
+        )
+        output_policy_contract_sidecar_sha256 = _runtime_file_sha256(
+            policy_contract_sidecar,
+            label="training output policy-contract sidecar",
+        )
+
     metrics = {
         "task_id": args.task_id,
         "num_envs": args.num_envs,
@@ -4142,7 +4816,59 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "device": args.device,
         "reward_injection": bool(args.reward_module_path),
         "checkpoint_path": str(ckpt_path),
+        "policy_contract_sidecar": (
+            str(policy_contract_sidecar)
+            if policy_contract_sidecar is not None else None
+        ),
     }
+    if train_reward_sha256 is not None:
+        assert train_reward_artifact is not None
+        observed_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="training reward module",
+        )
+        if observed_reward_artifact != train_reward_artifact:
+            raise RuntimeError(
+                "training reward module changed during the training process"
+            )
+        observed_reward_sha256 = observed_reward_artifact["selected"]["sha256"]
+        observed_train_environment_artifacts = environment_artifacts_for_phase(
+            capture_environment_artifacts(
+                env_spec_path=getattr(args, "env_spec", "") or None,
+                world_selection_path=(
+                    getattr(args, "world_selection", "") or None
+                ),
+            ),
+            "train",
+        )
+        if observed_train_environment_artifacts != train_environment_artifacts:
+            raise RuntimeError("training environment inputs changed during training")
+        metrics["runtime_artifacts"] = {
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "train",
+            "reward_module_sha256": observed_reward_sha256,
+            "requested_max_iterations": int(args.max_iterations),
+            "requested_seed": int(args.seed),
+            "requested_num_envs": int(args.num_envs),
+            "seed_application": train_seed_application,
+            "environment_artifacts": observed_train_environment_artifacts,
+            "env_spec_application": train_env_spec_application,
+            "input_checkpoint_requested_sha256": (
+                train_input_checkpoint_requested_sha256
+            ),
+            "input_checkpoint_loaded_sha256": (
+                train_input_checkpoint_loaded_sha256
+            ),
+            "input_checkpoint_load_completed": (
+                train_input_checkpoint_load_completed
+            ),
+            "output_checkpoint_sha256": _runtime_file_sha256(
+                ckpt_path, label="training output checkpoint",
+            ),
+            "output_policy_contract_sha256": output_policy_contract_sha256,
+            "output_policy_contract_sidecar_sha256": (
+                output_policy_contract_sidecar_sha256
+            ),
+        }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     _write_world_curriculum_stats(env, output_dir)
@@ -4448,6 +5174,21 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     keyframes_dir = output_dir / "keyframes"
     keyframes_dir.mkdir(exist_ok=True)
+    rollout_environment_artifacts = environment_artifacts_for_phase(
+        capture_environment_artifacts(
+            env_spec_path=getattr(args, "env_spec", "") or None,
+            eval_reset_path=getattr(args, "eval_reset", "") or None,
+            world_selection_path=(
+                getattr(args, "world_selection", "") or None
+            ),
+        ),
+        "rollout",
+    )
+    rollout_reward_sha256 = None
+    rollout_reward_artifact = None
+    rollout_checkpoint_sha256 = _runtime_file_sha256(
+        args.checkpoint_path, label="rollout checkpoint",
+    )
 
     n_episodes = int(args.n_episodes)
     # mujoco_warp amortizes kernel-launch overhead across envs; anything
@@ -4465,6 +5206,9 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    rollout_seed_application = _apply_runtime_seed(
+        int(args.seed), env_cfg=env_cfg,
+    )
     # Rollout loads the materialized evaluation artifact from the selected
     # tuple; it never re-samples WorldSpec generators from a seed.
     world_bundle = _apply_world_selection(
@@ -4478,9 +5222,34 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # here — evaluation starts from the honest task state, or the
     # metric's view (upright_start / return-to-start-height) would be
     # corrupted by mid-air spawns.
-    _apply_env_spec(
+    rollout_env_spec_application = _apply_env_spec(
         env_cfg, _resolve_env_spec(args), train=False, task_id=args.task_id)
     _reassert_authored_task_termination(env_cfg, world_bundle)
+    if getattr(args, "reward_module_path", None):
+        rollout_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="rollout reward module",
+        )
+        rollout_reward_sha256 = rollout_reward_artifact["selected"]["sha256"]
+        reward_module = _load_reward_module(args.reward_module_path)
+        _validate_loaded_reward_artifact(reward_module, rollout_reward_artifact)
+        if _capture_runner_reward_artifact(
+            args.reward_module_path, label="rollout reward module",
+        ) != rollout_reward_artifact:
+            raise RuntimeError(
+                "rollout reward module changed while it was being loaded"
+            )
+        reference_clock = _install_reference_clock_observation(
+            env_cfg, reward_module,
+        )
+        if reference_clock is not None:
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "reference_clock_observation_installed",
+                    "phase": "rollout",
+                    "reference_clock": reference_clock,
+                }, sort_keys=True),
+                flush=True,
+            )
     # §D17: stage-FIXED eval-reset override — reference-derived lying
     # start for get-up stages, applied ONLY here (never to training),
     # AFTER the shared-only env-spec above and strictly ADDITIVE to it.
@@ -4488,17 +5257,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # byte-identical no-op. See `_apply_eval_reset`'s docstring and
     # `sculptor.reference.derive_eval_reset` for the full rationale.
     _eval_reset_arg = getattr(args, "eval_reset", "") or ""
+    eval_reset_application = _apply_eval_reset(
+        env_cfg, None, task_id=args.task_id,
+    )
     if _eval_reset_arg:
-        try:
-            _eval_reset_payload = json.loads(
-                Path(_eval_reset_arg).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            print(f"[runner] --eval-reset {_eval_reset_arg!r} unreadable "
-                  f"({type(e).__name__}: {e}) — ignored", file=sys.stderr,
-                  flush=True)
-            _eval_reset_payload = None
-        _apply_eval_reset(
-            env_cfg, _eval_reset_payload, task_id=args.task_id)
+        _eval_reset_payload = _load_explicit_eval_reset(_eval_reset_arg)
+        eval_reset_application = _apply_eval_reset(
+            env_cfg, _eval_reset_payload, task_id=args.task_id, strict=True,
+        )
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # 720p + no ghost neighbor envs in the background (cosmetic, guarded).
@@ -4509,22 +5275,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         _enforce_actuator_limits(env_cfg)
     # §Selection statistics: deterministic eval seeding for repeat rollouts
     # of the SAME checkpoint (multi-seed evaluation / fresh-seed re-eval of
-    # the kept best). --seed 0 (default) leaves the legacy RNG state
-    # untouched. Reset-event randomization draws from torch's global RNG;
+    # the kept best). Seed 0 is applied like every other accepted seed.
+    # Reset-event randomization draws from torch's global RNG;
     # cfg.seed is additionally honored when the cfg exposes it.
-    _eval_seed = int(getattr(args, "seed", 0) or 0)
-    if _eval_seed:
-        try:
-            import torch
-            torch.manual_seed(_eval_seed)
-        except Exception:  # noqa: BLE001 — seeding is best-effort
-            pass
-        np.random.seed(_eval_seed % (2**32 - 1))
-        if hasattr(env_cfg, "seed"):
-            try:
-                env_cfg.seed = _eval_seed
-            except Exception:  # noqa: BLE001 — frozen cfg tolerated
-                pass
+    # The requested seed was applied fail-closed before any world/reset
+    # mutation or environment construction. Seed 0 is a real seed too.
     # §manipulation telemetry: registered (non-authored) tasks get generic
     # object/end-effector/contact/target channels discovered from the scene
     # cfg + capability descriptors — the artifact contract the YAM
@@ -4690,6 +5445,10 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     runner_cls = load_runner_cls(args.task_id) or MjlabOnPolicyRunner
     runner = runner_cls(wrapped, agent_cfg_dict, None, args.device)
     runner.load(args.checkpoint_path)
+    if _runtime_file_sha256(
+        args.checkpoint_path, label="rollout checkpoint",
+    ) != rollout_checkpoint_sha256:
+        raise RuntimeError("rollout checkpoint changed while it was being loaded")
     policy = runner.get_inference_policy(device=args.device)
 
     import torch
@@ -5176,6 +5935,81 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[runner] manipulation-telemetry finalize skipped: "
                   f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    ordered_joint_names = list(limits_snapshot.get("joint_names") or [])
+    observed_checkpoint_sha256 = _runtime_file_sha256(
+        args.checkpoint_path, label="rollout checkpoint",
+    )
+    if observed_checkpoint_sha256 != rollout_checkpoint_sha256:
+        raise RuntimeError("rollout checkpoint changed during rollout")
+    observed_reward_sha256 = None
+    if rollout_reward_sha256 is not None:
+        assert rollout_reward_artifact is not None
+        observed_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="rollout reward module",
+        )
+        if observed_reward_artifact != rollout_reward_artifact:
+            raise RuntimeError("rollout reward module changed during rollout")
+        observed_reward_sha256 = observed_reward_artifact["selected"]["sha256"]
+    observed_rollout_environment_artifacts = environment_artifacts_for_phase(
+        capture_environment_artifacts(
+            env_spec_path=getattr(args, "env_spec", "") or None,
+            eval_reset_path=getattr(args, "eval_reset", "") or None,
+            world_selection_path=(
+                getattr(args, "world_selection", "") or None
+            ),
+        ),
+        "rollout",
+    )
+    if observed_rollout_environment_artifacts != rollout_environment_artifacts:
+        raise RuntimeError("rollout environment inputs changed during rollout")
+    trajectory_contract = {
+        "schema": "reward-sculptor-trajectory-v1",
+        "layout": ["time", "environment", "feature"],
+        "ordered_joint_names": ordered_joint_names,
+        "control_dt_s": float(getattr(env, "step_dt", 0.0) or 0.0),
+        "root_link_pos_w_frame": "world",
+        "first_episode_lane": 0,
+        "valid_mask": {
+            "key": "first_episode_valid_mask",
+            "semantics": "true_prefix_before_first_done",
+            "invalid_state": "frozen_last_valid_sample",
+            "state_samples": "post_step_after_valid_transition",
+        },
+        "runtime_artifacts": {
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "rollout",
+            "reward_module_sha256": observed_reward_sha256,
+            "checkpoint_sha256": observed_checkpoint_sha256,
+            "checkpoint_load_completed": True,
+            "environment_artifacts": observed_rollout_environment_artifacts,
+            "env_spec_application": rollout_env_spec_application,
+            "eval_reset_application": eval_reset_application,
+            "requested_seed": int(args.seed),
+            "applied_seed": int(rollout_seed_application["applied_seed"]),
+            "seed_application": rollout_seed_application,
+            "requested_n_episodes": int(args.n_episodes),
+            "configured_n_episodes": int(n_episodes),
+            "requested_max_episode_steps": int(args.max_episode_steps),
+            "configured_max_episode_steps": int(max_steps),
+            "requested_task_id": str(args.task_id),
+            "configured_task_id": str(args.task_id),
+            "configured_num_envs": int(num_envs),
+            "completed_first_episodes": int(
+                ep_done[:n_episodes].sum().item()
+            ),
+        },
+    }
+    # A Unicode scalar keeps the receipt data-only and loadable with
+    # `allow_pickle=False`.  Tier-D copies this NPZ verbatim and re-validates
+    # the receipt before it may trust any recorded trajectory channel.
+    trajectory["trajectory_contract_json"] = np.asarray(
+        json.dumps(
+            trajectory_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+    )
     np.savez_compressed(output_dir / "trajectory.npz", **trajectory)
 
     # §7.1 / §7.2: per-term time-series as JSON (Eureka Appendix F shape).
@@ -5228,7 +6062,6 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     }
     import hashlib as _behavior_hashlib
 
-    ordered_joint_names = list(limits_snapshot.get("joint_names") or [])
     ordered_joint_names_sha256 = _behavior_hashlib.sha256(
         json.dumps(
             ordered_joint_names,
@@ -5390,6 +6223,14 @@ def main() -> None:
     p_roll = sub.add_parser("rollout")
     p_roll.add_argument("--task-id", required=True)
     p_roll.add_argument("--checkpoint-path", required=True)
+    p_roll.add_argument(
+        "--reward-module-path",
+        default=None,
+        help=(
+            "exact reward module used to reconstruct a reference-conditioned "
+            "policy observation interface"
+        ),
+    )
     p_roll.add_argument("--output-dir", required=True)
     p_roll.add_argument("--n-episodes", type=int, default=3)
     p_roll.add_argument("--max-episode-steps", type=int, default=500)

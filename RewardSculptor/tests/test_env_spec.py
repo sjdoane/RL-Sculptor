@@ -570,9 +570,25 @@ def test_apply_eval_reset_joint_target_length_mismatch_skips() -> None:
 
 def test_apply_eval_reset_removes_fell_over_termination() -> None:
     cfg = _fake_cfg_full()
-    _mjlab_runner._apply_eval_reset(
-        cfg, {"fell_over_termination": False})
+    receipt = _mjlab_runner._apply_eval_reset(
+        cfg, {"fell_over_termination": False}, strict=True)
     assert "fell_over" not in cfg.terminations
+    assert receipt["applied"] == ["fell_over_termination"]
+    assert receipt["dead"] == []
+    assert receipt["errors"] == []
+
+
+def test_apply_eval_reset_strict_accepts_fell_over_already_absent() -> None:
+    cfg = _fake_cfg_full()
+    cfg.terminations.pop("fell_over", None)
+
+    receipt = _mjlab_runner._apply_eval_reset(
+        cfg, {"fell_over_termination": False}, strict=True,
+    )
+
+    assert receipt["applied"] == ["fell_over_termination"]
+    assert receipt["dead"] == []
+    assert receipt["errors"] == []
 
 
 def test_apply_eval_reset_absent_payload_is_byte_identical_noop() -> None:
@@ -600,6 +616,64 @@ def test_apply_eval_reset_tolerates_partial_cfg() -> None:
     _mjlab_runner._apply_eval_reset(SimpleNamespace(), payload)
     _mjlab_runner._apply_eval_reset(
         SimpleNamespace(events={}, terminations={}), payload)
+
+
+def test_apply_eval_reset_strict_rejects_unapplied_fields() -> None:
+    payload = {
+        "reset_height_offset_m": -0.5,
+        "fell_over_termination": False,
+    }
+    with pytest.raises(RuntimeError, match="not applied exactly"):
+        _mjlab_runner._apply_eval_reset(
+            SimpleNamespace(), payload, strict=True,
+        )
+
+
+def test_load_explicit_eval_reset_fails_closed(tmp_path) -> None:
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unreadable/invalid"):
+        _mjlab_runner._load_explicit_eval_reset(str(malformed))
+
+    non_object = tmp_path / "list.json"
+    non_object.write_text("[]", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="must contain a JSON object"):
+        _mjlab_runner._load_explicit_eval_reset(str(non_object))
+
+
+def test_env_spec_application_receipt_distinguishes_applied_and_dead() -> None:
+    spec = {
+        "env_spec_version": 1,
+        "shared": {"episode_length_s": 7.0},
+    }
+    applied = _mjlab_runner._apply_env_spec(
+        _fake_cfg_full(), spec, train=False,
+    )
+    assert applied["phase"] == "rollout"
+    assert applied["requested"] == ["episode_length_s"]
+    assert applied["dead"] == []
+    assert applied["errors"] == []
+
+    dead = _mjlab_runner._apply_env_spec(
+        SimpleNamespace(), spec, train=False,
+    )
+    assert dead["requested"] == ["episode_length_s"]
+    assert dead["dead"] == ["episode_length_s"]
+
+
+@pytest.mark.parametrize("seed", [-1, 2**32])
+def test_runtime_seed_rejects_values_outside_shared_rng_domain(seed: int) -> None:
+    with pytest.raises(ValueError, match="0..4294967295"):
+        _mjlab_runner._apply_runtime_seed(seed)
+
+
+@pytest.mark.parametrize("seed", [0, 2**32 - 1])
+def test_runtime_seed_accepts_shared_rng_domain_boundaries(seed: int) -> None:
+    receipt = _mjlab_runner._apply_runtime_seed(seed)
+    assert receipt["applied_seed"] == seed
+    assert receipt["python_random"] is True
+    assert receipt["numpy_global"] is True
+    assert receipt["torch_global"] is True
 
 
 # ── Runner-side resolution ─────────────────────────────────────────────────

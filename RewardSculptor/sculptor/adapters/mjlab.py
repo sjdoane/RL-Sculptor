@@ -1047,6 +1047,7 @@ class MjlabAdapter(SculptorAdapter):
         render_height: int | None = None,
         render_env_index: int | None = None,
         seed: int | None = None,
+        reward_module_path: Path | None = None,
     ) -> RolloutResult:
         """§Ship-7: accept rollout-video knobs so the UI can drive them
         without config-file edits.
@@ -1066,6 +1067,10 @@ class MjlabAdapter(SculptorAdapter):
             None = legacy unseeded behavior.
         """
         checkpoint_path = Path(checkpoint_path).resolve()
+        reward_module_path = (
+            Path(reward_module_path).resolve()
+            if reward_module_path is not None else None
+        )
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1098,6 +1103,8 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-env-index", str(int(render_env_index))]
         if seed is not None:
             cmd += ["--seed", str(int(seed))]
+        if reward_module_path is not None:
+            cmd += ["--reward-module-path", str(reward_module_path)]
         if self.env_spec_path:
             cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
         elif self.env_profile:
@@ -1144,6 +1151,8 @@ class MjlabAdapter(SculptorAdapter):
                 options["--env-profile"] = self.env_profile
             rollout_inputs: dict[str, Path] = {
                 "--checkpoint-path": checkpoint_path}
+            if reward_module_path is not None:
+                rollout_inputs["--reward-module-path"] = reward_module_path
             if self.env_spec_path:
                 rollout_inputs["--env-spec"] = Path(self.env_spec_path).resolve()
             if self.eval_reset_path:

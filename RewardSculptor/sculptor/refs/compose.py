@@ -686,6 +686,39 @@ def compose_and_register(
             "clip_id": resolved_segment["source_id"],
             "content_sha256": parent_sha,
         })
+    root_frame_inheritance: Optional[dict[str, Any]] = None
+    inherited_root_frame = composite.get("root_frame")
+    if inherited_root_frame in {"absolute", "origin_relative"}:
+        parent_frame_receipts: list[dict[str, Any]] = []
+        for i, resolved_segment in enumerate(resolved):
+            parent_receipt, receipt_issues = library.root_frame_parent_receipt(
+                robot,
+                resolved_segment["source_id"],
+                root=root,
+            )
+            if receipt_issues or parent_receipt is None:
+                raise ComposeError(
+                    f"segment {i}: cannot inherit authoritative root_frame "
+                    f"from {resolved_segment['source_id']!r}: "
+                    + "; ".join(receipt_issues or ["evidence is missing"])
+                )
+            parent_frame_receipts.append(parent_receipt)
+        root_frame_inheritance = {
+            "schema": library.ROOT_FRAME_INHERITANCE_SCHEMA,
+            "method": library.ROOT_FRAME_INHERITANCE_METHOD,
+            "asserted_root_frame": inherited_root_frame,
+            "parents": parent_frame_receipts,
+        }
+        receipt_issues = library.validate_root_frame_inheritance_receipt(
+            root_frame_inheritance,
+            expected_root_frame=inherited_root_frame,
+            expected_parent_artifacts=parent_artifacts,
+        )
+        if receipt_issues:  # pragma: no cover - constructed from validated data
+            raise ComposeError(
+                "cannot build canonical root-frame inheritance receipt: "
+                + "; ".join(receipt_issues)
+            )
     comp_meta = composite["meta"]["composition"]
     n_frames = int(np.asarray(composite["root_pos_z"]).shape[0])
     d = library.clip_dir(robot, clip_id, root=root)
@@ -693,15 +726,19 @@ def compose_and_register(
     artifact_sha = library.content_sha256(clip_path.read_bytes())
     from sculptor.reference_clock import reference_playback_duration_s
 
+    source_provenance: dict[str, Any] = {
+        "kind": "compose",
+        "parent_clip_ids": [s["source_id"] for s in resolved],
+        "parent_artifacts": parent_artifacts,
+        "segments": comp_meta["segments"],
+    }
+    if root_frame_inheritance is not None:
+        source_provenance["root_frame_inheritance"] = root_frame_inheritance
+
     prov = library.make_provenance(
         clip_id=clip_id,
         robot=robot,
-        source={
-            "kind": "compose",
-            "parent_clip_ids": [s["source_id"] for s in resolved],
-            "parent_artifacts": parent_artifacts,
-            "segments": comp_meta["segments"],
-        },
+        source=source_provenance,
         license=license or merged_license,
         attribution=attribution or merged_attribution,
         content_sha256_=artifact_sha,

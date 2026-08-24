@@ -52,6 +52,7 @@ def test_procedural_generator_rejects_bad_params() -> None:
 # ── Clip format ─────────────────────────────────────────────────────────
 def test_clip_roundtrip_preserves_arrays_and_meta(tmp_path: Path) -> None:
     clip = make_procedural_jump_clip()
+    clip["root_frame"] = "origin_relative"
     p = save_clip(tmp_path / "ref" / "jump.npz", clip)
     loaded = load_clip(p)
     np.testing.assert_allclose(
@@ -61,6 +62,7 @@ def test_clip_roundtrip_preserves_arrays_and_meta(tmp_path: Path) -> None:
     assert loaded["joint_names"] == clip["joint_names"]
     assert loaded["meta"]["source"] == "procedural:jump"
     assert loaded["fps"] == pytest.approx(50.0)
+    assert loaded["root_frame"] == "origin_relative"
 
 
 def test_validate_clip_reports_all_violations() -> None:

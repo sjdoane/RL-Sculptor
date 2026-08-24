@@ -10,6 +10,7 @@ import pytest
 
 from sculptor.reference import save_clip
 from sculptor.reference_run import (
+    REFERENCE_INPUT_HASH_SCHEMA,
     ReferenceRunError,
     build_reference_guided_reward,
     load_exact_reference_motion,
@@ -76,7 +77,7 @@ def test_exact_reference_pair_loads_without_fallback(
         load_exact_reference_motion(clip_id=clip_id, robot="other")
 
 
-def test_dry_run_builds_looping_immutable_motion_prior(
+def test_dry_run_builds_certified_one_shot_immutable_motion_prior(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path))
@@ -91,7 +92,7 @@ def test_dry_run_builds_looping_immutable_motion_prior(
         dry_run=True,
     )
 
-    assert built.phase_mode == "loop"
+    assert built.phase_mode == "hold"
     assert built.task_residual_authored is False
     assert built.target_sha256 in built.source
     assert '"type": "reference_tracking_residual"' in built.source
@@ -177,6 +178,60 @@ def test_reference_input_hash_binds_goal_and_clip_content() -> None:
     assert base != reference_input_hash(
         clip_id="walk", robot="demo", clip_sha256="b" * 64,
         behavior_goal="weave",
+    )
+    legacy_payload = {
+        "clip_id": "walk",
+        "robot": "demo",
+        "clip_sha256": "a" * 64,
+        "behavior_goal": "weave",
+    }
+    legacy = hashlib.sha256(json.dumps(
+        legacy_payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    assert REFERENCE_INPUT_HASH_SCHEMA == "reference-guided-input-v2"
+    assert base != legacy, "old endpoint-exclusive cache keys must miss"
+
+
+def test_flat_reference_terminal_target_and_hash_include_final_clip_sample():
+    from sculptor.refs.track import generate_tracking_residual_reward_source
+
+    clip = {
+        "fps": 30.0,
+        "joint_names": ["left", "right"],
+        "joint_pos": np.zeros((20, 2), dtype=np.float64),
+        "root_pos_z": np.full(20, 0.7, dtype=np.float64),
+    }
+    changed = {
+        **clip,
+        "joint_pos": clip["joint_pos"].copy(),
+        "root_pos_z": clip["root_pos_z"].copy(),
+    }
+    changed["joint_pos"][-1] = np.asarray([0.35, -0.2])
+    changed["root_pos_z"][-1] = 0.82
+
+    original_ns: dict = {}
+    changed_ns: dict = {}
+    exec(compile(generate_tracking_residual_reward_source(
+        clip=clip, clip_id="flat-terminal", robot="g1",
+    ), "flat_original", "exec"), original_ns)  # noqa: S102
+    exec(compile(generate_tracking_residual_reward_source(
+        clip=changed, clip_id="flat-terminal", robot="g1",
+    ), "flat_changed", "exec"), changed_ns)  # noqa: S102
+
+    np.testing.assert_allclose(
+        changed_ns["REFERENCE_JOINT_POS"][-1],
+        changed["joint_pos"][-1],
+        atol=1e-5,
+    )
+    assert changed_ns["REFERENCE_ROOT_Z"][-1] == pytest.approx(
+        changed["root_pos_z"][-1], abs=1e-5,
+    )
+    assert changed_ns["REFERENCE_TARGET_SAMPLING"] == (
+        "nearest_frame_endpoint_inclusive"
+    )
+    assert (
+        original_ns["REFERENCE_TARGET_SHA256"]
+        != changed_ns["REFERENCE_TARGET_SHA256"]
     )
 
 

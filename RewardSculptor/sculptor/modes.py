@@ -471,6 +471,7 @@ def build_mode_execution_manifest(
     *,
     windows_s: Optional[Mapping[str, tuple[float, float]]] = None,
     terminal_hold_s: float = 0.0,
+    certified_clip_duration_s: Optional[float] = None,
     time_basis: str = PER_ENV_EPISODE_ELAPSED_S,
 ) -> ModeExecutionManifest:
     """Build and validate the exact schedule a reward/evaluator will execute."""
@@ -488,11 +489,30 @@ def build_mode_execution_manifest(
             "cannot build mode execution manifest: terminal_hold_s must be "
             f"finite and >= 0, got {terminal_hold_s!r}"
         )
+    raw_duration = max(
+        (float(hi) for _lo, hi in raw_windows.values()), default=0.0
+    )
+    certified_duration = (
+        raw_duration
+        if certified_clip_duration_s is None
+        else float(certified_clip_duration_s)
+    )
+    if (
+        not math.isfinite(certified_duration)
+        or certified_duration <= 0.0
+        or certified_duration > raw_duration + 1e-6
+    ):
+        raise ModeError(
+            "cannot build mode execution manifest: certified clip duration "
+            f"must be finite, positive, and <= graph duration {raw_duration:g}"
+        )
     resolved = dict(windows_s or raw_windows)
-    if windows_s is None and order and terminal_hold_s > 0.0:
+    if windows_s is None and order:
         terminal_name = order[-1]
-        lo, hi = resolved[terminal_name]
-        resolved[terminal_name] = (lo, hi + terminal_hold_s)
+        lo, _hi = resolved[terminal_name]
+        resolved[terminal_name] = (
+            lo, certified_duration + terminal_hold_s,
+        )
     if set(resolved) != set(order):
         raise ModeError(
             "cannot build mode execution manifest: windows_s keys must exactly "
@@ -513,9 +533,7 @@ def build_mode_execution_manifest(
         windows_s=rows,
         time_basis=str(time_basis),
         graph_sha256=mode_graph_sha256(graph),
-        certified_clip_duration_s=max(
-            (float(hi) for _lo, hi in raw_windows.values()), default=0.0
-        ),
+        certified_clip_duration_s=certified_duration,
         terminal_hold_s=terminal_hold_s,
     )
     errors = validate_mode_execution_manifest(manifest, graph)
@@ -581,15 +599,12 @@ def validate_mode_execution_manifest(
         if (
             manifest.certified_clip_duration_s is None
             or not math.isfinite(manifest.certified_clip_duration_s)
-            or not math.isclose(
-                manifest.certified_clip_duration_s,
-                raw_duration,
-                abs_tol=1e-3,
-            )
+            or manifest.certified_clip_duration_s <= 0.0
+            or manifest.certified_clip_duration_s > raw_duration + 1e-3
         ):
             errors.append(
-                "execution manifest certified_clip_duration_s does not match "
-                f"the graph: expected {raw_duration:g}, got "
+                "execution manifest certified_clip_duration_s must be positive "
+                f"and no longer than graph duration {raw_duration:g}, got "
                 f"{manifest.certified_clip_duration_s!r}"
             )
         if (
@@ -611,7 +626,10 @@ def validate_mode_execution_manifest(
         emitted_lo, emitted_hi = emitted.get(name, (float("nan"),) * 2)
         expected_hi = raw_hi
         if name == terminal_name and manifest.schema_version >= 2:
-            expected_hi = raw_hi + manifest.terminal_hold_s
+            expected_hi = (
+                float(manifest.certified_clip_duration_s)
+                + manifest.terminal_hold_s
+            )
         if (
             not math.isclose(emitted_lo, raw_lo, abs_tol=1e-3)
             or not math.isclose(emitted_hi, expected_hi, abs_tol=1e-3)
@@ -620,7 +638,8 @@ def validate_mode_execution_manifest(
                 f"certified-cadence window ({raw_lo:g}, {raw_hi:g})"
                 if name != terminal_name or manifest.schema_version < 2
                 else "certified terminal window "
-                f"({raw_lo:g}, {raw_hi:g}) plus explicit "
+                f"starting at {raw_lo:g}s and ending after the exact clip "
+                "duration plus explicit "
                 f"{manifest.terminal_hold_s:g}s hold"
             )
             errors.append(

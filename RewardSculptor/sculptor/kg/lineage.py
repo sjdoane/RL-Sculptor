@@ -23,9 +23,11 @@ from sculptor.kg.schema import (
     Relation,
     RobotEmbodiment,
     SoftwareEnvironment,
+    TrainingIteration,
     TrainingRun,
     WorldArtifact,
     make_mode_execution_artifact_id,
+    make_training_iteration_id,
     make_world_artifact_id,
 )
 from sculptor.kg.store import SculptorKG
@@ -216,6 +218,82 @@ def _merge_run_observation(
     return existing
 
 
+def record_iteration_started(
+    kg: SculptorKG | None,
+    *,
+    run: TrainingRun,
+    iteration_index: int,
+) -> TrainingIteration | None:
+    """Materialize one immutable per-iteration join point for runtime facts."""
+    if kg is None:
+        return None
+    if isinstance(iteration_index, bool) or not isinstance(iteration_index, int):
+        raise LineageConflict("training iteration index must be an integer")
+    if iteration_index < 0:
+        raise LineageConflict("training iteration index cannot be negative")
+    _merge_run_observation(
+        kg, run, observed_initialization_mode=run.observed_initialization_mode,
+    )
+    iteration = TrainingIteration(
+        id=make_training_iteration_id(
+            run.project, run.run_id, iteration_index,
+        ),
+        project=run.project,
+        run_id=run.run_id,
+        iteration_index=iteration_index,
+    )
+    _add_immutable(kg, iteration)
+    _add_edge_once(
+        kg,
+        Edge(
+            run.id,
+            iteration.id,
+            Relation.HAS_ITERATION,
+            data={"authority": "iter_started", "iteration": iteration_index},
+        ),
+    )
+    return iteration
+
+
+def record_iteration_world(
+    kg: SculptorKG | None,
+    *,
+    run: TrainingRun,
+    iteration: TrainingIteration,
+    world: WorldArtifact,
+    evidence: Mapping[str, Any],
+) -> None:
+    """Bind the exact authored tuple used by one training iteration."""
+    if kg is None:
+        return
+    canonical = record_iteration_started(
+        kg, run=run, iteration_index=iteration.iteration_index,
+    )
+    assert canonical is not None
+    if canonical.id != iteration.id:
+        raise LineageConflict("training iteration identity is inconsistent")
+    data = dict(evidence)
+    if (
+        data.get("validated") is not True
+        or data.get("status") != "active"
+        or data.get("iteration") != iteration.iteration_index
+        or data.get("tuple_hash") != world.sha256
+    ):
+        raise LineageConflict(
+            "iteration EXECUTES_IN requires its exact validated world receipt"
+        )
+    _add_immutable(kg, world)
+    _add_edge_once(
+        kg,
+        Edge(
+            iteration.id,
+            world.id,
+            Relation.EXECUTES_IN,
+            data=data,
+        ),
+    )
+
+
 def record_imported_skill(
     kg: SculptorKG | None,
     *,
@@ -340,6 +418,22 @@ def record_run_started(
     _merge_run_observation(kg, run, observed_initialization_mode=None)
     if effective_reference is not None:
         evidence = dict(reference_edge_data or {})
+        certification_scope = evidence.get("certification_scope")
+        tierd_receipt = evidence.get("tierd_receipt")
+        runtime_schedule = evidence.get("runtime_schedule")
+        tierd_receipt_fields = {
+            "status", "tier", "kinematic_only", "training_authorized",
+            "reference_tracking_certificate_admitted", "reference_robot",
+            "target_robot", "reference_clip_id", "clip_sha256",
+            "rollout_sha256", "certificate_sha256",
+            "execution_contract_sha256", "execution_boundary_sha256",
+            "certification_scope",
+        }
+        schedule_fields = {
+            "reference_robot", "reference_clip_id", "reference_target_sha256",
+            "phase_mode", "phase_duration_s", "n_phase_targets",
+            "tracking_backbone_sha256",
+        }
         if (
             evidence.get("verified") is not True
             or evidence.get("tier") != "D"
@@ -358,14 +452,66 @@ def record_run_started(
                     "certificate_sha256",
                     "execution_contract_sha256",
                     "execution_boundary_sha256",
+                    "reference_target_sha256",
+                    "tracking_backbone_sha256",
                 )
             )
             or evidence.get("clip_sha256") != effective_reference.sha256
+            or not isinstance(certification_scope, dict)
+            or not certification_scope
+            or evidence.get("certification_scope_sha256")
+            != _canonical_sha256(certification_scope)
+            or not isinstance(tierd_receipt, dict)
+            or set(tierd_receipt) != tierd_receipt_fields
+            or tierd_receipt.get("status") != "tierd_verified"
+            or tierd_receipt.get("tier") != "D"
+            or tierd_receipt.get("kinematic_only") is not False
+            or tierd_receipt.get("training_authorized") is not True
+            or tierd_receipt.get("reference_tracking_certificate_admitted")
+            is not True
+            or tierd_receipt.get("reference_robot") != evidence.get("robot")
+            or tierd_receipt.get("target_robot") != evidence.get("target_robot")
+            or tierd_receipt.get("reference_clip_id") != evidence.get("clip_id")
+            or tierd_receipt.get("certification_scope") != certification_scope
+            or any(
+                tierd_receipt.get(field) != evidence.get(field)
+                for field in (
+                    "clip_sha256", "rollout_sha256", "certificate_sha256",
+                    "execution_contract_sha256", "execution_boundary_sha256",
+                )
+            )
+            or evidence.get("tierd_receipt_sha256")
+            != _canonical_sha256(tierd_receipt)
+            or evidence.get("runtime_schedule_authority")
+            != "reference_runtime_schedule_admitted"
+            or not isinstance(runtime_schedule, dict)
+            or set(runtime_schedule) != schedule_fields
+            or runtime_schedule.get("reference_robot") != evidence.get("robot")
+            or runtime_schedule.get("reference_clip_id") != evidence.get("clip_id")
+            or any(
+                runtime_schedule.get(field) != evidence.get(field)
+                for field in (
+                    "reference_target_sha256", "phase_mode",
+                    "phase_duration_s", "n_phase_targets",
+                    "tracking_backbone_sha256",
+                )
+            )
+            or evidence.get("runtime_schedule_sha256")
+            != _canonical_sha256(runtime_schedule)
+            or not isinstance(evidence.get("phase_mode"), str)
+            or not evidence["phase_mode"]
+            or isinstance(evidence.get("n_phase_targets"), bool)
+            or not isinstance(evidence.get("n_phase_targets"), int)
+            or evidence["n_phase_targets"] <= 0
+            or isinstance(evidence.get("phase_duration_s"), bool)
+            or not isinstance(evidence.get("phase_duration_s"), (int, float))
+            or float(evidence["phase_duration_s"]) <= 0.0
         ):
             raise LineageConflict(
                 "TRACKS requires exact target robot/clip identity and verified "
                 "Tier-D clip, rollout, certificate, execution-contract, and "
-                "execution-boundary evidence"
+                "execution-boundary evidence plus the independently verified "
+                "runtime target, clock, and tracking backbone"
             )
         _add_immutable(kg, effective_reference)
         _add_edge_once(
@@ -429,6 +575,7 @@ def record_mode_execution_admitted(
     run: TrainingRun,
     artifact: ModeExecutionArtifact,
     selection_digest: str,
+    iteration: TrainingIteration | None = None,
 ) -> None:
     """Record the exact mode schedule/reward proven at the pre-train boundary."""
     if kg is None:
@@ -474,19 +621,48 @@ def record_mode_execution_admitted(
             "for this run"
         )
     _add_immutable(kg, artifact)
+    edge_data = {
+        "authority": "mode_execution_admitted",
+        "verified": True,
+        "selection_digest": selection_digest,
+    }
     _add_edge_once(
         kg,
         Edge(
             run.id,
             artifact.id,
             Relation.USES_MODE_EXECUTION,
-            data={
-                "authority": "mode_execution_admitted",
-                "verified": True,
-                "selection_digest": selection_digest,
-            },
+            data=edge_data,
         ),
     )
+    if iteration is not None:
+        canonical = record_iteration_started(
+            kg, run=run, iteration_index=iteration.iteration_index,
+        )
+        assert canonical is not None
+        iteration_world_edges = [
+            edge
+            for edge, destination in kg.neighbors(
+                canonical.id, relation=Relation.EXECUTES_IN, direction="out",
+            )
+            if destination == expected_world_id
+            and edge.data.get("validated") is True
+            and edge.data.get("status") == "active"
+        ]
+        if len(iteration_world_edges) != 1:
+            raise LineageConflict(
+                "mode execution selection is not the exact world tuple for its "
+                "training iteration"
+            )
+        _add_edge_once(
+            kg,
+            Edge(
+                canonical.id,
+                artifact.id,
+                Relation.USES_MODE_EXECUTION,
+                data={**edge_data, "iteration": canonical.iteration_index},
+            ),
+        )
 
 
 def record_policy_loaded(
@@ -497,32 +673,103 @@ def record_policy_loaded(
     transfer_mode: str,
     checkpoint_sha256: str,
     load_cfg_keys: Iterable[str],
+    initialization_receipt: Mapping[str, Any] | None = None,
+    iteration: TrainingIteration | None = None,
+    compatible_target: RobotEmbodiment | None = None,
     derived_from_policy: PolicyArtifact | None = None,
     derivation_data: Mapping[str, Any] | None = None,
 ) -> None:
-    """Earn INITIALIZED_FROM after the runtime confirms a successful load."""
+    """Earn INITIALIZED_FROM from one exact Requested/Resolved/Observed receipt."""
     if kg is None:
         return
     if checkpoint_sha256 != policy.sha256:
         raise LineageConflict("loaded checkpoint digest does not match policy node")
+    keys = sorted(str(key) for key in load_cfg_keys)
+    receipt = dict(initialization_receipt or {})
+    requested = receipt.get("requested")
+    resolved = receipt.get("resolved")
+    observed = receipt.get("observed")
+    if (
+        receipt.get("schema") != 1
+        or not isinstance(requested, dict)
+        or not isinstance(resolved, dict)
+        or not isinstance(observed, dict)
+        or requested.get("roles") != keys
+        or resolved.get("roles") != keys
+        or observed.get("roles") != keys
+        or observed.get("load_cfg_keys") != keys
+        or requested.get("initialization_mode") != transfer_mode
+        or resolved.get("initialization_mode") != transfer_mode
+        or observed.get("initialization_mode") != transfer_mode
+        or resolved.get("checkpoint_sha256") != observed.get("source_sha256")
+        or observed.get("loaded_checkpoint_sha256") != policy.sha256
+    ):
+        raise LineageConflict(
+            "INITIALIZED_FROM requires one exact Requested/Resolved/Observed "
+            "policy receipt matching the loaded bytes and roles"
+        )
     _add_immutable(kg, policy)
     _merge_run_observation(
         kg, run, observed_initialization_mode=transfer_mode
     )
+    edge_data = {
+        "transfer_mode": transfer_mode,
+        "checkpoint_sha256": checkpoint_sha256,
+        "load_cfg_keys": keys,
+        "authority": "starting_policy_initialization_verified",
+        "receipt": receipt,
+    }
     _add_edge_once(
         kg,
         Edge(
             run.id,
             policy.id,
             Relation.INITIALIZED_FROM,
-            data={
-                "transfer_mode": transfer_mode,
-                "checkpoint_sha256": checkpoint_sha256,
-                "load_cfg_keys": sorted(str(key) for key in load_cfg_keys),
-                "authority": "warm_start_loaded",
-            },
+            data=edge_data,
         ),
     )
+    if iteration is not None:
+        canonical = record_iteration_started(
+            kg, run=run, iteration_index=iteration.iteration_index,
+        )
+        assert canonical is not None
+        iteration_inputs = kg.neighbors(
+            canonical.id, relation=Relation.INITIALIZED_FROM, direction="out",
+        )
+        if any(destination != policy.id for _edge, destination in iteration_inputs):
+            raise LineageConflict(
+                f"training iteration {canonical.id!r} observed two inputs"
+            )
+        _add_edge_once(
+            kg,
+            Edge(
+                canonical.id,
+                policy.id,
+                Relation.INITIALIZED_FROM,
+                data={**edge_data, "iteration": canonical.iteration_index},
+            ),
+        )
+    if compatible_target is not None:
+        if (
+            resolved.get("target_policy_contract_sha256")
+            != compatible_target.contract_digest
+        ):
+            raise LineageConflict(
+                "initialization target differs from its verified policy contract"
+            )
+        _add_immutable(kg, compatible_target)
+        _add_edge_once(
+            kg,
+            Edge(
+                policy.id,
+                compatible_target.id,
+                Relation.COMPATIBLE_WITH,
+                data={
+                    "authority": "verified_policy_contract_receipt",
+                    "contract_digest": compatible_target.contract_digest,
+                },
+            ),
+        )
     if (
         derived_from_policy is not None
         and derived_from_policy.id != policy.id
@@ -548,6 +795,9 @@ def record_run_output(
     run: TrainingRun,
     output_policy: PolicyArtifact,
     input_policy: PolicyArtifact | None = None,
+    iteration: TrainingIteration | None = None,
+    output_evidence: Mapping[str, Any] | None = None,
+    compatible_target: RobotEmbodiment | None = None,
 ) -> None:
     """Record a checkpoint actually produced by a run and its ancestry."""
     if kg is None:
@@ -558,6 +808,54 @@ def record_run_output(
         observed_initialization_mode=run.observed_initialization_mode,
     )
     _add_immutable(kg, output_policy)
+    evidence = dict(output_evidence or {})
+    if evidence and evidence.get("output_checkpoint_sha256") != output_policy.sha256:
+        raise LineageConflict(
+            "produced checkpoint differs from its runner runtime receipt"
+        )
+    if iteration is not None or compatible_target is not None:
+        if (
+            any(
+                not _is_sha256(evidence.get(field))
+                for field in (
+                    "runtime_artifacts_sha256", "reward_module_sha256",
+                    "output_checkpoint_sha256",
+                    "output_policy_contract_sha256",
+                    "output_policy_contract_sidecar_sha256",
+                    "world_tuple_sha256",
+                )
+            )
+            or not isinstance(
+                evidence.get("input_checkpoint_load_completed"), bool,
+            )
+            or (
+                evidence["input_checkpoint_load_completed"]
+                and not _is_sha256(
+                    evidence.get("input_checkpoint_loaded_sha256")
+                )
+            )
+            or (
+                evidence["input_checkpoint_load_completed"]
+                and evidence.get("input_checkpoint_requested_sha256")
+                != evidence.get("input_checkpoint_loaded_sha256")
+            )
+            or (
+                not evidence["input_checkpoint_load_completed"]
+                and (
+                    evidence.get("input_checkpoint_loaded_sha256") is not None
+                    or evidence.get("input_checkpoint_requested_sha256") is not None
+                )
+            )
+            or (
+                compatible_target is not None
+                and evidence.get("output_policy_contract_sha256")
+                != compatible_target.contract_digest
+            )
+        ):
+            raise LineageConflict(
+                "reference output requires exact runner, world, input, and "
+                "policy-contract receipts"
+            )
     _add_edge_once(
         kg,
         Edge(
@@ -567,6 +865,27 @@ def record_run_output(
             data={"authority": "checkpoint_written"},
         ),
     )
+    if iteration is not None:
+        canonical = record_iteration_started(
+            kg, run=run, iteration_index=iteration.iteration_index,
+        )
+        assert canonical is not None
+        if evidence.get("iteration") != canonical.iteration_index:
+            raise LineageConflict(
+                "produced checkpoint receipt identifies a different iteration"
+            )
+        _add_edge_once(
+            kg,
+            Edge(
+                canonical.id,
+                output_policy.id,
+                Relation.PRODUCED,
+                data={
+                    "authority": "runner_runtime_artifacts",
+                    **evidence,
+                },
+            ),
+        )
     if input_policy is not None:
         _add_immutable(kg, input_policy)
         _add_edge_once(
@@ -575,6 +894,32 @@ def record_run_output(
                 output_policy.id,
                 input_policy.id,
                 Relation.DERIVED_FROM,
-                data={"authority": "observed_initialization"},
+                data={
+                    "authority": (
+                        "runner_runtime_artifacts"
+                        if evidence else "observed_initialization"
+                    ),
+                    **(
+                        {"iteration": iteration.iteration_index}
+                        if iteration is not None else {}
+                    ),
+                },
+            ),
+        )
+    if compatible_target is not None:
+        _add_immutable(kg, compatible_target)
+        _add_edge_once(
+            kg,
+            Edge(
+                output_policy.id,
+                compatible_target.id,
+                Relation.COMPATIBLE_WITH,
+                data={
+                    "authority": "verified_output_policy_contract",
+                    "contract_digest": compatible_target.contract_digest,
+                    "sidecar_sha256": evidence.get(
+                        "output_policy_contract_sidecar_sha256"
+                    ),
+                },
             ),
         )

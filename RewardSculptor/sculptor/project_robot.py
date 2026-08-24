@@ -88,11 +88,28 @@ LEGACY_REFERENCE_ROBOT_BY_LIBRARY_SLUG: dict[str, str] = {
 }
 
 
+def validate_robot_namespace(value: Any) -> str:
+    """Validate an exact robot/reference filesystem namespace.
+
+    This is the shared path-boundary contract for project metadata, policy
+    artifacts, and robot-scoped reference storage.  It deliberately does not
+    trim or rewrite input: identities must already be canonical before they
+    are used as a directory component.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("robot namespace is missing")
+    if value != value.strip() or _ROBOT_NAMESPACE_RE.fullmatch(value) is None:
+        raise ValueError("robot namespace is malformed")
+    return value
+
+
 def _namespace(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"project {field} is missing")
     namespace = value.strip()
-    if _ROBOT_NAMESPACE_RE.fullmatch(namespace) is None:
+    try:
+        validate_robot_namespace(namespace)
+    except ValueError:
         raise ValueError(f"project {field} is malformed")
     return namespace
 

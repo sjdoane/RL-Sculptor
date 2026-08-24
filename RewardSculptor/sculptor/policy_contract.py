@@ -20,6 +20,7 @@ from typing import Any, Mapping, Optional
 
 CONTRACT_SCHEMA = 2
 EVENT_CONTRACT_SCHEMA = 3
+REFERENCE_CLOCK_CONTRACT_SCHEMA = 4
 
 
 def contract_fingerprint(contract: dict[str, Any]) -> str:
@@ -236,11 +237,104 @@ def _shape_from_sensor_cfg(
     return [width]
 
 
+def condition_policy_contract_on_reference_clock(
+    policy_contract: Mapping[str, Any],
+    reference_clock: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact schema-4 policy interface for ``reference_clock``.
+
+    This pure transform is intentionally narrower than general contract
+    migration: it appends the one immutable reference-clock observation to
+    both actor and critic interfaces and adjusts only their input/normalizer
+    widths.  It is useful when a caller already holds a verified project
+    contract and must bind it to the same clock used by generated rewards.
+    """
+    from sculptor.reference_clock import validate_reference_clock
+
+    if not isinstance(policy_contract, Mapping):
+        raise TypeError("policy contract must be a mapping")
+    clock = validate_reference_clock(reference_clock)
+    conditioned = copy.deepcopy(dict(policy_contract))
+    schema = conditioned.get("schema")
+    if schema == REFERENCE_CLOCK_CONTRACT_SCHEMA:
+        existing = validate_reference_clock(conditioned.get("reference_clock"))
+        if existing != clock:
+            raise ValueError(
+                "policy contract is already bound to a different reference clock"
+            )
+        return conditioned
+    if schema not in {CONTRACT_SCHEMA, EVENT_CONTRACT_SCHEMA}:
+        raise ValueError(
+            "reference-clock conditioning requires policy schema 2 or 3"
+        )
+
+    observations = conditioned.get("observations")
+    if not isinstance(observations, dict):
+        raise ValueError("policy contract observations are missing")
+    width = int(clock["shape"][0])
+    term = {
+        "name": clock["term_name"],
+        "source": clock["source"],
+        "shape": [width],
+    }
+    for rows_key, shape_key, label in (
+        ("ordered_terms", "shape", "actor"),
+        ("critic_ordered_terms", "critic_shape", "critic"),
+    ):
+        rows = observations.get(rows_key)
+        shape = observations.get(shape_key)
+        if not isinstance(rows, list) or not isinstance(shape, list) or len(shape) != 1:
+            raise ValueError(f"policy contract {label} observations are malformed")
+        if not isinstance(shape[0], int) or isinstance(shape[0], bool) or shape[0] <= 0:
+            raise ValueError(f"policy contract {label} observation width is invalid")
+        if any(row.get("name") == term["name"] for row in rows if isinstance(row, dict)):
+            raise ValueError(
+                f"policy contract {label} already defines reference clock term"
+            )
+        rows.append(copy.deepcopy(term))
+        observations[shape_key] = [shape[0] + width]
+
+    policy = conditioned.get("policy")
+    normalizer = policy.get("normalizer") if isinstance(policy, dict) else None
+    if not isinstance(normalizer, dict):
+        raise ValueError("policy contract normalizer contract is missing")
+    for present_key, shape_key, label in (
+        ("actor_present", "actor_shape", "actor"),
+        ("critic_present", "critic_shape", "critic"),
+    ):
+        present = normalizer.get(
+            present_key,
+            normalizer.get("present", False) if label == "actor" else False,
+        )
+        shape = normalizer.get(shape_key)
+        if present:
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 1
+                or not isinstance(shape[0], int)
+                or isinstance(shape[0], bool)
+                or shape[0] <= 0
+            ):
+                raise ValueError(
+                    f"policy contract {label} normalizer shape is malformed"
+                )
+            normalizer[shape_key] = [shape[0] + width]
+        elif shape is not None:
+            raise ValueError(
+                f"policy contract {label} normalizer shape exists without a normalizer"
+            )
+
+    conditioned["schema"] = REFERENCE_CLOCK_CONTRACT_SCHEMA
+    conditioned["reference_clock"] = clock
+    return conditioned
+
+
 def build_project_policy_contract(
     project_dir: Path,
     *,
     observed_network: Optional[dict[str, Any]] = None,
     world_selection_path: Path | None = None,
+    reference_clock: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the current project's complete warm-start target contract.
 
@@ -363,6 +457,27 @@ def build_project_policy_contract(
     critic_obs_rows, critic_obs_dim = observation_contract(
         critic_group, "critic",
     )
+    canonical_reference_clock: dict[str, Any] | None = None
+    if reference_clock is not None:
+        from sculptor.reference_clock import validate_reference_clock
+
+        canonical_reference_clock = validate_reference_clock(reference_clock)
+        reference_term = {
+            "name": canonical_reference_clock["term_name"],
+            "source": canonical_reference_clock["source"],
+            "shape": list(canonical_reference_clock["shape"]),
+        }
+        for label, rows in (
+            ("actor", obs_rows), ("critic", critic_obs_rows),
+        ):
+            if any(row.get("name") == reference_term["name"] for row in rows):
+                raise ValueError(
+                    f"{label} observation already defines reference clock term"
+                )
+            rows.append(copy.deepcopy(reference_term))
+        width = int(canonical_reference_clock["shape"][0])
+        obs_dim += width
+        critic_obs_dim += width
 
     actor_cfg = getattr(rl_cfg, "actor", None)
     critic_cfg = getattr(rl_cfg, "critic", None)
@@ -398,13 +513,22 @@ def build_project_policy_contract(
     critic_normalizer = bool(getattr(critic_cfg, "obs_normalization", False))
     return {
         "schema": (
-            EVENT_CONTRACT_SCHEMA if event_observation is not None
-            else CONTRACT_SCHEMA
+            REFERENCE_CLOCK_CONTRACT_SCHEMA
+            if canonical_reference_clock is not None
+            else (
+                EVENT_CONTRACT_SCHEMA if event_observation is not None
+                else CONTRACT_SCHEMA
+            )
         ),
         "identity": {"adapter_class": adapter_class, "task_id": task_id},
         **(
             {"event_observation": event_observation}
             if event_observation is not None
+            else {}
+        ),
+        **(
+            {"reference_clock": canonical_reference_clock}
+            if canonical_reference_clock is not None
             else {}
         ),
         "joints": {"ordered_names": joints},
@@ -523,6 +647,108 @@ def policy_contract_migration(
     never an optimizer/full-state resume.
     """
     if not isinstance(source, dict) or not isinstance(target, dict):
+        return None
+    if target.get("schema") == REFERENCE_CLOCK_CONTRACT_SCHEMA:
+        from sculptor.reference_clock import (
+            REFERENCE_CLOCK_SOURCE,
+            REFERENCE_CLOCK_TERM,
+            validate_reference_clock,
+        )
+
+        try:
+            interface = validate_reference_clock(target.get("reference_clock"))
+        except (TypeError, ValueError):
+            return None
+        # Zero-padding is an exact function-preserving transform only for the
+        # feed-forward MLPs whose first input layer we can identify. Recurrent
+        # state layouts remain unsupported and fail closed.
+        for role in ("actor", "critic"):
+            recurrent = target.get("policy", {}).get(role, {}).get(
+                "recurrent", {}
+            )
+            if isinstance(recurrent, Mapping) and recurrent.get("type"):
+                return None
+        width = int(interface["shape"][0])
+        projected = copy.deepcopy(target)
+        projected.pop("reference_clock", None)
+        projected["schema"] = (
+            EVENT_CONTRACT_SCHEMA
+            if projected.get("event_observation") is not None
+            else CONTRACT_SCHEMA
+        )
+        observations = projected.get("observations")
+        if not isinstance(observations, dict):
+            return None
+        expected_term = {
+            "name": REFERENCE_CLOCK_TERM,
+            "source": REFERENCE_CLOCK_SOURCE,
+            "shape": [width],
+        }
+        for rows_key, shape_key in (
+            ("ordered_terms", "shape"),
+            ("critic_ordered_terms", "critic_shape"),
+        ):
+            rows = observations.get(rows_key)
+            shape = observations.get(shape_key)
+            if (
+                not isinstance(rows, list)
+                or not rows
+                or rows[-1] != expected_term
+                or not isinstance(shape, list)
+                or len(shape) != 1
+                or not isinstance(shape[0], int)
+                or shape[0] < width
+            ):
+                return None
+            observations[rows_key] = rows[:-1]
+            observations[shape_key] = [shape[0] - width]
+        normalizer = projected.get("policy", {}).get("normalizer")
+        if not isinstance(normalizer, dict):
+            return None
+        for present_key, shape_key in (
+            ("actor_present", "actor_shape"),
+            ("critic_present", "critic_shape"),
+        ):
+            present = normalizer.get(present_key)
+            shape = normalizer.get(shape_key)
+            if present:
+                if (
+                    not isinstance(shape, list)
+                    or len(shape) != 1
+                    or not isinstance(shape[0], int)
+                    or shape[0] < width
+                ):
+                    return None
+                normalizer[shape_key] = [shape[0] - width]
+            elif shape is not None:
+                return None
+        clock_receipt = {
+            "type": "zero_initialized_reference_clock_observation",
+            "from_schema": projected["schema"],
+            "to_schema": REFERENCE_CLOCK_CONTRACT_SCHEMA,
+            "observation_term": REFERENCE_CLOCK_TERM,
+            "extension_width": width,
+            "reference_clock_sha256": contract_fingerprint(interface),
+            "optimizer_resume": False,
+        }
+        if projected == source:
+            return clock_receipt
+        event_migration = policy_contract_migration(source, projected)
+        if (
+            isinstance(event_migration, dict)
+            and event_migration.get("type")
+            == "zero_initialized_event_phase_observation"
+        ):
+            return {
+                "type": "zero_initialized_observation_extensions",
+                "from_schema": source.get("schema"),
+                "to_schema": REFERENCE_CLOCK_CONTRACT_SCHEMA,
+                "extension_width": (
+                    int(event_migration["extension_width"]) + width
+                ),
+                "extensions": [event_migration, clock_receipt],
+                "optimizer_resume": False,
+            }
         return None
     if source.get("schema") != CONTRACT_SCHEMA \
             or target.get("schema") != EVENT_CONTRACT_SCHEMA:
@@ -762,7 +988,11 @@ def _completed_iteration_same_tuple_authority(
     if (
         not isinstance(sidecar_payload, dict)
         or sidecar_payload.get("schema")
-        not in (CONTRACT_SCHEMA, EVENT_CONTRACT_SCHEMA)
+        not in (
+            CONTRACT_SCHEMA,
+            EVENT_CONTRACT_SCHEMA,
+            REFERENCE_CLOCK_CONTRACT_SCHEMA,
+        )
         or canonical_json_bytes(sidecar_payload)
         != canonical_json_bytes(target_contract)
     ):
@@ -777,11 +1007,45 @@ def _completed_iteration_same_tuple_authority(
     return authority
 
 
+def _reference_clock_from_world_selection(
+    project_dir: Path,
+    selection: Any,
+) -> dict[str, Any] | None:
+    """Read a reference clock from the exact reward pinned by a selection.
+
+    This is a data-only AST parse. It never imports generated reward code, and
+    a reward that claims tracking but omits its descriptor fails closed in
+    ``reference_clock_from_reward_spec`` rather than being reconstructed from
+    a filename or clip alias.
+    """
+    reward_ref = getattr(selection, "refs", {}).get("reward")
+    if reward_ref is None:
+        return None
+    reward_path = Path(str(getattr(reward_ref, "path", "") or ""))
+    if not reward_path.is_absolute():
+        reward_path = Path(project_dir) / reward_path
+    if not reward_path.is_file():
+        raise FileNotFoundError(
+            f"selection reward artifact is absent: {reward_path}"
+        )
+    from sculptor.reference_clock import reference_clock_from_reward_source
+
+    try:
+        return reference_clock_from_reward_source(
+            reward_path.read_text(encoding="utf-8")
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "selection reward has no valid immutable reference-clock contract"
+        ) from exc
+
+
 def build_iteration_warm_start_contract_receipt(
     project_dir: Path,
     iteration: int,
     *,
     target_selection_path: Path,
+    reference_clock: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Attest an iteration's source tuple against one immutable target.
 
@@ -854,9 +1118,19 @@ def build_iteration_warm_start_contract_receipt(
         raise FileNotFoundError(
             f"immutable target selection is absent: {target_selection_path}"
         )
+    if reference_clock is None:
+        reference_clock = _reference_clock_from_world_selection(
+            project_dir,
+            target_selection,
+        )
+    target_contract_kwargs: dict[str, Any] = {
+        "world_selection_path": target_selection_path,
+    }
+    if reference_clock is not None:
+        target_contract_kwargs["reference_clock"] = reference_clock
     target_contract = build_project_policy_contract(
         project_dir,
-        world_selection_path=target_selection_path,
+        **target_contract_kwargs,
     )
     completed_authority = _completed_iteration_same_tuple_authority(
         tuple_path.parent,
@@ -877,9 +1151,18 @@ def build_iteration_warm_start_contract_receipt(
             "checkpoint_bytes": completed_authority["checkpoint_bytes"],
         }
     else:
+        source_reference_clock = _reference_clock_from_world_selection(
+            project_dir,
+            source_selection,
+        )
+        source_contract_kwargs: dict[str, Any] = {
+            "world_selection_path": source_selection_path,
+        }
+        if source_reference_clock is not None:
+            source_contract_kwargs["reference_clock"] = source_reference_clock
         source_contract = build_project_policy_contract(
             project_dir,
-            world_selection_path=source_selection_path,
+            **source_contract_kwargs,
         )
         source_contract_authority = {
             "kind": "reconstructed_from_source_selection",
@@ -934,6 +1217,7 @@ def build_recovery_snapshot_warm_start_contract_receipt(
     *,
     recovery_receipt: Mapping[str, Any],
     target_selection_path: Path,
+    reference_clock: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a runner receipt from one server-attested interrupted snapshot.
 
@@ -1080,9 +1364,19 @@ def build_recovery_snapshot_warm_start_contract_receipt(
         raise FileNotFoundError(
             f"immutable target selection is absent: {target_selection_path}"
         )
+    if reference_clock is None:
+        reference_clock = _reference_clock_from_world_selection(
+            project_dir,
+            target_selection,
+        )
+    target_contract_kwargs: dict[str, Any] = {
+        "world_selection_path": target_selection_path,
+    }
+    if reference_clock is not None:
+        target_contract_kwargs["reference_clock"] = reference_clock
     target_contract = build_project_policy_contract(
         project_dir,
-        world_selection_path=target_selection_path,
+        **target_contract_kwargs,
     )
     migration = policy_contract_migration(source_contract, target_contract)
     if source_contract == target_contract:
@@ -1205,6 +1499,7 @@ def build_skill_warm_start_contract_receipt(
 __all__ = [
     "CONTRACT_SCHEMA",
     "EVENT_CONTRACT_SCHEMA",
+    "REFERENCE_CLOCK_CONTRACT_SCHEMA",
     "build_project_policy_contract",
     "build_iteration_warm_start_contract_receipt",
     "build_recovery_snapshot_warm_start_contract_receipt",

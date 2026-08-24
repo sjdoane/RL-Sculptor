@@ -4065,13 +4065,19 @@ def test_reference_signature_text_from_provenance(
     # this file).
     monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
+    exact_clip_path = (
+        lib_root / "g1" / "test_getup_clip" / refs_library.CLIP_FILENAME
+    )
     refs_library.write_provenance(
         "g1", "test_getup_clip",
         refs_library.make_provenance(
             clip_id="test_getup_clip", robot="g1",
             text="a subject rises from lying to standing",
             source={"dataset": "unit-test"}, license="internal",
-            attribution="unit-test fixture", content_sha256_="0" * 64,
+            attribution="unit-test fixture",
+            content_sha256_=refs_library.content_sha256(
+                exact_clip_path.read_bytes()
+            ),
         ),
         root=lib_root,
     )

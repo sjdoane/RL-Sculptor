@@ -21,15 +21,24 @@ from pathlib import Path
 from typing import Any
 
 from sculptor.kg.schema import (
+    ArtifactAttestation,
     Environment,
     FailureMode,
     ImplementationStatus,
+    ModeExecutionArtifact,
     Paper,
+    PolicyArtifact,
+    ReferenceMotion,
     ResearchCapability,
     RewardComponent,
     Result,
+    RobotEmbodiment,
     RunCase,
+    SoftwareEnvironment,
     Technique,
+    TrainingIteration,
+    TrainingRun,
+    WorldArtifact,
 )
 from sculptor.kg.store import SculptorKG
 
@@ -50,9 +59,37 @@ _NODE_COLORS = {
         "background": "#64b5f6", "border": "#1565c0"},
     "ImplementationStatus": {
         "background": "#fff176", "border": "#f9a825"},
+    # Immutable artifact and execution-lineage nodes. These previously fell
+    # through to the anonymous gray fallback, which made a content hash, an
+    # attestation, and an observed run visually indistinguishable.
+    "PolicyArtifact":  {"background": "#26a69a", "border": "#00796b"},
+    "ReferenceMotion": {"background": "#ab47bc", "border": "#7b1fa2"},
+    "WorldArtifact":   {"background": "#ffa726", "border": "#ef6c00"},
+    "ModeExecutionArtifact": {
+        "background": "#ec407a", "border": "#ad1457"},
+    "ArtifactAttestation": {
+        "background": "#ffee58", "border": "#f9a825"},
+    "RobotEmbodiment": {"background": "#66bb6a", "border": "#2e7d32"},
+    "SoftwareEnvironment": {
+        "background": "#78909c", "border": "#455a64"},
+    "TrainingRun":     {"background": "#42a5f5", "border": "#1565c0"},
+    "TrainingIteration": {
+        "background": "#26c6da", "border": "#00838f"},
 }
 _ACTIVE_COLOR = {"background": "#ffd54f", "border": "#ffa000"}  # gold halo
 _FALLBACK_COLOR = {"background": "#bdbdbd", "border": "#757575"}
+_NODE_SHAPES = {
+    "RunCase": "diamond",
+    "PolicyArtifact": "box",
+    "ReferenceMotion": "box",
+    "WorldArtifact": "box",
+    "ModeExecutionArtifact": "box",
+    "ArtifactAttestation": "hexagon",
+    "RobotEmbodiment": "ellipse",
+    "SoftwareEnvironment": "database",
+    "TrainingRun": "triangle",
+    "TrainingIteration": "dot",
+}
 # RunCase borders encode the measured verdict at a glance.
 _VERDICT_BORDER = {"helped": "#00e676", "regressed": "#ff1744"}
 _VERDICT_GLYPH = {"helped": "✓", "regressed": "✗", "neutral": "=",
@@ -68,6 +105,17 @@ _EDGE_COLORS = {
     "IMPROVES_OVER": "#42a5f5",
     "GROUNDS_CAPABILITY": "#5c6bc0",
     "HAS_IMPLEMENTATION_STATUS": "#fdd835",
+    "INSTANTIATES": "#ef5350",
+    "INITIALIZED_FROM": "#26a69a",
+    "TRACKS": "#ab47bc",
+    "EXECUTES_IN": "#ffa726",
+    "DECLARES_TARGET": "#9ccc65",
+    "COMPATIBLE_WITH": "#66bb6a",
+    "DERIVED_FROM": "#00897b",
+    "ATTESTS": "#fdd835",
+    "PRODUCED": "#42a5f5",
+    "USES_MODE_EXECUTION": "#ec407a",
+    "HAS_ITERATION": "#26c6da",
 }
 _DEFAULT_EDGE_COLOR = "#b0bec5"
 
@@ -81,6 +129,11 @@ class VizResult:
 
 
 # ── Tooltip / label helpers ─────────────────────────────────────────────
+def _short_hash(value: str | None) -> str:
+    text = str(value or "")
+    return text[:10] + ("…" if len(text) > 10 else "")
+
+
 def _label_for(node: Any) -> str:
     """Short label shown on the node itself."""
     if isinstance(node, Paper):
@@ -102,6 +155,25 @@ def _label_for(node: Any) -> str:
         return node.name[:40]
     if isinstance(node, ImplementationStatus):
         return node.status.replace("_", " ")[:40]
+    if isinstance(node, PolicyArtifact):
+        return f"policy {_short_hash(node.sha256)}"
+    if isinstance(node, ReferenceMotion):
+        return f"motion {_short_hash(node.sha256)}"
+    if isinstance(node, WorldArtifact):
+        return f"world {_short_hash(node.sha256)}"
+    if isinstance(node, ModeExecutionArtifact):
+        return f"mode {node.clip_id[:28]}"
+    if isinstance(node, ArtifactAttestation):
+        return f"attestation {_short_hash(node.manifest_digest)}"
+    if isinstance(node, RobotEmbodiment):
+        return f"robot {node.slug[:32]}"
+    if isinstance(node, SoftwareEnvironment):
+        identity = node.code_commit or node.code_tree_digest or node.lock_digest
+        return f"software {_short_hash(identity)}"
+    if isinstance(node, TrainingRun):
+        return f"{node.project[:20]} · {node.run_id[:18]}"
+    if isinstance(node, TrainingIteration):
+        return f"iter {node.iteration_index}"
     return str(getattr(node, "id", node))[:40]
 
 
@@ -188,6 +260,101 @@ def _tooltip_for(node: Any, active_reason: str | None = None) -> str:
     elif isinstance(node, ImplementationStatus):
         _row("status", node.status.replace("_", " "))
         _row("definition", node.definition[:400])
+    elif isinstance(node, PolicyArtifact):
+        _row("sha256", node.sha256)
+        _row("format", node.artifact_format)
+        if node.size_bytes is not None:
+            _row("size bytes", str(node.size_bytes))
+        if node.tensor_inventory_digest:
+            _row("tensor inventory digest", node.tensor_inventory_digest)
+        _row("provenance", node.provenance)
+    elif isinstance(node, ReferenceMotion):
+        _row("sha256", node.sha256)
+        if node.fps is not None:
+            _row("fps", str(node.fps))
+        if node.frame_count is not None:
+            _row("frames", str(node.frame_count))
+        if node.joint_names:
+            _row("ordered joints", ", ".join(node.joint_names))
+        _row("provenance", node.provenance)
+    elif isinstance(node, WorldArtifact):
+        _row("sha256", node.sha256)
+        _row("format", node.artifact_format or "not recorded")
+        _row("provenance", node.provenance)
+    elif isinstance(node, ModeExecutionArtifact):
+        _row("bundle digest", node.bundle_digest)
+        _row("reward sha256", node.reward_sha256)
+        _row("robot", node.robot)
+        _row("clip", f"{node.clip_id} / {node.clip_sha256}")
+        _row("mode graph sha256", node.graph_sha256)
+        _row("execution manifest", node.execution_manifest_digest)
+        _row("world selection", node.selection_digest)
+        _row("context refs digest", node.context_refs_digest)
+        if node.context_refs:
+            _row("context refs", json.dumps(
+                node.context_refs, ensure_ascii=False, sort_keys=True))
+        _row("provenance", node.provenance)
+    elif isinstance(node, ArtifactAttestation):
+        _row("manifest digest", node.manifest_digest)
+        _row("trust status", node.trust_status)
+        _row("source format", node.source_format)
+        _row("admitted at", str(node.admitted_at))
+        if node.declared:
+            _row("declared metadata", json.dumps(
+                node.declared, ensure_ascii=False, sort_keys=True))
+        _row("provenance", node.provenance)
+    elif isinstance(node, RobotEmbodiment):
+        _row("slug", node.slug)
+        _row("contract digest", node.contract_digest)
+        if node.joint_names:
+            _row("ordered joints", ", ".join(node.joint_names))
+        if node.control_dt_s is not None:
+            _row("control dt s", str(node.control_dt_s))
+        if node.observation_contract:
+            _row("observation contract", json.dumps(
+                node.observation_contract, ensure_ascii=False, sort_keys=True))
+        if node.action_contract:
+            _row("action contract", json.dumps(
+                node.action_contract, ensure_ascii=False, sort_keys=True))
+        _row("provenance", node.provenance)
+    elif isinstance(node, SoftwareEnvironment):
+        _row("lock digest", node.lock_digest)
+        if node.code_commit:
+            _row("code commit", node.code_commit)
+        if node.code_dirty is not None:
+            _row("code dirty", str(node.code_dirty).lower())
+        if node.code_tree_digest:
+            _row("code tree digest", node.code_tree_digest)
+        if node.code_diff_digest:
+            _row("code diff digest", node.code_diff_digest)
+        if node.capture_schema is not None:
+            _row("capture schema", str(node.capture_schema))
+        if node.captured_source_sha256:
+            _row("captured source sha256", node.captured_source_sha256)
+        if node.versions:
+            _row("versions", json.dumps(
+                node.versions, ensure_ascii=False, sort_keys=True))
+        if node.runtime:
+            _row("runtime", json.dumps(
+                node.runtime, ensure_ascii=False, sort_keys=True))
+        _row("provenance", node.provenance)
+    elif isinstance(node, TrainingRun):
+        _row("project", node.project)
+        _row("run id", node.run_id)
+        _row("requested initialization", node.requested_initialization_mode)
+        _row("observed initialization",
+             node.observed_initialization_mode or "not observed")
+        if node.selection_digest:
+            _row("selection digest", node.selection_digest)
+        if node.code_commit:
+            _row("code commit", node.code_commit)
+        _row("created at", str(node.created_at))
+        _row("provenance", node.provenance)
+    elif isinstance(node, TrainingIteration):
+        _row("project", node.project)
+        _row("run id", node.run_id)
+        _row("iteration", str(node.iteration_index))
+        _row("provenance", node.provenance)
 
     if active_reason:
         rows.append(
@@ -365,7 +532,7 @@ def build_kg_html(
             color=color, size=size, borderWidth=border_width,
             # Diamonds separate "this system's own experience" from the
             # published-literature dots without needing the legend.
-            shape="diamond" if isinstance(node, RunCase) else "dot",
+            shape=_NODE_SHAPES.get(kind, "dot"),
         )
         added_ids.add(node.id)
 
@@ -426,14 +593,36 @@ def _edge_tooltip(edge) -> str:
     rel = edge.relation.value if hasattr(edge.relation, "value") else str(edge.relation)
     parts = [f"<b>{rel}</b>"]
     if edge.data:
-        ev = edge.data.get("evidence") if isinstance(edge.data, dict) else None
-        if ev:
-            parts.append(f"<div style='margin-top:4px'>{html.escape(str(ev))[:400]}</div>")
-        src_paper = edge.data.get("source_paper_id") if isinstance(edge.data, dict) else None
-        if src_paper:
-            parts.append(f"<div style='margin-top:4px;color:#8fb5ff'>"
-                         f"source_paper_id: {html.escape(str(src_paper))}</div>")
-    return "<div style='font-family:sans-serif;max-width:360px'>" + "".join(parts) + "</div>"
+        # Edge data is the requested/observed/authority receipt for artifact
+        # lineage. Rendering only ``evidence`` silently hid the exact hashes,
+        # load roles, world pins, and worker observations that make these
+        # relations scientifically meaningful. Stored edge data is JSON, so
+        # it is safe to render deterministically in full after HTML escaping.
+        receipt = json.dumps(
+            edge.data,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        parts.append(
+            "<div style='margin-top:6px;color:#8fb5ff'>structured receipt</div>"
+            "<pre style='margin:4px 0 0;max-width:520px;max-height:300px;"
+            "overflow:auto;white-space:pre-wrap;word-break:break-word;"
+            "font-size:11px;line-height:1.35'>"
+            f"{html.escape(receipt)}"
+            "</pre>"
+        )
+    else:
+        parts.append(
+            "<div style='margin-top:4px;color:#ffca80'>"
+            "no structured edge receipt recorded</div>"
+        )
+    return (
+        "<div style='font-family:sans-serif;max-width:540px'>"
+        + "".join(parts)
+        + "</div>"
+    )
 
 
 def _edge_touches_active(
@@ -461,7 +650,38 @@ _KIND_LEGEND_ORDER = (
     ("RunCase", "#4dd0e1", "diamond"),
     ("ResearchCapability", "#64b5f6", "dot"),
     ("ImplementationStatus", "#fff176", "dot"),
+    ("PolicyArtifact", "#26a69a", "box"),
+    ("ReferenceMotion", "#ab47bc", "box"),
+    ("WorldArtifact", "#ffa726", "box"),
+    ("ModeExecutionArtifact", "#ec407a", "box"),
+    ("ArtifactAttestation", "#ffee58", "hexagon"),
+    ("RobotEmbodiment", "#66bb6a", "ellipse"),
+    ("SoftwareEnvironment", "#78909c", "database"),
+    ("TrainingRun", "#42a5f5", "triangle"),
+    ("TrainingIteration", "#26c6da", "dot"),
 )
+
+_KIND_LABELS = {
+    "RunCase": "Run experience",
+    "PolicyArtifact": "Policy artifact",
+    "ReferenceMotion": "Reference motion",
+    "WorldArtifact": "World artifact",
+    "ModeExecutionArtifact": "Mode execution",
+    "ArtifactAttestation": "Artifact attestation",
+    "RobotEmbodiment": "Robot embodiment",
+    "SoftwareEnvironment": "Software environment",
+    "TrainingRun": "Training run",
+    "TrainingIteration": "Training iteration",
+}
+
+_LEGEND_SHAPE_CLASSES = {
+    "diamond": "kg-diamond",
+    "box": "kg-box",
+    "hexagon": "kg-hexagon",
+    "ellipse": "kg-ellipse",
+    "database": "kg-database",
+    "triangle": "kg-triangle",
+}
 
 _LEGEND_HTML = """
 <style>
@@ -479,6 +699,13 @@ _LEGEND_HTML = """
   #kg-search-status { font-size: 11px; opacity: 0.7; min-height: 14px;
     margin-top: 3px; }
   .kg-diamond { transform: rotate(45deg); border-radius: 2px !important; }
+  .kg-box { border-radius: 2px !important; }
+  .kg-hexagon { border-radius: 2px !important;
+    clip-path: polygon(25% 5%,75% 5%,100% 50%,75% 95%,25% 95%,0 50%); }
+  .kg-ellipse { width:16px !important; height:11px !important; }
+  .kg-database { border-radius: 50% 50% 3px 3px !important; }
+  .kg-triangle { border-radius: 0 !important;
+    clip-path: polygon(50% 0,100% 100%,0 100%); }
 </style>
 <div id="sculpt-legend" style="
     position: fixed; top: 16px; left: 16px; z-index: 1000;
@@ -486,7 +713,8 @@ _LEGEND_HTML = """
     padding: 14px 16px; border-radius: 10px;
     border: 1px solid #2a3444;
     font-family: Segoe UI, Arial, sans-serif; font-size: 13px;
-    max-width: 300px; box-shadow: 0 4px 16px rgba(0,0,0,0.45);">
+    max-width: 300px; max-height: calc(100vh - 32px); overflow-y: auto;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.45);">
   <div style="font-size: 15px; font-weight: 600; margin-bottom: 8px;">
     __TITLE__
   </div>
@@ -500,6 +728,11 @@ _LEGEND_HTML = """
               row-gap: 5px; column-gap: 8px; align-items: center;">
     <span style="width:14px; height:14px; background:#ffd54f; border-radius:50%; border:1px solid #ffa000;"></span><span>Active (provenance)</span>
 __KIND_ROWS__
+  </div>
+  <div style="opacity:0.72; margin-top:9px; font-size:11px; line-height:1.35;">
+    Boxes are immutable artifacts; hexagons are admission attestations;
+    triangles are concrete training runs. Hover an arrow for its full
+    structured requested/observed lineage receipt.
   </div>
   <button id="kg-physics-btn" title="Re-run the force layout">
     ↻ re-run layout
@@ -523,10 +756,10 @@ def _inject_title_and_legend(html_src: str, *, title: str, n_active: int,
         count = kind_counts.get(kind, 0)
         if count == 0:
             continue
-        label = "Run experience" if kind == "RunCase" else kind
+        label = _KIND_LABELS.get(kind, kind)
         rows.append(_KIND_ROW_TEMPLATE.format(
             kind=kind, kind_label=label, color=color, count=count,
-            shape_cls="kg-diamond" if shape == "diamond" else ""))
+            shape_cls=_LEGEND_SHAPE_CLASSES.get(shape, "")))
     active_note = (
         f"{n_active} node(s) in gold — cited by the current project's "
         f"provenance (still_active)."

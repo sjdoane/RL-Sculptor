@@ -1102,6 +1102,57 @@ def test_missing_contract_blocks_policy_compatibility(tmp_path: Path) -> None:
     assert any("target compatibility contract" in reason for reason in receipt["reasons"])
 
 
+@pytest.mark.parametrize(
+    ("migration_type", "expected"),
+    [
+        (
+            "zero_initialized_reference_clock_observation",
+            "reference-clock observation extension",
+        ),
+        (
+            "zero_initialized_observation_extensions",
+            "event-phase and reference-clock observation extensions",
+        ),
+        (
+            "zero_initialized_event_phase_observation",
+            "event-phase observation extension",
+        ),
+    ],
+)
+def test_policy_migration_copy_names_the_actual_interface_extension(
+    migration_type: str,
+    expected: str,
+) -> None:
+    assert skill_bundle._policy_migration_observation_label(
+        {"type": migration_type}
+    ) == expected
+
+
+def test_reference_clock_migration_gate_is_not_described_as_event_only(
+    tmp_path: Path,
+) -> None:
+    record = StartingSkillBundleImporter(
+        SkillLibrary(tmp_path / "library")
+    ).import_archive(_bundle(tmp_path), target=_target()).record
+    authorization = skill_bundle._authorization_for(
+        record,
+        {
+            "allowed_initialization_modes": ["actor_only"],
+            "reasons": [],
+            "policy_contract_migration": {
+                "type": "zero_initialized_reference_clock_observation",
+            },
+        },
+    )
+
+    gates = authorization["mode_gates"]["actor_only"]
+    assert any(
+        "zero-initialized reference-clock observation extension" in gate
+        for gate in gates
+    )
+    assert all("event-phase" not in gate for gate in gates)
+
+
 def test_reference_only_bundle_needs_no_policy_or_source_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -518,7 +518,7 @@ def test_reference_starting_skill_round_trips_through_importer(
         provenance_path.read_bytes()
     ).hexdigest()
     assert any(
-        "separate target-project Tier-D physics-tracking certification job"
+        "separate target-project Tier-D exact-schedule tracking evidence job"
         in warning
         for warning in exported.warnings
     )
@@ -709,7 +709,10 @@ def test_refs_export_skill_cli_uses_exact_identity_and_clear_candidate_copy(
     assert out.is_file()
     assert "pinned g1/parkour_seed" in result.output
     assert "candidate only" in result.output
-    assert "separate sculpt refs track Tier-D certification job" in result.output
+    assert (
+        "separate sculpt refs track Tier-D exact-schedule tracking evidence job"
+        in result.output
+    )
     assert "before live launch" in result.output
     assert "launch only re-verifies" in result.output
 

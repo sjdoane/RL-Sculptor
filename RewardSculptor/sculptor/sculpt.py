@@ -33,9 +33,7 @@ commit.
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
-import ast
 import json
 import math
 import re
@@ -472,7 +470,13 @@ def _ensure_current_py(rewards_dir: Path) -> Path:
     """Make sure rewards/current.py exists and re-exports the latest v<n>.py."""
     current = rewards_dir / "current.py"
     _, latest = _find_latest_reward_version(rewards_dir)
-    if not current.is_file():
+    selected = _current_reward_target(rewards_dir)
+    if selected is not None:
+        # Upgrade legacy core/UI selectors before every launch so the runner
+        # sees the complete reference-clock surface and an immutable digest
+        # receipt. The selected v<n>.py bytes remain the sole authority.
+        _write_current_reexport(rewards_dir, selected)
+    elif not current.is_file():
         _write_current_reexport(rewards_dir, latest)
     return current
 
@@ -494,6 +498,81 @@ def _pin_authored_selection(adapter: Any, project: Path) -> str | None:
         raise ValueError(f"immutable authored selection missing: {pinned}")
     adapter.world_selection_path = str(pinned.resolve())
     return selection.tuple_hash
+
+
+def _verify_requested_authored_selection(
+    project: Path,
+    *,
+    selection_path: Path | str | None,
+    expected_selection_sha256: str | None,
+    expected_tuple_hash: str | None,
+) -> dict[str, Any] | None:
+    """Fail closed on the exact immutable authored-world launch input."""
+    supplied = (
+        selection_path is not None,
+        expected_selection_sha256 is not None,
+        expected_tuple_hash is not None,
+    )
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise ValueError(
+            "world selection path, selection SHA-256, and tuple hash must be "
+            "supplied together"
+        )
+
+    def _valid_sha(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    if not _valid_sha(expected_selection_sha256):
+        raise ValueError("expected world selection SHA-256 is invalid")
+    if not _valid_sha(expected_tuple_hash):
+        raise ValueError("expected world tuple hash is invalid")
+
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    project = Path(project).expanduser().resolve()
+    store = WorldArtifactStore(project)
+    resolved = Path(str(selection_path)).expanduser().resolve(strict=True)
+    if resolved.parent != store.env_dir or not re.fullmatch(
+        r"selection_v([1-9][0-9]*)\.json",
+        resolved.name,
+    ):
+        raise ValueError(
+            "requested world selection must be an immutable project-local "
+            "selection_vN.json"
+        )
+    actual_selection_sha256 = file_sha256(resolved)
+    if actual_selection_sha256 != expected_selection_sha256:
+        raise ValueError(
+            "requested world selection bytes changed after launch admission"
+        )
+    selection = store.read_selection(resolved)
+    if selection is None:
+        raise ValueError("requested immutable world selection is missing")
+    if selection.tuple_hash != expected_tuple_hash:
+        raise ValueError(
+            "requested world tuple differs from launch admission"
+        )
+    version = int(resolved.stem.removeprefix("selection_v"))
+    if selection.selection_version != version:
+        raise ValueError(
+            "requested world selection version differs from its filename"
+        )
+    if file_sha256(resolved) != expected_selection_sha256:
+        raise ValueError(
+            "requested world selection changed during core verification"
+        )
+    return {
+        "selection_version": version,
+        "selection_path": str(resolved),
+        "selection_sha256": actual_selection_sha256,
+        "tuple_hash": selection.tuple_hash,
+    }
 
 
 def _promote_iteration_selection(
@@ -704,6 +783,7 @@ def _prepare_reference_guided_run(
             clip_sha256=clip_sha256,
             context_refs=context_refs,
             graph=canonical_graph,
+            reward_source=promoted_path.read_text(encoding="utf-8"),
         )
         if binding_errors:
             raise ValueError(
@@ -1594,6 +1674,7 @@ def _rollout_or_resume(
     render_height: int | None = None,
     render_env_index: int | None = None,
     seed: int | None = None,
+    reward_module_path: Path | None = None,
 ) -> None:
     """Skip `adapter.rollout` when the three artifacts it produces
     (`rollout.mp4` + `trajectory.npz` + `behavior.json`) are ALL on
@@ -1632,6 +1713,7 @@ def _rollout_or_resume(
         # §Selection statistics: distinct eval seeds per repeat rollout —
         # adapters that don't declare `seed` (gym_sb3) silently skip it.
         ("seed", seed),
+        ("reward_module_path", reward_module_path),
     ):
         if value is not None and name in sig.parameters:
             extra[name] = value
@@ -1736,6 +1818,7 @@ def _persist_mode_diagnostics(
         context_refs=context_refs,
         graph_sha256=mode_graph_sha256(graph),
         graph=graph,
+        reward_source=source,
     )
     if binding_errors:
         raise ValueError(
@@ -1934,6 +2017,7 @@ def _validated_mode_execution_admission(
         context_refs=context_refs,
         graph_sha256=graph_sha256,
         graph=graph,
+        reward_source=source,
     )
     if errors:
         raise ValueError(
@@ -2357,7 +2441,6 @@ def _run_one_iter(
     # present (overnight reliability: if a prior run errored at any
     # post-train phase, `iter_<i>/checkpoint.pt` is still on disk and
     # represents ~22 min of GPU work we must not redo).
-    t0 = time.time()
     train_result = _train_or_resume(
         adapter=adapter,
         iter_index=iter_index,
@@ -2370,8 +2453,6 @@ def _run_one_iter(
         warm_start_explicit=warm_start_explicit,
         pre_train_event=mode_execution_event,
     )
-    train_s = time.time() - t0
-
     # 2. Rollout — use the checkpoint path the adapter actually wrote.
     # Different adapters use different extensions: gym_sb3 writes
     # `checkpoint.zip` (SB3 convention), mjlab writes `checkpoint.pt`
@@ -2391,6 +2472,7 @@ def _run_one_iter(
         rollout_dir=rollout_dir,
         checkpoint_path=checkpoint_path,
         n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+        reward_module_path=Path(reward_path_trained),
         # §Ship-7: rollout video knobs — default None means runner defaults
         # (500 steps, playback 1x, auto render_every + fps). Each key
         # overrides independently when set in config.toml or passed via
@@ -2488,6 +2570,7 @@ def _run_one_iter(
                         rollout_dir=eval_dir,
                         checkpoint_path=checkpoint_path,
                         n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+                        reward_module_path=Path(reward_path_trained),
                         max_episode_steps=iter_cfg.get("max_episode_steps"),
                         playback_speed=iter_cfg.get("playback_speed"),
                         render_every=iter_cfg.get("render_every"),
@@ -3294,6 +3377,9 @@ def sculpt_run(
     reference_clip_id: Optional[str] = None,
     reference_robot: Optional[str] = None,
     expected_active_reference_reward_sha256: Optional[str] = None,
+    world_selection_path: Optional[Path | str] = None,
+    expected_world_selection_sha256: Optional[str] = None,
+    expected_world_tuple_hash: Optional[str] = None,
 ) -> SculptRunResult:
     """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
     artifacts are persisted. Returning `None` keeps the loop running;
@@ -3449,6 +3535,17 @@ def sculpt_run(
         raise FileNotFoundError(
             f"no rewards/ dir in {project} — run `sculpt init` first.")
 
+    # The UI admits a mutable current pointer, but launches the immutable
+    # selection_vN snapshot named at admission. Verify it before adapter load
+    # so a promotion in the subprocess-start gap cannot alter the experiment
+    # or trigger GPU allocation first.
+    requested_authored_world_receipt = _verify_requested_authored_selection(
+        project,
+        selection_path=world_selection_path,
+        expected_selection_sha256=expected_world_selection_sha256,
+        expected_tuple_hash=expected_world_tuple_hash,
+    )
+
     adapter = load_adapter(config_path)
     if num_envs is not None:
         if not hasattr(adapter, "num_envs"):
@@ -3470,13 +3567,40 @@ def sculpt_run(
             f"[sculpt] CLI override: device={device!r}",
             file=sys.stderr, flush=True,
         )
+    if requested_authored_world_receipt is not None:
+        adapter.world_selection_path = str(
+            requested_authored_world_receipt["selection_path"]
+        )
     authored_tuple_hash = _pin_authored_selection(adapter, project)
     if authored_tuple_hash:
+        pinned_path = Path(adapter.world_selection_path).resolve()
+        observed_authored_world_receipt = {
+            "selection_version": int(
+                pinned_path.stem.removeprefix("selection_v")
+            ),
+            "selection_path": str(pinned_path),
+            "selection_sha256": hashlib.sha256(
+                pinned_path.read_bytes()
+            ).hexdigest(),
+            "tuple_hash": authored_tuple_hash,
+        }
+        if (
+            requested_authored_world_receipt is not None
+            and observed_authored_world_receipt
+            != requested_authored_world_receipt
+        ):
+            raise ValueError(
+                "observed authored world differs from the requested launch pin"
+            )
         _emit_event({
             "type": "authored_world_pinned",
             "tuple_hash": authored_tuple_hash,
-            "selection": Path(adapter.world_selection_path).name,
+            "selection": pinned_path.name,
+            "requested_receipt": requested_authored_world_receipt,
+            "observed_receipt": observed_authored_world_receipt,
         })
+    else:
+        observed_authored_world_receipt = None
 
     # Resolve KG store once (shared across iterations). Skip entirely in
     # --no-kg to avoid side-effects on an absent/empty DB.
@@ -3530,19 +3654,20 @@ def sculpt_run(
             "reference_clip_id and reference_robot must be supplied together"
         )
     reference_motion_context: Optional[dict[str, Any]] = None
+    reference_certificate: Any = None
     if reference_clip_id and reference_robot:
         if not dry_run:
             # Direct CLI/programmatic calls bypass the UI's queue admission.
             # Re-derive Tier D here, immediately before reference-guided
             # training setup, so no caller can promote a tier string or stale
             # path into dynamics authority.
-            target_robot, certificate = _admit_reference_motion_for_target(
+            target_robot, reference_certificate = _admit_reference_motion_for_target(
                 project=project,
                 reference_robot=reference_robot,
                 reference_clip_id=reference_clip_id,
             )
             _emit_event(_reference_feasibility_admission_event(
-                certificate=certificate,
+                certificate=reference_certificate,
                 reference_robot=reference_robot,
                 target_robot=target_robot,
                 reference_clip_id=reference_clip_id,
@@ -3557,6 +3682,36 @@ def sculpt_run(
             kg_store=kg_store,
             dry_run=dry_run,
         )
+        if not dry_run:
+            from sculptor.reference_run import (
+                require_exact_reference_tracking_backbone,
+            )
+            from sculptor.refs.track import require_tierd_runtime_reference
+
+            reward_path = Path(reference_motion_context["reward_path"])
+            reward_source = reward_path.read_text(encoding="utf-8")
+            runtime_clock = require_tierd_runtime_reference(
+                reference_certificate,
+                reward_source,
+            )
+            backbone_sha256 = require_exact_reference_tracking_backbone(
+                reward_source=reward_source,
+                clip_id=reference_clip_id,
+                robot=reference_robot,
+            )
+            _emit_event({
+                "type": "reference_runtime_schedule_admitted",
+                "source": "sculpt_run_boundary",
+                "reference_robot": reference_robot,
+                "reference_clip_id": reference_clip_id,
+                "reference_target_sha256": runtime_clock[
+                    "reference_target_sha256"
+                ],
+                "phase_mode": runtime_clock["phase_mode"],
+                "phase_duration_s": runtime_clock["phase_duration_s"],
+                "n_phase_targets": runtime_clock["n_phase_targets"],
+                "tracking_backbone_sha256": backbone_sha256,
+            })
 
     # Start iter index
     latest_n_before_loop, _ = _find_latest_reward_version(rewards_dir)
@@ -3623,6 +3778,10 @@ def sculpt_run(
         "dry_run": bool(dry_run),
         "behavior_goal": behavior_goal,
         "reference_motion": reference_motion_context,
+        "authored_world": {
+            "requested": requested_authored_world_receipt,
+            "observed": observed_authored_world_receipt,
+        },
         # §Ship 24 (R1): seed surfaced at run start so any result can
         # be tied back to its seed plan from the event stream alone.
         "base_seed": int(base_seed),
@@ -3645,6 +3804,10 @@ def sculpt_run(
         )
         if reference_motion_context is not None:
             _rc["reference_motion"] = reference_motion_context
+        _rc["authored_world"] = {
+            "requested": requested_authored_world_receipt,
+            "observed": observed_authored_world_receipt,
+        }
         _rc_path = write_run_context(paths["reports"], _rc)
         _emit_event({
             "type": "run_context_captured",
@@ -4051,6 +4214,11 @@ def sculpt_run(
                         checkpoint_path=Path(_best_out.checkpoint_path),
                         n_episodes=int((cfg.get("iteration") or {}).get(
                             "rollout_episodes", 6)),
+                        reward_module_path=(
+                            Path(_best_out.reward_path_trained)
+                            if _best_out.reward_path_trained is not None
+                            else None
+                        ),
                         # Disjoint from training seeds and the in-loop
                         # eval band (10k+): deterministic held-out seeds.
                         seed=90_001 + 131 * _j,
@@ -5529,13 +5697,9 @@ def mission_run(
     """
     from filelock import FileLock, Timeout as _FileLockTimeout
 
-    from sculptor.mission import save_mission
     from sculptor.mission_runtime import (
-        CriterionEvalError,
         MissionResult,
         StageResult,
-        _build_criterion_namespace,
-        _evaluate_success_criterion,
     )
 
     if mission.mission_dir is None:
@@ -6166,10 +6330,15 @@ def _reference_feasibility_admission_event(
     target_robot: str,
     reference_clip_id: str,
 ) -> dict[str, Any]:
-    """Build the complete worker evidence event for a live reference."""
+    """Build the complete, narrowly scoped worker evidence event."""
     return {
         "type": "reference_feasibility_admitted",
         "source": "sculpt_run_worker",
+        "status": "tierd_verified",
+        "tier": "D",
+        "kinematic_only": False,
+        "training_authorized": True,
+        "reference_tracking_certificate_admitted": True,
         "reference_robot": reference_robot,
         "target_robot": target_robot,
         "reference_clip_id": reference_clip_id,
@@ -6178,6 +6347,10 @@ def _reference_feasibility_admission_event(
         "certificate_sha256": certificate.certificate_sha256,
         "execution_contract_sha256": certificate.execution_contract_sha256,
         "execution_boundary_sha256": certificate.execution_boundary_sha256,
+        "certification_scope": json.loads(json.dumps(
+            certificate.certification_scope,
+            allow_nan=False,
+        )),
     }
 
 
@@ -7251,12 +7424,6 @@ def _run_one_stage(
     # §Ship-19d: Goal A wraps each iter with a criterion-eval
     # callback; Goal B runs additional sculpt_run passes (resume
     # mode) when metric is still improving at end-of-budget.
-    from sculptor.mission_runtime import (
-        CriterionEvalError,
-        CriterionMissingKeyError,
-        _build_criterion_namespace,
-        _evaluate_success_criterion,
-    )
 
     # §Ship 20 Goal #2: re-use the value already computed for
     # stage_started's payload above. `max_iters` is the authoritative
@@ -7925,7 +8092,6 @@ def _maybe_redecompose_and_splice(
     """
     from sculptor.decompose import (
         DecompositionError,
-        StageTrainingFeedback,
         redecompose_stage,
     )
     from sculptor.mission import MissionValidationError, validate_mission

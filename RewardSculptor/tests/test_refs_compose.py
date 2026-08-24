@@ -322,6 +322,112 @@ def test_compose_and_register_records_every_parent(tmp_path):
         "approach", "strike"]
 
 
+def test_registered_composite_binds_ordered_root_frame_authority(tmp_path):
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+    from sculptor.refs.compose import compose_and_register
+
+    first = _clip()
+    second = _clip(joint_offset=0.05)
+    first["root_frame"] = "origin_relative"
+    second["root_frame"] = "origin_relative"
+    _register_source(tmp_path, "g1", "src_a", first)
+    _register_source(tmp_path, "g1", "src_b", second)
+
+    composed = compose_and_register(
+        "g1",
+        [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
+        clip_id="root-authority--g1",
+        root=tmp_path,
+    )
+    receipt = composed.provenance["source"]["root_frame_inheritance"]
+    assert receipt["schema"] == library.ROOT_FRAME_INHERITANCE_SCHEMA
+    assert receipt["method"] == library.ROOT_FRAME_INHERITANCE_METHOD
+    assert receipt["asserted_root_frame"] == "origin_relative"
+    assert [parent["clip_id"] for parent in receipt["parents"]] == [
+        "src_a", "src_b"
+    ]
+    assert all(
+        len(parent["root_frame_evidence_sha256"]) == 64
+        and parent["root_frame"] == "origin_relative"
+        for parent in receipt["parents"]
+    )
+    observed, issues = library.root_frame_inheritance_from_provenance(
+        composed.provenance,
+        root=tmp_path,
+        expected_root_frame="origin_relative",
+    )
+    assert issues == []
+    assert observed == receipt
+
+    # Parent bytes are authority, not the cached JSON receipt.
+    source_path = (
+        library.clip_dir("g1", "src_b", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    changed = _clip(joint_offset=0.10)
+    changed["root_frame"] = "origin_relative"
+    save_clip(source_path, changed)
+    observed, issues = library.root_frame_inheritance_from_provenance(
+        composed.provenance,
+        root=tmp_path,
+        expected_root_frame="origin_relative",
+    )
+    assert observed is None
+    assert any("content hash differs" in issue for issue in issues)
+
+
+def test_root_frame_inheritance_rejects_missing_and_weak_evidence(tmp_path):
+    from copy import deepcopy
+
+    from sculptor.refs import library
+    from sculptor.refs.compose import compose_and_register
+
+    legacy = _clip()
+    legacy.pop("root_frame", None)
+    _register_source(tmp_path, "g1", "legacy", legacy)
+    weak = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="legacy",
+        output_clip_id="weak-declaration",
+        root_frame="absolute",
+        rationale="A free-text assertion is deliberately not authority.",
+        root=tmp_path,
+    )
+    native = _clip(joint_offset=0.05)
+    native["root_frame"] = "absolute"
+    _register_source(tmp_path, "g1", "native", native)
+
+    with pytest.raises(ComposeError, match="weak root-frame evidence"):
+        compose_and_register(
+            "g1",
+            [{"clip_id": weak.clip_id}, {"clip_id": "native"}],
+            clip_id="weak-composite",
+            root=tmp_path,
+        )
+
+    strong_a = _clip()
+    strong_b = _clip(joint_offset=0.05)
+    strong_a["root_frame"] = strong_b["root_frame"] = "absolute"
+    _register_source(tmp_path, "g1", "strong_a", strong_a)
+    _register_source(tmp_path, "g1", "strong_b", strong_b)
+    composed = compose_and_register(
+        "g1",
+        [{"clip_id": "strong_a"}, {"clip_id": "strong_b"}],
+        clip_id="missing-receipt",
+        root=tmp_path,
+    )
+    missing = deepcopy(composed.provenance)
+    missing["source"].pop("root_frame_inheritance")
+    observed, issues = library.root_frame_inheritance_from_provenance(
+        missing,
+        root=tmp_path,
+        expected_root_frame="absolute",
+    )
+    assert observed is None
+    assert any("receipt is missing" in issue for issue in issues)
+
+
 def test_compose_and_register_rejects_mutated_parent_bytes(tmp_path):
     from sculptor.reference import save_clip
     from sculptor.refs import library

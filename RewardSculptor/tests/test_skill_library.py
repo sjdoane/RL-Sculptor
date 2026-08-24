@@ -30,6 +30,11 @@ from typing import Any
 
 import pytest
 
+from sculptor.compatibility_provenance import (
+    ORIGIN_PERSISTED,
+    build_origin_persisted_provenance,
+    provenance_fingerprint,
+)
 from sculptor.mission import Mission, Stage
 from sculptor.skill_library import (
     ENV_LIBRARY_ROOT,
@@ -617,7 +622,7 @@ def test_load_rejects_tampered_execution_enums_and_mode_contract(
 
 def _exact_policy_contract() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema": 2,
         "robot_slug": "g1",
         "identity": {"adapter_class": "A", "task_id": "T"},
         "joints": {"ordered_names": ["joint_0"]},
@@ -658,6 +663,13 @@ def _publish_imported_policy(tmp_path: Path) -> tuple[SkillLibrary, SkillRecord,
     checkpoint = tmp_path / "sanitized" / "checkpoint.pt"
     _write_ckpt(checkpoint, b"SERVER_OWNED_CHECKPOINT")
     contract = _exact_policy_contract()
+    contract_bytes = json.dumps(contract, sort_keys=True).encode("utf-8")
+    contract_path = tmp_path / "origin_policy_contract.json"
+    contract_path.write_bytes(contract_bytes)
+    contract_provenance = build_origin_persisted_provenance(
+        contract_bytes=contract_bytes,
+        policy_roles=["actor", "critic"],
+    )
     record = lib.publish_imported_checkpoint(
         checkpoint_path=checkpoint,
         adapter_class="A",
@@ -675,6 +687,14 @@ def _publish_imported_policy(tmp_path: Path) -> tuple[SkillLibrary, SkillRecord,
         world_bundle_sha256=None,
         compatibility_contract=contract,
         compatibility_contract_digest=contract_fingerprint(contract),
+        compatibility_contract_provenance=contract_provenance,
+        compatibility_contract_provenance_digest=provenance_fingerprint(
+            contract_provenance
+        ),
+        compatibility_contract_provenance_status=ORIGIN_PERSISTED,
+        compatibility_provenance_sources={
+            "origin_policy_contract": contract_path,
+        },
         tensor_contract_verified=True,
         tensor_signature_sha256="c" * 64,
         compatibility_status="transfer_actor_critic",

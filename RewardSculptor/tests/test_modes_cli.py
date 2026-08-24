@@ -311,8 +311,12 @@ def test_authoring_builds_a_twin_grafts_it_back_and_re_probes(
     scaffold = out.read_text()
     floats = re.compile(r"-?\d+\.\d{3,}")
 
-    def _table_rows(src):  # a row of the target table, vs. a lone window bound
-        return [ln for ln in src.splitlines() if len(floats.findall(ln)) >= 3]
+    def _table_rows(src):  # a row of the target table, vs. receipt/window bounds
+        return [
+            ln
+            for ln in src.splitlines()
+            if ln.lstrip().startswith("[") and len(floats.findall(ln)) >= 3
+        ]
 
     assert len(_table_rows(scaffold)) > 10
     assert _table_rows(seen["twin"]) == []

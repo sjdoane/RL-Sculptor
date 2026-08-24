@@ -1369,6 +1369,15 @@ def run(
     expected_active_reference_reward_sha256: Optional[str] = typer.Option(
         None, "--expected-active-reference-reward-sha256", hidden=True,
         help="Backend admission pin for the active reference-bearing reward."),
+    world_selection: Optional[Path] = typer.Option(
+        None, "--world-selection", exists=True, readable=True, hidden=True,
+        help="Backend-pinned immutable authored-world selection."),
+    expected_world_selection_sha256: Optional[str] = typer.Option(
+        None, "--expected-world-selection-sha256", hidden=True,
+        help="Expected SHA-256 of the immutable authored-world selection."),
+    expected_world_tuple_hash: Optional[str] = typer.Option(
+        None, "--expected-world-tuple-hash", hidden=True,
+        help="Expected content-addressed authored-world tuple hash."),
 ):
     """Run the inner loop: train → rollout → diagnose → edit → commit."""
     from sculptor.sculpt import sculpt_run
@@ -1426,6 +1435,9 @@ def run(
         expected_active_reference_reward_sha256=(
             expected_active_reference_reward_sha256
         ),
+        world_selection_path=world_selection,
+        expected_world_selection_sha256=expected_world_selection_sha256,
+        expected_world_tuple_hash=expected_world_tuple_hash,
     )
     # Only override sculpt_run's defaults when explicitly provided.
     if fitness_target is not None:
@@ -2498,8 +2510,10 @@ def refs_export_skill(
 
     The exporter re-verifies the selected provenance and clip digest, then
     writes only the exact motion and provenance. Upload registers a reference
-    candidate; a target-specific Tier-D gate is still required before a
-    research training run may consume it.
+    candidate. A separate ``sculpt refs track`` job must produce Tier-D
+    exact-schedule tracking evidence before a research training run may
+    consume it. Launch does not perform certification; it only re-verifies the
+    resulting exact evidence.
     """
     from sculptor.export import ExportError, export_reference_starting_skill_bundle
 
@@ -2521,8 +2535,10 @@ def refs_export_skill(
         f"clip_sha256={reference['content_sha256']}"
     )
     typer.echo(
-        "[refs export-skill] candidate only; target-specific Tier-D "
-        "admission remains required"
+        "[refs export-skill] candidate only; run a separate sculpt refs track "
+        "Tier-D exact-schedule tracking evidence job before live launch; "
+        "launch only re-verifies "
+        "the resulting exact evidence"
     )
 
 
@@ -2612,6 +2628,89 @@ def refs_preview(
         typer.echo(f"[refs preview] unavailable in this environment: {e}", err=True)
         raise typer.Exit(code=1) from e
     typer.echo(f"[refs preview] wrote {out_path}")
+
+
+@refs_app.command("declare-root-frame")
+def refs_declare_root_frame(
+    robot: str = typer.Option(
+        ..., "--robot",
+        help="Exact reference-library robot namespace (for example g1).",
+    ),
+    source_clip: str = typer.Option(
+        ..., "--source-clip",
+        help="Existing retained parent clip ID.",
+    ),
+    output_clip: str = typer.Option(
+        ..., "--output-clip",
+        help="New immutable clip ID; the parent is never edited.",
+    ),
+    root_frame: str = typer.Option(
+        ..., "--root-frame",
+        help="Explicit root-height convention: absolute | origin_relative.",
+    ),
+    rationale: str = typer.Option(
+        ..., "--rationale",
+        help="Human-review evidence supporting the declaration.",
+    ),
+    evidence_method: str = typer.Option(
+        ...,
+        "--evidence-method",
+        help=(
+            "How the exact parent bytes were inspected: visual_inspection | "
+            "source_documentation | deterministic_export_contract."
+        ),
+    ),
+    reviewer: str = typer.Option(
+        ...,
+        "--reviewer",
+        help="Person or review authority making the versioned assertion.",
+    ),
+) -> None:
+    """Materialize one metadata-only root-frame declaration as Tier K.
+
+    Every parent NPZ member and optional preview is preserved, the exact parent
+    artifact digest is recorded, and only ``root_frame`` is added.  Because the
+    new bytes have a new identity, any prior Tier-D evidence is intentionally
+    not inherited; run ``sculpt refs track`` on the output before live use.
+    """
+    from sculptor.refs.library import (
+        ArtifactMaterializationError,
+        materialize_root_frame_declaration,
+    )
+
+    try:
+        result = materialize_root_frame_declaration(
+            robot=robot,
+            source_clip_id=source_clip,
+            output_clip_id=output_clip,
+            root_frame=root_frame,
+            rationale=rationale,
+            evidence_method=evidence_method,
+            reviewer=reviewer,
+        )
+    except (ArtifactMaterializationError, OSError) as exc:
+        typer.echo(f"[refs declare-root-frame] refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    parent = result.provenance["parent_artifact"]
+    typer.echo(
+        f"[refs declare-root-frame] wrote {result.robot}/{result.clip_id} "
+        f"clip_sha256={result.provenance['content_sha256']}"
+    )
+    typer.echo(
+        "[refs declare-root-frame] exact parent "
+        f"{parent['robot']}/{parent['clip_id']} "
+        f"clip_sha256={parent['content_sha256']}"
+    )
+    typer.echo(
+        "[refs declare-root-frame] Tier K only; certify this new immutable "
+        "artifact with `sculpt refs track` before live reference use"
+    )
+    if result.index_refresh_error:
+        typer.echo(
+            "[refs declare-root-frame] artifact published; index cache refresh "
+            f"needs retry: {result.index_refresh_error}",
+            err=True,
+        )
 
 
 @refs_app.command("retarget")
@@ -2741,6 +2840,48 @@ def refs_resegment(
         typer.echo(f"  x rejected: {cand_id}: {reason}")
 
 
+@refs_app.command("export-tierd-interface")
+def refs_export_tierd_interface(
+    donor_project: Path = typer.Option(
+        ...,
+        "--donor-project",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help=(
+            "Trusted local Mjlab project whose adapter/task/interface should "
+            "be exported as the data-only Tier-D preflight receipt."
+        ),
+    ),
+) -> None:
+    """Export the exact donor interface consumed by Tier-D CPU preflight.
+
+    This explicit preparation step may import mjlab to inspect the configured
+    task.  Later ``refs track --dry-run`` calls consume only the resulting
+    immutable JSON receipt: they do not import mjlab, query CUDA, construct an
+    adapter, or start a subprocess.  Exporting never loads donor policy
+    weights.
+    """
+    import hashlib as _hashlib
+
+    from sculptor.refs.track import TrackError, export_tierd_donor_interface
+
+    try:
+        receipt_path = export_tierd_donor_interface(donor_project)
+    except (OSError, TrackError, ValueError) as exc:
+        typer.echo(f"[refs export-tierd-interface] refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    digest = _hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    typer.echo(
+        "[refs export-tierd-interface] wrote "
+        f"{receipt_path} receipt_sha256={digest}"
+    )
+    typer.echo(
+        "[refs export-tierd-interface] donor policy weights were not loaded; "
+        "refs track will independently verify live runner receipts"
+    )
+
+
 @refs_app.command("track")
 def refs_track(
     clip_id: str = typer.Option(
@@ -2748,36 +2889,50 @@ def refs_track(
     robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
     donor_project: Path = typer.Option(
         ..., "--donor-project",
-        help="Path to an existing sculpt project whose config.toml "
-             "[adapter] table (class + config) is templated into the "
-             "throwaway tracking project."),
+        help="Existing sculpt project supplying adapter class, task/policy "
+             "interface, and config only. Donor policy weights are never "
+             "loaded; the first tracker training starts fresh."),
     iterations: int = typer.Option(
         3, "--iterations", help="Number of adapter.train() calls "
-        "(each warm-started from the prior checkpoint)."),
+        "(the first starts fresh; later calls warm-start from the prior "
+        "tracker checkpoint)."),
     steps_per_iteration: int = typer.Option(
         2000, "--steps-per-iteration", help="mjlab max_iterations per "
         "adapter.train() call (see MjlabAdapter.train's docstring: "
         "'steps' IS max_iterations, not raw env steps)."),
     n_episodes: int = typer.Option(
-        2, "--n-episodes", help="Rollout episodes scored against the clip."),
+        1,
+        "--n-episodes",
+        help="Tier-D rollout lanes (currently exactly 1).",
+    ),
     seed: int = typer.Option(0, "--seed", help="Train/rollout seed."),
     project_dir: Optional[Path] = typer.Option(
         None, "--project-dir",
-        help="Throwaway project directory (default: "
-             "<clip_dir>/tierD_work)."),
+        help="Fresh non-existing throwaway project directory (default: a "
+             "unique directory outside the retained reference library)."),
     dry_run: bool = typer.Option(
         False, "--dry-run",
-        help="Build the throwaway project (config + tracking reward + "
-             "RSI/eval-reset env spec) and print the plan without "
-             "training."),
+        help="Run the complete CPU/pre-GPU donor, interface, environment, "
+             "and unbound Tier-D contract preflight; print its exact receipt "
+             "without constructing the GPU adapter or loading/training "
+             "policy weights."),
 ) -> None:
-    """Tier-D certification (§REFERENCE_TRAJECTORY_PLAN §2.3, §11 R4):
-    physics-track a Tier-K clip in our own mjlab sim with a bounded
-    DeepMimic-style tracking run. Success within tolerance upgrades the
-    clip's provenance tier K -> D and copies the tracked rollout beside
-    the clip as `tierD_rollout.npz`; failure records
-    `tierD.feasible=false` (a useful verdict, not an error) and leaves
-    the tier unchanged. See `sculptor.refs.track` for the full pipeline."""
+    """Build Tier-D exact-schedule tracking evidence (§REFERENCE_TRAJECTORY_PLAN
+    §2.3, §11 R4) for a Tier-K clip in our own mjlab simulation with a bounded
+    DeepMimic-style tracking run. Success within tolerance upgrades the clip's
+    provenance tier K -> D and copies the tracked rollout beside the clip as
+    ``tierD_rollout_<sha256>.npz``; failure records ``tierD.feasible=false``
+    (a useful verdict, not an error) and leaves the tier unchanged.
+
+    ``--donor-project`` contributes adapter/interface/config facts only. The
+    first generated tracker is trained from a fresh policy; this command never
+    inherits donor policy weights.
+
+    The certificate is limited to exact-schedule joint-position/root-height
+    tracking. It does not certify root-XY tracking, contact safety, collision
+    avoidance, or general dynamics feasibility. See ``sculptor.refs.track``
+    for the full pipeline.
+    """
     import json as _json
 
     from sculptor.refs.track import TrackError, track_clip
@@ -2800,6 +2955,7 @@ def refs_track(
             f"steps_per_iteration={result.plan.steps_per_iteration} "
             f"n_episodes={result.plan.n_episodes} "
             f"joint_names={result.plan.joint_names}")
+        typer.echo(_json.dumps(result.preflight_receipt, indent=2))
         return
 
     assert result.errors is not None
@@ -2916,6 +3072,7 @@ def modes_scaffold(
     try:
         source = generate_mode_reward_scaffold(
             graph, behavior_goal=goal, clip_id=clip_id,
+            robot=robot,
             clip=clip if tracking else None)
     except ModeError as e:
         typer.echo(f"[modes scaffold] FAILED: {e}", err=True)

@@ -44,18 +44,25 @@ def _rising_clip() -> dict:
 HONEST_GETUP = '''import numpy as np
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
-    if root is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if root is None or valid is None:
         return {"spec_score": 0.0}
-    z = root[..., 2]
-    n = z.shape[0]
-    # start read: EARLIEST frames only (FAST-COMPLETION rule — a policy can
-    # finish the whole transition inside any wide start window); min() is a
-    # robust floor read. End read: a wide window is safe (held terminal).
-    first_w = z[:min(5, n)].min()
-    final_w = z[-min(15, n):].mean()
-    rise = np.clip(final_w - first_w, 0.0, None)
-    val = float(np.clip(final_w * rise / 0.75, 0.0, 1.0))
-    return {"spec_score": val}
+    scores = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 2:
+            scores.append(0.0)
+            continue
+        z = root[keep, env, 2]
+        n = z.shape[0]
+        # start read: EARLIEST valid frames only (FAST-COMPLETION rule — a
+        # policy can finish inside any wide start window); min() is a robust
+        # floor read. End read: a wide valid window is safe (held terminal).
+        first_w = z[:min(5, n)].min()
+        final_w = z[-min(15, n):].mean()
+        rise = np.clip(final_w - first_w, 0.0, None)
+        scores.append(float(np.clip(final_w * rise / 0.75, 0.0, 1.0)))
+    return {"spec_score": float(np.mean(scores))}
 '''
 
 # The live D24 defect shape, pinned: a metric whose started-away read is a
@@ -156,9 +163,9 @@ def test_honest_metric_clears_all_four_reference_gates(tmp_path):
     assert "speed_slow" in ref_result["scores"]
     assert "speed_fast" in ref_result["scores"]
     assert "complete_then_hold" in ref_result["scores"]
-    assert f"reference:getup1" in v["archetype_scores"]
-    assert f"reference:getup1:trunc_50" in v["archetype_scores"]
-    assert f"reference:getup1:complete_then_hold" in v["archetype_scores"]
+    assert "reference:getup1" in v["archetype_scores"]
+    assert "reference:getup1:trunc_50" in v["archetype_scores"]
+    assert "reference:getup1:complete_then_hold" in v["archetype_scores"]
 
 
 def _late_rising_clip() -> dict:

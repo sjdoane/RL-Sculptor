@@ -837,11 +837,8 @@ def _prepare_reference(
         raise SkillBundleError(f"invalid bundled reference: {exc}") from exc
     if not isinstance(provenance, dict):
         raise SkillBundleError("invalid reference provenance: root must be an object")
-    errors = refs.validate_provenance(provenance)
-    if errors:
-        raise SkillBundleError("invalid reference provenance: " + "; ".join(errors))
-    clip_id = provenance["clip_id"]
-    robot = provenance["robot"]
+    clip_id = provenance.get("clip_id")
+    robot = provenance.get("robot")
     if not isinstance(clip_id, str):
         raise SkillBundleError("reference provenance clip_id must be a string")
     try:
@@ -854,6 +851,9 @@ def _prepare_reference(
         raise SkillBundleError(
             "reference provenance robot must be a safe stable identifier"
         )
+    errors = refs.validate_provenance(provenance)
+    if errors:
+        raise SkillBundleError("invalid reference provenance: " + "; ".join(errors))
     if expected_robot and robot != expected_robot:
         raise SkillBundleError(
             "bundle robot_slug conflicts with reference provenance "
@@ -1013,7 +1013,10 @@ def _install_reference(prepared: _PreparedReference) -> _ReferenceRegistration:
         shutil.copy2(prepared.provenance_path, stage / refs.PROVENANCE_FILENAME)
         os.replace(stage, destination)
         installed = True
-        refs.rebuild_index()
+        # The caller holds the same library-wide transaction lock used by
+        # certification and manual rebuilds.  Use the lock-owned primitive to
+        # avoid recursively acquiring a second FileLock instance.
+        refs._rebuild_index_unlocked()
     except Exception as exc:
         shutil.rmtree(stage, ignore_errors=True)
         if installed:
@@ -1025,6 +1028,24 @@ def _install_reference(prepared: _PreparedReference) -> _ReferenceRegistration:
             f"{prepared.robot}/{prepared.clip_id}: {exc}",
         ) from exc
     return registration
+
+
+def _policy_migration_observation_label(
+    migration: dict[str, Any] | None,
+) -> str:
+    """Plain-language name for the exact admitted interface transform."""
+    migration_type = migration.get("type") if migration else None
+    return {
+        "zero_initialized_event_phase_observation": (
+            "event-phase observation extension"
+        ),
+        "zero_initialized_reference_clock_observation": (
+            "reference-clock observation extension"
+        ),
+        "zero_initialized_observation_extensions": (
+            "event-phase and reference-clock observation extensions"
+        ),
+    }.get(migration_type, "observation interface extension")
 
 
 def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
@@ -1107,7 +1128,9 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
             and mode not in {"actor_only", "actor_critic", "reference_only"}
         ):
             failures.append(
-                "event-phase observation migration supports actor or "
+                "migration for "
+                f"{_policy_migration_observation_label(policy_migration)} "
+                "supports actor or "
                 "actor+critic initialization only, not full resume"
             )
         mode_reasons[mode] = list(dict.fromkeys(failures))
@@ -1141,11 +1164,14 @@ def _authorization_for(
 ) -> dict[str, Any]:
     """Describe remaining runtime proof without granting it at import time."""
     mode_gates: dict[str, list[str]] = {}
+    migration_label = _policy_migration_observation_label(
+        compatibility.get("policy_contract_migration")
+    )
     for mode in compatibility["allowed_initialization_modes"]:
         if mode == "reference_only":
             mode_gates[mode] = [
                 (
-                    "complete a separate Tier-D physics-tracking certification job "
+                    "complete a separate Tier-D exact-schedule tracking evidence job "
                     "for the exact clip and target execution boundary before live "
                     "launch"
                 ),
@@ -1164,8 +1190,8 @@ def _authorization_for(
             if compatibility.get("policy_contract_migration"):
                 mode_gates[mode].insert(
                     1,
-                    "materialize the declared zero-initialized event-phase "
-                    "observation extension and record its digest",
+                    "materialize the declared zero-initialized "
+                    f"{migration_label} and record its digest",
                 )
         elif mode == "actor_critic":
             mode_gates[mode] = [
@@ -1176,8 +1202,8 @@ def _authorization_for(
             if compatibility.get("policy_contract_migration"):
                 mode_gates[mode].insert(
                     1,
-                    "materialize the declared zero-initialized event-phase "
-                    "observation extension and record its digest",
+                    "materialize the declared zero-initialized "
+                    f"{migration_label} and record its digest",
                 )
         elif mode == "full_resume":
             mode_gates[mode] = [
@@ -1193,8 +1219,8 @@ def _authorization_for(
         )
         if "reference_only" in compatibility["allowed_initialization_modes"]:
             detail += (
-                " A reference requires a separate Tier-D physics-tracking "
-                "certification job before live launch; launch only re-verifies "
+                " A reference requires a separate Tier-D exact-schedule tracking "
+                "evidence job before live launch; launch only re-verifies "
                 "that existing evidence."
             )
         if any(
@@ -1330,8 +1356,8 @@ def receipt_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
                         ],
                         "training_authorized": False,
                         "next_gate": (
-                            "run a separate target-specific Tier-D physics-tracking "
-                            "certification job before live launch; launch only "
+                            "run a separate target-specific Tier-D exact-schedule "
+                            "tracking evidence job before live launch; launch only "
                             "re-verifies the resulting exact evidence"
                         ),
                     },

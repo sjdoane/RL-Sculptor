@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from sculptor.refs.track import TIER_D_CERTIFICATION_SCOPE
+
 
 def _write_robot(
     project,
@@ -30,6 +32,7 @@ def _certificate():
         certificate_sha256="3" * 64,
         execution_contract_sha256="4" * 64,
         execution_boundary_sha256="5" * 64,
+        certification_scope=TIER_D_CERTIFICATION_SCOPE,
     )
 
 
@@ -156,6 +159,11 @@ def test_direct_reference_admission_emits_complete_execution_evidence(
     assert event == {
         "type": "reference_feasibility_admitted",
         "source": "sculpt_run_worker",
+        "status": "tierd_verified",
+        "tier": "D",
+        "kinematic_only": False,
+        "training_authorized": True,
+        "reference_tracking_certificate_admitted": True,
         "reference_robot": "g1",
         "target_robot": "g1",
         "reference_clip_id": "flip",
@@ -164,4 +172,5 @@ def test_direct_reference_admission_emits_complete_execution_evidence(
         "certificate_sha256": "3" * 64,
         "execution_contract_sha256": "4" * 64,
         "execution_boundary_sha256": "5" * 64,
+        "certification_scope": TIER_D_CERTIFICATION_SCOPE,
     }

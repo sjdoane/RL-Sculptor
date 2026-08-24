@@ -544,6 +544,7 @@ def _tierd_module(tmp_path):
     rng = np.random.default_rng(0)
     src = generate_tracking_reward_source(
         clip_id="unit--g1",
+        robot="g1",
         joint_names=[f"j{i}" for i in range(n_joints)],
         target_joint_pos=rng.normal(size=(n_phase, n_joints)),
         target_root_z=np.linspace(0.0, 0.05, n_phase),

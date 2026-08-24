@@ -21,6 +21,48 @@ from sculptor.adapters.base import (
 )
 
 
+def test_runner_reward_receipt_tracks_immutable_selected_module(
+    tmp_path: Path,
+) -> None:
+    """Strict lineage publishes vN bytes even though the loader is current.py."""
+    import hashlib
+
+    from sculptor.adapters._mjlab_runner import (
+        _capture_runner_reward_artifact,
+        _load_reward_module,
+        _validate_loaded_reward_artifact,
+    )
+    from sculptor.edit import _write_current_reexport
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    selected = rewards / "v3.py"
+    selected.write_text(
+        "REWARD_SPEC = {'reference_clock': {'schema': 1}}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n"
+        "def compute_reward_batched(s, a, n, i): return a[:, 0], {}\n"
+        "def reference_clock_batched(step_count, device): return step_count\n"
+        "def reference_target_index_batched(step_count, device): return step_count\n",
+        encoding="utf-8",
+    )
+    _write_current_reexport(rewards, selected)
+
+    artifact = _capture_runner_reward_artifact(
+        rewards / "current.py", label="training reward module"
+    )
+    module = _load_reward_module(str(rewards / "current.py"))
+    _validate_loaded_reward_artifact(module, artifact)
+
+    selected_sha256 = hashlib.sha256(selected.read_bytes()).hexdigest()
+    current_sha256 = hashlib.sha256(
+        (rewards / "current.py").read_bytes()
+    ).hexdigest()
+    assert artifact["selection_kind"] == "selector"
+    assert artifact["selected"]["sha256"] == selected_sha256
+    assert artifact["loader"]["sha256"] == current_sha256
+    assert selected_sha256 != current_sha256
+
+
 def test_to_host_numpy_moves_tensor_metadata_to_cpu() -> None:
     """CUDA-like simulator metadata is copied to host before NumPy sees it."""
     import numpy as np
@@ -452,6 +494,66 @@ def test_event_observation_extension_supports_real_batched_normalizers() -> None
         )
 
 
+def test_reference_clock_is_installed_and_executed_for_actor_and_critic() -> None:
+    """The admitted reference clock must reach both live policy interfaces."""
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _install_reference_clock_observation,
+    )
+    from sculptor.reference_clock import build_reference_clock
+
+    clock = build_reference_clock(
+        clip_id="hop",
+        robot="g1",
+        target_sha256="a" * 64,
+        phase_mode="hold",
+        phase_duration_s=2.0,
+        n_phase_targets=32,
+    )
+
+    def reference_clock_batched(obs, like):
+        phase = obs["episode_length"] * obs["step_dt"] / 2.0
+        return phase.clamp(min=0.0, max=1.0).unsqueeze(-1).to(like)
+
+    reward_module = SimpleNamespace(
+        REWARD_SPEC={
+            "reference_tracking": True,
+            "reference_clock": clock,
+        },
+        reference_clock_batched=reference_clock_batched,
+        reference_target_index_batched=lambda _obs, like: like.to(
+            dtype=torch.long
+        ),
+    )
+    actor = SimpleNamespace(terms={})
+    critic = SimpleNamespace(terms={})
+    env_cfg = SimpleNamespace(observations={
+        "actor": actor,
+        "critic": critic,
+        # Alias the actor group as some MJLab tasks do. Installation must not
+        # double-add the same mutable term mapping.
+        "policy": actor,
+    })
+
+    installed = _install_reference_clock_observation(env_cfg, reward_module)
+
+    assert installed == clock
+    assert set(actor.terms) == {"reference_phase"}
+    assert set(critic.terms) == {"reference_phase"}
+    env = SimpleNamespace(
+        episode_length_buf=torch.tensor([0, 25, 100]),
+        step_dt=0.02,
+        num_envs=3,
+        device="cpu",
+    )
+    for group in (actor, critic):
+        cfg = group.terms["reference_phase"]
+        term = cfg.func(cfg, env)
+        torch.testing.assert_close(
+            term(env), torch.tensor([[0.0], [0.25], [1.0]])
+        )
+
+
 def test_warm_start_loaded_receipt_names_exact_loaded_bytes(tmp_path: Path) -> None:
     from sculptor.adapters._mjlab_runner import _warm_start_loaded_receipt
 
@@ -675,7 +777,7 @@ def test_runner_rejects_target_only_cli_event_adaptation(
         "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON",
     ):
         monkeypatch.delenv(name, raising=False)
-    with pytest.raises(RuntimeError, match="target-only CLI adaptation"):
+    with pytest.raises(RuntimeError, match="full immutable policy-contract"):
         _attest_warm_start_policy_contract(
             world_selection=tmp_path / "missing.json",
             extension_width=3,
@@ -2389,6 +2491,35 @@ def test_reward_module_flag_is_read_and_fails_soft(tmp_path) -> None:
     assert _reward_module_declares(None, "reference_tracking") is False
 
 
+def test_reference_tracking_capability_covers_flat_mode_and_task_only() -> None:
+    """Flat and mode rewards must drive the same runtime arbitration."""
+    from types import SimpleNamespace
+
+    from sculptor.adapters._mjlab_runner import (
+        _reward_module_tracks_reference,
+        _reward_spec_tracks_reference,
+    )
+
+    flat = {"reference_tracking": True}
+    tracked_mode = {"tracking_enabled": True}
+    task_only_mode = {"tracking_enabled": False}
+
+    assert _reward_spec_tracks_reference(flat) is True
+    assert _reward_spec_tracks_reference(tracked_mode) is True
+    assert _reward_spec_tracks_reference(task_only_mode) is False
+    assert _reward_spec_tracks_reference({"version": "plain"}) is False
+    assert _reward_spec_tracks_reference(None) is False
+    assert _reward_module_tracks_reference(
+        SimpleNamespace(REWARD_SPEC=flat)
+    ) is True
+    assert _reward_module_tracks_reference(
+        SimpleNamespace(REWARD_SPEC=tracked_mode)
+    ) is True
+    assert _reward_module_tracks_reference(
+        SimpleNamespace(REWARD_SPEC=task_only_mode)
+    ) is False
+
+
 def test_generated_tracking_rewards_declare_the_flag() -> None:
     """Both tracking-reward generators must set it, or the runner silently
     keeps the competing posture priors."""
@@ -2397,7 +2528,7 @@ def test_generated_tracking_rewards_declare_the_flag() -> None:
     from sculptor.refs.track import generate_tracking_reward_source
 
     src = generate_tracking_reward_source(
-        clip_id="c", joint_names=["j0"],
+        clip_id="c", robot="g1", joint_names=["j0"],
         target_joint_pos=np.zeros((4, 1)), target_root_z=np.zeros(4),
         episode_len_steps=100, duration_s=2.0)
     ns: dict = {}

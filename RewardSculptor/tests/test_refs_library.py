@@ -10,6 +10,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -456,6 +458,116 @@ def test_provenance_write_read_roundtrip(tmp_path: Path) -> None:
     assert loaded["source_content_sha256"] == "c" * 64
 
 
+def test_provenance_replace_is_atomic_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip_id = "atomic1"
+    clip_path = (
+        library.clip_dir("g1", clip_id, root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    clip_path.parent.mkdir(parents=True, exist_ok=True)
+    clip_path.write_bytes(b"exact retained test artifact")
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
+    original = library.make_provenance(
+        clip_id=clip_id,
+        robot="g1",
+        source={"kind": "hf_dataset", "repo": "r", "path": "p"},
+        license="cc-by-4.0",
+        attribution="original",
+        content_sha256_=artifact_sha,
+    )
+    library.write_provenance("g1", clip_id, original, root=tmp_path)
+    replacement = {**original, "attribution": "replacement"}
+
+    def fail_replace(
+        _source: object, _destination: object, **_kwargs: object,
+    ) -> None:
+        raise OSError("simulated atomic replace failure")
+
+    monkeypatch.setattr(library.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated atomic replace failure"):
+        library.write_provenance(
+            "g1", clip_id, replacement, root=tmp_path
+        )
+
+    assert library.read_provenance("g1", clip_id, root=tmp_path) == original
+    artifact_dir = library.clip_dir("g1", clip_id, root=tmp_path)
+    assert list(artifact_dir.glob(".provenance.json.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd confinement")
+def test_provenance_rename_symlink_swap_cannot_redirect_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip_id = "swap1"
+    clip_dir = library.clip_dir("g1", clip_id, root=tmp_path)
+    clip_dir.mkdir(parents=True)
+    clip_path = clip_dir / library.CLIP_FILENAME
+    clip_path.write_bytes(b"exact retained test artifact")
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
+    original = library.make_provenance(
+        clip_id=clip_id,
+        robot="g1",
+        source={"kind": "test"},
+        license="cc0",
+        attribution="original",
+        content_sha256_=artifact_sha,
+    )
+    library.write_provenance("g1", clip_id, original, root=tmp_path)
+    replacement = {**original, "attribution": "replacement"}
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_provenance = outside / library.PROVENANCE_FILENAME
+    outside_provenance.write_text("outside sentinel", encoding="utf-8")
+    moved = clip_dir.with_name(f"{clip_id}-moved")
+    real_replace = library.os.replace
+    exchanged = False
+
+    def exchange_then_replace(source, destination, **kwargs):
+        nonlocal exchanged
+        if not exchanged and destination == library.PROVENANCE_FILENAME:
+            exchanged = True
+            clip_dir.rename(moved)
+            clip_dir.symlink_to(outside, target_is_directory=True)
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(library.os, "replace", exchange_then_replace)
+    with pytest.raises(
+        library.LicenseGuardError,
+        match="changed during atomic replacement",
+    ):
+        library.write_provenance(
+            "g1", clip_id, replacement, root=tmp_path,
+        )
+
+    assert outside_provenance.read_text(encoding="utf-8") == "outside sentinel"
+    assert json.loads(
+        (moved / library.PROVENANCE_FILENAME).read_text(encoding="utf-8")
+    )["attribution"] == "replacement"
+
+
+def test_index_replace_is_atomic_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = [{"clip_id": "before", "robot": "g1"}]
+    library.write_index(original, root=tmp_path)
+    original_bytes = library.index_path(root=tmp_path).read_bytes()
+
+    def fail_replace(_source: object, _destination: object) -> None:
+        raise OSError("simulated index replace failure")
+
+    monkeypatch.setattr(library.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated index replace failure"):
+        library.write_index(
+            [{"clip_id": "after", "robot": "g1"}], root=tmp_path,
+        )
+
+    assert library.index_path(root=tmp_path).read_bytes() == original_bytes
+    assert list(tmp_path.glob(f".{library.INDEX_FILENAME}.*.tmp")) == []
+
+
 def test_rebuild_index_from_provenance_files(tmp_path: Path) -> None:
     for i in range(3):
         cid = f"clip{i}"
@@ -659,6 +771,732 @@ def test_migrate_artifact_identities_preserves_source_and_downgrades_tierd(
     assert "fresh Tier-D certification required" in (
         prov["tierD"]["identity_migration_invalidated"]["reason"])
     assert library.migrate_artifact_identities(root=tmp_path) == []
+
+
+def test_materialize_root_frame_is_new_exact_tierk_artifact(
+    tmp_path: Path,
+) -> None:
+    source_id = "legacy_hop"
+    output_id = "legacy_hop--origin-relative"
+    source_dir = library.clip_dir("g1", source_id, root=tmp_path)
+    source_clip_path = save_clip(
+        source_dir / library.CLIP_FILENAME,
+        {
+            "root_pos_z": np.linspace(0.001, 0.16, 229),
+            "root_pos_xy": np.zeros((229, 2)),
+            "joint_pos": np.zeros((229, N_JOINTS)),
+            "joint_names": list(G1_29),
+            "fps": 60.0,
+            "meta": {"source": "legacy fixture"},
+        },
+    )
+    source_bytes = source_clip_path.read_bytes()
+    source_preview_bytes = b"exact preview bytes for unchanged arrays"
+    (source_dir / library.PREVIEW_FILENAME).write_bytes(source_preview_bytes)
+    raw_source_sha = "9" * 64
+    source_prov = {
+        "schema": 1,
+        "clip_id": source_id,
+        "robot": "g1",
+        "source": {"kind": "hf_dataset", "repo": "r", "path": "p"},
+        "license": "cc-by-4.0",
+        "attribution": "fixture dataset",
+        "content_sha256": raw_source_sha,
+        "tier": "D",
+        "fps_source": 60.0,
+        "labels": ["hop"],
+        "text": "one leg hop",
+        "joint_mapping": {"identity": True},
+        "qc": {"n_frames": 229, "duration_s": 229 / 60},
+    }
+    library.write_provenance("g1", source_id, source_prov, root=tmp_path)
+    with np.load(source_clip_path, allow_pickle=False) as archive:
+        source_members = {
+            name: archive[name].copy() for name in archive.files
+        }
+
+    result = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id=source_id,
+        output_clip_id=output_id,
+        root_frame="origin_relative",
+        rationale="Source retarget stores height offsets from the origin.",
+        evidence_method="source_documentation",
+        reviewer="reference-curation-v1",
+        root=tmp_path,
+    )
+
+    assert source_clip_path.read_bytes() == source_bytes
+    assert "root_frame" not in load_clip(source_clip_path)
+    assert load_clip(result.clip_path)["root_frame"] == "origin_relative"
+    assert (
+        result.clip_path.parent / library.PREVIEW_FILENAME
+    ).read_bytes() == source_preview_bytes
+    with np.load(result.clip_path, allow_pickle=False) as derived:
+        assert set(derived.files) == set(source_members) | {"root_frame"}
+        for name, expected in source_members.items():
+            np.testing.assert_array_equal(derived[name], expected)
+
+    prov = library.read_provenance("g1", output_id, root=tmp_path)
+    assert prov["schema"] == 2
+    assert prov["tier"] == "K"
+    assert prov["content_sha256"] == library.content_sha256(
+        result.clip_path.read_bytes()
+    )
+    assert prov["source_content_sha256"] == raw_source_sha
+    assert prov["parent_artifact"] == {
+        "robot": "g1",
+        "clip_id": source_id,
+        "content_sha256": library.content_sha256(source_bytes),
+    }
+    assert prov["source"]["parent_artifact"] == prov["parent_artifact"]
+    assert prov["parent_preview_sha256"] == library.content_sha256(
+        source_preview_bytes
+    )
+    assert prov["qc"]["duration_s"] == pytest.approx(3.8)
+    assert prov["qc"]["metadata_declaration"]["arrays_preserved"] is True
+    assert prov["qc"]["metadata_declaration"]["preview_preserved"] is True
+    assert prov["qc"]["metadata_declaration"]["rationale"] == (
+        "Source retarget stores height offsets from the origin."
+    )
+    assert prov["source"]["rationale"] == (
+        "Source retarget stores height offsets from the origin."
+    )
+    evidence = prov["source"]["evidence"]
+    assert evidence == {
+        "schema": library.ROOT_FRAME_DECLARATION_EVIDENCE_SCHEMA,
+        "method": "source_documentation",
+        "inspected_source_artifact_sha256": prov[
+            "parent_artifact"
+        ]["content_sha256"],
+        "reviewer": "reference-curation-v1",
+        "assertion_version": (
+            library.ROOT_FRAME_DECLARATION_ASSERTION_VERSION
+        ),
+        "asserted_root_frame": "origin_relative",
+    }
+    extracted, evidence_issues = (
+        library.root_frame_declaration_evidence_from_provenance(prov)
+    )
+    assert evidence_issues == []
+    assert extracted == evidence
+    assert [row["clip_id"] for row in library.rebuild_index(root=tmp_path)] == [
+        source_id,
+        output_id,
+    ]
+
+
+def test_materialize_root_frame_never_overwrites_or_trusts_bad_parent(
+    tmp_path: Path,
+) -> None:
+    source_id = "schema2_parent"
+    source_dir = library.clip_dir("g1", source_id, root=tmp_path)
+    source_clip_path = save_clip(
+        source_dir / library.CLIP_FILENAME,
+        {"root_pos_z": np.linspace(0.7, 0.8, 20), "fps": 50.0},
+    )
+    prov = library.make_provenance(
+        clip_id=source_id,
+        robot="g1",
+        source={"kind": "test"},
+        license="cc0",
+        attribution="fixture",
+        content_sha256_=library.content_sha256(source_clip_path.read_bytes()),
+    )
+    library.write_provenance("g1", source_id, prov, root=tmp_path)
+
+    output_id = "declared_parent"
+    first = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id=source_id,
+        output_clip_id=output_id,
+        root_frame="absolute",
+        rationale="Fixture trajectory is expressed in world coordinates.",
+        root=tmp_path,
+    )
+    first_bytes = first.clip_path.read_bytes()
+    with pytest.raises(
+        library.ArtifactMaterializationError, match="destination already exists"
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id=source_id,
+            output_clip_id=output_id,
+            root_frame="absolute",
+            rationale="Fixture trajectory is expressed in world coordinates.",
+            root=tmp_path,
+        )
+    assert first.clip_path.read_bytes() == first_bytes
+
+    source_clip_path.write_bytes(b"mutated parent")
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="content_sha256 does not match retained",
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id=source_id,
+            output_clip_id="must_not_exist",
+            root_frame="origin_relative",
+            rationale="Fixture is origin-relative.",
+            root=tmp_path,
+        )
+    assert not library.clip_dir(
+        "g1", "must_not_exist", root=tmp_path
+    ).exists()
+
+
+@pytest.mark.parametrize("root_frame", ["", "relative", "world"])
+def test_materialize_root_frame_rejects_unknown_frame(
+    tmp_path: Path, root_frame: str,
+) -> None:
+    with pytest.raises(
+        library.ArtifactMaterializationError, match="root_frame must be"
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="parent",
+            output_clip_id="child",
+            root_frame=root_frame,
+            rationale="Fixture declaration.",
+            root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("rationale", ["  ", None])
+def test_materialize_root_frame_requires_declaration_rationale(
+    tmp_path: Path, rationale: str | None,
+) -> None:
+    with pytest.raises(
+        library.ArtifactMaterializationError, match="rationale must explain"
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="parent",
+            output_clip_id="child",
+            root_frame="origin_relative",
+            rationale=rationale,  # type: ignore[arg-type]
+            root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("evidence_method", "reviewer", "message"),
+    [
+        ("visual_inspection", None, "must be supplied together"),
+        (None, "reviewer", "must be supplied together"),
+        ("free_text", "reviewer", "evidence_method must be one of"),
+        ("visual_inspection", "  ", "reviewer must be non-empty"),
+    ],
+)
+def test_materialize_root_frame_rejects_invalid_structured_evidence(
+    tmp_path: Path,
+    evidence_method: str | None,
+    reviewer: str | None,
+    message: str,
+) -> None:
+    with pytest.raises(library.ArtifactMaterializationError, match=message):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="parent",
+            output_clip_id="child",
+            root_frame="origin_relative",
+            rationale="Free text is context, not certification authority.",
+            evidence_method=evidence_method,
+            reviewer=reviewer,
+            root=tmp_path,
+        )
+
+
+def _write_schema2_materialization_parent(
+    root: Path,
+    *,
+    clip_id: str = "materialization_parent",
+    root_pos_z: np.ndarray | None = None,
+    root_frame: str | None = None,
+) -> Path:
+    source_dir = library.clip_dir("g1", clip_id, root=root)
+    clip: dict[str, object] = {
+        "root_pos_z": (
+            np.linspace(0.70, 0.82, 30)
+            if root_pos_z is None
+            else root_pos_z
+        ),
+        "fps": 50.0,
+    }
+    if root_frame is not None:
+        clip["root_frame"] = root_frame
+    source_clip_path = save_clip(
+        source_dir / library.CLIP_FILENAME, clip,
+    )
+    provenance = library.make_provenance(
+        clip_id=clip_id,
+        robot="g1",
+        source={"kind": "test"},
+        license="cc0",
+        attribution="materializer regression fixture",
+        content_sha256_=library.content_sha256(
+            source_clip_path.read_bytes()
+        ),
+    )
+    library.write_provenance(
+        "g1", clip_id, provenance, root=root,
+    )
+    return source_clip_path
+
+
+@pytest.mark.parametrize(
+    "robot", ["../outside", "/tmp/outside", "G1", " g1"],
+)
+def test_materialize_root_frame_rejects_noncanonical_robot_path(
+    tmp_path: Path, robot: str,
+) -> None:
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="invalid robot namespace",
+    ):
+        library.materialize_root_frame_declaration(
+            robot=robot,
+            source_clip_id="parent",
+            output_clip_id="child",
+            root_frame="origin_relative",
+            rationale="Regression fixture declaration.",
+            root=tmp_path,
+        )
+    assert not (tmp_path.parent / "outside" / "child").exists()
+
+
+def test_materialize_root_frame_rejects_symlinked_robot_or_source(
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "references"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    library_root.mkdir()
+    (library_root / "g1").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(
+        library.ArtifactMaterializationError, match="must not be a symlink"
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="parent",
+            output_clip_id="child",
+            root_frame="origin_relative",
+            rationale="Regression fixture declaration.",
+            root=library_root,
+        )
+
+    library_root = tmp_path / "references-with-source-link"
+    robot_dir = library_root / "g1"
+    robot_dir.mkdir(parents=True)
+    source_outside = tmp_path / "source-outside"
+    source_outside.mkdir()
+    (robot_dir / "parent").symlink_to(
+        source_outside, target_is_directory=True,
+    )
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="source reference directory must not be a symlink",
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="parent",
+            output_clip_id="child",
+            root_frame="origin_relative",
+            rationale="Regression fixture declaration.",
+            root=library_root,
+        )
+
+
+def test_materialize_root_frame_uses_one_parent_byte_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor import reference as reference_module
+
+    source_clip_path = _write_schema2_materialization_parent(tmp_path)
+    original_bytes = source_clip_path.read_bytes()
+    with np.load(io.BytesIO(original_bytes), allow_pickle=False) as archive:
+        original_root_z = archive["root_pos_z"].copy()
+
+    replacement_path = save_clip(
+        tmp_path / "replacement.npz",
+        {"root_pos_z": np.linspace(0.2, 0.3, 30), "fps": 50.0},
+    )
+    replacement_bytes = replacement_path.read_bytes()
+    original_load_clip = reference_module.load_clip
+    mutated = False
+
+    def mutate_parent_then_load(path: Path | str) -> dict:
+        nonlocal mutated
+        if not mutated:
+            source_clip_path.write_bytes(replacement_bytes)
+            mutated = True
+        return original_load_clip(path)
+
+    monkeypatch.setattr(
+        reference_module, "load_clip", mutate_parent_then_load,
+    )
+    result = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="materialization_parent",
+        output_clip_id="snapshot_child",
+        root_frame="absolute",
+        rationale="Regression fixture uses absolute world height.",
+        root=tmp_path,
+    )
+
+    assert source_clip_path.read_bytes() == replacement_bytes
+    assert result.provenance["parent_artifact"]["content_sha256"] == (
+        library.content_sha256(original_bytes)
+    )
+    with np.load(result.clip_path, allow_pickle=False) as child:
+        np.testing.assert_array_equal(child["root_pos_z"], original_root_z)
+
+
+def test_materialize_root_frame_directory_swap_cannot_redirect_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_clip_path = _write_schema2_materialization_parent(tmp_path)
+    source_dir = source_clip_path.parent
+    original_root_z = load_clip(source_clip_path)["root_pos_z"].copy()
+    outside_dir = tmp_path / "outside-parent"
+    outside_clip = save_clip(
+        outside_dir / library.CLIP_FILENAME,
+        {"root_pos_z": np.linspace(0.2, 0.3, 30), "fps": 50.0},
+    )
+    outside_provenance = library.make_provenance(
+        clip_id="materialization_parent",
+        robot="g1",
+        source={"kind": "test"},
+        license="cc0",
+        attribution="outside replacement fixture",
+        content_sha256_=library.content_sha256(outside_clip.read_bytes()),
+    )
+    (outside_dir / library.PROVENANCE_FILENAME).write_text(
+        json.dumps(outside_provenance), encoding="utf-8",
+    )
+    detached = source_dir.with_name("detached-parent")
+    original_read_at = library._read_regular_file_at
+    swapped = False
+
+    def swap_directory_then_read(
+        directory_fd: int, name: str, *, required: bool,
+    ) -> bytes | None:
+        nonlocal swapped
+        if not swapped:
+            source_dir.rename(detached)
+            source_dir.symlink_to(outside_dir, target_is_directory=True)
+            swapped = True
+        return original_read_at(directory_fd, name, required=required)
+
+    monkeypatch.setattr(
+        library, "_read_regular_file_at", swap_directory_then_read,
+    )
+    result = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="materialization_parent",
+        output_clip_id="dirfd_child",
+        root_frame="absolute",
+        rationale="Regression fixture uses absolute world height.",
+        root=tmp_path,
+    )
+
+    assert swapped is True
+    np.testing.assert_array_equal(
+        load_clip(result.clip_path)["root_pos_z"], original_root_z,
+    )
+    assert result.provenance["parent_artifact"]["content_sha256"] == (
+        library.content_sha256((detached / library.CLIP_FILENAME).read_bytes())
+    )
+
+
+def test_materialize_root_frame_raced_file_symlink_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_clip_path = _write_schema2_materialization_parent(tmp_path)
+    outside_clip = save_clip(
+        tmp_path / "outside-clip.npz",
+        {"root_pos_z": np.linspace(0.2, 0.3, 30), "fps": 50.0},
+    )
+    original_read_at = library._read_regular_file_at
+    swapped = False
+
+    def swap_file_then_read(
+        directory_fd: int, name: str, *, required: bool,
+    ) -> bytes | None:
+        nonlocal swapped
+        if name == library.CLIP_FILENAME and not swapped:
+            source_clip_path.unlink()
+            source_clip_path.symlink_to(outside_clip)
+            swapped = True
+        return original_read_at(directory_fd, name, required=required)
+
+    monkeypatch.setattr(
+        library, "_read_regular_file_at", swap_file_then_read,
+    )
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="cannot capture source artifact snapshot",
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="materialization_parent",
+            output_clip_id="must_not_publish",
+            root_frame="absolute",
+            rationale="Regression fixture uses absolute world height.",
+            root=tmp_path,
+        )
+    assert swapped is True
+    assert not library.clip_dir(
+        "g1", "must_not_publish", root=tmp_path,
+    ).exists()
+
+
+def test_materialize_root_frame_rejects_duplicate_npz_members(
+    tmp_path: Path,
+) -> None:
+    source_clip_path = _write_schema2_materialization_parent(tmp_path)
+    with np.load(source_clip_path, allow_pickle=False) as source:
+        duplicate_buffer = io.BytesIO()
+        np.save(duplicate_buffer, source["root_pos_z"] + 1.0)
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(source_clip_path, "a") as archive:
+            archive.writestr("root_pos_z.npy", duplicate_buffer.getvalue())
+    provenance = library.make_provenance(
+        clip_id="materialization_parent",
+        robot="g1",
+        source={"kind": "test"},
+        license="cc0",
+        attribution="duplicate-member fixture",
+        content_sha256_=library.content_sha256(source_clip_path.read_bytes()),
+    )
+    library.write_provenance(
+        "g1", "materialization_parent", provenance, root=tmp_path,
+    )
+
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="duplicate NPZ member names",
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="materialization_parent",
+            output_clip_id="duplicate_child",
+            root_frame="absolute",
+            rationale="Regression fixture declaration.",
+            root=tmp_path,
+        )
+
+
+def test_materialize_root_frame_rejects_semantically_invalid_parent(
+    tmp_path: Path,
+) -> None:
+    source_dir = library.clip_dir(
+        "g1", "invalid_parent", root=tmp_path,
+    )
+    source_dir.mkdir(parents=True)
+    source_clip_path = source_dir / library.CLIP_FILENAME
+    source_clip_path.write_bytes(b"not an npz archive")
+    provenance = library.make_provenance(
+        clip_id="invalid_parent",
+        robot="g1",
+        source={"kind": "test"},
+        license="cc0",
+        attribution="invalid fixture",
+        content_sha256_=library.content_sha256(source_clip_path.read_bytes()),
+    )
+    library.write_provenance(
+        "g1", "invalid_parent", provenance, root=tmp_path,
+    )
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="invalid source clip snapshot",
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="invalid_parent",
+            output_clip_id="invalid_child",
+            root_frame="absolute",
+            rationale="Regression fixture declaration.",
+            root=tmp_path,
+        )
+
+
+def test_materialize_root_frame_rejects_existing_declaration(
+    tmp_path: Path,
+) -> None:
+    _write_schema2_materialization_parent(
+        tmp_path, root_frame="absolute",
+    )
+    with pytest.raises(
+        library.ArtifactMaterializationError,
+        match="already declares root_frame",
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="materialization_parent",
+            output_clip_id="redundant_child",
+            root_frame="absolute",
+            rationale="Regression fixture declaration.",
+            root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("license", ["MIT"], "license must be non-empty text"),
+        ("attribution", {"name": "fixture"}, "attribution must be non-empty text"),
+        ("qc", ["bad"], "qc must be an object"),
+        ("labels", ["hop", 7], "labels must be a list of text"),
+        ("joint_mapping", ["bad"], "joint_mapping must be an object"),
+    ],
+)
+def test_materialize_root_frame_rejects_malformed_parent_metadata(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    _write_schema2_materialization_parent(tmp_path)
+    provenance_path = (
+        library.clip_dir("g1", "materialization_parent", root=tmp_path)
+        / library.PROVENANCE_FILENAME
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance[field_name] = invalid_value
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(
+        library.ArtifactMaterializationError, match=message,
+    ):
+        library.materialize_root_frame_declaration(
+            robot="g1",
+            source_clip_id="materialization_parent",
+            output_clip_id="malformed_child",
+            root_frame="absolute",
+            rationale="Regression fixture uses absolute world height.",
+            root=tmp_path,
+        )
+    assert not library.clip_dir(
+        "g1", "malformed_child", root=tmp_path,
+    ).exists()
+
+
+def test_directory_publication_never_replaces_existing_destination(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "source-marker").write_text("source", encoding="utf-8")
+    (destination / "destination-marker").write_text(
+        "destination", encoding="utf-8",
+    )
+
+    with pytest.raises(FileExistsError):
+        library._rename_directory_noreplace(source, destination)
+    assert (source / "source-marker").read_text(encoding="utf-8") == "source"
+    assert (
+        destination / "destination-marker"
+    ).read_text(encoding="utf-8") == "destination"
+
+
+@pytest.mark.parametrize("failure_type", [OSError, AttributeError])
+def test_materialize_root_frame_reports_index_refresh_failure_after_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    _write_schema2_materialization_parent(tmp_path)
+
+    def fail_index(*, root: Path) -> list[dict]:
+        raise failure_type(f"simulated index failure under {root}")
+
+    monkeypatch.setattr(library, "_rebuild_index_unlocked", fail_index)
+    result = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="materialization_parent",
+        output_clip_id="published_child",
+        root_frame="absolute",
+        rationale="Regression fixture uses absolute world height.",
+        root=tmp_path,
+    )
+
+    assert result.clip_path.is_file()
+    assert result.provenance_path.is_file()
+    assert result.index_refresh_error is not None
+    assert "simulated index failure" in result.index_refresh_error
+
+
+def test_materialize_root_frame_fsyncs_staged_and_published_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_schema2_materialization_parent(tmp_path)
+    observed: list[Path] = []
+    original_fsync_directory = library._fsync_directory
+
+    def record_fsync(path: Path) -> None:
+        observed.append(Path(path))
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(library, "_fsync_directory", record_fsync)
+    result = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="materialization_parent",
+        output_clip_id="durable_child",
+        root_frame="absolute",
+        rationale="Regression fixture uses absolute world height.",
+        root=tmp_path,
+    )
+
+    assert result.clip_path.parent.parent in observed
+    assert any(path.name == "durable_child" for path in observed)
+
+
+def test_cli_declare_root_frame_materializes_new_tierk_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    from sculptor.cli import app
+
+    _write_schema2_materialization_parent(tmp_path)
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path))
+    result = CliRunner().invoke(
+        app,
+        [
+            "refs", "declare-root-frame",
+            "--robot", "g1",
+            "--source-clip", "materialization_parent",
+            "--output-clip", "declared_child",
+            "--root-frame", "absolute",
+            "--rationale", "Fixture values are absolute world heights.",
+            "--evidence-method", "visual_inspection",
+            "--reviewer", "test-suite",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Tier K only" in result.output
+    provenance = library.read_provenance(
+        "g1", "declared_child", root=tmp_path,
+    )
+    assert provenance["tier"] == "K"
+    assert provenance["parent_clip_id"] == "materialization_parent"
+    assert provenance["source"]["evidence"] == {
+        "schema": library.ROOT_FRAME_DECLARATION_EVIDENCE_SCHEMA,
+        "method": "visual_inspection",
+        "inspected_source_artifact_sha256": provenance[
+            "parent_artifact"
+        ]["content_sha256"],
+        "reviewer": "test-suite",
+        "assertion_version": (
+            library.ROOT_FRAME_DECLARATION_ASSERTION_VERSION
+        ),
+        "asserted_root_frame": "absolute",
+    }
 
 
 # ── segmentation (§decision 6) ────────────────────────────────────────────

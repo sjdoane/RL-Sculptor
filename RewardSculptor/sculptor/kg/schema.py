@@ -123,6 +123,7 @@ class Relation(str, enum.Enum):
     ATTESTS        = "ATTESTS"        # ArtifactAttestation → immutable artifact
     PRODUCED       = "PRODUCED"       # TrainingRun → output PolicyArtifact
     USES_MODE_EXECUTION = "USES_MODE_EXECUTION"  # TrainingRun → ModeExecutionArtifact
+    HAS_ITERATION  = "HAS_ITERATION"  # TrainingRun → TrainingIteration
     GROUNDS_CAPABILITY = "GROUNDS_CAPABILITY"  # Paper → ResearchCapability
     HAS_IMPLEMENTATION_STATUS = "HAS_IMPLEMENTATION_STATUS"  # ResearchCapability → ImplementationStatus
 
@@ -487,6 +488,22 @@ class TrainingRun:
 
 
 @dataclass
+class TrainingIteration:
+    """One ordered execution unit inside a concrete training invocation.
+
+    Run-level edges remain useful summaries, but they cannot distinguish two
+    iterations that used different policy inputs, worlds, or mode executors.
+    This node is the collision-safe join point for those observed facts.
+    """
+    kind: ClassVar[str] = "TrainingIteration"
+    id: str
+    project: str
+    run_id: str
+    iteration_index: int
+    provenance: str = PROVENANCE_OBSERVED_RUN
+
+
+@dataclass
 class Edge:
     src: str
     dst: str
@@ -585,6 +602,17 @@ def make_training_run_id(project: str, run_id: str) -> str:
     return f"training-run:{_slugify(project)}:{_slugify(run_id)}"
 
 
+def make_training_iteration_id(
+    project: str, run_id: str, iteration_index: int,
+) -> str:
+    if isinstance(iteration_index, bool) or int(iteration_index) < 0:
+        raise ValueError("training iteration index must be a non-negative integer")
+    return (
+        f"training-iteration:{_slugify(project)}:{_slugify(run_id)}:"
+        f"{int(iteration_index)}"
+    )
+
+
 # ── Serialization helpers ───────────────────────────────────────────────────
 NODE_TYPES: dict[str, type] = {
     cls.kind: cls  # type: ignore[attr-defined]
@@ -594,7 +622,7 @@ NODE_TYPES: dict[str, type] = {
         RunCase, PolicyArtifact, ReferenceMotion, WorldArtifact,
         ModeExecutionArtifact,
         ArtifactAttestation,
-        RobotEmbodiment, SoftwareEnvironment, TrainingRun,
+        RobotEmbodiment, SoftwareEnvironment, TrainingRun, TrainingIteration,
     )
 }
 

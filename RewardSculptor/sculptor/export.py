@@ -720,7 +720,7 @@ def export_reference_starting_skill_bundle(
     policy, Python, pickle, and raw checkpoint bytes are never included.
 
     A reference-only import is still a candidate.  The researcher must run a
-    separate target-project Tier-D physics-tracking certification job before
+    separate target-project Tier-D exact-schedule tracking evidence job before
     live launch.  Launch only re-verifies the resulting exact evidence; it
     does not create a certificate, and this transfer artifact claims none.
     """
@@ -839,7 +839,7 @@ def export_reference_starting_skill_bundle(
     source_provenance_sha = reference_source_provenance_sha256(provenance)
     warnings = [
         "This upload registers a reference candidate only. Run a separate "
-        "target-project Tier-D physics-tracking certification job before live "
+        "target-project Tier-D exact-schedule tracking evidence job before live "
         "launch; launch only re-verifies the resulting exact evidence."
     ]
     manifest: dict[str, Any] = {

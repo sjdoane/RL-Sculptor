@@ -49,6 +49,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import re
 from typing import Any, Mapping, Optional, Sequence
 
@@ -63,6 +64,7 @@ from sculptor.modes import (
     validate_mode_execution_manifest,
     validate_phase_window_execution_graph,
 )
+from sculptor.reference_clock import reference_playback_duration_s
 
 #: Identifier-safe form of a mode name, for the generated function names.
 _IDENT_RE = re.compile(r"[^0-9a-zA-Z_]+")
@@ -140,7 +142,7 @@ def scale_windows(
     Kept for reading and diagnosing older generated rewards. New generation
     preserves certified clip cadence and declares terminal holds. A caller
     that truly needs a retimed motion must materialize new clip bytes and
-    obtain a new dynamics certificate.
+    obtain a new Tier-D tracking certificate for those new bytes.
 
     """
     if time_scale <= 0.0 or abs(time_scale - 1.0) < 1e-12:
@@ -225,11 +227,13 @@ def _stub_body_batched(mode: Mode) -> str:
 
 
 def _tracking_block(clip: Mapping[str, Any], n_phase: int,
+                    clip_id: str = "",
+                    robot: str = "",
                     placeholder: bool = False,
                     time_scale: float = 1.0,
-                    tracking_weight: float = 1.0) -> tuple[str, str, str]:
-    """`(constants, scalar_fns, batched_fns)` for the reference-tracking
-    backbone, or three empty strings when `clip` is None.
+                    tracking_weight: float = 1.0,
+                    ) -> tuple[str, str, str, dict[str, Any]]:
+    """Generated tracking code plus its immutable policy clock descriptor.
 
     This is the same two-Gaussian-plus-orientation formula
     `sculptor.refs.track` emits, deliberately reproduced rather than improved
@@ -263,7 +267,9 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int,
     import numpy as np
 
     from sculptor.refs.track import (JOINT_ERR_WEIGHT, ORIENTATION_ERR_WEIGHT,
+                                     REFERENCE_TARGET_SAMPLING,
                                      ROOT_ERR_WEIGHT, _format_array_literal,
+                                     clip_root_frame,
                                      downsample_phase_targets,
                                      projected_gravity_from_quat)
 
@@ -278,7 +284,11 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int,
     # Scaled by the SAME factor as the mode windows. If only one of the two
     # were stretched, the mode gate and the phase clock would disagree and the
     # backbone would be tracking a different instant than the mode being paid.
-    duration_s = (n_frames / fps if fps > 0 else 0.0) * float(time_scale)
+    from sculptor.reference_clock import reference_playback_duration_s
+
+    duration_s = reference_playback_duration_s(
+        frame_count=n_frames, fps=fps,
+    ) * float(time_scale)
     joint_pos = downsample_phase_targets(
         np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase)
     root_z = downsample_phase_targets(
@@ -297,6 +307,44 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int,
             f"np.asarray({_format_array_literal(gravity)}, dtype=np.float64)"
             f".reshape(N_PHASE, 3)")
         orientation_weight = ORIENTATION_ERR_WEIGHT
+
+    from sculptor.reference_clock import (
+        build_reference_clock,
+        reference_target_sha256,
+    )
+
+    hash_joint_pos = (
+        np.zeros_like(joint_pos) if placeholder else np.round(joint_pos, 5)
+    )
+    hash_root_z = (
+        np.zeros_like(root_z) if placeholder else np.round(root_z, 5)
+    )
+    hash_gravity = None
+    if quat is not None:
+        hash_gravity = (
+            np.tile(
+                np.asarray([0.0, 0.0, -1.0], dtype=np.float64),
+                (n_phase, 1),
+            )
+            if placeholder
+            else np.round(gravity, 5)
+        )
+    root_frame = clip_root_frame(dict(clip))
+    target_hash = reference_target_sha256({
+        "joint_names": [str(name) for name in joint_names],
+        "joint_pos": hash_joint_pos.tolist(),
+        "root_z": hash_root_z.tolist(),
+        "root_frame": root_frame,
+        "gravity": hash_gravity.tolist() if hash_gravity is not None else None,
+    })
+    reference_clock = build_reference_clock(
+        clip_id=clip_id,
+        robot=robot,
+        target_sha256=target_hash,
+        phase_mode="hold",
+        phase_duration_s=duration_s,
+        n_phase_targets=n_phase,
+    )
 
     joint_literal = (f"np.asarray({_format_array_literal(joint_pos)}, "
                      f"dtype=np.float64).reshape(N_PHASE, N_JOINTS)")
@@ -327,6 +375,8 @@ JOINT_NAMES = {joint_names!r}
 N_JOINTS = {len(joint_names)}
 N_PHASE = {n_phase}
 REFERENCE_DURATION_S = {duration_s!r}
+REFERENCE_ROOT_FRAME = {root_frame!r}
+REFERENCE_TARGET_SAMPLING = {REFERENCE_TARGET_SAMPLING!r}
 JOINT_ERR_WEIGHT = {JOINT_ERR_WEIGHT!r}
 ROOT_ERR_WEIGHT = {ROOT_ERR_WEIGHT!r}
 # 0.0 when the clip carries no root orientation, making the term an exact
@@ -344,7 +394,7 @@ TARGET_GRAVITY = {gravity_literal}
 '''
 
     scalar = '''
-def _phase_index(info) -> int:
+def reference_clock_scalar(info) -> float:
     """Where in the WHOLE composite we are — not where in the mode.
 
     The tracking target is the reference's own frame at this instant, and the
@@ -352,7 +402,11 @@ def _phase_index(info) -> int:
     """
     t = _elapsed_s(info)
     phase = (t / REFERENCE_DURATION_S) if REFERENCE_DURATION_S > 0.0 else 0.0
-    return int(min(max(phase, 0.0), 0.999999) * N_PHASE)
+    return min(max(phase, 0.0), 0.999999)
+
+
+def _phase_index(info) -> int:
+    return int(reference_clock_scalar(info) * N_PHASE)
 
 
 def _tracking(next_state, info):
@@ -386,9 +440,13 @@ def _tracking(next_state, info):
     # vector; a joints-only row has no root at index 2 to read.
     root0 = float(TARGET_ROOT_Z[0])
     if "base_height_delta" in info or "base_height" in info:
-        actual_delta = float(info.get(
-            "base_height_delta", float(info.get("base_height", root0)) - root0))
-        root_err = actual_delta - (float(TARGET_ROOT_Z[i]) - root0)
+        base_height = float(info.get("base_height", root0))
+        if REFERENCE_ROOT_FRAME == "absolute":
+            root_err = base_height - float(TARGET_ROOT_Z[i])
+        else:
+            actual_delta = float(info.get(
+                "base_height_delta", base_height - root0))
+            root_err = actual_delta - (float(TARGET_ROOT_Z[i]) - root0)
     elif qpos.shape[0] >= 7 + N_JOINTS:
         root_err = float(qpos[2]) - float(TARGET_ROOT_Z[i])
     else:
@@ -410,6 +468,22 @@ def _tracking(next_state, info):
 '''
 
     batched = '''
+def reference_clock_batched(info, like):
+    import torch
+
+    t = _elapsed_s_batched(like, info)
+    phase = torch.clamp(t / REFERENCE_DURATION_S, 0.0, 0.999999) \\
+        if REFERENCE_DURATION_S > 0.0 else torch.zeros_like(like)
+    return (phase + torch.zeros_like(like))[:, None]
+
+
+def reference_target_index_batched(info, like):
+    import torch
+
+    phase = reference_clock_batched(info, like)[:, 0]
+    return torch.clamp((phase * N_PHASE).long(), 0, N_PHASE - 1)
+
+
 def _tracking_batched(next_state, info, like):
     """The training path's backbone.
 
@@ -429,10 +503,7 @@ def _tracking_batched(next_state, info, like):
         raise ValueError(
             f"batched qpos has {qpos.shape[-1]} columns, fewer than the "
             f"{N_JOINTS} tracked joints")
-    t = _elapsed_s_batched(like, info)
-    phase = torch.clamp(t / REFERENCE_DURATION_S, 0.0, 0.999999) \\
-        if REFERENCE_DURATION_S > 0.0 else torch.zeros_like(like)
-    i = torch.clamp((phase * N_PHASE).long(), 0, N_PHASE - 1)
+    i = reference_target_index_batched(info, like)
 
     target_joint = torch.as_tensor(
         TARGET_JOINT_POS, device=qpos.device, dtype=qpos.dtype)[i]
@@ -444,8 +515,12 @@ def _tracking_batched(next_state, info, like):
         TARGET_ROOT_Z, device=qpos.device, dtype=qpos.dtype)[i]
     root0 = float(TARGET_ROOT_Z[0])
     base_height = info.get("base_height", torch.zeros_like(like))
-    actual_delta = info.get("base_height_delta", base_height - root0)
-    root_term = torch.exp(-ROOT_ERR_WEIGHT * (actual_delta - (target_root - root0)) ** 2)
+    if REFERENCE_ROOT_FRAME == "absolute":
+        root_err = base_height - target_root
+    else:
+        actual_delta = info.get("base_height_delta", base_height - root0)
+        root_err = actual_delta - (target_root - root0)
+    root_term = torch.exp(-ROOT_ERR_WEIGHT * root_err ** 2)
 
     components = {"joint_tracking": joint_term, "root_tracking": root_term}
     if TARGET_GRAVITY is not None:
@@ -464,7 +539,7 @@ def _tracking_batched(next_state, info, like):
     return total, components
 
 '''
-    return constants, scalar, batched
+    return constants, scalar, batched, reference_clock
 
 
 def generate_mode_reward_scaffold(
@@ -473,6 +548,7 @@ def generate_mode_reward_scaffold(
     behavior_goal: str = "",
     goal_by_mode: Optional[Mapping[str, str]] = None,
     clip_id: str = "",
+    robot: str = "",
     clip: Optional[Mapping[str, Any]] = None,
     n_phase: int = 32,
     placeholder_targets: bool = False,
@@ -526,23 +602,43 @@ def generate_mode_reward_scaffold(
     # Stretching the windows to fill an episode creates an uncertified motion
     # while retaining the old content identity. Execute in clip time and make
     # any remaining budget an explicit terminal hold instead.
-    clip_duration_s = max(
+    graph_duration_s = max(
         (float(hi) for _, hi in windows.values()), default=0.0
     )
+    clip_duration_s = graph_duration_s
+    if clip is not None:
+        try:
+            clip_duration_s = reference_playback_duration_s(
+                frame_count=len(clip["joint_pos"]),
+                fps=float(clip["fps"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModeError(
+                "reference-tracking scaffold requires valid joint_pos/fps "
+                "duration evidence"
+            ) from exc
+        if clip_duration_s > graph_duration_s + 1e-6:
+            raise ModeError(
+                f"exact reference duration {clip_duration_s:g}s exceeds the "
+                f"mode graph duration {graph_duration_s:g}s"
+            )
     horizon_s = float(horizon_s) if horizon_s and horizon_s > 0.0 else None
-    if horizon_s is not None and horizon_s + 1e-6 < clip_duration_s:
+    if horizon_s is not None and horizon_s + 1e-6 < graph_duration_s:
         raise ModeError(
             f"episode horizon {horizon_s:g}s is shorter than the certified "
-            f"motion ({clip_duration_s:g}s); truncate/materialize the motion "
+            f"motion schedule ({graph_duration_s:g}s); truncate/materialize "
+            "the motion "
             "and obtain a new Tier-D certificate rather than silently "
             "retiming it"
         )
     time_scale = 1.0
     terminal_hold_s = max(
-        0.0, (horizon_s or clip_duration_s) - clip_duration_s
+        0.0, (horizon_s or graph_duration_s) - clip_duration_s
     )
     execution_manifest = build_mode_execution_manifest(
-        graph, terminal_hold_s=terminal_hold_s,
+        graph,
+        terminal_hold_s=terminal_hold_s,
+        certified_clip_duration_s=clip_duration_s,
     )
     execution_windows = execution_manifest.window_map
     goals = dict(goal_by_mode or {})
@@ -563,11 +659,30 @@ def generate_mode_reward_scaffold(
         for name in order)
 
     has_track = clip is not None
-    track_const, track_scalar, track_batched = (
-        _tracking_block(clip, int(n_phase), bool(placeholder_targets),
+    reference_clip_id = str(clip_id or (
+        clip.get("clip_id") if isinstance(clip, Mapping) else "") or ""
+    )
+    reference_robot = str(robot or (
+        clip.get("robot") if isinstance(clip, Mapping) else "") or ""
+    )
+    if has_track and (
+        not reference_clip_id.strip() or not reference_robot.strip()
+    ):
+        raise ModeError(
+            "reference-tracking scaffold requires non-empty clip_id and robot"
+        )
+    track_const, track_scalar, track_batched, reference_clock = (
+        _tracking_block(
+            clip, int(n_phase), clip_id=reference_clip_id,
+            robot=reference_robot,
+            placeholder=bool(placeholder_targets),
                         time_scale=time_scale,
                         tracking_weight=float(tracking_weight))
-        if has_track else ("", "", ""))
+        if has_track else ("", "", "", {}))
+    reference_clock_spec = (
+        f'    "reference_clock": {reference_clock!r},\n'
+        if has_track else ""
+    )
     # The calls are spliced rather than always emitted-and-zeroed: a stubs-only
     # scaffold must not require `qpos` in the contract, since it does not read
     # the state at all.
@@ -580,7 +695,7 @@ def generate_mode_reward_scaffold(
         "    total = total + track_total\n"
         "    components.update(track_components)\n") if has_track else ""
 
-    return f'''"""Auto-generated per-mode reward scaffold{f" for clip {clip_id!r}" if clip_id else ""}.
+    source = f'''"""Auto-generated per-mode reward scaffold{f" for clip {clip_id!r}" if clip_id else ""}.
 
 Generated by `sculptor.mode_rewards.generate_mode_reward_scaffold` from a
 validated `ModeGraph`. The mode gating below is DERIVED, not authored — both
@@ -612,7 +727,7 @@ REWARD_SPEC: dict = {{
     # chain, and without the id the UI could not re-open the per-mode panel on
     # its own reward — it had to make the user search the clip library for it
     # by hand, twice.
-    "reference_clip_id": {clip_id!r},
+    "reference_clip_id": {reference_clip_id!r},
     # The episode budget is provenance, not a retiming instruction. The
     # reference cadence remains 1.0 and any remainder is an explicit hold of
     # the terminal mode and final reference frame.
@@ -627,6 +742,7 @@ REWARD_SPEC: dict = {{
     # Explicit capability bit for API/UI consumers. Inferring this by grepping
     # generated source made task-only scaffolds look like imitation rewards.
     "tracking_enabled": {has_track!r},
+{reference_clock_spec}    "reference_robot": {reference_robot!r},
     "hyperparameters": {{}},
     "references": [],
 }}
@@ -813,6 +929,13 @@ def compute_reward_batched(state, action, next_state, info):
     components["active_mode_index"] = index
 {track_call_b}    return total, components
 '''
+    if has_track:
+        spec = reward_spec_from_source(source)
+        spec["tracking_backbone"] = mode_tracking_backbone_contract_from_source(
+            source
+        )
+        source = _rewrite_reward_spec(source, spec)
+    return source
 
 
 def _fn_span(source: str, fn_name: str) -> Optional[tuple[int, int]]:
@@ -1017,6 +1140,7 @@ def authoring_twin_source(
     clip: Optional[Mapping[str, Any]] = None,
     behavior_goal: str = "",
     clip_id: str = "",
+    robot: str = "",
     n_phase: int = 4,
     horizon_s: Optional[float] = None,
     tracking_weight: float = 1.0,
@@ -1048,10 +1172,23 @@ def authoring_twin_source(
     # `horizon_s` and `tracking_weight` must match the module the bodies are
     # grafted back into, or the twin gates on different windows — and reports a
     # different backbone magnitude — than the real thing.
-    return _strip_prose(generate_mode_reward_scaffold(
-        graph, behavior_goal=behavior_goal, clip_id=clip_id, clip=clip,
+    source = _strip_prose(generate_mode_reward_scaffold(
+        graph, behavior_goal=behavior_goal, clip_id=clip_id, robot=robot,
+        clip=clip,
         n_phase=n_phase, placeholder_targets=True, horizon_s=horizon_s,
         tracking_weight=tracking_weight))
+    # `_strip_prose` removes function docstrings, which intentionally changes
+    # the frozen AST digest even though this authoring twin is never executed.
+    # Keep the twin internally self-consistent so validation can still prove
+    # that the model only authored mode bodies before those bodies are grafted
+    # into the real, target-bearing module.
+    spec = reward_spec_from_source(source)
+    if spec.get("tracking_enabled"):
+        spec["tracking_backbone"] = mode_tracking_backbone_contract_from_source(
+            source
+        )
+        source = _rewrite_reward_spec(source, spec)
+    return source
 
 
 def _horizon_of(source: str) -> Optional[float]:
@@ -1272,9 +1409,8 @@ def validate_mode_reward_source(source: str, graph: ModeGraph) -> list[str]:
     # New scaffolds publish the authoritative train/eval schedule. Keep legacy
     # modules readable, but when the manifest exists it must agree with both the
     # graph and the literal the reward actually dispatches against.
-    raw_manifest = reward_spec_from_source(source).get(
-        "mode_execution_manifest"
-    )
+    source_spec = reward_spec_from_source(source)
+    raw_manifest = source_spec.get("mode_execution_manifest")
     if raw_manifest is not None:
         from sculptor.modes import (
             ModeExecutionManifest,
@@ -1292,6 +1428,24 @@ def validate_mode_reward_source(source: str, graph: ModeGraph) -> list[str]:
                     "REWARD_SPEC mode_execution_manifest windows do not match "
                     "MODE_WINDOWS_S — training and evaluation would use "
                     "different schedules"
+                )
+    if source_spec.get("tracking_enabled"):
+        stored_backbone = source_spec.get("tracking_backbone")
+        try:
+            observed_backbone = mode_tracking_backbone_contract_from_source(
+                source
+            )
+        except (ModeError, ValueError) as exc:
+            errors.append(f"tracking backbone is invalid: {exc}")
+        else:
+            if not isinstance(stored_backbone, Mapping):
+                errors.append(
+                    "REWARD_SPEC.tracking_backbone is missing"
+                )
+            elif dict(stored_backbone) != observed_backbone:
+                errors.append(
+                    "REWARD_SPEC.tracking_backbone is stale relative to "
+                    "the immutable targets/schedule/dispatch/compute runtime"
                 )
     return errors
 
@@ -1873,8 +2027,10 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
         graph, mode, behavior_goal=behavior_goal, mode_goal=mode_goal,
         windows=windows_in_source(source) or None, task_brief=mission)
 
+    source_spec = reward_spec_from_source(source)
     twin_source = authoring_twin_source(
         graph, clip=clip, behavior_goal=behavior_goal, clip_id=clip_id,
+        robot=str(source_spec.get("reference_robot") or ""),
         horizon_s=_horizon_of(source),
         tracking_weight=_tracking_weight_of(source))
     already = [n for n, ok in authored_modes(source).items() if ok]
@@ -1938,6 +2094,240 @@ def _canonical_json_sha256(value: Any) -> str:
             f"{type(exc).__name__}: {exc}"
         ) from exc
     return hashlib.sha256(payload).hexdigest()
+
+
+_TRACKING_BACKBONE_ASSIGNMENTS = frozenset({
+    # Schedule and dispatch are execution authority, not authorable reward
+    # content. If any of these drift, training no longer executes the admitted
+    # ModeExecutionManifest even when every reference target stays unchanged.
+    "MODE_WINDOWS_S",
+    "MODE_ORDER",
+    "_MODE_FNS",
+    "_MODE_FNS_BATCHED",
+    "JOINT_NAMES",
+    "N_JOINTS",
+    "N_PHASE",
+    "REFERENCE_DURATION_S",
+    "REFERENCE_ROOT_FRAME",
+    "REFERENCE_TARGET_SAMPLING",
+    "JOINT_ERR_WEIGHT",
+    "ROOT_ERR_WEIGHT",
+    "ORIENTATION_ERR_WEIGHT",
+    "TRACKING_W",
+    "TARGET_JOINT_POS",
+    "TARGET_ROOT_Z",
+    "TARGET_GRAVITY",
+    "DEFAULT_STEP_DT",
+})
+_TRACKING_BACKBONE_FUNCTIONS = frozenset({
+    "_elapsed_s",
+    "_elapsed_s_batched",
+    "active_mode",
+    "_batch_like",
+    "_mode_masks",
+    "reference_clock_scalar",
+    "_phase_index",
+    "reference_clock_batched",
+    "reference_target_index_batched",
+    "_tracking",
+    "_tracking_batched",
+    "compute_reward",
+    "compute_reward_batched",
+})
+
+
+def _assignment_name(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        target = node.targets[0]
+    elif isinstance(node, ast.AnnAssign):
+        target = node.target
+    else:
+        return None
+    return target.id if isinstance(target, ast.Name) else None
+
+
+def _literal_array_payload(
+    node: ast.AST,
+    *,
+    n_phase: int,
+    n_joints: int,
+    kind: str,
+) -> Any:
+    """Read an emitted numpy literal without importing the reward module."""
+    current = node
+    while (
+        isinstance(current, ast.Call)
+        and isinstance(current.func, ast.Attribute)
+        and current.func.attr == "reshape"
+    ):
+        current = current.func.value
+    if isinstance(current, ast.Constant) and current.value is None:
+        return None
+    if (
+        isinstance(current, ast.Call)
+        and isinstance(current.func, ast.Attribute)
+        and current.func.attr in {"asarray", "array"}
+        and current.args
+    ):
+        try:
+            return ast.literal_eval(current.args[0])
+        except (TypeError, ValueError) as exc:
+            raise ModeError(
+                "tracking target table is not immutable literal data"
+            ) from exc
+    if (
+        isinstance(current, ast.Call)
+        and isinstance(current.func, ast.Attribute)
+        and current.func.attr == "zeros"
+    ):
+        if kind == "joint_pos":
+            return [[0.0] * n_joints for _ in range(n_phase)]
+        if kind == "root_z":
+            return [0.0] * n_phase
+    if (
+        isinstance(current, ast.Call)
+        and isinstance(current.func, ast.Attribute)
+        and current.func.attr == "tile"
+        and kind == "gravity"
+    ):
+        return [[0.0, 0.0, -1.0] for _ in range(n_phase)]
+    raise ModeError("tracking target table is not a supported immutable literal")
+
+
+def mode_tracking_backbone_contract_from_source(
+    source: str,
+) -> Optional[dict[str, Any]]:
+    """Re-derive the complete immutable tracking authority from source.
+
+    Mode bodies are deliberately excluded so researchers can author them.
+    Every target table, kernel scalar, schedule/mask/dispatch function, and
+    scalar or batched compute entry point is included. A promoted reward
+    therefore cannot alter its motion prior *or bypass when/how it executes*
+    while retaining the old clip/mode binding. Only ``_mode_*`` authoring
+    bodies and their tightly scoped helpers remain outside this authority.
+    """
+    from sculptor.reference_clock import (
+        reference_clock_from_reward_source,
+        reference_target_sha256,
+    )
+    from sculptor.refs.track import REFERENCE_TARGET_SAMPLING
+
+    clock = reference_clock_from_reward_source(source)
+    if clock is None:
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise ModeError("tracking reward source is not valid Python") from exc
+    assignments: dict[str, ast.AST] = {}
+    frozen_nodes: list[ast.AST] = []
+    seen_functions: set[str] = set()
+    for node in tree.body:
+        name = _assignment_name(node)
+        if name in _TRACKING_BACKBONE_ASSIGNMENTS:
+            value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+            assert value is not None
+            assignments[name] = value
+            frozen_nodes.append(node)
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in _TRACKING_BACKBONE_FUNCTIONS
+        ):
+            seen_functions.add(node.name)
+            frozen_nodes.append(node)
+    missing_assignments = sorted(
+        _TRACKING_BACKBONE_ASSIGNMENTS - set(assignments)
+    )
+    missing_functions = sorted(
+        _TRACKING_BACKBONE_FUNCTIONS - seen_functions
+    )
+    if missing_assignments or missing_functions:
+        raise ModeError(
+            "tracking backbone is incomplete: "
+            f"missing assignments={missing_assignments}, "
+            f"missing functions={missing_functions}"
+        )
+    try:
+        joint_names = ast.literal_eval(assignments["JOINT_NAMES"])
+        n_joints = int(ast.literal_eval(assignments["N_JOINTS"]))
+        n_phase = int(ast.literal_eval(assignments["N_PHASE"]))
+        duration_s = float(ast.literal_eval(assignments["REFERENCE_DURATION_S"]))
+        root_frame = str(ast.literal_eval(assignments["REFERENCE_ROOT_FRAME"]))
+        target_sampling = str(ast.literal_eval(
+            assignments["REFERENCE_TARGET_SAMPLING"]
+        ))
+        kernel = {
+            key: float(ast.literal_eval(assignments[key]))
+            for key in (
+                "JOINT_ERR_WEIGHT",
+                "ROOT_ERR_WEIGHT",
+                "ORIENTATION_ERR_WEIGHT",
+                "TRACKING_W",
+            )
+        }
+        target_joint_pos = _literal_array_payload(
+            assignments["TARGET_JOINT_POS"],
+            n_phase=n_phase,
+            n_joints=n_joints,
+            kind="joint_pos",
+        )
+        target_root_z = _literal_array_payload(
+            assignments["TARGET_ROOT_Z"],
+            n_phase=n_phase,
+            n_joints=n_joints,
+            kind="root_z",
+        )
+        target_gravity = _literal_array_payload(
+            assignments["TARGET_GRAVITY"],
+            n_phase=n_phase,
+            n_joints=n_joints,
+            kind="gravity",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ModeError(
+            "tracking backbone constants are not immutable literal data"
+        ) from exc
+    if (
+        not isinstance(joint_names, list)
+        or len(joint_names) != n_joints
+        or not all(isinstance(name, str) and name for name in joint_names)
+        or n_phase != clock["n_phase_targets"]
+        or not math.isclose(duration_s, clock["phase_duration_s"], abs_tol=1e-12)
+        or root_frame not in {"absolute", "origin_relative"}
+        or target_sampling != REFERENCE_TARGET_SAMPLING
+    ):
+        raise ModeError(
+            "tracking backbone dimensions/duration/sampling disagree with "
+            "reference clock"
+        )
+    target_payload = {
+        "joint_names": joint_names,
+        "joint_pos": target_joint_pos,
+        "root_z": target_root_z,
+        "root_frame": root_frame,
+        "gravity": target_gravity,
+    }
+    target_sha = reference_target_sha256(target_payload)
+    if target_sha != clock["reference_target_sha256"]:
+        raise ModeError(
+            "tracking TARGET_* tables disagree with reference clock target hash"
+        )
+    frozen_module = ast.Module(body=frozen_nodes, type_ignores=[])
+    frozen_ast_sha = hashlib.sha256(
+        ast.dump(
+            frozen_module,
+            annotate_fields=True,
+            include_attributes=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema": 3,
+        "target_sampling": target_sampling,
+        "reference_clock": clock,
+        "target_sha256": target_sha,
+        "kernel": kernel,
+        "frozen_ast_sha256": frozen_ast_sha,
+    }
 
 
 def mode_execution_manifest_digest(value: Mapping[str, Any]) -> str:
@@ -2010,8 +2400,29 @@ def mode_reward_binding_errors(
     context_refs: Mapping[str, str],
     graph_sha256: Optional[str] = None,
     graph: Optional[ModeGraph] = None,
+    reward_source: Optional[str] = None,
 ) -> list[str]:
     """Explain why a promoted phase reward is not reusable for this run."""
+    if spec.get("tracking_enabled"):
+        if reward_source is None:
+            return [
+                "active reward source is required to verify the frozen "
+                "tracking backbone"
+            ]
+        try:
+            observed_backbone = mode_tracking_backbone_contract_from_source(
+                reward_source
+            )
+        except (ModeError, ValueError) as exc:
+            return [f"active tracking backbone is invalid: {exc}"]
+        stored_backbone = spec.get("tracking_backbone")
+        if not isinstance(stored_backbone, Mapping):
+            return ["REWARD_SPEC.tracking_backbone is missing"]
+        if dict(stored_backbone) != observed_backbone:
+            return [
+                "active reward targets/schedule/dispatch/compute runtime "
+                "differs from the frozen tracking backbone"
+            ]
     binding = spec.get("mode_binding")
     manifest = spec.get("mode_execution_manifest")
     if not isinstance(binding, Mapping):

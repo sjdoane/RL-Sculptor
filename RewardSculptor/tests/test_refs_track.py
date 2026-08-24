@@ -10,9 +10,14 @@ directly; the real GPU tracking pass is the orchestrator's job later
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import os
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,11 +25,17 @@ import numpy as np
 import pytest
 
 from sculptor.reference import save_clip
+from sculptor.reference_clock import (
+    reference_clock_from_reward_source,
+    reference_playback_duration_s,
+)
+from sculptor.runtime_inputs import environment_artifacts_for_phase
 from sculptor.refs import library
 from sculptor.refs.track import (
     DEFAULT_ITERATIONS,
     MEAN_JOINT_ERR_THRESHOLD_RAD,
     MIN_REFERENCE_MOTION_RAD,
+    N_PHASE_TARGETS,
     ORIGIN_RELATIVE_MAX_ROOT_Z_M,
     ROOT_Z_RMSE_THRESHOLD_M,
     STATIC_BASELINE_RATIO_MAX,
@@ -32,7 +43,9 @@ from sculptor.refs.track import (
     TierDCertificate,
     TrackError,
     TrackingErrors,
+    build_tierd_reference_clock,
     build_tierd_execution_contract,
+    bind_tierd_runtime_artifacts,
     build_track_project,
     clip_root_frame,
     compare_tierd_target_contract,
@@ -40,6 +53,7 @@ from sculptor.refs.track import (
     downsample_phase_targets,
     generate_tracking_residual_reward_source,
     generate_tracking_reward_source,
+    projected_gravity_from_quat,
     read_donor_adapter_config,
     require_stage_tierd_admission,
     require_tierd_admission,
@@ -49,6 +63,13 @@ from sculptor.refs.track import (
     update_provenance_tier_d,
     verify_tierd_certificate,
     write_project_config_toml,
+    _build_generated_tracker_policy_contract,
+    _content_addressed_rollout_name,
+    _materialize_tierd_rollout_artifact,
+    _prepare_tierd_tracking_preflight,
+    _publish_and_verify_tierd_verdict,
+    _score_tierd_rollout_artifact,
+    _verify_checkpoint_policy_contract_sidecar,
 )
 
 
@@ -61,6 +82,7 @@ def _make_getup_clip(n: int = 40) -> dict:
     joint_pos[:, 1] = np.linspace(0.0, -0.2, n)
     return {
         "root_pos_z": z,
+        "root_frame": "absolute",
         "fps": 30.0,
         "joint_pos": joint_pos,
         "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
@@ -87,13 +109,31 @@ def _register_clip(root: Path, clip: dict, *, clip_id: str = "getup1",
     return content_sha
 
 
-def _write_donor_project(path: Path) -> Path:
+def _write_donor_project(
+    path: Path,
+    *,
+    policy_contract: dict | None = None,
+) -> Path:
     path.mkdir(parents=True, exist_ok=True)
-    (path / "config.toml").write_text(
+    config_path = path / "config.toml"
+    config_path.write_text(
         '[adapter]\n'
         'class = "sculptor.adapters.mjlab.MjlabAdapter"\n'
         'config = { task_id = "Mjlab-Velocity-Flat-Unitree-G1", '
         'num_envs = 64, device = "cuda:0" }\n'
+    )
+    contract = copy.deepcopy(policy_contract or _policy_contract())
+    config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    receipt = {
+        "schema": "reward-sculptor-tier-d-donor-interface-v1",
+        "donor_config_sha256": config_sha,
+        "certification_config_sha256": config_sha,
+        "policy_contract": contract,
+        "policy_contract_sha256": _canonical_sha256(contract),
+    }
+    (path / "tier_d_interface_contract.json").write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return path
 
@@ -120,11 +160,37 @@ def _policy_contract(
             "term_names": ["joint_position"],
             "shape": [len(joints)],
         },
+        "observations": {
+            "ordered_terms": [
+                {"name": "base", "source": "base", "shape": [3]},
+            ],
+            "shape": [3],
+            "critic_ordered_terms": [
+                {"name": "base", "source": "base", "shape": [3]},
+            ],
+            "critic_shape": [3],
+        },
         # Retained in the full policy digest but deliberately outside the
         # Tier-D physical boundary. This gives tests a way to prove that
         # legitimate network/optimizer changes do not invalidate dynamics
         # evidence for an otherwise identical execution interface.
-        "policy": {"actor": {"hidden_dims": [128, 128]}},
+        "policy": {
+            "actor": {
+                "hidden_dims": [128, 128],
+                "recurrent": {"type": None},
+            },
+            "critic": {
+                "hidden_dims": [128, 128],
+                "recurrent": {"type": None},
+            },
+            "normalizer": {
+                "present": False,
+                "actor_present": False,
+                "critic_present": False,
+                "actor_shape": None,
+                "critic_shape": None,
+            },
+        },
         "timing": {
             "sim_timestep_s": sim_timestep_s,
             "decimation": decimation,
@@ -137,6 +203,101 @@ def _policy_contract(
             "adapter": "0.7.0",
         },
     }
+
+
+def _patch_cpu_preflight_policy_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    donor_contract: dict | None = None,
+    generated_contract: dict | None = None,
+) -> list[tuple[Path, dict]]:
+    """Keep dry-run tests CPU/offline while exercising the full boundary."""
+    donor = copy.deepcopy(donor_contract or _policy_contract())
+    calls: list[tuple[Path, dict]] = []
+
+    def fake_read(project: Path, *, robot: str):
+        project = Path(project).resolve()
+        calls.append((project, {"robot": robot}))
+        config_sha = hashlib.sha256(
+            (project / "config.toml").read_bytes()
+        ).hexdigest()
+        return SimpleNamespace(
+            donor_project=project,
+            policy_contract=copy.deepcopy(donor),
+            donor_config_sha256=config_sha,
+            certification_config_sha256=config_sha,
+            receipt_sha256="f" * 64,
+        )
+
+    monkeypatch.setattr(
+        "sculptor.refs.track._read_tierd_donor_interface", fake_read,
+    )
+    if generated_contract is not None:
+        monkeypatch.setattr(
+            "sculptor.refs.track._build_generated_tracker_policy_contract",
+            lambda *_args, **_kwargs: copy.deepcopy(generated_contract),
+        )
+    return calls
+
+
+def _reference_clock_for_clip(
+    clip: dict,
+    *,
+    clip_id: str = "getup1",
+    robot: str = "g1",
+    n_phase_targets: int = 32,
+) -> dict:
+    joint_pos = downsample_phase_targets(
+        np.asarray(clip["joint_pos"], dtype=np.float64),
+        n=n_phase_targets,
+    )
+    root_z = downsample_phase_targets(
+        np.asarray(clip["root_pos_z"], dtype=np.float64),
+        n=n_phase_targets,
+    )
+    gravity = None
+    if clip.get("root_quat_wxyz") is not None:
+        gravity = downsample_phase_targets(
+            projected_gravity_from_quat(clip["root_quat_wxyz"]),
+            n=n_phase_targets,
+        )
+    duration_s = reference_playback_duration_s(
+        frame_count=int(np.asarray(clip["joint_pos"]).shape[0]),
+        fps=float(clip["fps"]),
+    )
+    source = generate_tracking_reward_source(
+        clip_id=clip_id,
+        robot=robot,
+        joint_names=list(clip["joint_names"]),
+        target_joint_pos=joint_pos,
+        target_root_z=root_z,
+        target_gravity=gravity,
+        root_frame=str(clip["root_frame"]),
+        episode_len_steps=max(1, round(duration_s * 50.0)),
+        duration_s=duration_s,
+    )
+    clock = reference_clock_from_reward_source(source)
+    assert clock is not None
+    return clock
+
+
+def _clock_conditioned_policy_contract(base: dict, clock: dict) -> dict:
+    contract = copy.deepcopy(base)
+    term = {
+        "name": clock["term_name"],
+        "source": clock["source"],
+        "shape": list(clock["shape"]),
+    }
+    base_term = {"name": "base", "source": "base", "shape": [3]}
+    contract["schema"] = 4
+    contract["reference_clock"] = copy.deepcopy(clock)
+    contract["observations"] = {
+        "ordered_terms": [base_term, copy.deepcopy(term)],
+        "shape": [4],
+        "critic_ordered_terms": [copy.deepcopy(base_term), copy.deepcopy(term)],
+        "critic_shape": [4],
+    }
+    return contract
 
 
 def _execution_contract(
@@ -152,12 +313,87 @@ def _execution_contract(
         (donor / "config.toml").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    return build_tierd_execution_contract(
+    clock = _reference_clock_for_clip(clip, robot=robot)
+    tracker_contract = _clock_conditioned_policy_contract(
+        policy_contract or _policy_contract(), clock,
+    )
+    contract = build_tierd_execution_contract(
         donor_project=donor,
         certification_config_path=certification,
+        clip_id="getup1",
         robot=robot,
         clip=clip,
-        policy_contract=policy_contract or _policy_contract(),
+        policy_contract=tracker_contract,
+        reference_clock=clock,
+    )
+    reward_sha = "a" * 64
+    final_checkpoint_sha = "c" * 64
+    train_environment = environment_artifacts_for_phase(
+        contract["environment_artifacts"], "train",
+    )
+    seed_application = {
+        "schema": "reward-sculptor-seed-application-v1",
+        "applied_seed": 0,
+        "python_random": True,
+        "numpy_global": True,
+        "torch_global": True,
+        "env_cfg": True,
+        "rl_cfg": True,
+    }
+    policy_contract_sha = contract["donor"]["policy_contract_sha256"]
+    return bind_tierd_runtime_artifacts(
+        contract,
+        requested_reward_module_sha256=reward_sha,
+        train_receipts=[
+            {
+                "iteration": 1,
+                "schema": "reward-sculptor-runner-artifacts-v2",
+                "phase": "train",
+                "reward_module_sha256": reward_sha,
+                "requested_max_iterations": 2000,
+                "requested_seed": 0,
+                "requested_num_envs": 64,
+                "seed_application": seed_application,
+                "environment_artifacts": train_environment,
+                "env_spec_application": {
+                    "schema": "reward-sculptor-env-spec-application-v1",
+                    "phase": "train", "requested": [], "applied": [],
+                    "dead": [], "errors": [],
+                },
+                "input_checkpoint_requested_sha256": None,
+                "input_checkpoint_loaded_sha256": None,
+                "input_checkpoint_load_completed": False,
+                "output_checkpoint_sha256": "b" * 64,
+                "output_policy_contract_sha256": policy_contract_sha,
+                "output_policy_contract_sidecar_sha256": "d" * 64,
+            },
+            {
+                "iteration": 2,
+                "schema": "reward-sculptor-runner-artifacts-v2",
+                "phase": "train",
+                "reward_module_sha256": reward_sha,
+                "requested_max_iterations": 2000,
+                "requested_seed": 0,
+                "requested_num_envs": 64,
+                "seed_application": seed_application,
+                "environment_artifacts": train_environment,
+                "env_spec_application": {
+                    "schema": "reward-sculptor-env-spec-application-v1",
+                    "phase": "train", "requested": [], "applied": [],
+                    "dead": [], "errors": [],
+                },
+                "input_checkpoint_requested_sha256": "b" * 64,
+                "input_checkpoint_loaded_sha256": "b" * 64,
+                "input_checkpoint_load_completed": True,
+                "output_checkpoint_sha256": final_checkpoint_sha,
+                "output_policy_contract_sha256": policy_contract_sha,
+                "output_policy_contract_sidecar_sha256": "e" * 64,
+            },
+        ],
+        final_checkpoint_sha256=final_checkpoint_sha,
+        requested_steps_per_iteration=2000,
+        requested_seed=0,
+        requested_num_envs=64,
     )
 
 
@@ -177,7 +413,17 @@ def test_downsample_phase_targets_exact_count():
     out = downsample_phase_targets(arr, n=5)
     assert out.shape == (5, 1)
     # Deterministic nearest-frame lookup at evenly spaced phases.
-    assert out.ravel().tolist() == [0.0, 2.0, 4.0, 5.0, 7.0]
+    assert out.ravel().tolist() == [0.0, 2.0, 4.0, 7.0, 9.0]
+    np.testing.assert_array_equal(out[-1], arr[-1])
+
+
+def test_downsample_phase_targets_one_row_is_exact_terminal_sample():
+    arr = np.arange(12.0).reshape(6, 2)
+
+    out = downsample_phase_targets(arr, n=1)
+
+    assert out.shape == (1, 2)
+    np.testing.assert_array_equal(out[0], arr[-1])
 
 
 def test_downsample_phase_targets_n_equals_source_length_is_identity_order():
@@ -204,6 +450,35 @@ def test_downsample_phase_targets_single_frame_source():
     assert out.shape == (4, 2)
     assert (out == 1.0).any() or (out == 2.0).any()  # sanity: values echoed
     np.testing.assert_allclose(out, np.tile(arr, (4, 1)))
+
+
+def test_tierd_reference_identity_changes_when_only_final_sample_changes():
+    base = {
+        "joint_names": ["left", "right"],
+        "joint_pos": np.zeros((9, 2), dtype=np.float64),
+        "root_pos_z": np.full(9, 0.72, dtype=np.float64),
+        "root_frame": "absolute",
+        "fps": 50.0,
+    }
+    changed = copy.deepcopy(base)
+    changed["joint_pos"][-1] = np.asarray([0.4, -0.3])
+    changed["root_pos_z"][-1] = 0.81
+
+    original_clock = build_tierd_reference_clock(
+        base, clip_id="terminal-identity", robot="g1", n_phase_targets=4,
+    )
+    changed_clock = build_tierd_reference_clock(
+        changed, clip_id="terminal-identity", robot="g1", n_phase_targets=4,
+    )
+
+    assert (
+        original_clock["reference_target_sha256"]
+        != changed_clock["reference_target_sha256"]
+    )
+    np.testing.assert_array_equal(
+        downsample_phase_targets(changed["joint_pos"], n=4)[-1],
+        changed["joint_pos"][-1],
+    )
 
 
 def test_tracking_phase_window_loops_repeatable_translation_suffix():
@@ -246,6 +521,7 @@ def test_generate_tracking_reward_source_compiles_and_is_callable():
     target_root_z = np.array([0.7, 0.72, 0.74, 0.76])
     src = generate_tracking_reward_source(
         clip_id="testclip",
+        robot="g1",
         joint_names=["left_knee_joint", "right_knee_joint"],
         target_joint_pos=target_jp, target_root_z=target_root_z,
         episode_len_steps=100)
@@ -275,7 +551,7 @@ def test_generate_tracking_reward_source_phase_clocks_through_episode():
     target_jp[:, 0] = [0.0, 1.0, 2.0, 3.0]
     target_root_z = np.zeros(n_phase)
     src = generate_tracking_reward_source(
-        clip_id="c", joint_names=["knee_joint"],
+        clip_id="c", robot="g1", joint_names=["knee_joint"],
         target_joint_pos=target_jp, target_root_z=target_root_z,
         episode_len_steps=8)
     ns: dict = {}
@@ -293,7 +569,7 @@ def test_generate_tracking_reward_source_phase_clocks_through_episode():
 def test_generate_tracking_reward_source_rejects_shape_mismatch():
     with pytest.raises(ValueError, match="phase-count"):
         generate_tracking_reward_source(
-            clip_id="c", joint_names=["a"],
+            clip_id="c", robot="g1", joint_names=["a"],
             target_joint_pos=np.zeros((4, 1)), target_root_z=np.zeros(3),
             episode_len_steps=10)
 
@@ -301,14 +577,14 @@ def test_generate_tracking_reward_source_rejects_shape_mismatch():
 def test_generate_tracking_reward_source_rejects_joint_name_mismatch():
     with pytest.raises(ValueError, match="joint_names"):
         generate_tracking_reward_source(
-            clip_id="c", joint_names=["a", "b"],
+            clip_id="c", robot="g1", joint_names=["a", "b"],
             target_joint_pos=np.zeros((4, 1)), target_root_z=np.zeros(4),
             episode_len_steps=10)
 
 
 def test_generate_tracking_reward_source_raises_on_qpos_too_short():
     src = generate_tracking_reward_source(
-        clip_id="c", joint_names=["a", "b", "c"],
+        clip_id="c", robot="g1", joint_names=["a", "b", "c"],
         target_joint_pos=np.zeros((2, 3)), target_root_z=np.zeros(2),
         episode_len_steps=10)
     ns: dict = {}
@@ -329,7 +605,7 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
     assert len(src) < 30_000
     ns: dict = {}
     exec(compile(src, "tracking_first_reward", "exec"), ns)  # noqa: S102
-    assert ns["REFERENCE_N_PHASES"] == 16
+    assert ns["REFERENCE_N_PHASES"] == N_PHASE_TARGETS
     composition = ns["REWARD_SPEC"]["composition"]
     assert composition["type"] == "reference_tracking_residual"
     assert composition["residual_max"] <= 0.35 * composition["tracking_weight"]
@@ -341,8 +617,8 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
     info = {
         "episode_length": 0.0,
         "step_dt": 1.0 / 30.0,
-        # Simulator and reference origins may differ; displacement does not.
-        "base_height": 0.74,
+        # This fixture explicitly declares an absolute world-height frame.
+        "base_height": float(ns["REFERENCE_ROOT_Z"][0]),
         "base_height_delta": 0.0,
         "fallen": 0.0,
     }
@@ -380,7 +656,7 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
     assert torch.all(batch_components["residual_task"] == 0.0)
 
 
-def test_tracking_first_locomotion_prior_wraps_repeatable_gait():
+def test_tracking_first_locomotion_prior_preserves_certified_full_schedule():
     n = 180
     fps = 60.0
     t = np.arange(n, dtype=np.float64) / fps
@@ -397,16 +673,17 @@ def test_tracking_first_locomotion_prior_wraps_repeatable_gait():
     ns: dict = {}
     exec(compile(src, "looping_tracking", "exec"), ns)  # noqa: S102
 
-    assert ns["REFERENCE_PHASE_MODE"] == "loop"
+    assert ns["REFERENCE_PHASE_MODE"] == "hold"
     assert ns["REWARD_SPEC"]["composition"]["root_height_frame"] == (
-        "episode_relative")
+        "origin_relative")
     start = ns["_phase_index_scalar"]({
         "episode_length": 0.0, "step_dt": 0.02})
-    wrapped = ns["_phase_index_scalar"]({
+    completed = ns["_phase_index_scalar"]({
         "episode_length": ns["REFERENCE_DURATION_S"] / 0.02,
         "step_dt": 0.02,
     })
-    assert start == wrapped == 0
+    assert start == 0
+    assert completed == ns["REFERENCE_N_PHASES"] - 1
 
 
 def test_tracking_first_validator_allows_hooks_but_freezes_composition():
@@ -445,7 +722,8 @@ def test_tracking_first_validator_allows_hooks_but_freezes_composition():
     }
     info = {
         "episode_length": 0.0, "step_dt": 1.0 / 30.0,
-        "base_height": 0.74, "base_height_delta": 0.0,
+        "base_height": float(child_ns["REFERENCE_ROOT_Z"][0]),
+        "base_height_delta": 0.0,
         "fallen": 0.0,
     }
     _, components = child_ns["compute_reward"]({}, None, next_state, info)
@@ -491,7 +769,7 @@ def test_compute_tracking_errors_perfect_match_is_near_zero():
     errs = compute_tracking_errors(
         clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
         rollout_root_z=clip["root_pos_z"].copy(),
-        rollout_joint_names=clip["joint_names"])
+        rollout_joint_names=clip["joint_names"], control_hz=clip["fps"])
     assert errs.mean_joint_err_rad < 1e-9
     assert errs.max_joint_err_rad < 1e-9
     assert errs.root_z_rmse_m < 1e-9
@@ -569,13 +847,47 @@ def test_compute_tracking_errors_duration_coverage_short_rollout():
         # ratio now, so the rate has to be stated truthfully for the frame
         # ratio and the time ratio to coincide.
         control_hz=clip["fps"])
-    assert errs.duration_coverage == pytest.approx(short_len / 40)
+    assert errs.duration_coverage == pytest.approx((short_len - 1) / (40 - 1))
+
+
+def test_capped_post_step_rollout_meets_coverage_without_reset_state():
+    """A horizon-capped mjlab episode must not need the auto-reset state.
+
+    A 191-frame, 50 Hz reference spans 190 control intervals (3.8 s).  The
+    runner records post-step states, excludes the done/reset transition, and
+    therefore retains 189 valid transition states.  Those states prove 3.78 s
+    of control, which clears the 99% Tier-D coverage gate honestly.
+    """
+    n_clip = 191
+    n_valid = 189
+    phase = np.linspace(0.0, 1.0, n_clip)
+    clip = {
+        "joint_pos": np.stack((phase, -phase), axis=1),
+        "joint_names": ["a", "b"],
+        "root_pos_z": np.full(n_clip, 0.75),
+        "root_frame": "absolute",
+        "fps": 50.0,
+    }
+    rollout_joint_pos = downsample_phase_targets(
+        clip["joint_pos"], n=n_valid,
+    )
+    errs = compute_tracking_errors(
+        clip=clip,
+        rollout_joint_pos=rollout_joint_pos,
+        rollout_root_z=np.full(n_valid, 0.75),
+        rollout_joint_names=clip["joint_names"],
+        control_hz=50.0,
+        rollout_samples_are_post_step=True,
+    )
+    assert errs.duration_coverage == pytest.approx(189 / 190)
+    assert errs.duration_coverage >= 0.99
 
 
 def test_tracking_errors_to_dict_shape():
     errs = TrackingErrors(
         mean_joint_err_rad=0.1, max_joint_err_rad=0.2, root_z_rmse_m=0.05,
-        duration_coverage=1.0, common_joint_names=["a"], n_common_joints=1)
+        duration_coverage=1.0, common_joint_names=["a"], n_common_joints=1,
+        static_baseline_err_rad=0.2)
     d = errs.to_dict()
     assert d["feasible"] is True
     assert d["thresholds"]["mean_joint_err_rad"] == MEAN_JOINT_ERR_THRESHOLD_RAD
@@ -633,16 +945,18 @@ def test_clip_root_frame_falls_back_when_the_declaration_is_junk():
 
 def test_origin_relative_clip_scores_the_excursion_not_the_standing_height():
     """The real bug: a rollout that tracks the motion perfectly, offset by the
-    robot's standing height, must certify — the offset is a frame convention,
-    not tracking error."""
+    robot's standing height, must score zero root error — the offset is a
+    frame convention, not tracking error. This tiny fixture deliberately has
+    too little joint motion for the independent Tier-D temporal gate."""
     clip = _make_hop_clip()
     rollout_z = clip["root_pos_z"] + STANDING_G1_BASE_M
     errs = compute_tracking_errors(
         clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
-        rollout_root_z=rollout_z, rollout_joint_names=clip["joint_names"])
+        rollout_root_z=rollout_z, rollout_joint_names=clip["joint_names"],
+        control_hz=clip["fps"])
     assert errs.root_frame == "origin_relative"
     assert errs.root_z_rmse_m < 1e-9
-    assert errs.feasible
+    assert not errs.feasible
     # The offset is divided out, but recorded — never silently dropped.
     assert errs.root_z_offset_m == pytest.approx(STANDING_G1_BASE_M, abs=1e-9)
 
@@ -712,7 +1026,7 @@ def test_a_perfect_tracker_beats_the_static_baseline():
     errs = compute_tracking_errors(
         clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
         rollout_root_z=clip["root_pos_z"].copy(),
-        rollout_joint_names=clip["joint_names"])
+        rollout_joint_names=clip["joint_names"], control_hz=clip["fps"])
     assert errs.mean_joint_err_rad < 1e-9
     assert errs.static_baseline_err_rad > 0.2   # standing still would be bad
     assert errs.beats_static_baseline
@@ -748,9 +1062,8 @@ def test_a_time_reversed_rollout_does_not_certify():
     assert not errs.feasible
 
 
-def test_a_motionless_reference_skips_the_control_rather_than_failing():
-    """A constant reference IS tracked by a constant pose; failing it would
-    be a false negative, so the vacuous comparison is skipped."""
+def test_a_motionless_reference_cannot_claim_temporal_tier_d_tracking():
+    """A constant pose has no non-vacuous temporal baseline evidence."""
     n = 40
     clip = {
         "root_pos_z": np.full(n, 0.74), "fps": 30.0,
@@ -760,22 +1073,23 @@ def test_a_motionless_reference_skips_the_control_rather_than_failing():
     errs = compute_tracking_errors(
         clip=clip, rollout_joint_pos=np.zeros((n, 2)),
         rollout_root_z=clip["root_pos_z"].copy(),
-        rollout_joint_names=clip["joint_names"])
+        rollout_joint_names=clip["joint_names"], control_hz=clip["fps"])
     assert errs.static_baseline_err_rad < MIN_REFERENCE_MOTION_RAD
-    assert errs.beats_static_baseline
-    assert errs.feasible
+    assert not errs.beats_static_baseline
+    assert not errs.feasible
 
 
-def test_root_only_scoring_is_not_failed_by_the_control():
-    """No common joints -> no joint trace -> the control cannot apply."""
+def test_root_only_scoring_cannot_claim_full_joint_tier_d_tracking():
+    """No common joints means the Tier-D temporal control is unproven."""
     clip = _moving_clip()
     errs = compute_tracking_errors(
         clip=clip, rollout_joint_pos=np.zeros((60, 2)),
         rollout_root_z=clip["root_pos_z"].copy(),
-        rollout_joint_names=["unrelated_a", "unrelated_b"])
+        rollout_joint_names=["unrelated_a", "unrelated_b"],
+        control_hz=clip["fps"])
     assert errs.n_common_joints == 0
-    assert errs.beats_static_baseline
-    assert errs.feasible
+    assert not errs.beats_static_baseline
+    assert not errs.feasible
 
 
 def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
@@ -784,7 +1098,7 @@ def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
     played at quarter speed and the policy never saw past phase 0.25."""
     from sculptor.refs.track import DEFAULT_CONTROL_HZ
 
-    n, fps = 444, 120.0                      # the real composite: 3.70 s
+    n, fps = 444, 120.0  # 443 sampled intervals: 3.6917 s
     clip = {
         "root_pos_z": np.full(n, 0.05), "fps": fps,
         "joint_pos": np.zeros((n, 2)),
@@ -803,13 +1117,14 @@ def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
     match = re.search(r"^EPISODE_LEN_STEPS = (\d+)", src, re.M)
     assert match, "reward must declare EPISODE_LEN_STEPS"
     got = int(match.group(1))
-    # 3.70 s at the task's 50 Hz control rate (200 Hz physics / decimation 4)
+    # 3.6917 s at the task's 50 Hz control rate (200 Hz / decimation 4)
     # = 185 steps -- NOT the 2000 training budget.
-    assert got == round((n / fps) * DEFAULT_CONTROL_HZ) == 185
+    exact_duration_s = (n - 1) / fps
+    assert got == round(exact_duration_s * DEFAULT_CONTROL_HZ) == 185
     assert got != 2000
     # ...and the reward carries the real duration so it can clock off step_dt
     # rather than trusting the build-time rate at all.
-    assert re.search(r"^REFERENCE_DURATION_S = 3\.7", src, re.M)
+    assert re.search(r"^REFERENCE_DURATION_S = 3\.691666", src, re.M)
 
 
 def test_phase_clock_prefers_step_dt_over_the_assumed_rate():
@@ -819,6 +1134,7 @@ def test_phase_clock_prefers_step_dt_over_the_assumed_rate():
     n_phase = 32
     src = generate_tracking_reward_source(
         clip_id="c",
+        robot="g1",
         joint_names=["left_hip_pitch_joint"],
         target_joint_pos=np.zeros((n_phase, 1)),
         target_root_z=np.zeros(n_phase),
@@ -864,7 +1180,9 @@ def test_episode_is_capped_to_the_reference_duration(tmp_path: Path):
         clip=_clip_of_duration(3.70), clip_id="c", robot="g1",
         donor_project=_donor(tmp_path), project_dir=tmp_path / "proj")
     spec = json.loads((plan.env_dir / "current.json").read_text())
-    assert spec["shared"]["episode_length_s"] == pytest.approx(3.70, abs=1e-3)
+    assert spec["shared"]["episode_length_s"] == pytest.approx(
+        (444 - 1) / 120.0, abs=1e-3,
+    )
 
 
 def test_capped_episode_still_validates_as_an_env_spec(tmp_path: Path):
@@ -956,6 +1274,80 @@ def test_write_project_config_toml_roundtrips_via_load_adapter(tmp_path: Path):
     assert parsed["adapter"]["config"]["device"] == "cuda:0"
 
 
+def test_exported_tierd_interface_is_data_only_and_config_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sculptor.refs.track as track_module
+
+    donor = _write_donor_project(tmp_path / "donor")
+    base_contract = _policy_contract()
+    configured = read_donor_adapter_config(donor)
+    monkeypatch.setattr(
+        track_module,
+        "_resolved_adapter_signature",
+        lambda _path: (configured, set(), False),
+    )
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda _project, **_kwargs: copy.deepcopy(base_contract),
+    )
+
+    receipt_path = track_module.export_tierd_donor_interface(donor)
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "reward-sculptor-tier-d-donor-interface-v1"
+    assert payload["policy_contract"] == base_contract
+    assert payload["policy_contract_sha256"] == _canonical_sha256(base_contract)
+    admitted = track_module._read_tierd_donor_interface(donor, robot="g1")
+    assert admitted.policy_contract == base_contract
+    assert admitted.receipt_sha256 == hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+
+    (donor / "config.toml").write_text(
+        (donor / "config.toml").read_text(encoding="utf-8").replace(
+            "num_envs = 64", "num_envs = 32",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TrackError, match="stale for config.toml"):
+        track_module._read_tierd_donor_interface(donor, robot="g1")
+
+
+def test_tracking_project_replaces_donor_env_and_eval_reset_paths(
+    tmp_path: Path,
+) -> None:
+    donor = _write_donor_project(tmp_path / "donor")
+    (donor / "config.toml").write_text(
+        '[adapter]\n'
+        'class = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { task_id = "Mjlab-Velocity-Flat-Unitree-G1", '
+        'num_envs = 64, device = "cuda:0", '
+        'env_spec_path = "/donor/env/current.json", '
+        'eval_reset_path = "/donor/env/eval_reset.json" }\n',
+        encoding="utf-8",
+    )
+
+    plan = build_track_project(
+        clip=_make_getup_clip(),
+        clip_id="getup1",
+        robot="g1",
+        donor_project=donor,
+        project_dir=tmp_path / "tracker",
+    )
+
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[no-redef]
+    with plan.config_path.open("rb") as handle:
+        generated = tomllib.load(handle)["adapter"]["config"]
+    assert "env_spec_path" not in generated
+    assert "eval_reset_path" not in generated
+    assert (plan.env_dir / "current.json").is_file()
+    assert (plan.env_dir / "eval_reset.json").is_file()
+
+
 def test_write_project_config_toml_rejects_unsupported_value_type(tmp_path: Path):
     with pytest.raises(TrackError, match="unsupported TOML value"):
         write_project_config_toml(
@@ -1000,15 +1392,56 @@ def test_build_tierd_execution_contract_rejects_donor_task_mismatch(
     tmp_path: Path,
 ) -> None:
     donor = _write_donor_project(tmp_path / "donor")
+    clip = _make_getup_clip()
+    clock = _reference_clock_for_clip(clip)
+    policy_contract = _clock_conditioned_policy_contract(
+        _policy_contract(task_id="Mjlab-Other-Task"), clock,
+    )
 
     with pytest.raises(TrackError, match="donor config task id does not match"):
         build_tierd_execution_contract(
             donor_project=donor,
             certification_config_path=donor / "config.toml",
+            clip_id="getup1",
             robot="g1",
-            clip=_make_getup_clip(),
-            policy_contract=_policy_contract(task_id="Mjlab-Other-Task"),
+            clip=clip,
+            policy_contract=policy_contract,
+            reference_clock=clock,
         )
+
+
+def test_build_tierd_execution_contract_requires_generated_tracker_contract(
+    tmp_path: Path,
+) -> None:
+    donor = _write_donor_project(tmp_path / "donor")
+    clip = _make_getup_clip()
+    clock = _reference_clock_for_clip(clip)
+
+    with pytest.raises(
+        TrackError, match="explicit generated tracker policy contract",
+    ):
+        build_tierd_execution_contract(
+            donor_project=donor,
+            certification_config_path=donor / "config.toml",
+            clip_id="getup1",
+            robot="g1",
+            clip=clip,
+            reference_clock=clock,
+        )
+
+
+def test_tierd_execution_contract_versions_endpoint_inclusive_target_sampling(
+    tmp_path: Path,
+) -> None:
+    contract = _execution_contract(tmp_path, _make_getup_clip())
+
+    assert contract["reference"]["cadence"] == {
+        "schema": "generated-target-control-phase-clock-v3",
+        "target_table_sampling": "nearest_frame_endpoint_inclusive",
+        "target_selection": "floor(phase * n_phase_targets)",
+        "phase_interval": "[0,1)",
+        "clock": "per_environment_episode_elapsed_control_time",
+    }
 
 
 # ── provenance update: K->D and infeasible paths ─────────────────────────
@@ -1017,22 +1450,26 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     clip = _make_getup_clip()
     content_sha = _register_clip(root, clip, tier="K")
 
-    errs = TrackingErrors(
-        mean_joint_err_rad=0.1, max_joint_err_rad=0.2, root_z_rmse_m=0.05,
-        duration_coverage=1.0, common_joint_names=["left_hip_pitch_joint"],
-        n_common_joints=1)
-    rollout_path = tmp_path / "fake_rollout.npz"
-    rollout_bytes = b"fake npz payload for hashing"
-    rollout_path.write_bytes(rollout_bytes)
+    clip_dir = library.clip_dir("g1", "getup1", root=root)
+    rollout_path = clip_dir / "rollout-candidate.npz"
+    execution_contract = _execution_contract(tmp_path, clip)
+    errs = _write_valid_tierd_rollout(
+        rollout_path, clip=clip, execution_contract=execution_contract,
+    )
+    rollout_digest = hashlib.sha256(rollout_path.read_bytes()).hexdigest()
+    retained_path = clip_dir / f"tierD_rollout_{rollout_digest}.npz"
+    rollout_path.replace(retained_path)
+    rollout_path = retained_path
+    rollout_bytes = rollout_path.read_bytes()
     prov = update_provenance_tier_d(
         robot="g1", clip_id="getup1", errors=errs, iterations=2,
         rollout_path=rollout_path,
-        execution_contract=_execution_contract(tmp_path, clip),
+        execution_contract=execution_contract,
         root=root)
 
     assert prov["tier"] == "D"
     assert prov["tierD"]["iterations"] == 2
-    assert prov["tierD"]["rollout_path"] == str(rollout_path)
+    assert prov["tierD"]["rollout_path"] == str(rollout_path.resolve())
     assert prov["tierD"]["errors"]["feasible"] is True
     # §audit-finding close: the tierD block now also records the rollout's
     # sha256 and a copy of the clip's content_sha256 at tracking time.
@@ -1048,30 +1485,239 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     assert any(r["clip_id"] == "getup1" and r["tier"] == "D" for r in rows)
 
 
-def test_update_provenance_tier_d_feasible_missing_rollout_file_omits_hash(
+def test_update_provenance_tier_d_feasible_missing_rollout_file_fails_closed(
     tmp_path: Path,
 ):
-    """A `rollout_path` that doesn't actually exist on disk (e.g. a caller
-    error) must not crash provenance bookkeeping — `rollout_sha256` is
-    just omitted, best-effort, and `verify_tierd_certificate` denies
-    cleanly later."""
+    """A feasible verdict is never persisted without retained evidence."""
     root = tmp_path / "lib"
     clip = _make_getup_clip()
     _register_clip(root, clip, tier="K")
 
     errs = TrackingErrors(
         mean_joint_err_rad=0.1, max_joint_err_rad=0.2, root_z_rmse_m=0.05,
-        duration_coverage=1.0, common_joint_names=["left_hip_pitch_joint"],
-        n_common_joints=1)
-    rollout_path = tmp_path / "never_written.npz"
-    prov = update_provenance_tier_d(
-        robot="g1", clip_id="getup1", errors=errs, iterations=2,
-        rollout_path=rollout_path,
-        execution_contract=_execution_contract(tmp_path, clip),
-        root=root)
+        duration_coverage=1.0,
+        common_joint_names=list(clip["joint_names"]),
+        n_common_joints=len(clip["joint_names"]),
+        static_baseline_err_rad=0.2)
+    rollout_path = (
+        library.clip_dir("g1", "getup1", root=root) / "tierD_rollout.npz"
+    )
+    with pytest.raises(TrackError, match="unreadable"):
+        update_provenance_tier_d(
+            robot="g1", clip_id="getup1", errors=errs, iterations=2,
+            rollout_path=rollout_path,
+            execution_contract=_execution_contract(tmp_path, clip),
+            root=root)
 
-    assert prov["tier"] == "D"
-    assert "rollout_sha256" not in prov["tierD"]
+
+def test_fresh_v4_certificate_rejects_mutable_fixed_rollout_name(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    contract = _execution_contract(tmp_path, clip)
+    fixed = library.clip_dir(
+        "g1", "getup1", root=root,
+    ) / "tierD_rollout.npz"
+    errors = _write_valid_tierd_rollout(
+        fixed, clip=clip, execution_contract=contract,
+    )
+    with pytest.raises(TrackError, match="content-addressed path"):
+        update_provenance_tier_d(
+            robot="g1", clip_id="getup1", errors=errors, iterations=2,
+            rollout_path=fixed, execution_contract=contract, root=root,
+        )
+
+
+def test_failed_provenance_write_preserves_prior_content_addressed_certificate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lib"
+    prior = _certify_valid_tier_d(tmp_path, root)
+    prior_bytes = (
+        library.clip_dir("g1", "getup1", root=root)
+        / library.PROVENANCE_FILENAME
+    ).read_bytes()
+    prior_rollout = Path(prior["tierD"]["rollout_path"])
+    clip = _make_getup_clip()
+    contract = prior["tierD"]["execution_contract"]
+    with np.load(prior_rollout, allow_pickle=False) as archive:
+        payload = {key: np.asarray(archive[key]) for key in archive.files}
+    metadata = json.loads(str(payload["trajectory_contract_json"].item()))
+    payload["trajectory_contract_json"] = np.asarray(json.dumps(
+        metadata, indent=2, sort_keys=True,
+    ))
+    candidate = tmp_path / "replacement-candidate.npz"
+    np.savez_compressed(candidate, **payload)
+    errors = _score_tierd_rollout_artifact(
+        candidate, clip=clip, execution_contract=contract,
+    )
+    retained = _materialize_tierd_rollout_artifact(
+        candidate,
+        clip_dir=library.clip_dir("g1", "getup1", root=root),
+        clip=clip,
+        execution_contract=contract,
+        lane=0,
+        expected_errors=errors,
+        library_root=root,
+    )
+    assert retained != prior_rollout
+
+    def fail_write(*args, **kwargs):
+        raise OSError("simulated provenance replacement failure")
+
+    monkeypatch.setattr(library, "write_provenance", fail_write)
+    with pytest.raises(OSError, match="simulated provenance"):
+        update_provenance_tier_d(
+            robot="g1", clip_id="getup1", errors=errors, iterations=2,
+            rollout_path=retained, execution_contract=contract, root=root,
+        )
+    assert prior_rollout.is_file()
+    assert (
+        library.clip_dir("g1", "getup1", root=root)
+        / library.PROVENANCE_FILENAME
+    ).read_bytes() == prior_bytes
+    certificate, reason = verify_tierd_certificate(
+        "g1", "getup1", root=root,
+    )
+    assert reason is None
+    assert certificate is not None
+    assert certificate.rollout_path == prior_rollout
+
+
+def test_tierd_promotion_persists_rollout_link_before_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    contract = _execution_contract(tmp_path, clip)
+    candidate = tmp_path / "candidate.npz"
+    errors = _write_valid_tierd_rollout(
+        candidate, clip=clip, execution_contract=contract,
+    )
+    events: list[str] = []
+
+    def record_fsync(path, *, label):
+        del path
+        events.append(f"fsync:{label}")
+
+    def record_fsync_descriptor(descriptor, *, label):
+        del descriptor
+        events.append(f"fsync:{label}")
+
+    original_write = library.write_provenance
+
+    def record_write(*args, **kwargs):
+        events.append("write:provenance")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "sculptor.refs.track._fsync_directory", record_fsync,
+    )
+    monkeypatch.setattr(
+        "sculptor.refs.track._fsync_directory_descriptor",
+        record_fsync_descriptor,
+    )
+    monkeypatch.setattr(library, "write_provenance", record_write)
+    retained = _materialize_tierd_rollout_artifact(
+        candidate,
+        clip_dir=library.clip_dir("g1", "getup1", root=root),
+        clip=clip,
+        execution_contract=contract,
+        lane=0,
+        expected_errors=errors,
+        library_root=root,
+    )
+    update_provenance_tier_d(
+        robot="g1",
+        clip_id="getup1",
+        errors=errors,
+        iterations=2,
+        rollout_path=retained,
+        execution_contract=contract,
+        root=root,
+    )
+
+    assert events[:3] == [
+        "fsync:Tier-D rollout",
+        "write:provenance",
+        "fsync:Tier-D provenance",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd confinement")
+def test_tierd_rollout_rename_symlink_swap_cannot_escape_or_certify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    contract = _execution_contract(tmp_path, clip)
+    candidate = tmp_path / "candidate.npz"
+    errors = _write_valid_tierd_rollout(
+        candidate, clip=clip, execution_contract=contract,
+    )
+    clip_dir = library.clip_dir("g1", "getup1", root=root)
+    moved = clip_dir.with_name("getup1-moved")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_link = os.link
+    exchanged = False
+
+    def exchange_then_link(
+        source,
+        destination,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal exchanged
+        if not exchanged:
+            exchanged = True
+            clip_dir.rename(moved)
+            clip_dir.symlink_to(outside, target_is_directory=True)
+        return real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr("sculptor.refs.track.os.link", exchange_then_link)
+    with pytest.raises(
+        TrackError,
+        match="publication coordinate changed during write",
+    ):
+        _materialize_tierd_rollout_artifact(
+            candidate,
+            clip_dir=clip_dir,
+            clip=clip,
+            execution_contract=contract,
+            lane=0,
+            expected_errors=errors,
+            library_root=root,
+        )
+
+    retained_name = _content_addressed_rollout_name(
+        library.content_sha256(candidate.read_bytes())
+    )
+    assert not (outside / retained_name).exists()
+    assert (moved / retained_name).is_file()
+    assert json.loads(
+        (moved / library.PROVENANCE_FILENAME).read_text(encoding="utf-8")
+    )["tier"] == "K"
+    # The coordinate no longer names a confined clip, so no Tier-D authority
+    # can be read or minted after the failed retention.
+    certificate, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert certificate is None
+    assert reason is not None
 
 
 def test_update_provenance_tier_d_feasible_requires_execution_contract(
@@ -1085,8 +1731,9 @@ def test_update_provenance_tier_d_feasible_requires_execution_contract(
         max_joint_err_rad=0.2,
         root_z_rmse_m=0.05,
         duration_coverage=1.0,
-        common_joint_names=["left_hip_pitch_joint"],
-        n_common_joints=1,
+        common_joint_names=list(clip["joint_names"]),
+        n_common_joints=len(clip["joint_names"]),
+        static_baseline_err_rad=0.2,
     )
 
     with pytest.raises(TrackError, match="requires an execution contract"):
@@ -1120,12 +1767,235 @@ def test_update_provenance_tier_d_infeasible_keeps_tier_k(tmp_path: Path):
     assert reloaded["tierD"]["feasible"] is False
 
 
+def test_tierd_updates_serialize_global_index_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different clips still share one index transaction domain.
+
+    Without the root-scoped lock, two rebuilds can overlap: a slower scan taken
+    before the other provenance commit can then replace ``index.jsonl`` last
+    and silently drop the newer row.
+    """
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    for clip_id in ("getup_a", "getup_b"):
+        _register_clip(root, clip, clip_id=clip_id, tier="K")
+
+    errors = TrackingErrors(
+        mean_joint_err_rad=1.0,
+        max_joint_err_rad=2.0,
+        root_z_rmse_m=0.5,
+        duration_coverage=1.0,
+        common_joint_names=[],
+        n_common_joints=0,
+    )
+    original_rebuild = library._rebuild_index_unlocked
+    state_lock = threading.Lock()
+    active_rebuilds = 0
+    max_active_rebuilds = 0
+
+    def observed_rebuild(*, root: Path | None = None):
+        nonlocal active_rebuilds, max_active_rebuilds
+        with state_lock:
+            active_rebuilds += 1
+            max_active_rebuilds = max(max_active_rebuilds, active_rebuilds)
+        try:
+            # Make an unlocked implementation overlap reliably.
+            time.sleep(0.05)
+            return original_rebuild(root=root)
+        finally:
+            with state_lock:
+                active_rebuilds -= 1
+
+    monkeypatch.setattr(library, "_rebuild_index_unlocked", observed_rebuild)
+    start = threading.Barrier(3)
+
+    def publish(clip_id: str) -> dict:
+        start.wait()
+        return update_provenance_tier_d(
+            robot="g1",
+            clip_id=clip_id,
+            errors=errors,
+            iterations=2,
+            root=root,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(publish, clip_id)
+            for clip_id in ("getup_a", "getup_b")
+        ]
+        start.wait()
+        results = [future.result(timeout=5.0) for future in futures]
+
+    assert max_active_rebuilds == 1
+    assert all(result["tierD"]["feasible"] is False for result in results)
+    assert {
+        (row["robot"], row["clip_id"])
+        for row in library.read_index(root=root)
+    } >= {("g1", "getup_a"), ("g1", "getup_b")}
+
+
+def test_direct_rebuild_and_tierd_mutation_share_one_transaction_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual rebuild cannot publish a scan from inside a Tier-D mutation."""
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    failed = TrackingErrors(
+        mean_joint_err_rad=1.0,
+        max_joint_err_rad=2.0,
+        root_z_rmse_m=0.5,
+        duration_coverage=1.0,
+        common_joint_names=[],
+        n_common_joints=0,
+    )
+    original_rebuild = library._rebuild_index_unlocked
+    state_lock = threading.Lock()
+    active_rebuilds = 0
+    max_active_rebuilds = 0
+
+    def observed_rebuild(*, root: Path | None = None):
+        nonlocal active_rebuilds, max_active_rebuilds
+        with state_lock:
+            active_rebuilds += 1
+            max_active_rebuilds = max(max_active_rebuilds, active_rebuilds)
+        try:
+            time.sleep(0.05)
+            return original_rebuild(root=root)
+        finally:
+            with state_lock:
+                active_rebuilds -= 1
+
+    monkeypatch.setattr(library, "_rebuild_index_unlocked", observed_rebuild)
+    start = threading.Barrier(3)
+
+    def manual_rebuild() -> list[dict]:
+        start.wait()
+        return library.rebuild_index(root=root)
+
+    def failed_recertification() -> dict:
+        start.wait()
+        return update_provenance_tier_d(
+            robot="g1",
+            clip_id="getup1",
+            errors=failed,
+            iterations=7,
+            root=root,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rebuild_future = executor.submit(manual_rebuild)
+        update_future = executor.submit(failed_recertification)
+        start.wait()
+        rebuild_future.result(timeout=5.0)
+        updated = update_future.result(timeout=5.0)
+
+    assert max_active_rebuilds == 1
+    assert updated["tier"] == "K"
+    assert updated["tierD"]["iterations"] == 7
+    indexed = {
+        (row["robot"], row["clip_id"]): row
+        for row in library.read_index(root=root)
+    }
+    assert indexed[("g1", "getup1")]["tier"] == "K"
+
+
+def test_same_clip_failed_self_check_cannot_clobber_later_recertification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verification/invalidation stays ordered with same-clip recertification."""
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    contract = _execution_contract(tmp_path, clip)
+    candidate = library.clip_dir(
+        "g1", "getup1", root=root,
+    ) / "rollout-candidate.npz"
+    passed = _write_valid_tierd_rollout(
+        candidate, clip=clip, execution_contract=contract,
+    )
+    rollout_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    retained = candidate.with_name(f"tierD_rollout_{rollout_sha}.npz")
+    candidate.replace(retained)
+    failed = TrackingErrors(
+        mean_joint_err_rad=1.0,
+        max_joint_err_rad=2.0,
+        root_z_rmse_m=0.5,
+        duration_coverage=1.0,
+        common_joint_names=[],
+        n_common_joints=0,
+    )
+    verification_entered = threading.Event()
+    release_verification = threading.Event()
+
+    def blocked_denial(*args, **kwargs):
+        del args, kwargs
+        verification_entered.set()
+        assert release_verification.wait(timeout=5.0)
+        return None, "forced self-verification denial"
+
+    monkeypatch.setattr(
+        "sculptor.refs.track.verify_tierd_certificate", blocked_denial,
+    )
+
+    def publish_then_fail() -> dict:
+        return _publish_and_verify_tierd_verdict(
+            robot="g1",
+            clip_id="getup1",
+            errors=passed,
+            iterations=2,
+            rollout_path=retained,
+            execution_contract=contract,
+            root=root,
+        )
+
+    def publish_later_failure() -> dict:
+        return update_provenance_tier_d(
+            robot="g1",
+            clip_id="getup1",
+            errors=failed,
+            iterations=7,
+            root=root,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(publish_then_fail)
+        assert verification_entered.wait(timeout=5.0)
+        second = executor.submit(publish_later_failure)
+        try:
+            time.sleep(0.05)
+            assert not second.done()
+        finally:
+            release_verification.set()
+        with pytest.raises(TrackError, match="forced self-verification denial"):
+            first.result(timeout=5.0)
+        later = second.result(timeout=5.0)
+
+    persisted = library.read_provenance("g1", "getup1", root=root)
+    assert later["tierD"]["iterations"] == 7
+    assert persisted["tierD"]["iterations"] == 7
+    assert "verification_error" not in persisted["tierD"]
+    assert persisted["tier"] == "K"
+
+
 # ── dry-run pipeline (track_clip) ─────────────────────────────────────────
-def test_track_clip_dry_run_builds_project_without_training(tmp_path: Path):
+def test_track_clip_dry_run_completes_cpu_preflight_without_weights_or_gpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     root = tmp_path / "lib"
     donor = _write_donor_project(tmp_path / "donor")
     clip = _make_getup_clip()
     _register_clip(root, clip, tier="K")
+    calls = _patch_cpu_preflight_policy_contract(monkeypatch)
+
+    def forbid_adapter_load(_config_path: Path):
+        raise AssertionError("dry-run must not construct the GPU-aware adapter")
+
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter", forbid_adapter_load,
+    )
 
     result = track_clip(
         clip_id="getup1", robot="g1", donor_project=donor,
@@ -1135,6 +2005,30 @@ def test_track_clip_dry_run_builds_project_without_training(tmp_path: Path):
     assert result.errors is None
     assert result.plan.reward_path.is_file()
     assert result.plan.config_path.is_file()
+    assert len(calls) == 1
+    receipt = result.preflight_receipt
+    assert receipt["schema"] == "reward-sculptor-tier-d-preflight-v1"
+    assert receipt["status"] == "ready"
+    assert receipt["initialization"] == {
+        "donor_project_role": "adapter_interface_and_config_only",
+        "first_tracker_training": "fresh_random_policy",
+        "donor_policy_weights_loaded": False,
+    }
+    contract = receipt["unbound_execution_contract"]
+    assert contract["donor"]["policy_contract"]["schema"] == 4
+    assert "runtime_artifacts" not in contract
+    asserted_digest = receipt.pop("receipt_sha256")
+    try:
+        encoded = json.dumps(
+            receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        assert hashlib.sha256(encoded).hexdigest() == asserted_digest
+    finally:
+        receipt["receipt_sha256"] = asserted_digest
     # Dry-run must not touch provenance's tierD state.
     assert "tierD" not in result.provenance
 
@@ -1148,18 +2042,537 @@ def test_track_clip_missing_clip_raises(tmp_path: Path):
             dry_run=True, library_root=root)
 
 
-def test_track_clip_default_project_dir_is_under_clip_dir(tmp_path: Path):
+def test_track_clip_requires_explicit_donor_interface_export(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    (donor / "tier_d_interface_contract.json").unlink()
+    _register_clip(root, _make_getup_clip(), tier="K")
+
+    with pytest.raises(
+        TrackError,
+        match=r"sculpt refs export-tierd-interface --donor-project",
+    ):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            project_dir=tmp_path / "work",
+            dry_run=True,
+            library_root=root,
+        )
+
+
+def test_track_clip_default_project_dir_is_unique_and_outside_library(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     root = tmp_path / "lib"
     donor = _write_donor_project(tmp_path / "donor")
     clip = _make_getup_clip()
     _register_clip(root, clip, tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
 
     result = track_clip(
         clip_id="getup1", robot="g1", donor_project=donor,
         dry_run=True, library_root=root)  # no project_dir override
 
-    expected = library.clip_dir("g1", "getup1", root=root) / "tierD_work"
-    assert result.plan.project_dir == expected
+    assert result.plan.project_dir.parent == root.parent / "tierD_work"
+    assert result.plan.project_dir.name.startswith("g1-getup1-")
+    assert result.plan.project_dir.is_dir()
+    assert not result.plan.project_dir.is_relative_to(root.resolve())
+
+
+def test_dry_run_receipt_matches_shared_live_preflight_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    clip = _make_getup_clip()
+    clip_sha = _register_clip(root, clip, tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+
+    direct = _prepare_tierd_tracking_preflight(
+        clip=clip,
+        clip_content_sha256=clip_sha,
+        clip_id="getup1",
+        robot="g1",
+        donor_project=donor,
+        project_dir=tmp_path / "direct",
+        iterations=3,
+        steps_per_iteration=2000,
+        n_episodes=1,
+        seed=0,
+    )
+    dry = track_clip(
+        clip_id="getup1",
+        robot="g1",
+        donor_project=donor,
+        dry_run=True,
+        library_root=root,
+        project_dir=tmp_path / "dry",
+    )
+
+    assert dry.preflight_receipt["artifacts"] == direct.receipt["artifacts"]
+    assert (
+        dry.preflight_receipt["unbound_execution_contract"]
+        == direct.execution_contract
+    )
+
+
+def test_live_path_uses_shared_preflight_before_adapter_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import sculptor.refs.track as track_module
+
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+    real_prepare = track_module._prepare_tierd_tracking_preflight
+    receipts: list[dict] = []
+
+    def observed_prepare(**kwargs):
+        prepared = real_prepare(**kwargs)
+        receipts.append(prepared.receipt)
+        return prepared
+
+    def stop_at_adapter(_config_path: Path):
+        raise RuntimeError("test stop after shared preflight")
+
+    monkeypatch.setattr(
+        track_module, "_prepare_tierd_tracking_preflight", observed_prepare,
+    )
+    monkeypatch.setattr("sculptor.adapters.base.load_adapter", stop_at_adapter)
+
+    with pytest.raises(TrackError, match="test stop after shared preflight"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            dry_run=False,
+            library_root=root,
+            project_dir=tmp_path / "work",
+        )
+    assert len(receipts) == 1
+    assert receipts[0]["status"] == "ready"
+    assert "tierD" not in library.read_provenance(
+        "g1", "getup1", root=root,
+    )
+
+
+def test_track_clip_dry_run_rejects_non_authoritative_donor_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    (donor / "config.toml").write_text(
+        (donor / "config.toml").read_text(encoding="utf-8").replace(
+            "sculptor.adapters.mjlab.MjlabAdapter", "missing.Adapter",
+        ),
+        encoding="utf-8",
+    )
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+
+    with pytest.raises(TrackError, match="trusted local adapter"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            dry_run=True,
+            library_root=root,
+            project_dir=tmp_path / "work",
+        )
+
+
+def test_track_clip_dry_run_rejects_bad_donor_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(
+        monkeypatch,
+        donor_contract=_policy_contract(task_id="Mjlab-Other-Task"),
+    )
+
+    with pytest.raises(TrackError, match="donor config task id does not match"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            dry_run=True,
+            library_root=root,
+            project_dir=tmp_path / "work",
+        )
+
+
+def test_track_clip_dry_run_rejects_bad_generated_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(
+        monkeypatch,
+        generated_contract=_policy_contract(),
+    )
+
+    with pytest.raises(TrackError, match="must use schema 4"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            dry_run=True,
+            library_root=root,
+            project_dir=tmp_path / "work",
+        )
+
+
+def test_track_clip_dry_run_rejects_invalid_environment_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import sculptor.refs.track as track_module
+
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+    real_build = track_module.build_track_project
+
+    def build_with_corrupt_env(*args, **kwargs):
+        plan = real_build(*args, **kwargs)
+        (plan.env_dir / "current.json").write_text(
+            "{not-json", encoding="utf-8",
+        )
+        return plan
+
+    monkeypatch.setattr(track_module, "build_track_project", build_with_corrupt_env)
+
+    with pytest.raises(TrackError, match="cannot capture Tier-D environment"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            dry_run=True,
+            library_root=root,
+            project_dir=tmp_path / "work",
+        )
+
+
+def test_track_clip_requires_fresh_nonoverlapping_work_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+
+    existing = tmp_path / "existing-work"
+    existing.mkdir()
+    marker = existing / "owned.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    with pytest.raises(TrackError, match="fresh and non-existing"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            project_dir=existing,
+            dry_run=True,
+            library_root=root,
+        )
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert not (existing / "config.toml").exists()
+
+    nested_in_donor = donor / "tier-d-work"
+    donor_config = (donor / "config.toml").read_bytes()
+    with pytest.raises(TrackError, match="distinct from donor/library/source"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            project_dir=nested_in_donor,
+            dry_run=True,
+            library_root=root,
+        )
+    assert (donor / "config.toml").read_bytes() == donor_config
+    assert not nested_in_donor.exists()
+
+
+def test_track_clip_rejects_untrusted_or_remote_certification_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lib"
+    _register_clip(root, _make_getup_clip(), tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+
+    untrusted = _write_donor_project(tmp_path / "untrusted")
+    (untrusted / "config.toml").write_text(
+        (untrusted / "config.toml").read_text(encoding="utf-8").replace(
+            "sculptor.adapters.mjlab.MjlabAdapter",
+            "sculptor.adapters.gym_sb3.GymSB3Adapter",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TrackError, match="trusted local adapter"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=untrusted,
+            project_dir=tmp_path / "untrusted-work",
+            dry_run=True,
+            library_root=root,
+        )
+
+    remote = _write_donor_project(tmp_path / "remote")
+    with (remote / "config.toml").open("a", encoding="utf-8") as stream:
+        stream.write('\n[remote]\nhost = "worker.example"\n')
+    with pytest.raises(TrackError, match="remote execution is refused"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=remote,
+            project_dir=tmp_path / "remote-work",
+            dry_run=True,
+            library_root=root,
+        )
+
+    local = _write_donor_project(tmp_path / "local")
+    monkeypatch.setenv("SCULPTOR_REMOTE_HOST", "worker.example")
+    with pytest.raises(TrackError, match="remote execution environment"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=local,
+            project_dir=tmp_path / "remote-env-work",
+            dry_run=True,
+            library_root=root,
+        )
+
+
+def test_track_clip_rejects_robot_traversal_and_symlinked_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    donor = _write_donor_project(tmp_path / "donor")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+    with pytest.raises(TrackError, match="invalid robot namespace"):
+        track_clip(
+            clip_id="getup1",
+            robot="../escape",
+            donor_project=donor,
+            project_dir=tmp_path / "work",
+            dry_run=True,
+            library_root=tmp_path / "lib",
+        )
+
+    outside = tmp_path / "outside"
+    _register_clip(outside, _make_getup_clip(), tier="K")
+    root = tmp_path / "linked-lib"
+    root.mkdir()
+    (root / "g1").symlink_to(outside / "g1", target_is_directory=True)
+    with pytest.raises(TrackError, match="must not be a symlink"):
+        track_clip(
+            clip_id="getup1",
+            robot="g1",
+            donor_project=donor,
+            project_dir=tmp_path / "linked-work",
+            dry_run=True,
+            library_root=root,
+        )
+
+
+def test_track_clip_binds_structured_root_frame_declaration_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    parent_clip = _make_getup_clip()
+    parent_clip.pop("root_frame")
+    _register_clip(root, parent_clip, clip_id="legacy", tier="K")
+
+    free_text = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="legacy",
+        output_clip_id="free_text_only",
+        root_frame="absolute",
+        rationale="The fixture values look like world heights.",
+        root=root,
+    )
+    with pytest.raises(TrackError, match="lacks structured evidence"):
+        track_clip(
+            clip_id=free_text.clip_id,
+            robot="g1",
+            donor_project=donor,
+            project_dir=tmp_path / "free-text-work",
+            dry_run=True,
+            library_root=root,
+        )
+
+    reviewed = library.materialize_root_frame_declaration(
+        robot="g1",
+        source_clip_id="legacy",
+        output_clip_id="reviewed",
+        root_frame="absolute",
+        rationale="The exporter contract defines world-space root height.",
+        evidence_method="deterministic_export_contract",
+        reviewer="test-exporter-contract-v1",
+        root=root,
+    )
+    _patch_cpu_preflight_policy_contract(monkeypatch)
+    result = track_clip(
+        clip_id=reviewed.clip_id,
+        robot="g1",
+        donor_project=donor,
+        project_dir=tmp_path / "reviewed-work",
+        dry_run=True,
+        library_root=root,
+    )
+    assert result.preflight_receipt["unbound_execution_contract"][
+        "reference"
+    ]["root_frame_declaration_evidence"] == reviewed.provenance[
+        "source"
+    ]["evidence"]
+
+
+def _register_root_frame_composite(root: Path, *, clip_id: str):
+    from sculptor.refs.compose import compose_and_register
+
+    _register_clip(root, _make_getup_clip(), clip_id=f"{clip_id}_a")
+    second = _make_getup_clip()
+    second["joint_pos"] = second["joint_pos"] + 0.02
+    _register_clip(root, second, clip_id=f"{clip_id}_b")
+    return compose_and_register(
+        "g1",
+        [
+            {"clip_id": f"{clip_id}_a"},
+            {"clip_id": f"{clip_id}_b"},
+        ],
+        clip_id=clip_id,
+        root=root,
+    )
+
+
+def test_track_clip_rejects_missing_composite_root_frame_receipt_before_gpu(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    composite = _register_root_frame_composite(root, clip_id="missing_receipt")
+    provenance = copy.deepcopy(composite.provenance)
+    provenance["source"].pop("root_frame_inheritance")
+    library.write_provenance(
+        "g1", composite.clip_id, provenance, root=root,
+    )
+
+    with pytest.raises(TrackError, match="root-frame inheritance is invalid"):
+        track_clip(
+            clip_id=composite.clip_id,
+            robot="g1",
+            donor_project=donor,
+            project_dir=tmp_path / "work",
+            dry_run=True,
+            library_root=root,
+        )
+    assert not (tmp_path / "work").exists()
+
+
+def test_track_clip_rehashes_composite_parents_before_gpu(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    donor = _write_donor_project(tmp_path / "donor")
+    composite = _register_root_frame_composite(root, clip_id="stale_parent")
+    changed = _make_getup_clip()
+    changed["joint_pos"] = changed["joint_pos"] + 0.10
+    save_clip(
+        library.clip_dir("g1", "stale_parent_b", root=root)
+        / library.CLIP_FILENAME,
+        changed,
+    )
+
+    with pytest.raises(TrackError, match="root-frame inheritance is invalid"):
+        track_clip(
+            clip_id=composite.clip_id,
+            robot="g1",
+            donor_project=donor,
+            project_dir=tmp_path / "work",
+            dry_run=True,
+            library_root=root,
+        )
+    assert not (tmp_path / "work").exists()
+
+
+def test_real_cpu_preflight_never_calls_cuda_or_subprocess(
+    tmp_path: Path,
+) -> None:
+    """A cold dry-run cannot import mjlab, construct an adapter, or execute."""
+    import subprocess
+    import sys
+
+    from sculptor.eval.robot_manifest import robot_joint_names
+
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    joints = robot_joint_names("Mjlab-Velocity-Flat-Unitree-G1")
+    donor = _write_donor_project(
+        tmp_path / "donor",
+        policy_contract=_policy_contract(robot_joints=joints),
+    )
+    clip["joint_names"] = joints
+    clip["joint_pos"] = np.zeros((len(clip["root_pos_z"]), len(joints)))
+    _register_clip(root, clip, tier="K")
+    script = f"""
+import subprocess
+import sys
+import torch
+
+assert not any(name == 'mjlab' or name.startswith('mjlab.') for name in sys.modules)
+
+def forbidden(*args, **kwargs):
+    del args, kwargs
+    raise AssertionError('cold CPU preflight crossed an execution boundary')
+
+subprocess.run = forbidden
+subprocess.Popen.__init__ = forbidden
+torch.cuda.is_available = forbidden
+torch.cuda.mem_get_info = forbidden
+
+from sculptor.adapters import base as adapter_base
+adapter_base.load_adapter = forbidden
+from sculptor.refs.track import track_clip
+
+assert not any(name == 'mjlab' or name.startswith('mjlab.') for name in sys.modules)
+result = track_clip(
+    clip_id='getup1',
+    robot='g1',
+    donor_project={str(donor)!r},
+    project_dir={str(tmp_path / 'real-cpu-work')!r},
+    dry_run=True,
+    library_root={str(root)!r},
+)
+assert result.dry_run is True
+assert result.preflight_receipt['status'] == 'ready'
+assert not any(name == 'mjlab' or name.startswith('mjlab.') for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 # ── CLI: refs track --dry-run ─────────────────────────────────────────────
@@ -1173,6 +2586,7 @@ def test_cli_refs_track_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     donor = _write_donor_project(tmp_path / "donor")
     clip = _make_getup_clip()
     _register_clip(root, clip, tier="K")
+    _patch_cpu_preflight_policy_contract(monkeypatch)
 
     runner = CliRunner()
     result = runner.invoke(app, [
@@ -1181,8 +2595,45 @@ def test_cli_refs_track_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     ])
     assert result.exit_code == 0, result.output
     assert "dry-run plan" in result.output
+    assert "reward-sculptor-tier-d-preflight-v1" in result.output
+    assert '"donor_policy_weights_loaded": false' in result.output
     assert "getup1" not in "".join(
         line for line in result.output.splitlines() if "FAILED" in line)
+
+
+def test_cli_exports_researcher_visible_tierd_interface_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    from sculptor.cli import app
+
+    donor = tmp_path / "donor"
+    donor.mkdir()
+    receipt = donor / "tier_d_interface_contract.json"
+    receipt.write_bytes(b"exact donor interface receipt\n")
+    observed: list[Path] = []
+
+    def fake_export(path: Path) -> Path:
+        observed.append(Path(path))
+        return receipt
+
+    monkeypatch.setattr(
+        "sculptor.refs.track.export_tierd_donor_interface",
+        fake_export,
+    )
+    result = CliRunner().invoke(app, [
+        "refs",
+        "export-tierd-interface",
+        "--donor-project",
+        str(donor),
+    ])
+    assert result.exit_code == 0, result.output
+    assert observed == [donor]
+    assert str(receipt) in result.output
+    assert hashlib.sha256(receipt.read_bytes()).hexdigest() in result.output
+    assert "policy weights were not loaded" in result.output
 
 
 def test_cli_refs_track_missing_clip_exits_nonzero(
@@ -1214,6 +2665,10 @@ def test_cli_refs_track_help_lists_key_options():
     assert result.exit_code == 0
     for opt in ("--clip-id", "--donor-project", "--iterations", "--dry-run"):
         assert opt in result.output
+    compact_help = " ".join(result.output.replace("│", " ").split())
+    assert "donor policy weights are never loaded" in compact_help.lower()
+    assert "first tracker training starts fresh" in compact_help
+    assert "tierD_rollout_<sha256>.npz" in compact_help
 
 
 # ── §audit-finding close: verify_tierd_certificate ─────────────────────────
@@ -1223,7 +2678,293 @@ def test_cli_refs_track_help_lists_key_options():
 # certificate this module verifies from disk counts. Every check in
 # `verify_tierd_certificate`'s docstring gets its own tamper test below —
 # each mutates exactly ONE thing off the otherwise-valid fixture.
-_ROLLOUT_BYTES = b"legit tracking rollout npz bytes"
+def _write_valid_tierd_rollout(
+    path: Path,
+    *,
+    clip: dict,
+    execution_contract: dict,
+) -> TrackingErrors:
+    dt = float(execution_contract["execution_boundary"]["timing"][
+        "control_dt_s"
+    ])
+    duration_s = reference_playback_duration_s(
+        frame_count=len(clip["joint_pos"]), fps=float(clip["fps"]),
+    )
+    n_steps = int(round(duration_s / dt)) + 1
+    n_targets = int(execution_contract["reference"]["phase_target_count"])
+    target_joint_pos = np.round(
+        downsample_phase_targets(clip["joint_pos"], n=n_targets), 5,
+    )
+    target_root_z = np.round(
+        downsample_phase_targets(clip["root_pos_z"], n=n_targets), 5,
+    )
+    phase = np.clip(
+        (np.arange(n_steps, dtype=np.float64) + 1.0) * dt / duration_s,
+        0.0,
+        0.999999,
+    )
+    indices = np.floor(phase * n_targets).astype(np.int64)
+    joint_pos = target_joint_pos[indices]
+    root_z = target_root_z[indices]
+    root_pos = np.zeros((n_steps, 1, 3), dtype=np.float32)
+    root_pos[:, 0, 2] = root_z
+    metadata = {
+        "schema": "reward-sculptor-trajectory-v1",
+        "layout": ["time", "environment", "feature"],
+        "ordered_joint_names": list(execution_contract[
+            "execution_boundary"
+        ]["joints"]["ordered_names"]),
+        "control_dt_s": dt,
+        "root_link_pos_w_frame": "world",
+        "first_episode_lane": 0,
+        "valid_mask": {
+            "key": "first_episode_valid_mask",
+            "semantics": "true_prefix_before_first_done",
+            "invalid_state": "frozen_last_valid_sample",
+            "state_samples": "post_step_after_valid_transition",
+        },
+        "runtime_artifacts": {
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "rollout",
+            "reward_module_sha256": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["reward_module_sha256"],
+            "checkpoint_sha256": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["checkpoint_sha256"],
+            "checkpoint_load_completed": True,
+            "environment_artifacts": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["environment_artifacts"],
+            "requested_seed": 0,
+            "applied_seed": 0,
+            "seed_application": {
+                "schema": "reward-sculptor-seed-application-v1",
+                "applied_seed": 0,
+                "python_random": True,
+                "numpy_global": True,
+                "torch_global": True,
+                "env_cfg": True,
+                "rl_cfg": False,
+            },
+            "env_spec_application": {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "rollout", "requested": [], "applied": [],
+                "dead": [], "errors": [],
+            },
+            "eval_reset_application": {
+                "schema": "reward-sculptor-eval-reset-application-v1",
+                "requested": [], "applied": [], "dead": [], "errors": [],
+            },
+            "requested_n_episodes": 1,
+            "configured_n_episodes": 1,
+            "requested_max_episode_steps": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["requested_max_episode_steps"],
+            "configured_max_episode_steps": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["requested_max_episode_steps"],
+            "requested_task_id": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["requested_task_id"],
+            "configured_task_id": execution_contract[
+                "runtime_artifacts"
+            ]["rollout_requirements"]["requested_task_id"],
+            "configured_num_envs": 1,
+            "completed_first_episodes": 0,
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        joint_pos=joint_pos[:, None, :].astype(np.float32),
+        root_link_pos_w=root_pos,
+        first_episode_valid_mask=np.ones((n_steps, 1), dtype=bool),
+        trajectory_contract_json=np.asarray(json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"),
+        )),
+    )
+    return _score_tierd_rollout_artifact(
+        path, clip=clip, execution_contract=execution_contract,
+    )
+
+
+def test_tierd_rollout_rejects_time_dilated_replay(tmp_path: Path) -> None:
+    """Repeating a good motion slowly cannot manufacture Tier-D evidence."""
+    clip = _make_getup_clip()
+    execution_contract = _execution_contract(tmp_path, clip)
+    path = tmp_path / "tierD_rollout.npz"
+    _write_valid_tierd_rollout(
+        path, clip=clip, execution_contract=execution_contract,
+    )
+    with np.load(path, allow_pickle=False) as archive:
+        payload = {key: np.asarray(archive[key]) for key in archive.files}
+    for key in ("joint_pos", "root_link_pos_w", "first_episode_valid_mask"):
+        payload[key] = np.repeat(payload[key], 2, axis=0)
+    np.savez_compressed(path, **payload)
+
+    with pytest.raises(TrackError, match="exceeds the certified reference"):
+        _score_tierd_rollout_artifact(
+            path, clip=clip, execution_contract=execution_contract,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reward_module_sha256", "f" * 64),
+        ("checkpoint_sha256", "e" * 64),
+        ("checkpoint_load_completed", False),
+    ],
+)
+def test_tierd_rollout_rejects_runtime_artifact_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: str | bool,
+) -> None:
+    clip = _make_getup_clip()
+    execution_contract = _execution_contract(tmp_path, clip)
+    path = tmp_path / "tierD_rollout.npz"
+    _write_valid_tierd_rollout(
+        path, clip=clip, execution_contract=execution_contract,
+    )
+    with np.load(path, allow_pickle=False) as archive:
+        payload = {key: np.asarray(archive[key]) for key in archive.files}
+    metadata = json.loads(str(payload["trajectory_contract_json"].item()))
+    metadata["runtime_artifacts"][field] = value
+    payload["trajectory_contract_json"] = np.asarray(json.dumps(
+        metadata, sort_keys=True, separators=(",", ":"),
+    ))
+    np.savez_compressed(path, **payload)
+
+    with pytest.raises(TrackError, match="trajectory contract differs"):
+        _score_tierd_rollout_artifact(
+            path, clip=clip, execution_contract=execution_contract,
+        )
+
+
+def test_tierd_scores_exact_rounded_phase_table_not_native_clip_frames(
+    tmp_path: Path,
+) -> None:
+    """A 65-frame intra-bin alternation cannot change the 32-table target."""
+    frame = np.arange(65, dtype=np.float64)
+    clip = {
+        "root_pos_z": np.full(65, 0.75),
+        "root_frame": "absolute",
+        "fps": 64.0,
+        "joint_pos": (
+            (frame / 64.0) + 0.35 * np.where(frame % 2 == 0, 1.0, -1.0)
+        )[:, None],
+        "joint_names": ["left_hip_pitch_joint"],
+    }
+    execution_contract = _execution_contract(
+        tmp_path,
+        clip,
+        policy_contract=_policy_contract(
+            robot_joints=["left_hip_pitch_joint"],
+        ),
+    )
+    exact_path = tmp_path / "exact-table.npz"
+    exact = _write_valid_tierd_rollout(
+        exact_path, clip=clip, execution_contract=execution_contract,
+    )
+    assert exact.mean_joint_err_rad == pytest.approx(0.0, abs=1e-7)
+
+    with np.load(exact_path, allow_pickle=False) as archive:
+        native_payload = {
+            key: np.asarray(archive[key]) for key in archive.files
+        }
+    steps = native_payload["joint_pos"].shape[0]
+    dt = execution_contract["execution_boundary"]["timing"]["control_dt_s"]
+    native_indices = np.minimum(
+        np.floor(
+            (np.arange(steps, dtype=np.float64) + 1.0)
+            * dt * float(clip["fps"])
+            + 1e-12
+        ).astype(np.int64),
+        64,
+    )
+    native_payload["joint_pos"] = np.asarray(
+        clip["joint_pos"], dtype=np.float32,
+    )[native_indices, None, :]
+    native_path = tmp_path / "native-frame-replay.npz"
+    np.savez_compressed(native_path, **native_payload)
+    native = _score_tierd_rollout_artifact(
+        native_path, clip=clip, execution_contract=execution_contract,
+    )
+    assert native.mean_joint_err_rad > 0.1
+
+
+def test_short_origin_relative_schedule_uses_rounded_table_zero_anchor() -> None:
+    clip = {
+        "root_pos_z": np.linspace(0.0, 0.16, 17),
+        "root_frame": "origin_relative",
+        "fps": 40.0,
+        "joint_pos": np.linspace(0.0, 0.4, 17)[:, None],
+        "joint_names": ["joint"],
+    }
+    table_root = np.round(
+        downsample_phase_targets(clip["root_pos_z"], n=32), 5,
+    )
+    # Exercise a short rollout whose first observed phase is already above
+    # the immutable table-zero anchor.  The scorer must not silently re-anchor
+    # the reference at this truncated rollout's first scheduled sample.
+    scheduled = table_root[np.array([2, 3, 4], dtype=np.int64)]
+    result = compute_tracking_errors(
+        clip=clip,
+        rollout_joint_pos=np.zeros((3, 1)),
+        rollout_root_z=scheduled.copy(),
+        rollout_joint_names=["joint"],
+        control_hz=50.0,
+        rollout_samples_are_post_step=True,
+        scheduled_target_joint_pos=np.zeros((3, 1)),
+        scheduled_target_root_z=scheduled,
+        scheduled_target_root_anchor=float(table_root[0]),
+    )
+    expected = float(abs(table_root[2] - table_root[0]))
+    assert result.root_z_rmse_m == pytest.approx(expected, abs=1e-12)
+    assert result.root_z_rmse_m > 0.0
+
+
+def test_generated_tracker_contract_is_pure_clock_conditioning() -> None:
+    base = _policy_contract()
+    clock = _reference_clock_for_clip(_make_getup_clip())
+    observed = _build_generated_tracker_policy_contract(
+        base,
+        reference_clock=clock,
+    )
+    assert observed == _clock_conditioned_policy_contract(base, clock)
+    assert base["schema"] == 2
+    assert "reference_clock" not in base
+
+
+def test_checkpoint_sidecar_rejects_runner_contract_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    from sculptor.policy_contract import contract_fingerprint
+
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    expected = {"schema": 4, "observations": {"shape": [99]}}
+    observed = {"schema": 4, "observations": {"shape": [171]}}
+    sidecar = Path(str(checkpoint) + ".policy_contract.json")
+    sidecar.write_text(json.dumps({
+        "schema": 1,
+        "checkpoint_sha256": checkpoint_sha,
+        "policy_contract": observed,
+        "policy_contract_sha256": contract_fingerprint(observed),
+    }, sort_keys=True), encoding="utf-8")
+    with pytest.raises(TrackError, match="differs from the generated tracker"):
+        _verify_checkpoint_policy_contract_sidecar(
+            checkpoint,
+            checkpoint_sha256=checkpoint_sha,
+            expected_policy_contract=expected,
+            expected_policy_contract_sha256=contract_fingerprint(expected),
+            expected_sidecar_sha256=hashlib.sha256(
+                sidecar.read_bytes()
+            ).hexdigest(),
+        )
 
 
 def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
@@ -1236,20 +2977,24 @@ def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
     bytes (§F7). Returns the written provenance dict."""
     clip = _make_getup_clip()
     _register_clip(root, clip, clip_id=clip_id, robot=robot, tier="K")
-    rollout_path = library.clip_dir(robot, clip_id, root=root) / "tierD_rollout.npz"
-    rollout_path.write_bytes(_ROLLOUT_BYTES)
-    errs = TrackingErrors(
-        mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
-        duration_coverage=1.0, common_joint_names=["left_hip_pitch_joint"],
-        n_common_joints=1)
+    clip_dir = library.clip_dir(robot, clip_id, root=root)
+    rollout_path = clip_dir / "rollout-candidate.npz"
+    execution_contract = _execution_contract(
+        tmp_path, clip, robot=robot,
+        policy_contract=_policy_contract(),
+    )
+    errs = _write_valid_tierd_rollout(
+        rollout_path, clip=clip, execution_contract=execution_contract,
+    )
+    rollout_sha = hashlib.sha256(rollout_path.read_bytes()).hexdigest()
+    retained_rollout = clip_dir / f"tierD_rollout_{rollout_sha}.npz"
+    rollout_path.replace(retained_rollout)
+    rollout_path = retained_rollout
     assert errs.feasible  # sanity: fixture stats are within threshold
     return update_provenance_tier_d(
         robot=robot, clip_id=clip_id, errors=errs, iterations=2,
         rollout_path=rollout_path,
-        execution_contract=_execution_contract(
-            tmp_path, clip, robot=robot,
-            policy_contract=_policy_contract(),
-        ),
+        execution_contract=execution_contract,
         root=root)
 
 
@@ -1263,9 +3008,15 @@ def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Pa
     assert isinstance(cert, TierDCertificate)
     assert cert.robot == "g1"
     assert cert.clip_id == "getup1"
-    assert cert.mean_joint_err_rad == pytest.approx(0.05)
-    assert cert.root_z_rmse_m == pytest.approx(0.02)
-    assert cert.rollout_sha256 == library.content_sha256(_ROLLOUT_BYTES)
+    assert cert.mean_joint_err_rad == pytest.approx(
+        prov["tierD"]["errors"]["mean_joint_err_rad"], abs=5e-7,
+    )
+    assert cert.root_z_rmse_m == pytest.approx(
+        prov["tierD"]["errors"]["root_z_rmse_m"], abs=5e-7,
+    )
+    assert cert.rollout_sha256 == library.content_sha256(
+        cert.rollout_path.read_bytes()
+    )
     assert cert.clip_content_sha256 == prov["content_sha256"]
     assert cert.execution_contract_sha256 == prov["tierD"][
         "execution_contract_sha256"
@@ -1376,8 +3127,21 @@ def test_verify_tierd_certificate_reference_cadence_receipt_cannot_go_stale(
         reference = contract["reference"]
         reference["fps"] = 25.0
         reference["playback_duration_s"] = (
-            reference["frame_count"] / reference["fps"]
+            (reference["frame_count"] - 1) / reference["fps"]
         )
+        reference["clock_contract"]["phase_duration_s"] = reference[
+            "playback_duration_s"
+        ]
+        contract["donor"]["policy_contract"]["reference_clock"] = copy.deepcopy(
+            reference["clock_contract"]
+        )
+        contract["donor"]["policy_contract_sha256"] = _canonical_sha256(
+            contract["donor"]["policy_contract"]
+        )
+        for observation in contract["runtime_artifacts"]["train_observations"]:
+            observation["output_policy_contract_sha256"] = contract["donor"][
+                "policy_contract_sha256"
+            ]
         unsigned = dict(contract)
         unsigned.pop("contract_sha256", None)
         contract["contract_sha256"] = _canonical_sha256(unsigned)
@@ -1587,7 +3351,13 @@ def test_verify_tierd_certificate_infeasible_run_denied(tmp_path: Path):
 def _mutate_provenance(root: Path, robot: str, clip_id: str, fn) -> None:
     prov = library.read_provenance(robot, clip_id, root=root)
     fn(prov)
-    library.write_provenance(robot, clip_id, prov, root=root)
+    # Deliberately bypass the write-time guard: these tests model an
+    # adversary editing provenance.json after a valid certificate was issued.
+    path = (
+        library.clip_dir(robot, clip_id, root=root)
+        / library.PROVENANCE_FILENAME
+    )
+    path.write_text(json.dumps(prov, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def test_verify_tierd_certificate_tamper_edited_tier_without_stats_denied(
@@ -1691,10 +3461,11 @@ def test_verify_tierd_certificate_rollout_path_escapes_root_denied(tmp_path: Pat
     a hand-edited provenance.json must not be able to point this at an
     arbitrary file elsewhere on disk."""
     root = tmp_path / "lib"
-    _certify_valid_tier_d(tmp_path, root)
+    prov = _certify_valid_tier_d(tmp_path, root)
 
     escaped = tmp_path / "outside_root_rollout.npz"
-    escaped.write_bytes(_ROLLOUT_BYTES)  # same bytes/hash as the real one
+    retained = Path(prov["tierD"]["rollout_path"])
+    escaped.write_bytes(retained.read_bytes())  # exact same bytes/hash
     _mutate_provenance(root, "g1", "getup1", lambda p: p["tierD"].update({
         "rollout_path": str(escaped),
     }))
@@ -1748,6 +3519,105 @@ def test_verify_tierd_certificate_never_raises_on_corrupt_provenance(tmp_path: P
     assert reason is not None
 
 
+def test_verify_tierd_certificate_never_raises_on_non_object_provenance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    _register_clip(root, _make_getup_clip(), tier="K")
+    prov_path = (
+        library.clip_dir("g1", "getup1", root=root)
+        / library.PROVENANCE_FILENAME
+    )
+    prov_path.write_text("[]", encoding="utf-8")
+
+    certificate, reason = verify_tierd_certificate(
+        "g1", "getup1", root=root,
+    )
+    assert certificate is None
+    assert "JSON object" in reason
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason_fragment"),
+    [
+        (lambda provenance: provenance.__setitem__("schema", 1), "schema"),
+        (
+            lambda provenance: provenance.__setitem__("robot", "t1"),
+            "provenance.robot",
+        ),
+        (
+            lambda provenance: provenance.__setitem__("clip_id", "other"),
+            "provenance.clip_id",
+        ),
+    ],
+)
+def test_verify_tierd_certificate_rejects_legacy_or_misscoped_provenance(
+    tmp_path: Path,
+    mutation,
+    reason_fragment: str,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    _mutate_provenance(root, "g1", "getup1", mutation)
+
+    certificate, reason = verify_tierd_certificate(
+        "g1", "getup1", root=root,
+    )
+    assert certificate is None
+    assert reason_fragment in reason
+
+
+@pytest.mark.parametrize("iterations", ["oops", 0, 3])
+def test_verify_tierd_certificate_rejects_invalid_or_stale_iterations(
+    tmp_path: Path,
+    iterations,
+) -> None:
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    _mutate_provenance(
+        root,
+        "g1",
+        "getup1",
+        lambda provenance: provenance["tierD"].__setitem__(
+            "iterations", iterations,
+        ),
+    )
+
+    certificate, reason = verify_tierd_certificate(
+        "g1", "getup1", root=root,
+    )
+    assert certificate is None
+    assert "tierD.iterations" in reason
+
+
+def test_update_provenance_rechecks_schema_after_execution(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    provenance = _certify_valid_tier_d(tmp_path, root)
+    rollout = Path(provenance["tierD"]["rollout_path"])
+    contract = provenance["tierD"]["execution_contract"]
+    clip = _make_getup_clip()
+    errors = _score_tierd_rollout_artifact(
+        rollout, clip=clip, execution_contract=contract,
+    )
+    _mutate_provenance(
+        root, "g1", "getup1",
+        lambda current: current.__setitem__("schema", 1),
+    )
+
+    with pytest.raises(TrackError, match="invalid or mis-scoped provenance"):
+        update_provenance_tier_d(
+            robot="g1",
+            clip_id="getup1",
+            errors=errors,
+            iterations=2,
+            rollout_path=rollout,
+            execution_contract=contract,
+            root=root,
+        )
+
+
 # ── orientation tracking (OGMP Eq. 8) ───────────────────────────────────
 def _load_src(src, tmp_path, name="orient_mod"):
     import importlib.util
@@ -1762,7 +3632,7 @@ def _load_src(src, tmp_path, name="orient_mod"):
 def _orient_src(target_gravity, n=8, j=4):
     from sculptor.refs.track import generate_tracking_reward_source
     return generate_tracking_reward_source(
-        clip_id="t", joint_names=[f"j{i}" for i in range(j)],
+        clip_id="t", robot="g1", joint_names=[f"j{i}" for i in range(j)],
         target_joint_pos=np.zeros((n, j)), target_root_z=np.zeros(n),
         episode_len_steps=100, duration_s=2.0, target_gravity=target_gravity)
 
@@ -1897,6 +3767,7 @@ def test_orientation_does_not_gate_certification():
     e = TrackingErrors(
         mean_joint_err_rad=0.01, max_joint_err_rad=0.02, root_z_rmse_m=0.01,
         duration_coverage=1.0, static_baseline_err_rad=0.5,
+        common_joint_names=["joint"], n_common_joints=1,
         orientation_err=2.0)               # fully inverted
     assert e.feasible is True
     assert e.to_dict()["orientation_err"] == 2.0
@@ -1932,12 +3803,12 @@ def test_orientation_is_skipped_when_the_clip_has_no_quaternion():
 
 
 def test_duration_coverage_is_wall_time_not_frame_count():
-    """The real case: a 444-frame 120 fps clip and a 185-step 50 Hz rollout
-    both span 3.70 s. Dividing frame counts reported 41.7% coverage — exactly
-    50/120 — for a rollout that ran the entire motion."""
+    """A 361-sample 120 fps clip and 151-sample 50 Hz rollout both contain
+    3.0 s of sample intervals. Dividing frame counts reports about 41.8% for a
+    rollout that ran the entire motion."""
     from sculptor.refs.track import compute_tracking_errors
 
-    n_clip, n_roll = 444, 185
+    n_clip, n_roll = 361, 151
     clip = {"joint_pos": np.zeros((n_clip, 2)), "joint_names": ["a", "b"],
             "root_pos_z": np.zeros(n_clip), "fps": 120.0}
     e = compute_tracking_errors(
@@ -1957,7 +3828,9 @@ def test_a_rollout_that_really_stops_early_still_reports_partial_coverage():
         clip=clip, rollout_joint_pos=np.zeros((92, 2)),
         rollout_root_z=np.zeros(92), rollout_joint_names=["a", "b"],
         control_hz=50.0)
-    assert e.duration_coverage == pytest.approx(92 / 50 / 3.70, rel=1e-3)
+    assert e.duration_coverage == pytest.approx(
+        ((92 - 1) / 50) / ((444 - 1) / 120), rel=1e-3,
+    )
 
 
 def test_duration_coverage_falls_back_to_frames_without_fps():

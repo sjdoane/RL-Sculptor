@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -75,9 +77,43 @@ def _run(mode: str = "actor_only") -> TrainingRun:
 
 
 def _reference_evidence(digest: str) -> dict[str, object]:
+    scope = {"simulator": "mjlab", "cadence_hz": 50.0}
+    tierd_receipt = {
+        "status": "tierd_verified",
+        "tier": "D",
+        "kinematic_only": False,
+        "training_authorized": True,
+        "reference_tracking_certificate_admitted": True,
+        "reference_robot": "g1",
+        "target_robot": "g1",
+        "reference_clip_id": "cartwheel",
+        "clip_sha256": digest,
+        "rollout_sha256": "7" * 64,
+        "certificate_sha256": "8" * 64,
+        "execution_contract_sha256": "9" * 64,
+        "execution_boundary_sha256": "a" * 64,
+        "certification_scope": scope,
+    }
+    schedule = {
+        "reference_robot": "g1",
+        "reference_clip_id": "cartwheel",
+        "reference_target_sha256": "b" * 64,
+        "phase_mode": "hold",
+        "phase_duration_s": 1.0,
+        "n_phase_targets": 32,
+        "tracking_backbone_sha256": "c" * 64,
+    }
+
+    def digest_of(value: object) -> str:
+        return hashlib.sha256(json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+
     return {
         "authority": "reference_feasibility_admitted+run_started",
         "verified": True,
+        "tierd_receipt": tierd_receipt,
+        "tierd_receipt_sha256": digest_of(tierd_receipt),
         "tier": "D",
         "robot": "g1",
         "clip_id": "cartwheel",
@@ -87,6 +123,38 @@ def _reference_evidence(digest: str) -> dict[str, object]:
         "execution_contract_sha256": "9" * 64,
         "execution_boundary_sha256": "a" * 64,
         "target_robot": "g1",
+        "certification_scope": scope,
+        "certification_scope_sha256": digest_of(scope),
+        "runtime_schedule_authority": "reference_runtime_schedule_admitted",
+        "runtime_schedule": schedule,
+        "runtime_schedule_sha256": digest_of(schedule),
+        "reference_target_sha256": "b" * 64,
+        "phase_mode": "hold",
+        "phase_duration_s": 1.0,
+        "n_phase_targets": 32,
+        "tracking_backbone_sha256": "c" * 64,
+    }
+
+
+def _initialization_receipt(policy: PolicyArtifact) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "requested": {
+            "roles": ["actor"],
+            "initialization_mode": "actor_only",
+        },
+        "resolved": {
+            "roles": ["actor"],
+            "initialization_mode": "actor_only",
+            "checkpoint_sha256": policy.sha256,
+        },
+        "observed": {
+            "roles": ["actor"],
+            "load_cfg_keys": ["actor"],
+            "initialization_mode": "actor_only",
+            "source_sha256": policy.sha256,
+            "loaded_checkpoint_sha256": policy.sha256,
+        },
     }
 
 
@@ -227,16 +295,18 @@ def test_initialization_edge_is_earned_only_after_observed_load(kg) -> None:
         transfer_mode="actor_only",
         checkpoint_sha256=policy.sha256,
         load_cfg_keys=["actor"],
+        initialization_receipt=_initialization_receipt(policy),
     )
 
     edges = kg.neighbors(run.id, relation=Relation.INITIALIZED_FROM)
     assert len(edges) == 1
-    assert edges[0][0].data == {
-        "transfer_mode": "actor_only",
-        "checkpoint_sha256": policy.sha256,
-        "load_cfg_keys": ["actor"],
-        "authority": "warm_start_loaded",
-    }
+    assert edges[0][0].data["transfer_mode"] == "actor_only"
+    assert edges[0][0].data["checkpoint_sha256"] == policy.sha256
+    assert edges[0][0].data["load_cfg_keys"] == ["actor"]
+    assert edges[0][0].data["authority"] == (
+        "starting_policy_initialization_verified"
+    )
+    assert edges[0][0].data["receipt"] == _initialization_receipt(policy)
     assert kg.get_node(run.id).observed_initialization_mode == "actor_only"
 
 
@@ -456,6 +526,7 @@ def test_output_policy_has_production_and_derivation_lineage(kg) -> None:
         transfer_mode="actor_only",
         checkpoint_sha256=input_policy.sha256,
         load_cfg_keys=["actor"],
+        initialization_receipt=_initialization_receipt(input_policy),
     )
     record_run_output(
         kg,
