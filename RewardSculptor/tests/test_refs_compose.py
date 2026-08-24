@@ -77,6 +77,39 @@ def test_composes_two_clips_into_a_valid_clip():
     assert comp["certified"] is False
 
 
+def test_composition_preserves_a_shared_root_frame_contract():
+    first = _clip()
+    second = _clip(joint_offset=0.05)
+    first["root_frame"] = "origin_relative"
+    second["root_frame"] = "origin_relative"
+
+    out = compose_reference([
+        {"clip": first, "label": "prepare"},
+        {"clip": second, "label": "hop"},
+    ])
+
+    assert out["root_frame"] == "origin_relative"
+    assert validate_clip(out) == []
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("origin_relative", None),
+        ("origin_relative", "absolute"),
+    ],
+)
+def test_composition_refuses_mixed_root_frame_contracts(left, right):
+    first = _clip()
+    second = _clip(joint_offset=0.05)
+    first["root_frame"] = left
+    if right is not None:
+        second["root_frame"] = right
+
+    with pytest.raises(ComposeError, match="incompatible root_frame"):
+        compose_reference([{"clip": first}, {"clip": second}])
+
+
 def test_requires_at_least_two_segments():
     with pytest.raises(ComposeError, match=">= 2 segments"):
         compose_reference([{"clip": _clip()}])

@@ -21,7 +21,7 @@ What this module does and does not claim:
 - It is a **kinematic** composer. Concatenating dynamically-valid spans does
   NOT yield a dynamically-valid whole: momentum is not conserved across a
   seam, and a blend window is interpolation, not physics. The composite is a
-  *candidate*, and `refs.track`'s Tier-D physics certification is the
+  *candidate*, and `refs.track`'s Tier-D exact-schedule tracking evidence is the
   admission filter that decides whether it is trackable. Compose then track;
   never compose and trust.
 - Seams are the risk, so they are measured, not assumed. `seam_report`
@@ -436,6 +436,31 @@ def compose_reference(
             f"compose_reference needs >= 2 segments, got {len(raw)}; a single "
             "span is already handled by refs.spans.crop_span")
 
+    # Root height has two materially different meanings in the library. A
+    # composer must not silently erase that contract (forcing a researcher to
+    # re-assert it later) or combine clips whose heights live in different
+    # frames. Legacy clips with no declaration remain composable as Tier-K
+    # candidates, but a partially declared or contradictory composition fails
+    # closed.
+    root_frames = [spec.get("clip", {}).get("root_frame")
+                   if isinstance(spec.get("clip"), Mapping) else None
+                   for spec in raw]
+    declared_root_frames = {str(value) for value in root_frames
+                            if value is not None}
+    if declared_root_frames and (
+        len(declared_root_frames) != 1
+        or any(value is None for value in root_frames)
+    ):
+        rendered = [str(value) if value is not None else "<missing>"
+                    for value in root_frames]
+        raise ComposeError(
+            "source clips have incompatible root_frame contracts: "
+            f"{rendered}; declare one exact convention on every source before "
+            "composition")
+    inherited_root_frame = (
+        next(iter(declared_root_frames)) if declared_root_frames else None
+    )
+
     # 1. crop
     cropped: list[dict] = []
     provenance: list[dict[str, Any]] = []
@@ -520,6 +545,8 @@ def compose_reference(
                 "sculptor.refs.track before authoring a reward against it."),
         },
     }
+    if inherited_root_frame is not None:
+        acc["root_frame"] = inherited_root_frame
 
     errors = validate_clip(acc)
     if errors:
@@ -596,7 +623,8 @@ def compose_and_register(
 
     The composite is registered at **tier K** (kinematics only, no dynamics
     guarantee) — the same tier a fresh retarget gets, and for the same
-    reason. `refs.track`'s Tier-D certification is what promotes it, and
+    reason. `refs.track`'s Tier-D exact-schedule tracking evidence is what
+    promotes it, and
     until that runs the provenance says so.
 
     Licenses are inherited from every parent (see `_merge_source_licenses`).
@@ -683,8 +711,11 @@ def compose_and_register(
                 "Kinematic composite of spans from the listed parent clips: "
                 "SE(2)-aligned at each seam, smoothstep cross-faded, "
                 "velocities recomputed from the composed positions. No "
-                "dynamics guarantee — momentum is not conserved across a "
-                "seam. Promote to tier D only via refs.track certification."),
+                "general dynamics guarantee — momentum is not conserved across "
+                "a seam. Tier-D promotion is available only through refs.track "
+                "exact-schedule joint-position/root-height tracking evidence; "
+                "that evidence does not certify contact safety, collision "
+                "avoidance, root-XY tracking, or general dynamics feasibility."),
         },
         # Tier K for the same reason a fresh retarget is: kinematics only.
         tier="K",
