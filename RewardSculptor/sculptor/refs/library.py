@@ -193,6 +193,37 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _schema2_artifact_identity_errors(
+    robot: str, clip_id: str, prov: dict[str, Any], *, root: Optional[Path],
+) -> list[str]:
+    """Verify that schema-2 provenance names the retained artifact bytes.
+
+    Schema 2 exists specifically to make ``content_sha256`` the identity of
+    the server-owned ``clip.npz`` consumed by training.  Validating only the
+    digest's syntax would let a caller write a perfectly shaped lie at the
+    library's single persistence choke point.
+    """
+    if prov.get("schema") != PROVENANCE_SCHEMA:
+        return []
+    path = clip_dir(robot, clip_id, root=root) / CLIP_FILENAME
+    if not path.is_file():
+        return [
+            "schema-2 provenance requires the retained clip.npz artifact "
+            "to exist before provenance is written"
+        ]
+    try:
+        actual_sha = content_sha256(path.read_bytes())
+    except OSError as exc:
+        return [f"cannot read retained clip.npz artifact: {exc}"]
+    declared_sha = prov.get("content_sha256")
+    if declared_sha != actual_sha:
+        return [
+            "provenance.content_sha256 does not match the exact retained "
+            f"clip.npz bytes ({declared_sha!r} != {actual_sha!r})"
+        ]
+    return []
+
+
 def write_provenance(
     robot: str, clip_id: str, prov: dict[str, Any], *, root: Optional[Path] = None,
 ) -> Path:
@@ -208,6 +239,11 @@ def write_provenance(
         errors.append(
             "provenance.clip_id does not match the destination "
             f"({prov.get('clip_id')!r} != {clip_id!r})")
+    errors.extend(
+        _schema2_artifact_identity_errors(
+            robot, clip_id, prov, root=root,
+        )
+    )
     if errors:
         raise LicenseGuardError(
             "refusing to write provenance for clip "
@@ -298,6 +334,17 @@ def rebuild_index(*, root: Optional[Path] = None) -> list[dict[str, Any]]:
                 except (json.JSONDecodeError, OSError):
                     continue
                 errors = validate_provenance(prov)
+                if prov.get("robot") != robot_d.name:
+                    errors.append(
+                        "provenance.robot does not match its robot directory")
+                if prov.get("clip_id") != clip_d.name:
+                    errors.append(
+                        "provenance.clip_id does not match its clip directory")
+                errors.extend(
+                    _schema2_artifact_identity_errors(
+                        robot_d.name, clip_d.name, prov, root=r,
+                    )
+                )
                 if errors:
                     continue
                 has_preview = (clip_d / PREVIEW_FILENAME).is_file()
@@ -329,7 +376,13 @@ def indexed_content_hashes(*, root: Optional[Path] = None) -> set[str]:
                 except (json.JSONDecodeError, OSError):
                     continue
                 sha = prov.get("content_sha256")
-                if sha:
+                if (
+                    prov.get("schema") == PROVENANCE_SCHEMA
+                    and not _schema2_artifact_identity_errors(
+                        robot_d.name, clip_d.name, prov, root=r,
+                    )
+                    and sha
+                ):
                     hashes.add(sha)
     return hashes
 
@@ -357,6 +410,13 @@ def indexed_source_hashes(*, root: Optional[Path] = None) -> set[str]:
             try:
                 prov = json.loads(prov_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
+                continue
+            if (
+                prov.get("schema") == PROVENANCE_SCHEMA
+                and _schema2_artifact_identity_errors(
+                    robot_d.name, clip_d.name, prov, root=r,
+                )
+            ):
                 continue
             sha = prov.get("source_content_sha256")
             if not sha and prov.get("schema") == 1:

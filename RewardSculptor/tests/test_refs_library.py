@@ -434,29 +434,43 @@ def test_write_provenance_refuses_incomplete_record(tmp_path: Path) -> None:
 
 
 def test_provenance_write_read_roundtrip(tmp_path: Path) -> None:
+    clip_path = (
+        library.clip_dir("g1", "dance1_2", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    clip_path.parent.mkdir(parents=True, exist_ok=True)
+    clip_path.write_bytes(b"exact retained test artifact")
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
     prov = library.make_provenance(
         clip_id="dance1_2", robot="g1",
         source={"kind": "hf_dataset", "repo": "r", "path": "p", "url": "u"},
         license="CC BY-NC-ND 4.0", attribution="attrib",
-        content_sha256_="b" * 64, source_content_sha256_="c" * 64,
+        content_sha256_=artifact_sha, source_content_sha256_="c" * 64,
         labels=["dance"], text="dance")
     path = library.write_provenance("g1", "dance1_2", prov, root=tmp_path)
     assert path.is_file()
     loaded = library.read_provenance("g1", "dance1_2", root=tmp_path)
     assert loaded == prov
     assert loaded["schema"] == 2
-    assert loaded["content_sha256"] == "b" * 64
+    assert loaded["content_sha256"] == artifact_sha
     assert loaded["source_content_sha256"] == "c" * 64
 
 
 def test_rebuild_index_from_provenance_files(tmp_path: Path) -> None:
     for i in range(3):
         cid = f"clip{i}"
+        clip_path = (
+            library.clip_dir("g1", cid, root=tmp_path)
+            / library.CLIP_FILENAME
+        )
+        clip_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_path.write_bytes(f"artifact-{i}".encode())
         prov = library.make_provenance(
             clip_id=cid, robot="g1",
             source={"kind": "hf_dataset", "repo": "r", "path": f"p{i}", "url": "u"},
             license="cc-by-4.0", attribution="a",
-            content_sha256_=f"{i}" * 64, labels=["walk"], text="walk",
+            content_sha256_=library.content_sha256(clip_path.read_bytes()),
+            labels=["walk"], text="walk",
             qc={"duration_s": 1.0, "root_z_range": [0.1, 0.8], "n_frames": 50})
         library.write_provenance("g1", cid, prov, root=tmp_path)
     rows = library.rebuild_index(root=tmp_path)
@@ -485,18 +499,32 @@ def test_rebuild_index_is_robot_symmetric(tmp_path: Path) -> None:
     identically — a g1 clip and a t1 clip in the SAME library must both
     survive the rebuild, each tagged with its own `robot`, and per-robot
     disk lookups (`clip_dir`) must resolve each to its own directory."""
+    g1_clip = (
+        library.clip_dir("g1", "walk1", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    g1_clip.parent.mkdir(parents=True, exist_ok=True)
+    g1_clip.write_bytes(b"g1 artifact")
     prov_g1 = library.make_provenance(
         clip_id="walk1", robot="g1",
         source={"kind": "hf_dataset", "repo": "r", "path": "p", "url": "u"},
-        license="cc-by-4.0", attribution="a", content_sha256_="a" * 64,
+        license="cc-by-4.0", attribution="a",
+        content_sha256_=library.content_sha256(g1_clip.read_bytes()),
         labels=["walk"], text="walk",
         qc={"duration_s": 1.0, "root_z_range": [0.1, 0.8], "n_frames": 50})
     library.write_provenance("g1", "walk1", prov_g1, root=tmp_path)
 
+    t1_clip = (
+        library.clip_dir("t1", "walk1", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    t1_clip.parent.mkdir(parents=True, exist_ok=True)
+    t1_clip.write_bytes(b"t1 artifact")
     prov_t1 = library.make_provenance(
         clip_id="walk1", robot="t1",
         source={"kind": "retarget", "repo": "gmr", "path": "p", "url": "u"},
-        license="cc-by-4.0", attribution="a", content_sha256_="b" * 64,
+        license="cc-by-4.0", attribution="a",
+        content_sha256_=library.content_sha256(t1_clip.read_bytes()),
         labels=["walk"], text="walk",
         qc={"duration_s": 1.0, "root_z_range": [0.1, 0.8], "n_frames": 50})
     library.write_provenance("t1", "walk1", prov_t1, root=tmp_path)
@@ -517,17 +545,73 @@ def test_rebuild_index_is_robot_symmetric(tmp_path: Path) -> None:
 
 
 def test_indexed_content_hashes_reads_from_provenance(tmp_path: Path) -> None:
+    clip_path = (
+        library.clip_dir("g1", "c1", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    clip_path.parent.mkdir(parents=True, exist_ok=True)
+    clip_path.write_bytes(b"indexed artifact")
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
     prov = library.make_provenance(
         clip_id="c1", robot="g1", source={"kind": "hf_dataset"},
         license="cc-by-4.0", attribution="a",
-        content_sha256_="deadbeef" * 8,
+        content_sha256_=artifact_sha,
         source_content_sha256_="cafebabe" * 8)
     library.write_provenance("g1", "c1", prov, root=tmp_path)
     hashes = library.indexed_content_hashes(root=tmp_path)
-    assert "deadbeef" * 8 in hashes
+    assert artifact_sha in hashes
     assert "cafebabe" * 8 not in hashes
     assert library.indexed_source_hashes(root=tmp_path) == {"cafebabe" * 8}
 
+
+def test_schema2_provenance_rejects_missing_or_mismatched_artifact(
+    tmp_path: Path,
+) -> None:
+    prov = library.make_provenance(
+        clip_id="exact1", robot="g1", source={"kind": "test"},
+        license="cc0", attribution="test", content_sha256_="a" * 64,
+    )
+    with pytest.raises(
+        library.LicenseGuardError,
+        match="requires the retained clip.npz artifact",
+    ):
+        library.write_provenance("g1", "exact1", prov, root=tmp_path)
+
+    clip_path = (
+        library.clip_dir("g1", "exact1", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    clip_path.parent.mkdir(parents=True, exist_ok=True)
+    clip_path.write_bytes(b"different bytes")
+    with pytest.raises(
+        library.LicenseGuardError,
+        match="does not match the exact retained clip.npz bytes",
+    ):
+        library.write_provenance("g1", "exact1", prov, root=tmp_path)
+
+
+def test_rebuild_index_drops_a_mutated_schema2_artifact(tmp_path: Path) -> None:
+    clip_path = (
+        library.clip_dir("g1", "exact2", root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+    clip_path.parent.mkdir(parents=True, exist_ok=True)
+    clip_path.write_bytes(b"admitted bytes")
+    admitted_sha = library.content_sha256(clip_path.read_bytes())
+    prov = library.make_provenance(
+        clip_id="exact2", robot="g1", source={"kind": "test"},
+        license="cc0", attribution="test", content_sha256_=admitted_sha,
+        source_content_sha256_="d" * 64,
+    )
+    library.write_provenance("g1", "exact2", prov, root=tmp_path)
+    assert [row["clip_id"] for row in library.rebuild_index(root=tmp_path)] == [
+        "exact2"
+    ]
+
+    clip_path.write_bytes(b"mutated after admission")
+    assert library.rebuild_index(root=tmp_path) == []
+    assert admitted_sha not in library.indexed_content_hashes(root=tmp_path)
+    assert "d" * 64 not in library.indexed_source_hashes(root=tmp_path)
 
 def test_migrate_artifact_identities_preserves_source_and_downgrades_tierd(
     tmp_path: Path,

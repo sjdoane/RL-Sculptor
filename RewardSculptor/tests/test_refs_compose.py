@@ -289,6 +289,32 @@ def test_compose_and_register_records_every_parent(tmp_path):
         "approach", "strike"]
 
 
+def test_compose_and_register_rejects_mutated_parent_bytes(tmp_path):
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+    from sculptor.refs.compose import compose_and_register
+
+    _register_source(tmp_path, "g1", "src_a", _clip())
+    _register_source(tmp_path, "g1", "src_b", _clip(joint_offset=0.05))
+    mutated_path = library.clip_dir(
+        "g1", "src_b", root=tmp_path) / library.CLIP_FILENAME
+    save_clip(mutated_path, _clip(joint_offset=0.25))
+
+    with pytest.raises(
+        ComposeError,
+        match=(
+            "parent 'src_b' provenance content_sha256 does not match its "
+            "exact clip.npz bytes"
+        ),
+    ):
+        compose_and_register(
+            "g1",
+            [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
+            clip_id="mutated-parent-composite",
+            root=tmp_path,
+        )
+
+
 def test_registration_inherits_a_single_shared_license(tmp_path):
     from sculptor.refs.compose import compose_and_register
 

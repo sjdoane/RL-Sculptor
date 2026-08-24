@@ -620,6 +620,7 @@ def compose_and_register(
             raise ComposeError(
                 f"segment {i}: clip {source_id!r} is not in the {robot} library")
         resolved.append({**dict(spec), "clip": load_clip(clip_path),
+                         "clip_path": clip_path,
                          "source_id": str(source_id)})
         try:
             parents.append(library.read_provenance(robot, str(source_id),
@@ -640,6 +641,18 @@ def compose_and_register(
             raise ComposeError(
                 f"segment {i}: parent {resolved_segment['source_id']!r} has "
                 "no exact lowercase SHA-256 artifact identity")
+        try:
+            actual_parent_sha = library.content_sha256(
+                Path(resolved_segment["clip_path"]).read_bytes())
+        except OSError as exc:
+            raise ComposeError(
+                f"segment {i}: cannot re-read exact parent artifact "
+                f"{resolved_segment['source_id']!r}: {exc}") from exc
+        if actual_parent_sha != parent_sha:
+            raise ComposeError(
+                f"segment {i}: parent {resolved_segment['source_id']!r} "
+                "provenance content_sha256 does not match its exact "
+                "clip.npz bytes")
         parent_artifacts.append({
             "robot": robot,
             "clip_id": resolved_segment["source_id"],

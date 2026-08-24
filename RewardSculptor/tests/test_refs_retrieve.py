@@ -155,12 +155,18 @@ def test_search_public_api_reads_disk_index(tmp_path: Path) -> None:
     """`search()` (not `search_rows()`) reads a real on-disk index via
     `library.read_index` — exercise the full disk path once."""
     for row in FIXTURE_ROWS:
+        clip_path = (
+            library.clip_dir("g1", row["clip_id"], root=tmp_path)
+            / library.CLIP_FILENAME
+        )
+        clip_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_path.write_bytes(f"artifact:{row['clip_id']}".encode())
         prov = library.make_provenance(
             clip_id=row["clip_id"], robot="g1",
             source={"kind": "hf_dataset", "repo": "r",
                     "path": row["clip_id"], "url": "u"},
             license=row["license"], attribution="a",
-            content_sha256_=f"{hash(row['clip_id']) & 0xffffffffffffffff:016x}" * 4,
+            content_sha256_=library.content_sha256(clip_path.read_bytes()),
             labels=row["labels"], text=row["text"],
             qc={"duration_s": row["duration_s"], "n_frames": row["n_frames"],
                 "root_z_range": row["root_z_range"]})
@@ -185,12 +191,20 @@ def test_search_filters_by_robot_symmetrically(tmp_path: Path) -> None:
     robot filter is not a g1-specific special case, it treats every
     robot slug the same way."""
     for robot in ("g1", "t1"):
+        clip_id = f"fallandgetup1_subject1--{robot}"
+        clip_path = (
+            library.clip_dir(robot, clip_id, root=tmp_path)
+            / library.CLIP_FILENAME
+        )
+        clip_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_path.write_bytes(f"artifact:{robot}".encode())
         prov = library.make_provenance(
-            clip_id=f"fallandgetup1_subject1--{robot}", robot=robot,
+            clip_id=clip_id, robot=robot,
             source={"kind": "hf_dataset", "repo": "r",
                     "path": "p", "url": "u"},
             license="cc-by-4.0", attribution="a",
-                content_sha256_=("1" if robot == "g1" else "2") * 64,
+                content_sha256_=library.content_sha256(
+                    clip_path.read_bytes()),
             labels=["fall", "and", "get", "up", "1", "subject", "1"],
             text="fall and get up 1 subject 1",
             qc={"duration_s": 5.0, "n_frames": 150, "root_z_range": [0.1, 0.8]})
