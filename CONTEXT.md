@@ -1,8 +1,12 @@
-# RL-Sculptor — session context
+# RL-Sculptor — archived bootstrap context
 
-Bootstrap doc for a new Claude Code window working on this tree. Read this
-end-to-end before making any changes; check the **Change Log** section
-at the bottom for what's been touched most recently.
+> **Historical snapshot.** This file predates the current git, UI, reference,
+> and research state. For a new window, read `AGENTS.md`,
+> `docs/GUIDING_RESEARCH_CONTEXT.md`, the newest section of `HANDOFF.md`, and
+> `docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. Do not use the commands, test
+> counts, or task queue below as current authority.
+
+This is retained only as historical project context.
 
 ---
 

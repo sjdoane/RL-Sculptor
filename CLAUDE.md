@@ -2,8 +2,9 @@
 
 `AGENTS.md` is the single authoritative engineering contract for this
 workspace. Read it before changing either `RewardSculptor/` or
-`reward-sculptor-ui/`, then read the newest section of `HANDOFF.md` for current
-state. Do not duplicate or weaken those rules here.
+`reward-sculptor-ui/`, then read `docs/GUIDING_RESEARCH_CONTEXT.md` for the
+current research direction and the newest section of `HANDOFF.md` for exact
+implementation/runtime state. Do not duplicate or weaken those rules here.
 
 For work that changes researcher-facing behavior:
 

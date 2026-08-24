@@ -64,8 +64,9 @@ from observed execution. A useful demo is not allowed to erase that boundary.
 
 ## Lokesh feedback as executable gates
 
-The lab feedback in `docs/RESEARCH_DIRECTION.md` is represented by tests and
-launch rules rather than copy alone:
+The current lab direction in `docs/GUIDING_RESEARCH_CONTEXT.md` and historical
+first-meeting feedback in `docs/RESEARCH_DIRECTION.md` are represented by
+tests and launch rules rather than copy alone:
 
 | Feedback | Executable contract |
 |---|---|

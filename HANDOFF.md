@@ -1,9 +1,12 @@
 # HANDOFF — start here
 
-**Current authority:** read `AGENTS.md`, then this newest section, then
-`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. The old numbered task queue below
-is historical context, not an instruction to restart already-completed work.
-Historical GPU heartbeat messages are also not launch authority.
+**Current authority:** read `AGENTS.md`, then
+`docs/GUIDING_RESEARCH_CONTEXT.md`, then this newest section, then
+`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. The guiding context is the current
+research direction reconstructed from both Lokesh meetings and the primary
+SONIC/OGMP literature. The old numbered task queue below is historical
+context, not an instruction to restart already-completed work. Historical GPU
+heartbeat messages are also not launch authority.
 
 Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 - `RewardSculptor/` — the core Python library + `sculpt` CLI (the train→rollout→diagnose→edit loop, the paper knowledge graph, the objective-metric trust pipeline, adapters for MJLab/MuJoCo + Isaac). Run things with `uv run …` from inside `RewardSculptor/`.
@@ -11,7 +14,22 @@ Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 
 Current git branch: `ship-20-ux-revamp` (do NOT work on `main`). Keep committing to this branch.
 
-## 0. Active physical example — reference-guided four-rail hopping (2026-08-23)
+## 0. Current research program — adaptive policy training (2026-08-24)
+
+Sam's second meeting with Lokesh reframed the proposed contribution as an
+agentic **policy-training harness** between generated behavior data and one
+task-adapted controller. The canonical reconstruction, public SONIC/OGMP
+reading, exact RewardSculptor capability matrix, proposed displaced-object
+recovery benchmark, proposal seed, and open questions are in
+`docs/GUIDING_RESEARCH_CONTEXT.md`. Do not collapse public SONIC, the lab's
+unpublished visual behavior-adaptation work, the separate VLM behavior-data
+agent, and RewardSculptor into one system.
+
+The reference-guided rail-hop example below remains valuable plumbing evidence
+but is paused until Sam explicitly resumes it. It is not the proposed adaptive
+object-recovery research benchmark.
+
+## 0a. Paused physical example — reference-guided four-rail hopping (2026-08-23)
 
 The active goal is a fresh, visible G1 project that evolves a solved stationary
 one-leg-jump motion into four forward rail hops and a verified stop. It is not
@@ -54,7 +72,7 @@ materialize and certify the exact composite, then create and launch the fresh
 UI project. During a live GPU worker, do not edit reload-watched core or run
 intermediate GPU audits.
 
-## 0a. Current work — research starting points and honest OGMP integration (2026-08-17)
+## 0b. Current implementation — research starting points and honest OGMP integration (2026-08-17)
 
 The active implementation adds a researcher-facing starting-point workflow
 with three independent inputs: compatible policy weights, an immutable
