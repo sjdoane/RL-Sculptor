@@ -51,6 +51,7 @@ Continuity handling, in order:
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -629,21 +630,40 @@ def compose_and_register(
     composite = compose_reference(resolved, **compose_kwargs)
 
     merged_license, merged_attribution = _merge_source_licenses(parents)
+    parent_artifacts: list[dict[str, str]] = []
+    for i, (resolved_segment, parent) in enumerate(zip(resolved, parents)):
+        parent_sha = parent.get("content_sha256")
+        if (
+            not isinstance(parent_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", parent_sha) is None
+        ):
+            raise ComposeError(
+                f"segment {i}: parent {resolved_segment['source_id']!r} has "
+                "no exact lowercase SHA-256 artifact identity")
+        parent_artifacts.append({
+            "robot": robot,
+            "clip_id": resolved_segment["source_id"],
+            "content_sha256": parent_sha,
+        })
     comp_meta = composite["meta"]["composition"]
     n_frames = int(np.asarray(composite["root_pos_z"]).shape[0])
+    d = library.clip_dir(robot, clip_id, root=root)
+    clip_path = save_clip(d / library.CLIP_FILENAME, composite)
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
+    from sculptor.reference_clock import reference_playback_duration_s
+
     prov = library.make_provenance(
         clip_id=clip_id,
         robot=robot,
         source={
             "kind": "compose",
             "parent_clip_ids": [s["source_id"] for s in resolved],
+            "parent_artifacts": parent_artifacts,
             "segments": comp_meta["segments"],
         },
         license=license or merged_license,
         attribution=attribution or merged_attribution,
-        content_sha256_=library.content_sha256(
-            np.ascontiguousarray(
-                composite["root_pos_z"], dtype=np.float64).tobytes()),
+        content_sha256_=artifact_sha,
         retarget={
             "tool": "sculptor.refs.compose",
             "notes": (
@@ -662,7 +682,8 @@ def compose_and_register(
         text=text,
         qc={
             "n_frames": n_frames,
-            "duration_s": round(n_frames / float(composite["fps"]), 4),
+            "duration_s": round(reference_playback_duration_s(
+                frame_count=n_frames, fps=float(composite["fps"])), 4),
             "root_z_range": [
                 round(float(composite["root_pos_z"].min()), 4),
                 round(float(composite["root_pos_z"].max()), 4),
@@ -672,8 +693,6 @@ def compose_and_register(
         },
     )
 
-    d = library.clip_dir(robot, clip_id, root=root)
-    save_clip(d / library.CLIP_FILENAME, composite)
     prov_path = library.write_provenance(robot, clip_id, prov, root=root)
 
     # Render the keyframe strip. A composite is the clip a user most wants to

@@ -48,6 +48,7 @@ from sculptor.eval.joint_resolver import (
     resolve_joint_roles,
 )
 from sculptor.eval.robot_manifest import G1_29
+from sculptor.reference_clock import reference_playback_duration_s
 from sculptor.refs import library
 from sculptor.reference import validate_clip
 
@@ -304,7 +305,8 @@ def _run_qc_gates(
 
     z = root_pos[:, 2]
     qc_out: dict[str, Any] = {
-        "duration_s": round(n / float(fps), 4),
+        "duration_s": round(
+            reference_playback_duration_s(frame_count=n, fps=float(fps)), 4),
         "root_z_range": [round(float(z.min()), 4), round(float(z.max()), 4)],
         "n_frames": n,
         "checks": checks,
@@ -806,7 +808,9 @@ def ingest_source(
     if limit is not None:
         files = files[:limit]
 
-    existing_hashes = library.indexed_content_hashes(root=root)
+    # Re-ingest idempotency is a property of the downloaded source bytes,
+    # independent from the canonical clip.npz artifact those bytes produce.
+    existing_hashes = library.indexed_source_hashes(root=root)
     summary = IngestSummary(accepted=[], rejected=[], skipped_existing=[])
 
     for rel_path in files:
@@ -884,6 +888,7 @@ def persist_segments(
     clip: dict, *, clip_id: str, robot: str, source: dict[str, Any],
     license_: str, attribution: str, fps_source: float, tokens: list[str],
     parent_qc: dict[str, Any], root: Optional[Path] = None,
+    source_content_sha256: Optional[str] = None,
     no_preview: bool = False,
     progress: Optional[Callable[[str], None]] = None,
 ) -> list["library.LibraryClip"]:
@@ -918,22 +923,23 @@ def persist_segments(
         library.validate_clip_id(seg_clip_id)
         seg_qc = dict(parent_qc)
         z = seg_clip["root_pos_z"]
-        seg_qc["duration_s"] = round(z.shape[0] / float(clip["fps"]), 4)
+        seg_qc["duration_s"] = round(reference_playback_duration_s(
+            frame_count=int(z.shape[0]), fps=float(clip["fps"])), 4)
         seg_qc["root_z_range"] = [round(float(z.min()), 4), round(float(z.max()), 4)]
         seg_qc["n_frames"] = int(z.shape[0])
         seg_labels = tokens + ["segment"]
+        seg_d = library.clip_dir(robot, seg_clip_id, root=root)
+        seg_clip_path = save_clip(seg_d / library.CLIP_FILENAME, seg_clip)
         seg_prov = library.make_provenance(
             clip_id=seg_clip_id, robot=robot,
             source=source, license=license_, attribution=attribution,
-            content_sha256_=library.content_sha256(
-                seg_clip["root_pos_z"].tobytes()),
+            content_sha256_=library.content_sha256(seg_clip_path.read_bytes()),
+            source_content_sha256_=source_content_sha256,
             tier="K", fps_source=fps_source,
             parent_clip_id=clip_id, frame_range=list(frame_range),
             joint_mapping={"identity": True}, labels=seg_labels,
             text=" ".join(seg_labels), qc=seg_qc,
         )
-        seg_d = library.clip_dir(robot, seg_clip_id, root=root)
-        save_clip(seg_d / library.CLIP_FILENAME, seg_clip)
         seg_prov_path = library.write_provenance(robot, seg_clip_id, seg_prov, root=root)
         results.append(library.LibraryClip(
             robot=robot, clip_id=seg_clip_id,
@@ -971,22 +977,25 @@ def ingest_clip_bytes(
         raise ValueError(f"unknown source {source!r}")
 
     clip_id = library.slugify(stem)
-    sha = library.content_sha256(raw)
+    source_sha = library.content_sha256(raw)
     tokens = tokenize_label(stem)
+    from sculptor.reference import save_clip
+
+    d = library.clip_dir(robot, clip_id, root=root)
+    clip_path = save_clip(d / library.CLIP_FILENAME, clip)
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
     prov = library.make_provenance(
         clip_id=clip_id, robot=robot,
         source={"kind": "hf_dataset", "repo": repo, "path": rel_path,
                 "url": _hf_resolve_url(repo, rel_path)},
         license=license_, attribution=attribution,
-        content_sha256_=sha, tier="K", fps_source=fps_source,
+        content_sha256_=artifact_sha,
+        source_content_sha256_=source_sha,
+        tier="K", fps_source=fps_source,
         joint_mapping={"identity": True}, labels=tokens,
         text=" ".join(tokens), qc=qc,
     )
 
-    from sculptor.reference import save_clip
-
-    d = library.clip_dir(robot, clip_id, root=root)
-    save_clip(d / library.CLIP_FILENAME, clip)
     prov_path = library.write_provenance(robot, clip_id, prov, root=root)
     result = library.LibraryClip(
         robot=robot, clip_id=clip_id, clip_path=d / library.CLIP_FILENAME,
@@ -1003,7 +1012,7 @@ def ingest_clip_bytes(
             clip, clip_id=clip_id, robot=robot, source=prov["source"],
             license_=license_, attribution=attribution, fps_source=fps_source,
             tokens=tokens, parent_qc=qc, root=root, no_preview=no_preview,
-            progress=progress)
+            progress=progress, source_content_sha256=source_sha)
 
     return result
 
@@ -1117,7 +1126,17 @@ def resegment_clip(
         source=parent_prov["source"], license_=parent_prov["license"],
         attribution=parent_prov["attribution"],
         fps_source=parent_prov["fps_source"], tokens=tokens, parent_qc=qc,
-        root=r, no_preview=no_preview, progress=progress)
+        root=r, no_preview=no_preview, progress=progress,
+        source_content_sha256=(
+            parent_prov.get("source_content_sha256")
+            or (
+                parent_prov.get("content_sha256")
+                if parent_prov.get("schema") == 1
+                and not parent_prov.get("parent_clip_id")
+                and (parent_prov.get("source") or {}).get("kind")
+                in {"hf_dataset", "retarget"}
+                else None
+            )))
     added = [lc.clip_id for lc in persisted]
 
     library.rebuild_index(root=r)

@@ -438,11 +438,15 @@ def test_provenance_write_read_roundtrip(tmp_path: Path) -> None:
         clip_id="dance1_2", robot="g1",
         source={"kind": "hf_dataset", "repo": "r", "path": "p", "url": "u"},
         license="CC BY-NC-ND 4.0", attribution="attrib",
-        content_sha256_="b" * 64, labels=["dance"], text="dance")
+        content_sha256_="b" * 64, source_content_sha256_="c" * 64,
+        labels=["dance"], text="dance")
     path = library.write_provenance("g1", "dance1_2", prov, root=tmp_path)
     assert path.is_file()
     loaded = library.read_provenance("g1", "dance1_2", root=tmp_path)
     assert loaded == prov
+    assert loaded["schema"] == 2
+    assert loaded["content_sha256"] == "b" * 64
+    assert loaded["source_content_sha256"] == "c" * 64
 
 
 def test_rebuild_index_from_provenance_files(tmp_path: Path) -> None:
@@ -515,10 +519,62 @@ def test_rebuild_index_is_robot_symmetric(tmp_path: Path) -> None:
 def test_indexed_content_hashes_reads_from_provenance(tmp_path: Path) -> None:
     prov = library.make_provenance(
         clip_id="c1", robot="g1", source={"kind": "hf_dataset"},
-        license="cc-by-4.0", attribution="a", content_sha256_="deadbeef" * 8)
+        license="cc-by-4.0", attribution="a",
+        content_sha256_="deadbeef" * 8,
+        source_content_sha256_="cafebabe" * 8)
     library.write_provenance("g1", "c1", prov, root=tmp_path)
     hashes = library.indexed_content_hashes(root=tmp_path)
     assert "deadbeef" * 8 in hashes
+    assert "cafebabe" * 8 not in hashes
+    assert library.indexed_source_hashes(root=tmp_path) == {"cafebabe" * 8}
+
+
+def test_migrate_artifact_identities_preserves_source_and_downgrades_tierd(
+    tmp_path: Path,
+) -> None:
+    from sculptor.reference import save_clip
+
+    clip_id = "legacy_hop"
+    clip = {
+        "root_pos_z": np.linspace(0.72, 0.82, 229),
+        "fps": 60.0,
+    }
+    d = library.clip_dir("g1", clip_id, root=tmp_path)
+    clip_path = save_clip(d / library.CLIP_FILENAME, clip)
+    raw_source_sha = "1" * 64
+    legacy = {
+        "schema": 1,
+        "clip_id": clip_id,
+        "robot": "g1",
+        "source": {"kind": "hf_dataset", "repo": "r", "path": "p"},
+        "license": "cc-by-4.0",
+        "attribution": "dataset",
+        "content_sha256": raw_source_sha,
+        "tier": "D",
+        "tierD": {"feasible": True, "rollout_sha256": "2" * 64},
+        "fps_source": 60.0,
+        "qc": {"n_frames": 229, "duration_s": round(229 / 60, 4)},
+    }
+    library.write_provenance("g1", clip_id, legacy, root=tmp_path)
+
+    dry = library.migrate_artifact_identities(root=tmp_path, dry_run=True)
+    assert len(dry) == 1
+    assert library.read_provenance("g1", clip_id, root=tmp_path)["schema"] == 1
+
+    receipts = library.migrate_artifact_identities(root=tmp_path)
+    assert len(receipts) == 1
+    prov = library.read_provenance("g1", clip_id, root=tmp_path)
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
+    assert prov["schema"] == 2
+    assert prov["content_sha256"] == artifact_sha
+    assert prov["source_content_sha256"] == raw_source_sha
+    assert prov["legacy_content_sha256"] == raw_source_sha
+    assert prov["qc"]["duration_s"] == pytest.approx(3.8)
+    assert prov["tier"] == "K"
+    assert prov["tierD"]["feasible"] is False
+    assert "fresh Tier-D certification required" in (
+        prov["tierD"]["identity_migration_invalidated"]["reason"])
+    assert library.migrate_artifact_identities(root=tmp_path) == []
 
 
 # ── segmentation (§decision 6) ────────────────────────────────────────────
@@ -824,7 +880,10 @@ def test_ingest_clip_bytes_persists_clip_and_provenance(tmp_path: Path) -> None:
     assert validate_clip(loaded) == []
     prov = json.loads(result.provenance_path.read_text())
     assert prov["license"] == "CC BY-NC-ND 4.0"
-    assert prov["content_sha256"] == library.content_sha256(raw)
+    assert prov["content_sha256"] == library.content_sha256(
+        result.clip_path.read_bytes())
+    assert prov["source_content_sha256"] == library.content_sha256(raw)
+    assert prov["content_sha256"] != prov["source_content_sha256"]
     assert "dance" in prov["labels"]
 
 
@@ -849,6 +908,10 @@ def test_ingest_clip_bytes_fall_getup_produces_segments(tmp_path: Path) -> None:
         assert prov["parent_clip_id"] == "fallandgetup1_subject1"
         assert prov["frame_range"] is not None
         assert "segment" in prov["labels"]
+        clip_path = library.clip_dir("g1", r["clip_id"], root=tmp_path) / "clip.npz"
+        assert prov["content_sha256"] == library.content_sha256(
+            clip_path.read_bytes())
+        assert prov["source_content_sha256"] is not None
 
 
 def test_ingest_clip_bytes_rejects_bad_source() -> None:

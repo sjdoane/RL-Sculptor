@@ -289,6 +289,11 @@ def test_retarget_and_register_writes_clip_and_provenance(tmp_path: Path, monkey
     assert prov["source"]["kind"] == "retarget"
     assert prov["license"] == "MIT"
     assert prov["tier"] == "K"
+    assert prov["content_sha256"] == library.content_sha256(
+        lc.clip_path.read_bytes())
+    assert prov["source_content_sha256"] == library.content_sha256(
+        src.read_bytes())
+    assert prov["qc"]["duration_s"] == pytest.approx(19 / 30, abs=1e-4)
 
     rows = library.rebuild_index(root=lib_root)
     assert len(rows) == 1

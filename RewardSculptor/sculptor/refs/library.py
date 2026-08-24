@@ -16,8 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-#: Provenance schema version. Bump + document on any breaking field change.
-PROVENANCE_SCHEMA = 1
+#: Provenance schema version.  Schema 2 makes ``content_sha256`` the
+#: immutable identity of the bytes that execution actually consumes
+#: (``clip.npz``).  Schema 1 overloaded that field with a downloaded source
+#: hash, a partial array hash, or a retarget input hash depending on the
+#: producer.  ``source_content_sha256`` now carries raw-source lineage
+#: independently.
+PROVENANCE_SCHEMA = 2
+SUPPORTED_PROVENANCE_SCHEMAS = frozenset({1, PROVENANCE_SCHEMA})
 
 #: clip_id charset (§decision 4): lowercase alnum + `_-`, must start
 #: alnum, max 96 chars total.
@@ -103,6 +109,7 @@ def make_provenance(
     license: str,
     attribution: str,
     content_sha256_: str,
+    source_content_sha256_: Optional[str] = None,
     retarget: Optional[dict[str, Any]] = None,
     tier: str = "K",
     fps_source: Optional[float] = None,
@@ -133,6 +140,7 @@ def make_provenance(
         "frame_range": frame_range,
         "joint_mapping": joint_mapping or {"identity": True},
         "content_sha256": content_sha256_,
+        "source_content_sha256": source_content_sha256_,
         "labels": list(labels or []),
         "text": text,
         "qc": qc or {},
@@ -151,6 +159,11 @@ def validate_provenance(prov: dict[str, Any]) -> list[str]:
     for key in required:
         if key not in prov or prov[key] in (None, ""):
             errors.append(f"provenance missing required field: {key}")
+    schema = prov.get("schema")
+    if schema not in SUPPORTED_PROVENANCE_SCHEMAS:
+        errors.append(
+            "provenance.schema must be one of "
+            f"{sorted(SUPPORTED_PROVENANCE_SCHEMAS)}, got {schema!r}")
     clip_id = prov.get("clip_id")
     if isinstance(clip_id, str):
         try:
@@ -160,6 +173,19 @@ def validate_provenance(prov: dict[str, Any]) -> list[str]:
     src = prov.get("source")
     if src is not None and not isinstance(src, dict):
         errors.append("provenance.source must be an object")
+    artifact_sha = prov.get("content_sha256")
+    if artifact_sha not in (None, "") and (
+            not isinstance(artifact_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None):
+        errors.append(
+            "provenance.content_sha256 must be a lowercase SHA-256 digest")
+    source_sha = prov.get("source_content_sha256")
+    if source_sha is not None and (
+            not isinstance(source_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_sha) is None):
+        errors.append(
+            "provenance.source_content_sha256 must be null or a lowercase "
+            "SHA-256 digest")
     return errors
 
 
@@ -174,6 +200,14 @@ def write_provenance(
     to write an invalid record (license guard lives here — this is the
     single choke point every ingest/segment path must go through)."""
     errors = validate_provenance(prov)
+    if prov.get("robot") != robot:
+        errors.append(
+            "provenance.robot does not match the robot-scoped destination "
+            f"({prov.get('robot')!r} != {robot!r})")
+    if prov.get("clip_id") != clip_id:
+        errors.append(
+            "provenance.clip_id does not match the destination "
+            f"({prov.get('clip_id')!r} != {clip_id!r})")
     if errors:
         raise LicenseGuardError(
             "refusing to write provenance for clip "
@@ -274,9 +308,12 @@ def rebuild_index(*, root: Optional[Path] = None) -> list[dict[str, Any]]:
 
 
 def indexed_content_hashes(*, root: Optional[Path] = None) -> set[str]:
-    """content_sha256 values already present in the library (via
-    provenance, not the possibly-stale index) — used by ingest for
-    idempotency (§decision 9: re-ingest skips already-indexed content)."""
+    """Exact ``clip.npz`` artifact identities present in provenance.
+
+    This is deliberately *not* the raw-source deduplication index.  Call
+    :func:`indexed_source_hashes` when deciding whether downloaded source
+    bytes have already been admitted.
+    """
     r = root or references_root()
     hashes: set[str] = set()
     if not r.is_dir():
@@ -295,6 +332,189 @@ def indexed_content_hashes(*, root: Optional[Path] = None) -> set[str]:
                 if sha:
                     hashes.add(sha)
     return hashes
+
+
+def indexed_source_hashes(*, root: Optional[Path] = None) -> set[str]:
+    """Raw-source SHA-256 values already admitted to the library.
+
+    Schema-2 records expose this as ``source_content_sha256``.  For an
+    unmigrated schema-1 *root* dataset/retarget record only, the legacy
+    ``content_sha256`` field is the raw source digest and is accepted as a
+    compatibility fallback.  Derived segments and composites are never
+    treated as independent source admissions.
+    """
+    r = root or references_root()
+    hashes: set[str] = set()
+    if not r.is_dir():
+        return hashes
+    for robot_d in r.iterdir():
+        if not robot_d.is_dir():
+            continue
+        for clip_d in robot_d.iterdir():
+            prov_path = clip_d / PROVENANCE_FILENAME
+            if not prov_path.is_file():
+                continue
+            try:
+                prov = json.loads(prov_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            sha = prov.get("source_content_sha256")
+            if not sha and prov.get("schema") == 1:
+                source = prov.get("source") or {}
+                if (
+                    not prov.get("parent_clip_id")
+                    and isinstance(source, dict)
+                    and source.get("kind") in {"hf_dataset", "retarget"}
+                ):
+                    sha = prov.get("content_sha256")
+            if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha):
+                hashes.add(sha)
+    return hashes
+
+
+@dataclass(frozen=True)
+class ArtifactIdentityMigration:
+    """One schema-1 -> schema-2 reference identity migration receipt."""
+
+    robot: str
+    clip_id: str
+    previous_content_sha256: str
+    artifact_content_sha256: str
+    source_content_sha256: Optional[str]
+    previous_tier: str
+    resulting_tier: str
+
+
+def migrate_artifact_identities(
+    *, root: Optional[Path] = None, robot: Optional[str] = None,
+    clip_ids: Optional[set[str]] = None, dry_run: bool = False,
+) -> list[ArtifactIdentityMigration]:
+    """Make every retained reference identity name its exact clip bytes.
+
+    The migration is explicit and idempotent.  It preserves the overloaded
+    schema-1 value under ``legacy_content_sha256``, carries true raw-source
+    identity in ``source_content_sha256`` where it can be established, and
+    recalculates sampled duration from the shared ``(N - 1) / fps`` clock.
+    Any Tier-D claim touched by the migration is downgraded to Tier K because
+    its old certificate did not bind the new identity contract; its evidence
+    remains on disk and is marked invalidated for audit rather than deleted.
+    """
+    from sculptor.reference import load_clip
+    from sculptor.reference_clock import reference_playback_duration_s
+
+    r = root or references_root()
+    if not r.is_dir():
+        return []
+
+    records: dict[tuple[str, str], tuple[Path, dict[str, Any]]] = {}
+    target_keys: set[tuple[str, str]] = set()
+    for robot_d in sorted(p for p in r.iterdir() if p.is_dir()):
+        for clip_d in sorted(p for p in robot_d.iterdir() if p.is_dir()):
+            prov_path = clip_d / PROVENANCE_FILENAME
+            clip_path = clip_d / CLIP_FILENAME
+            if not prov_path.is_file() or not clip_path.is_file():
+                continue
+            try:
+                prov = json.loads(prov_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            key = (robot_d.name, clip_d.name)
+            records[key] = (clip_path, prov)
+            if (
+                (robot is None or robot_d.name == robot)
+                and (clip_ids is None or clip_d.name in clip_ids)
+            ):
+                target_keys.add(key)
+
+    def resolve_source_sha(
+        key: tuple[str, str], seen: frozenset[tuple[str, str]] = frozenset(),
+    ) -> Optional[str]:
+        if key in seen or key not in records:
+            return None
+        _clip_path, prov = records[key]
+        direct = prov.get("source_content_sha256")
+        if isinstance(direct, str) and re.fullmatch(r"[0-9a-f]{64}", direct):
+            return direct
+        parent = prov.get("parent_clip_id")
+        source = prov.get("source") or {}
+        if parent and isinstance(source, dict) and source.get("kind") != "compose":
+            inherited = resolve_source_sha(
+                (key[0], str(parent)), seen | {key})
+            if inherited:
+                return inherited
+        if (
+            prov.get("schema") == 1
+            and not parent
+            and isinstance(source, dict)
+            and source.get("kind") in {"hf_dataset", "retarget"}
+        ):
+            legacy = prov.get("content_sha256")
+            if isinstance(legacy, str) and re.fullmatch(r"[0-9a-f]{64}", legacy):
+                return legacy
+        return None
+
+    migrated: list[ArtifactIdentityMigration] = []
+    for robot_name, clip_id in sorted(target_keys):
+        clip_path, original = records[(robot_name, clip_id)]
+        artifact_sha = content_sha256(clip_path.read_bytes())
+        previous_sha = str(original.get("content_sha256") or "")
+        source_sha = resolve_source_sha((robot_name, clip_id))
+        needs_migration = (
+            original.get("schema") != PROVENANCE_SCHEMA
+            or previous_sha != artifact_sha
+            or original.get("source_content_sha256") != source_sha
+        )
+        if not needs_migration:
+            continue
+
+        prov = dict(original)
+        prov["schema"] = PROVENANCE_SCHEMA
+        prov["content_sha256"] = artifact_sha
+        prov["source_content_sha256"] = source_sha
+        if previous_sha and previous_sha != artifact_sha:
+            prov.setdefault("legacy_content_sha256", previous_sha)
+
+        clip = load_clip(clip_path)
+        qc = dict(prov.get("qc") or {})
+        n_frames = int(clip["root_pos_z"].shape[0])
+        fps = float(clip["fps"])
+        qc["n_frames"] = n_frames
+        qc["duration_s"] = round(
+            reference_playback_duration_s(frame_count=n_frames, fps=fps), 6)
+        prov["qc"] = qc
+
+        previous_tier = str(original.get("tier") or "K")
+        resulting_tier = previous_tier
+        if previous_tier == "D" or isinstance(original.get("tierD"), dict):
+            resulting_tier = "K"
+            prov["tier"] = "K"
+            tier_d = dict(original.get("tierD") or {})
+            tier_d["feasible"] = False
+            tier_d["identity_migration_invalidated"] = {
+                "reason": (
+                    "schema-1 certificate did not bind the exact clip.npz "
+                    "artifact identity; fresh Tier-D certification required"),
+                "previous_content_sha256": previous_sha,
+                "artifact_content_sha256": artifact_sha,
+            }
+            prov["tierD"] = tier_d
+
+        receipt = ArtifactIdentityMigration(
+            robot=robot_name,
+            clip_id=clip_id,
+            previous_content_sha256=previous_sha,
+            artifact_content_sha256=artifact_sha,
+            source_content_sha256=source_sha,
+            previous_tier=previous_tier,
+            resulting_tier=resulting_tier,
+        )
+        migrated.append(receipt)
+        if not dry_run:
+            write_provenance(robot_name, clip_id, prov, root=r)
+
+    if migrated and not dry_run:
+        rebuild_index(root=r)
+    return migrated
 
 
 @dataclass

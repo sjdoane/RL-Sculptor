@@ -240,17 +240,18 @@ def _register_source(root, robot, clip_id, clip, *, license_="cc-by-4.0",
     from sculptor.reference import save_clip
     from sculptor.refs import library
 
+    d = library.clip_dir(robot, clip_id, root=root)
+    clip_path = save_clip(d / library.CLIP_FILENAME, clip)
     prov = library.make_provenance(
         clip_id=clip_id, robot=robot,
         source={"kind": "test"}, license=license_, attribution=attribution,
-        content_sha256_="0" * 64)
-    d = library.clip_dir(robot, clip_id, root=root)
-    save_clip(d / library.CLIP_FILENAME, clip)
+        content_sha256_=library.content_sha256(clip_path.read_bytes()))
     library.write_provenance(robot, clip_id, prov, root=root)
 
 
 def test_compose_and_register_records_every_parent(tmp_path):
     from sculptor.reference import load_clip
+    from sculptor.refs import library
     from sculptor.refs.compose import compose_and_register
 
     _register_source(tmp_path, "g1", "src_a", _clip())
@@ -268,6 +269,17 @@ def test_compose_and_register_records_every_parent(tmp_path):
     assert prov["tier"] == "K"
     assert prov["source"]["kind"] == "compose"
     assert prov["source"]["parent_clip_ids"] == ["src_a", "src_b"]
+    assert prov["source"]["parent_artifacts"] == [
+        {
+            "robot": "g1",
+            "clip_id": source_id,
+            "content_sha256": library.read_provenance(
+                "g1", source_id, root=tmp_path)["content_sha256"],
+        }
+        for source_id in ("src_a", "src_b")
+    ]
+    assert prov["content_sha256"] == library.content_sha256(
+        lc.clip_path.read_bytes())
     assert "composed" in prov["labels"]
     assert prov["qc"]["n_sources"] == 2
     # The saved clip round-trips with its composition provenance intact.
