@@ -2273,6 +2273,52 @@ def test_first_episode_freeze_fails_soft_on_incompatible_mask() -> None:
     np.testing.assert_array_equal(result, values)
 
 
+def test_biped_foot_site_selector_preserves_world_positions_and_order() -> None:
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _select_biped_foot_site_positions,
+    )
+
+    sites = np.arange(2 * 5 * 3, dtype=np.float32).reshape(2, 5, 3)
+    selected = _select_biped_foot_site_positions(sites, 3, 1)
+
+    assert selected is not None
+    left, right = selected
+    np.testing.assert_array_equal(left, sites[:, 3, :])
+    np.testing.assert_array_equal(right, sites[:, 1, :])
+
+
+@pytest.mark.parametrize(
+    ("sites_shape", "left_index", "right_index"),
+    [
+        (None, 0, 1),
+        ((2, 3), 0, 1),
+        ((2, 2, 4), 0, 1),
+        ((2, 2, 3), -1, 1),
+        ((2, 2, 3), 0, 0),
+        ((2, 2, 3), 0, 2),
+    ],
+)
+def test_biped_foot_site_selector_rejects_ambiguous_or_malformed_tables(
+    sites_shape, left_index: int, right_index: int,
+) -> None:
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _select_biped_foot_site_positions,
+    )
+
+    sites = (
+        None
+        if sites_shape is None
+        else np.zeros(sites_shape, dtype=np.float32)
+    )
+    assert _select_biped_foot_site_positions(
+        sites, left_index, right_index,
+    ) is None
+
+
 # ── reference-tracking narrows the realism floor (HANDOFF §10, option 2) ──
 #
 # A reference dictates posture, gait and body motion frame by frame, so the

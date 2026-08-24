@@ -3904,3 +3904,18 @@ sidecar, an unrelated third tuple, and malformed modern evidence fail closed.
 The actual project receipt now produces exact schema-3 actor+critic admission
 with the two contract fingerprints equal. The focused policy-contract suite is
 23 passed.
+
+## Reference-guided demo status (2026-08-23)
+
+No G1 motion in the local library currently has a valid Tier-D certificate, so
+no live UI launch may honestly claim reference following yet. The leading
+candidate is `g1/50009_one_leg_jump_poses_60_jpos` (229 frames at 60 Hz,
+content SHA `92fc2431f99969e0835a91657a040c55a0cfe5db9db536d2daed533a7b9deca0`).
+It must pass the physics-tracking certificate before attachment.
+
+Objective evidence now has additive direct world-space left/right foot-site
+positions. A landing pass must place both feet inside the finish on first
+bilateral contact after flight and retain both there on every later valid
+frame. The reference path is currently an immutable phase-indexed reward, not
+general OGMP policy conditioning: arbitrary reference phase/mode is not yet an
+actor observation, and the policy-only slalom run is not reference-guided.

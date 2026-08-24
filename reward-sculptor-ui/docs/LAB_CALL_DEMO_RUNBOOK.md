@@ -1712,3 +1712,23 @@ source tuple uses strict historical reconstruction. Same-target evidence
 without the sidecar, an unrelated third tuple, or malformed modern evidence
 fails closed. A stale backend must be restarted before retrying; no worker
 exists after this 412.
+
+## Reference-guided motion evidence (2026-08-23)
+
+The current candidate demonstration is a fresh G1 one-leg-hop evolution, not
+the slalom project's policy warm start. Before any live launch, the exact
+reference bytes must first earn Tier D through the physics-tracking pipeline;
+the library currently contains no admissible G1 Tier-D clip.
+
+For jump landing and finish retention, require the immutable trajectory to
+contain direct `left_foot_pos_w` and `right_foot_pos_w` channels. Evaluate both
+feet against an authored region with
+`(foot_pos_w - root_link_pos_w)[..., :2] - region_relative[..., :2]`, require
+both feet inside at the first bilateral landing after flight, and hard-veto
+every later valid frame where either foot exits. Root position alone and a
+best-window hold are insufficient.
+
+Keep the capability label narrow until the runtime clock is upgraded: the
+attached clip currently supplies an immutable phase-indexed reward target, but
+arbitrary reference phase/mode is not yet a general actor observation. Do not
+call this OGMP policy conditioning or a controller warm start.

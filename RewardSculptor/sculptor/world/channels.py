@@ -43,6 +43,11 @@ BASE_METRIC_ARRAYS = (
     "right_foot_contact",
     "left_foot_pos_b",
     "right_foot_pos_b",
+    # World-space site positions are required for exact authored-region
+    # containment.  Pelvis-frame positions cannot be rotated into world XY
+    # without yaw, which projected gravity deliberately does not observe.
+    "left_foot_pos_w",
+    "right_foot_pos_w",
 )
 
 _CATALOG_KEYS = {

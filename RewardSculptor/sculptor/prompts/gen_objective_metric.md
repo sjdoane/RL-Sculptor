@@ -100,6 +100,12 @@ Some adapters also expose, WHEN AVAILABLE (biped tasks), end-effector channels:
                                             (forward +) displacement — the clean
                                             forward-vs-rearward kick direction
   arrays.get("right_foot_pos_b") (T, E, 3)  right foot, same convention
+  arrays.get("left_foot_pos_w")  (T, E, 3)  left foot site in simulator world
+                                            coordinates; use with root world
+                                            position and a catalogued region
+                                            relative channel for exact region
+                                            containment
+  arrays.get("right_foot_pos_w") (T, E, 3)  right foot, same convention
   arrays.get("left_foot_contact")  (T, E)   1.0 when the left foot is on the
                                             ground, else 0.0 (support schedule)
   arrays.get("right_foot_contact") (T, E)   right foot ground contact
@@ -108,6 +114,15 @@ the DATA-SUFFICIENCY rule below, if a channel you need is absent you must
 ABSTAIN that check, never silently fall back to a magnitude proxy that re-opens
 a hole.
 Any array may be ABSENT — always `arrays.get(k)` + guard for None.
+
+For an authored region channel `region__NAME__relative = region_center_local -
+root_position_local`, compute a foot's exact XY displacement from its center as
+`(foot_pos_w - root_link_pos_w)[..., :2] - region_relative[..., :2]`.
+Environment origins cancel in that expression. Never compare a world-space foot
+position directly with a local authored-zone center. If the goal says that a
+landing or hold must remain inside, require every named foot inside at landing
+and every valid post-landing sample; a later exit is a hard veto even when an
+earlier consecutive hold window was long enough.
 
 When a temporal claim is requested (phase order, event count, a run, or a
 hold), `first_episode_valid_mask` is REQUIRED. Evaluate each environment only

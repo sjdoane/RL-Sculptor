@@ -1434,6 +1434,12 @@ def _abstract_objective_probe(
             (probe_steps, E, 3), dtype=np.float64),
         "left_foot_pos_b": lfoot,
         "right_foot_pos_b": rfoot,
+        # Synthetic probes use an identity root orientation, so adding the
+        # pelvis-frame offset to root world position is the exact site world
+        # position.  Supplying both surfaces lets an authored-region metric
+        # validate its world-XY containment logic instead of abstaining.
+        "left_foot_pos_w": root + lfoot,
+        "right_foot_pos_w": root + rfoot,
         "left_foot_contact": contact_l,
         "right_foot_contact": contact_r,
     }
@@ -1468,8 +1474,11 @@ def _archetypes() -> dict[str, dict]:
         }
         if lfoot is not None:
             d["left_foot_pos_b"] = lfoot
+            # Synthetic archetypes use identity root orientation.
+            d["left_foot_pos_w"] = root + lfoot
         if rfoot is not None:
             d["right_foot_pos_b"] = rfoot
+            d["right_foot_pos_w"] = root + rfoot
         return d
 
     # §Metric-quality laws: a left-foot anterior (pelvis-frame x) swing for the
@@ -1752,6 +1761,16 @@ def _with_official_base_channels(arrays: dict[str, Any]) -> dict[str, Any]:
             "default_pose_rms",
             np.zeros((time_steps, num_envs), dtype=np.float64),
         )
+    root = arrays.get("root_link_pos_w")
+    if isinstance(root, np.ndarray) and root.shape == (time_steps, num_envs, 3):
+        for side in ("left", "right"):
+            foot_b = arrays.get(f"{side}_foot_pos_b")
+            if (
+                isinstance(foot_b, np.ndarray)
+                and foot_b.shape == root.shape
+            ):
+                # These deterministic probes have identity root orientation.
+                arrays.setdefault(f"{side}_foot_pos_w", root + foot_b)
     return arrays
 
 
@@ -1800,10 +1819,9 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
         # not kick); contact 1.0 (feet on the ground). A metric that abstains on absence
         # (the contract) is unaffected; one that hard-reads them no longer false-rejects.
         z = np.zeros((T, E, 3)); c = np.ones((T, E))
-        _with_official_base_channels(d)
         d["left_foot_pos_b"] = z; d["right_foot_pos_b"] = z.copy()
         d["left_foot_contact"] = c; d["right_foot_contact"] = c.copy()
-        return d
+        return _with_official_base_channels(d)
 
     # C1 — UPRIGHT pelvis dip-and-return + full-ROM joint fold (squat / sit-to-stand).
     # joints sweep 0→1.2→0 (ROM 1.2); pelvis dips 0.35 m and returns; torso stays upright.

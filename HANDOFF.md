@@ -1691,3 +1691,22 @@ that tuple. Its required sidecar corroborates the independently rebuilt contract
 the sidecar and current target both fingerprint to
 `83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`;
 current target physics remains strictly recompiled and verified.
+
+## 2026-08-23: exact foot landing and retention evidence
+
+The objective-metric surface now includes optional `left_foot_pos_w` and
+`right_foot_pos_w` arrays captured directly from the simulator's ordered foot
+sites. These channels are additive: robots without a validated biped foot-site
+mapping keep the prior artifact shape rather than receiving fabricated zeros.
+
+For an authored finish-region channel, exact foot containment cancels the
+replicated-environment world origin with
+`(foot_pos_w - root_link_pos_w)[..., :2] - region_relative[..., :2]`.
+Landing metrics must require both feet inside on the first bilateral contact
+after an airborne interval and must veto any later valid frame where either
+foot leaves. Pelvis-in-region, a momentary landing frame, or a best 100-frame
+window is not proof of terminal retention.
+
+The active reference-guided demonstration remains unlaunched. No G1 library
+motion currently has an admissible Tier-D certificate; do not describe a
+Tier-K preview or the policy-only slalom experiment as reference following.

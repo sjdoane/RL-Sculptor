@@ -120,6 +120,35 @@ def _to_host_numpy(value: Any) -> Any:
     return np.asarray(candidate)
 
 
+def _select_biped_foot_site_positions(
+    site_pos_w: Any,
+    left_index: int,
+    right_index: int,
+) -> tuple[Any, Any] | None:
+    """Select ordered left/right world-space foot-site tensors.
+
+    The helper is backend-neutral: NumPy arrays and simulator tensors both
+    support the indexing operation, and transfer to host memory remains the
+    caller's responsibility.  Malformed or stale site tables fail soft so an
+    adapter without the optional biped evidence keeps its historical rollout
+    surface instead of emitting mislabeled positions.
+    """
+    shape = getattr(site_pos_w, "shape", None)
+    if shape is None or len(shape) != 3 or int(shape[-1]) != 3:
+        return None
+    if (
+        left_index < 0
+        or right_index < 0
+        or left_index == right_index
+        or max(left_index, right_index) >= int(shape[1])
+    ):
+        return None
+    return (
+        site_pos_w[:, left_index, :],
+        site_pos_w[:, right_index, :],
+    )
+
+
 def _record_components(
     sink: dict[str, list[float]] | None,
     components: dict[str, Any],
@@ -4721,7 +4750,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     root_link_lin_vel_b_buf: list[np.ndarray] = []
     root_link_ang_vel_b_buf: list[np.ndarray] = []
     # §Metric-quality laws (LAW 3/4): per-foot ground contact + foot position
-    # in the pelvis frame, persisted to the metric arrays so an objective
+    # in both pelvis and world frames, persisted to the metric arrays so an objective
     # metric can measure signed forward-kick DIRECTION (anterior foot
     # displacement) and the single-vs-double support SCHEDULE (one-leg-balance
     # veto). Biped-only — stay empty (and are dropped at save time) on tasks
@@ -4730,6 +4759,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     right_foot_contact_buf: list[np.ndarray] = []
     left_foot_pos_b_buf: list[np.ndarray] = []
     right_foot_pos_b_buf: list[np.ndarray] = []
+    left_foot_pos_w_buf: list[np.ndarray] = []
+    right_foot_pos_w_buf: list[np.ndarray] = []
     per_term_reward_buf: dict[str, list[np.ndarray]] = {}
     # Post-step mjlab state is already reset for environments whose `done`
     # fired.  These masks let artifact finalization preserve only each env's
@@ -4902,8 +4933,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             rav = _tensor_to_np(getattr(d, "root_link_ang_vel_b", None))
             if rav is not None:
                 root_link_ang_vel_b_buf.append(rav)
-            # §Metric-quality laws (LAW 3/4): per-foot contact + pelvis-frame
-            # foot position. Each signal is independently guarded so a missing
+            # §Metric-quality laws (LAW 3/4): per-foot contact plus pelvis- and
+            # world-frame foot position. Each signal is independently guarded so a missing
             # sensor/site degrades to "field absent" (an empty buf is dropped
             # at save time) rather than crashing the rollout — same discipline
             # as _foot_info. Contact columns 0/1 = left/right (mjlab wiring,
@@ -4923,24 +4954,32 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                                 right_foot_contact_buf.append(rc)
                     except Exception:  # noqa: BLE001
                         pass
-                if _quat_apply_inverse is not None:
-                    try:
-                        sp = getattr(d, "site_pos_w", None)        # (N, S, 3)
-                        rq = getattr(d, "root_link_quat_w", None)  # (N, 4)
-                        rpw = getattr(d, "root_link_pos_w", None)  # (N, 3)
-                        li, ri = _feet["li"], _feet["ri"]
-                        if (sp is not None and rq is not None and rpw is not None
-                                and sp.shape[1] > max(li, ri)):
-                            lf_b = _quat_apply_inverse(rq, sp[:, li, :] - rpw)
-                            rf_b = _quat_apply_inverse(rq, sp[:, ri, :] - rpw)
-                            lfp = _tensor_to_np(lf_b)
-                            rfp = _tensor_to_np(rf_b)
-                            if lfp is not None:
-                                left_foot_pos_b_buf.append(lfp)
-                            if rfp is not None:
-                                right_foot_pos_b_buf.append(rfp)
-                    except Exception:  # noqa: BLE001
-                        pass
+                try:
+                    sp = getattr(d, "site_pos_w", None)        # (N, S, 3)
+                    li, ri = _feet["li"], _feet["ri"]
+                    selected = _select_biped_foot_site_positions(sp, li, ri)
+                    if selected is not None:
+                        lf_w, rf_w = selected
+                        lfp_w = _tensor_to_np(lf_w)
+                        rfp_w = _tensor_to_np(rf_w)
+                        if lfp_w is not None:
+                            left_foot_pos_w_buf.append(lfp_w)
+                        if rfp_w is not None:
+                            right_foot_pos_w_buf.append(rfp_w)
+                        if _quat_apply_inverse is not None:
+                            rq = getattr(d, "root_link_quat_w", None)  # (N, 4)
+                            rpw = getattr(d, "root_link_pos_w", None)  # (N, 3)
+                            if rq is not None and rpw is not None:
+                                lf_b = _quat_apply_inverse(rq, lf_w - rpw)
+                                rf_b = _quat_apply_inverse(rq, rf_w - rpw)
+                                lfp_b = _tensor_to_np(lf_b)
+                                rfp_b = _tensor_to_np(rf_b)
+                                if lfp_b is not None:
+                                    left_foot_pos_b_buf.append(lfp_b)
+                                if rfp_b is not None:
+                                    right_foot_pos_b_buf.append(rfp_b)
+                except Exception:  # noqa: BLE001
+                    pass
         ap = _tensor_to_np(action)
         if ap is not None:
             action_buf.append(ap)
@@ -5103,6 +5142,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         ("right_foot_contact", right_foot_contact_buf),
         ("left_foot_pos_b", left_foot_pos_b_buf),
         ("right_foot_pos_b", right_foot_pos_b_buf),
+        ("left_foot_pos_w", left_foot_pos_w_buf),
+        ("right_foot_pos_w", right_foot_pos_w_buf),
     ):
         arr = _stack_if_consistent(buf)
         if arr is not None:

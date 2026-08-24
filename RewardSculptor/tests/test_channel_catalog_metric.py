@@ -210,6 +210,62 @@ def compute_spec(arrays, behavior, meta):
 '''
 
 
+FOOT_REGION_RETENTION_METRIC = '''
+import numpy as np
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays.get("first_episode_valid_mask")
+    root = arrays.get("root_link_pos_w")
+    finish = arrays.get("region__goal_mouth__relative")
+    left = arrays.get("left_foot_pos_w")
+    right = arrays.get("right_foot_pos_w")
+    left_contact = arrays.get("left_foot_contact")
+    right_contact = arrays.get("right_foot_contact")
+    if any(x is None for x in (
+        valid, root, finish, left, right, left_contact, right_contact,
+    )):
+        return {"spec_score": 0.0}
+    passed = []
+    landing_inside = []
+    retained = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 3:
+            passed.append(False); landing_inside.append(False); retained.append(False)
+            continue
+        lc = left_contact[keep, env] > 0.5
+        rc = right_contact[keep, env] > 0.5
+        both_air = (~lc) & (~rc)
+        land = -1
+        seen_air = False
+        for index in range(keep.size):
+            if both_air[index]:
+                seen_air = True
+            elif seen_air and lc[index] and rc[index]:
+                land = index
+                break
+        foot_center = []
+        for foot in (left, right):
+            relative = (
+                (foot[keep, env] - root[keep, env])[:, :2]
+                - finish[keep, env, :2]
+            )
+            foot_center.append(np.linalg.norm(relative, axis=-1) <= 0.35)
+        both_inside = foot_center[0] & foot_center[1]
+        at_landing = bool(land >= 0 and both_inside[land])
+        never_exited = bool(land >= 0 and np.all(both_inside[land:]))
+        landing_inside.append(at_landing)
+        retained.append(never_exited)
+        passed.append(at_landing and never_exited)
+    score = float(np.mean(passed))
+    return {
+        "spec_score": score,
+        "landing_feet_inside_frac": float(np.mean(landing_inside)),
+        "post_landing_retained_frac": float(np.mean(retained)),
+    }
+'''
+
+
 DISTANCE_ONLY_METRIC = '''
 import numpy as np
 
@@ -911,6 +967,72 @@ def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_pat
         metric_path, rollout, channel_catalog=catalog)
     assert mismatch["spec_score"] == 0.0
     assert "hash mismatch" in mismatch["error"]
+
+
+@pytest.mark.parametrize(
+    ("right_foot_overrides", "expected_landing", "expected_retained"),
+    [
+        ({}, 1.0, 1.0),
+        ({4: 0.36}, 0.0, 0.0),
+        ({7: 0.36}, 1.0, 0.0),
+    ],
+)
+def test_world_foot_channels_prove_landing_and_veto_later_region_exit(
+    tmp_path: Path,
+    right_foot_overrides: dict[int, float],
+    expected_landing: float,
+    expected_retained: float,
+) -> None:
+    catalog = _catalog()
+    metric_path = _write_metric(
+        tmp_path, FOOT_REGION_RETENTION_METRIC, "foot_retention.py")
+    rollout = tmp_path / "rollout"
+    rollout.mkdir()
+    time_steps = 9
+    arrays = catalog_fixture_arrays(
+        catalog, time_steps=time_steps, num_envs=1, case="competent")
+
+    root = np.zeros((time_steps, 1, 3), dtype=np.float32)
+    root[..., 0] = 10.0  # replicated-environment world offset
+    root[..., 2] = 0.8
+    finish_relative = np.zeros((time_steps, 1, 3), dtype=np.float32)
+    left = root.copy()
+    right = root.copy()
+    left[..., 0] += 0.10
+    right[..., 0] -= 0.10
+    for frame, offset in right_foot_overrides.items():
+        right[frame, 0, 0] = root[frame, 0, 0] + offset
+    left_contact = np.ones((time_steps, 1), dtype=np.float32)
+    right_contact = np.ones((time_steps, 1), dtype=np.float32)
+    left_contact[2:4] = 0.0
+    right_contact[2:4] = 0.0
+
+    arrays.update({
+        "first_episode_valid_mask": np.ones(
+            (time_steps, 1), dtype=bool),
+        "root_link_pos_w": root,
+        "region__goal_mouth__relative": finish_relative,
+        "left_foot_pos_w": left,
+        "right_foot_pos_w": right,
+        "left_foot_contact": left_contact,
+        "right_foot_contact": right_contact,
+    })
+    np.savez(
+        rollout / "trajectory.npz",
+        **arrays,
+        channel_catalog_hash=np.asarray(catalog.catalog_hash),
+    )
+
+    result = compute_generated_metric(
+        metric_path,
+        rollout,
+        behavior={"step_dt": 0.02},
+        channel_catalog=catalog,
+    )
+
+    assert result["landing_feet_inside_frac"] == expected_landing
+    assert result["post_landing_retained_frac"] == expected_retained
+    assert result["spec_score"] == min(expected_landing, expected_retained)
 
 
 @dataclass

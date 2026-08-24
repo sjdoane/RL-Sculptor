@@ -141,6 +141,11 @@ _LEGACY_ALLOWED_ARRAYS = (
     "right_foot_contact",
     "left_foot_pos_b",
     "right_foot_pos_b",
+    # Optional direct site positions in world coordinates.  These are needed
+    # for exact authored-region containment because pelvis-frame positions and
+    # projected gravity do not determine the robot's world yaw.
+    "left_foot_pos_w",
+    "right_foot_pos_w",
 )
 # Guard the externally-visible legacy tuple while moving its canonical
 # definition to the catalog module shared by compiler and runtime.
