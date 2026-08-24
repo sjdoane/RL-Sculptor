@@ -541,6 +541,7 @@ def test_compact_low_rail_profile_is_exact_and_policy_compatible() -> None:
     assert all(
         item["shape"] == "box"
         and item["fixed"] is True
+        and item["route_semantics"] == "traverse_over"
         and item["nominal"]["size_m"] == [0.10, 0.60, 0.06]
         for item in world["shared"]["objects"].values()
     )
@@ -590,6 +591,16 @@ def test_compact_low_rail_profile_is_exact_and_policy_compatible() -> None:
         "region_relative": waypoints,
     }
     assert "event_sequence" not in task["shared"]
+
+    invalid = copy.deepcopy(world)
+    invalid["shared"]["objects"]["rail_01"][
+        "route_semantics"
+    ] = "tunnel_through"
+    assert any(
+        "shared.objects.rail_01.route_semantics" in error
+        and "must be one of" in error
+        for error in validate_world_spec(invalid)
+    )
 
 
 def test_slalom_preserves_obstacles_waypoints_and_terminal_dwell():

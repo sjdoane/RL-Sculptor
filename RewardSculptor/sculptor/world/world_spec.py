@@ -7,7 +7,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from sculptor.world.capabilities import (
     CapabilityError, SimulatorCapability, resolve_robot_capability,
@@ -37,7 +37,8 @@ _COURSE_NOMINAL_KEYS: dict[str, set[str]] = {
     "stepping_stones": {
         "stone_size_m", "spacing_m", "height_m", "count", "width_m"},
 }
-_OBJECT_KEYS = {"shape", "fixed", "nominal"}
+_OBJECT_KEYS = {"shape", "fixed", "nominal", "route_semantics"}
+_OBJECT_ROUTE_SEMANTICS = {"avoid_around", "traverse_over"}
 _OBJECT_NOMINAL_COMMON = {
     "mass_kg", "friction", "restitution", "pose", "rgba",
 }
@@ -353,6 +354,15 @@ def _validate_objects(
             continue
         if "fixed" in obj and not isinstance(obj["fixed"], bool):
             errors.append(f"{path}.fixed: must be boolean")
+        if (
+            "route_semantics" in obj
+            and obj["route_semantics"] not in _OBJECT_ROUTE_SEMANTICS
+        ):
+            errors.append(
+                f"{path}.route_semantics: must be one of "
+                f"{sorted(_OBJECT_ROUTE_SEMANTICS)}, got "
+                f"{obj['route_semantics']!r}"
+            )
         nominal = _strict(
             obj.get("nominal"), f"{path}.nominal",
             _OBJECT_NOMINAL_COMMON | _OBJECT_SHAPE_KEYS.get(str(shape), set()),

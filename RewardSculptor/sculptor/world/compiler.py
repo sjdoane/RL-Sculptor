@@ -1629,6 +1629,8 @@ def resolve_objects(world: Mapping[str, Any]) -> dict[str, Any]:
             "position_m": list(position),
             "quaternion_wxyz": list(rotation),
         }
+        if "route_semantics" in obj:
+            resolved[name]["route_semantics"] = str(obj["route_semantics"])
     return resolved
 
 
@@ -2983,6 +2985,13 @@ def _clearance_adjusted_waypoint_points(
         conflicts: list[tuple[float, str, tuple[float, float], float]] = []
         for object_name in forbidden_names:
             record = manifest.objects[object_name]
+            # Forbidden contact remains literal for every object.  This branch
+            # controls only command geometry: an obstacle explicitly authored
+            # for vertical traversal must not be converted into a planar
+            # slalom target.  Missing metadata retains the historical
+            # ``avoid_around`` behavior for existing immutable worlds.
+            if record.get("route_semantics", "avoid_around") == "traverse_over":
+                continue
             nominal = record.get("nominal", record)
             pose = nominal.get("pose", {}) if isinstance(nominal, Mapping) else {}
             position = tuple(float(value) for value in pose.get("position_m", ()))

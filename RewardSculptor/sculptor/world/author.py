@@ -770,6 +770,7 @@ def _compact_low_rail_geometry(
         objects[rail_id] = {
             "shape": "box",
             "fixed": True,
+            "route_semantics": "traverse_over",
             "nominal": {
                 "size_m": list(_COMPACT_RAIL_SIZE_M),
                 "rgba": [0.95, 0.18, 0.04, 1.0],
@@ -1808,6 +1809,7 @@ def _raise_compact_low_rail_drift(
             not isinstance(actual, Mapping)
             or actual.get("shape") != "box"
             or actual.get("fixed") is not True
+            or actual.get("route_semantics") != "traverse_over"
             or not isinstance(nominal, Mapping)
             or not _semantic_vector_matches(
                 nominal.get("size_m"), expected["nominal"]["size_m"]

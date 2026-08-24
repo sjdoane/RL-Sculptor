@@ -388,6 +388,9 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
             },
         },
     )
+    # Missing route semantics is the immutable legacy contract: forbidden
+    # objects continue to receive planar avoid-around command clearance.
+    assert "route_semantics" not in manifest.objects["box"]
 
     points, notes = _clearance_adjusted_waypoint_points(
         manifest, ["waypoint", "finish"], robot)
@@ -1373,6 +1376,54 @@ def test_compact_low_rail_profile_compiles_and_passes_admission() -> None:
             "finish",
         ],
     }
+
+    # A rail remains a literal forbidden-contact object, but its explicit
+    # traverse-over semantic prevents the planar clearance controller from
+    # rewriting this straight hopping course into a slalom.  Predicate disks
+    # and command targets therefore share the exact authored centers.
+    robot = resolve_robot_capability("unitree_g1:base")
+    waypoints = compiled.resolved_eval.task_shared["goal"]["waypoints"]
+    command_points, notes = _clearance_adjusted_waypoint_points(
+        compiled.resolved_eval, waypoints, robot,
+    )
+    expected_points = (
+        (0.65, 0.0, 0.0),
+        (1.15, 0.0, 0.0),
+        (1.65, 0.0, 0.0),
+        (2.15, 0.0, 0.0),
+        (2.55, 0.0, 0.0),
+    )
+    assert command_points == expected_points
+    assert notes == ()
+
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0),
+        lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5),
+        heading=None,
+    )
+    env_cfg = SimpleNamespace(
+        events={},
+        commands={"twist": SimpleNamespace(
+            ranges=ranges,
+            entity_name="robot",
+            debug_vis=False,
+        )},
+        curriculum={},
+    )
+    _reconcile_waypoint_course(
+        env_cfg,
+        compiled.resolved_eval,
+        train=True,
+        robot=robot,
+    )
+    routed = env_cfg.commands["twist"]
+    assert routed.predicate_waypoints_m == expected_points
+    assert routed.waypoints_m == expected_points
+    assert routed.clearance_shifts_m == ((0.0, 0.0, 0.0),) * 5
+    assert routed.clearance_staging_shifts_m == ((0.0, 0.0, 0.0),) * 5
+    assert routed.clearance_traversal_shifts_m == ((0.0, 0.0, 0.0),) * 5
+    assert routed.cruise_speed_mps == pytest.approx(0.8)
 
 
 def test_axis_aligned_box_gate_still_rejects_real_rail_overlap() -> None:

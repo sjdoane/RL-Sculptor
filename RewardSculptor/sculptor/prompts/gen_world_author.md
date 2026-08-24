@@ -46,7 +46,11 @@ Hard rules (a violation means your output is thrown away):
 - also allowed: `beam`, `wall`, `stairs`, `stepping_stones`.
 Give a robot a lead-in (`start_offset_m` ≥ 0.6) before the first platform.
 
-**Objects** (`shared.objects`) — `{shape, fixed, nominal}`. Shapes & their required nominal:
+**Objects** (`shared.objects`) — `{shape, fixed, route_semantics?, nominal}`.
+`route_semantics` is data-only command geometry: `avoid_around` asks the route
+controller for planar clearance; `traverse_over` preserves a straight crossing
+command while contact predicates remain unchanged. Omission retains the legacy
+`avoid_around` behavior. Shapes & their required nominal:
 - sphere:   `radius_m`                          (a ball)
 - box:      `size_m: [x,y,z]`
 - cylinder / capsule: `radius_m, height_m`

@@ -238,7 +238,10 @@ def test_hybrid_accepts_exact_compact_low_rail_profile() -> None:
 
 @pytest.mark.parametrize(
     "drift",
-    ["cardinality", "geometry", "observations", "episode_horizon"],
+    [
+        "cardinality", "geometry", "route_semantics", "observations",
+        "episode_horizon",
+    ],
 )
 def test_hybrid_rejects_compact_low_rail_semantic_drift(drift: str) -> None:
     """Schema-valid model output cannot weaken the named execution profile."""
@@ -258,6 +261,10 @@ def test_hybrid_rejects_compact_low_rail_semantic_drift(drift: str) -> None:
         task["shared"]["contacts"]["forbidden"].pop()
     elif drift == "geometry":
         world["shared"]["objects"]["rail_02"]["nominal"]["size_m"][0] = 0.12
+    elif drift == "route_semantics":
+        # Missing metadata is legacy ``avoid_around`` for old worlds, but the
+        # named compact profile explicitly promises traverse-over behavior.
+        world["shared"]["objects"]["rail_02"].pop("route_semantics")
     elif drift == "observations":
         task["shared"]["observations"]["object_relative"] = ["rail_01"]
     else:
@@ -281,6 +288,9 @@ def test_hybrid_rejects_compact_low_rail_semantic_drift(drift: str) -> None:
     assert draft.world_spec["shared"]["objects"]["rail_02"]["nominal"][
         "size_m"
     ] == [0.10, 0.60, 0.06]
+    assert draft.world_spec["shared"]["objects"]["rail_02"][
+        "route_semantics"
+    ] == "traverse_over"
     assert draft.task_spec["shared"]["observations"]["object_relative"] == []
     assert draft.task_spec["shared"]["termination"]["episode_length_s"] == 8.0
 
