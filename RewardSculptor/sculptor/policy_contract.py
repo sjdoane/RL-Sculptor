@@ -593,30 +593,53 @@ def _major_minor(value: Optional[str]) -> Optional[str]:
 
 
 def compare_policy_contracts(
-    source: Optional[dict[str, Any]], target: Optional[dict[str, Any]],
+    source: Optional[dict[str, Any]],
+    target: Optional[dict[str, Any]],
+    *,
+    roles: tuple[str, ...] = ("actor", "critic"),
 ) -> list[str]:
     if not isinstance(source, dict):
         return ["source bundle is missing compatibility_contract"]
     if not isinstance(target, dict):
         return ["project target compatibility contract is unavailable"]
-    if policy_contract_migration(source, target) is not None:
+    canonical_roles = _canonical_policy_roles(roles)
+    if canonical_roles is None:
+        return ["requested policy roles are invalid"]
+    if policy_contract_migration(
+        source, target, roles=canonical_roles,
+    ) is not None:
         return []
     reasons: list[str] = []
     required_paths = (
         ("schema",),
         ("identity", "adapter_class"), ("identity", "task_id"),
         ("joints", "ordered_names"),
-        ("observations", "ordered_terms"), ("observations", "shape"),
-        ("observations", "critic_ordered_terms"),
-        ("observations", "critic_shape"),
         ("actions", "ordered_names"), ("actions", "term_names"),
         ("actions", "shape"),
-        ("policy", "actor"), ("policy", "critic"),
-        ("policy", "normalizer"),
         ("timing", "sim_timestep_s"), ("timing", "decimation"),
         ("timing", "control_dt_s"),
         ("versions", "torch"), ("versions", "mjlab"),
         ("versions", "rsl_rl"), ("versions", "adapter"),
+    )
+    role_paths = {
+        "actor": (
+            ("observations", "ordered_terms"),
+            ("observations", "shape"),
+            ("policy", "actor"),
+            ("policy", "normalizer", "present"),
+            ("policy", "normalizer", "actor_present"),
+            ("policy", "normalizer", "actor_shape"),
+        ),
+        "critic": (
+            ("observations", "critic_ordered_terms"),
+            ("observations", "critic_shape"),
+            ("policy", "critic"),
+            ("policy", "normalizer", "critic_present"),
+            ("policy", "normalizer", "critic_shape"),
+        ),
+    }
+    required_paths = required_paths + tuple(
+        path for role in canonical_roles for path in role_paths[role]
     )
     for path in required_paths:
         left: Any = source
@@ -625,29 +648,400 @@ def compare_policy_contracts(
             left = left.get(key) if isinstance(left, dict) else None
             right = right.get(key) if isinstance(right, dict) else None
         label = ".".join(path)
+        nullable_equal = (
+            path in {
+                ("policy", "normalizer", "actor_shape"),
+                ("policy", "normalizer", "critic_shape"),
+            }
+            and left is None
+            and right is None
+        )
+        if nullable_equal:
+            continue
         if left is None or right is None:
             reasons.append(f"{label} is missing/unknown")
         elif left != right:
             reasons.append(f"{label} differs")
     if reasons:
         return reasons
-    return [] if source == target else ["compatibility contract differs"]
+    source_projection = _policy_contract_role_projection(
+        source, roles=canonical_roles,
+    )
+    target_projection = _policy_contract_role_projection(
+        target, roles=canonical_roles,
+    )
+    return (
+        []
+        if source_projection == target_projection
+        else ["compatibility contract differs"]
+    )
+
+
+def _canonical_policy_roles(
+    roles: tuple[str, ...] | list[str],
+) -> tuple[str, ...] | None:
+    """Return one canonical, non-empty actor/critic role selection."""
+    if not isinstance(roles, (tuple, list)) or not roles:
+        return None
+    requested = set(roles)
+    if any(not isinstance(role, str) for role in roles) or not requested <= {
+        "actor", "critic",
+    }:
+        return None
+    return tuple(role for role in ("actor", "critic") if role in requested)
+
+
+def _policy_contract_role_projection(
+    contract: Mapping[str, Any],
+    *,
+    roles: tuple[str, ...],
+) -> dict[str, Any]:
+    """Remove unrequested policy-role bytes from a comparison projection."""
+    projected = copy.deepcopy(dict(contract))
+    observations = projected.get("observations")
+    policy = projected.get("policy")
+    normalizer = policy.get("normalizer") if isinstance(policy, dict) else None
+    for role, rows_key, shape_key, normalizer_shape_key in (
+        ("actor", "ordered_terms", "shape", "actor_shape"),
+        ("critic", "critic_ordered_terms", "critic_shape", "critic_shape"),
+    ):
+        if role in roles:
+            continue
+        if isinstance(observations, dict):
+            observations.pop(rows_key, None)
+            observations.pop(shape_key, None)
+        if isinstance(policy, dict):
+            policy.pop(role, None)
+        if isinstance(normalizer, dict):
+            normalizer.pop(f"{role}_present", None)
+            normalizer.pop(normalizer_shape_key, None)
+            if role == "actor":
+                normalizer.pop("present", None)
+    return projected
+
+
+def _supported_feed_forward_mlp_role(
+    contract: Mapping[str, Any], role: str,
+) -> bool:
+    """Prove the runtime knows how to remap this role's first layer.
+
+    The adapter migration only recognizes RSL-RL feed-forward MLP state
+    dictionaries rooted at ``mlp.0.weight``.  Unknown classes, missing
+    recurrent evidence, and active recurrent state therefore fail closed.
+    """
+    policy = contract.get("policy")
+    role_contract = policy.get(role) if isinstance(policy, Mapping) else None
+    if not isinstance(role_contract, Mapping):
+        return False
+    class_name = role_contract.get("class_name")
+    if not isinstance(class_name, str) or re.sub(
+        r"[^a-z0-9]", "", class_name.lower(),
+    ) not in {"mlp", "mlpmodel"}:
+        return False
+    recurrent = role_contract.get("recurrent")
+    if not isinstance(recurrent, Mapping) or recurrent.get("type") not in {
+        None, "",
+    }:
+        return False
+    return True
+
+
+def _observation_role_insertion_migration(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    rows_key: str,
+    shape_key: str,
+    role: str,
+) -> dict[str, Any] | None:
+    """Describe one exact ordered-subsequence observation migration.
+
+    Each source term must occur byte-for-byte in the target under the same
+    unique name and in the same order.  Target-only terms may appear between
+    those preserved terms.  Offsets are derived from declared term shapes so
+    the runtime can move an inherited input column (for example a trailing
+    reference clock) instead of incorrectly treating every new feature as a
+    tail append.
+    """
+    source_observations = source.get("observations")
+    target_observations = target.get("observations")
+    if not isinstance(source_observations, Mapping) or not isinstance(
+        target_observations, Mapping
+    ):
+        return None
+    source_rows = source_observations.get(rows_key)
+    target_rows = target_observations.get(rows_key)
+    source_shape = source_observations.get(shape_key)
+    target_shape = target_observations.get(shape_key)
+    if not isinstance(source_rows, list) or not isinstance(target_rows, list):
+        return None
+    if (
+        not isinstance(source_shape, list)
+        or len(source_shape) != 1
+        or not isinstance(source_shape[0], int)
+        or isinstance(source_shape[0], bool)
+        or source_shape[0] <= 0
+        or not isinstance(target_shape, list)
+        or len(target_shape) != 1
+        or not isinstance(target_shape[0], int)
+        or isinstance(target_shape[0], bool)
+        or target_shape[0] <= source_shape[0]
+    ):
+        return None
+
+    def validated_rows(
+        rows: list[Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, tuple[int, int]]] | None:
+        validated: list[dict[str, Any]] = []
+        offsets: dict[str, tuple[int, int]] = {}
+        offset = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            name = row.get("name")
+            shape = row.get("shape")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in offsets
+                or not isinstance(shape, list)
+                or not shape
+                or any(
+                    not isinstance(dimension, int)
+                    or isinstance(dimension, bool)
+                    or dimension <= 0
+                    for dimension in shape
+                )
+            ):
+                return None
+            width = math.prod(shape)
+            validated.append(copy.deepcopy(row))
+            offsets[name] = (offset, width)
+            offset += width
+        return validated, offsets
+
+    source_validated = validated_rows(source_rows)
+    target_validated = validated_rows(target_rows)
+    if source_validated is None or target_validated is None:
+        return None
+    canonical_source_rows, source_offsets = source_validated
+    canonical_target_rows, target_offsets = target_validated
+    if sum(width for _, width in source_offsets.values()) != source_shape[0]:
+        return None
+    if sum(width for _, width in target_offsets.values()) != target_shape[0]:
+        return None
+
+    target_by_name = {row["name"]: row for row in canonical_target_rows}
+    target_indices = {
+        row["name"]: index for index, row in enumerate(canonical_target_rows)
+    }
+    previous_target_index = -1
+    preserved_segments: list[dict[str, Any]] = []
+    for source_row in canonical_source_rows:
+        name = source_row["name"]
+        target_row = target_by_name.get(name)
+        target_index = target_indices.get(name)
+        if (
+            target_row != source_row
+            or target_index is None
+            or target_index <= previous_target_index
+        ):
+            return None
+        previous_target_index = target_index
+        source_offset, width = source_offsets[name]
+        target_offset, target_width = target_offsets[name]
+        if target_width != width:
+            return None
+        preserved_segments.append({
+            "term_name": name,
+            "source_offset": source_offset,
+            "target_offset": target_offset,
+            "width": width,
+        })
+
+    source_names = set(source_offsets)
+    inserted_segments = [
+        {
+            "term_name": row["name"],
+            "target_offset": target_offsets[row["name"]][0],
+            "width": target_offsets[row["name"]][1],
+        }
+        for row in canonical_target_rows
+        if row["name"] not in source_names
+    ]
+    extension_width = int(target_shape[0]) - int(source_shape[0])
+    if (
+        not inserted_segments
+        or sum(segment["width"] for segment in inserted_segments)
+        != extension_width
+    ):
+        return None
+    return {
+        "role": role,
+        "source_width": int(source_shape[0]),
+        "target_width": int(target_shape[0]),
+        "extension_width": extension_width,
+        "preserved_segments": preserved_segments,
+        "inserted_segments": inserted_segments,
+    }
+
+
+def _ordered_observation_insertion_migration(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    roles: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Admit only a same-schema, function-preserving term insertion."""
+    if source.get("schema") != target.get("schema"):
+        return None
+    if source.get("schema") not in {
+        CONTRACT_SCHEMA,
+        EVENT_CONTRACT_SCHEMA,
+        REFERENCE_CLOCK_CONTRACT_SCHEMA,
+    }:
+        return None
+
+    role_migrations: dict[str, dict[str, Any]] = {}
+    role_interfaces = {
+        "actor": ("ordered_terms", "shape"),
+        "critic": ("critic_ordered_terms", "critic_shape"),
+    }
+    for role in roles:
+        rows_key, shape_key = role_interfaces[role]
+        if not _supported_feed_forward_mlp_role(
+            source, role,
+        ) or not _supported_feed_forward_mlp_role(target, role):
+            return None
+        migration = _observation_role_insertion_migration(
+            source,
+            target,
+            rows_key=rows_key,
+            shape_key=shape_key,
+            role=role,
+        )
+        if migration is None:
+            return None
+        role_migrations[role] = migration
+
+    # Prove that observation rows/dimensions and their matching normalizer
+    # widths are the only changed bytes in the structural contract.
+    projected = copy.deepcopy(dict(target))
+    projected_observations = projected.get("observations")
+    source_observations = source.get("observations")
+    target_observations = target.get("observations")
+    if not isinstance(projected_observations, dict) or not isinstance(
+        source_observations, Mapping
+    ) or not isinstance(target_observations, Mapping):
+        return None
+    for role, (rows_key, shape_key) in role_interfaces.items():
+        if role in roles:
+            projected_observations[rows_key] = copy.deepcopy(
+                source_observations.get(rows_key)
+            )
+            projected_observations[shape_key] = copy.deepcopy(
+                source_observations.get(shape_key)
+            )
+
+    source_event = source.get("event_observation")
+    target_event = target.get("event_observation")
+    if source_event != target_event:
+        expected_event = {
+            "schema": 1,
+            "term_name": "authored_event_phase",
+            "encoding": "one_hot",
+            "ordered_phase_ids": ["route", "jump", "hold"],
+        }
+        if source_event is not None or target_event != expected_event:
+            return None
+        expected_event_term = {
+            "name": "authored_event_phase",
+            "source": "authored_event_phase_observation",
+            "shape": [3],
+        }
+        for role in roles:
+            rows_key, _shape_key = role_interfaces[role]
+            target_rows = target_observations.get(rows_key)
+            if not any(
+                segment.get("term_name") == "authored_event_phase"
+                and segment.get("width") == 3
+                for segment in role_migrations[role]["inserted_segments"]
+            ) or not isinstance(target_rows, list) or (
+                expected_event_term not in target_rows
+            ):
+                return None
+        projected.pop("event_observation", None)
+
+    projected_normalizer = projected.get("policy", {}).get("normalizer")
+    source_normalizer = source.get("policy", {}).get("normalizer")
+    target_normalizer = target.get("policy", {}).get("normalizer")
+    if not isinstance(projected_normalizer, dict) or not isinstance(
+        source_normalizer, Mapping
+    ) or not isinstance(target_normalizer, Mapping):
+        return None
+    for role in roles:
+        shape_key = f"{role}_shape"
+        present_key = f"{role}_present"
+        if source_normalizer.get(present_key) != target_normalizer.get(
+            present_key
+        ):
+            return None
+        migration = role_migrations[role]
+        source_normalizer_shape = source_normalizer.get(shape_key)
+        target_normalizer_shape = target_normalizer.get(shape_key)
+        if source_normalizer.get(present_key):
+            if source_normalizer_shape != [migration["source_width"]] or (
+                target_normalizer_shape != [migration["target_width"]]
+            ):
+                return None
+        elif source_normalizer_shape is not None or target_normalizer_shape is not None:
+            return None
+        projected_normalizer[shape_key] = copy.deepcopy(
+            source_normalizer_shape
+        )
+    if _policy_contract_role_projection(
+        projected, roles=roles,
+    ) != _policy_contract_role_projection(source, roles=roles):
+        return None
+
+    return {
+        "type": "zero_initialized_ordered_observation_insertions",
+        "from_schema": source.get("schema"),
+        "to_schema": target.get("schema"),
+        "roles": list(roles),
+        "extension_width": role_migrations["actor"]["extension_width"],
+        "role_migrations": role_migrations,
+        "optimizer_resume": False,
+    }
 
 
 def policy_contract_migration(
     source: Optional[dict[str, Any]],
     target: Optional[dict[str, Any]],
+    *,
+    roles: tuple[str, ...] = ("actor", "critic"),
 ) -> dict[str, Any] | None:
-    """Admit the sole structural schema-2 -> schema-3 migration.
+    """Admit an explicit function-preserving observation migration.
 
-    The target must be the exact legacy contract plus one final, three-wide
-    one-hot event-phase term for both actor and critic.  Observation dimensions
-    and normalizer dimensions may grow by exactly that width; every other byte
-    of structural compatibility remains exact.  This is policy initialization,
-    never an optimizer/full-state resume.
+    Same-schema targets may insert new, zero-initialized observation terms
+    around an exact ordered subsequence of source terms.  The historical
+    schema-2 event-phase and schema-4 reference-clock append migrations remain
+    separately admitted.  Every other byte of structural compatibility stays
+    exact.  This is policy initialization, never an optimizer/full-state
+    resume.
     """
     if not isinstance(source, dict) or not isinstance(target, dict):
         return None
+    canonical_roles = _canonical_policy_roles(roles)
+    if canonical_roles is None or "actor" not in canonical_roles:
+        return None
+    insertion_migration = _ordered_observation_insertion_migration(
+        source,
+        target,
+        roles=canonical_roles,
+    )
+    if insertion_migration is not None:
+        return insertion_migration
     if target.get("schema") == REFERENCE_CLOCK_CONTRACT_SCHEMA:
         from sculptor.reference_clock import (
             REFERENCE_CLOCK_SOURCE,
@@ -1429,11 +1823,38 @@ def build_skill_warm_start_contract_receipt(
     source_contract: Mapping[str, Any],
     target_contract: Mapping[str, Any],
     target_receipt: Mapping[str, Any],
+    initialization_mode: str | None = None,
 ) -> dict[str, Any]:
     """Build one re-attestable imported/local skill initialization receipt."""
     source = dict(source_contract)
     target = dict(target_contract)
-    migration = policy_contract_migration(source, target)
+    if initialization_mode not in {None, "actor_only", "actor_critic"}:
+        raise ValueError(
+            "starting-skill policy receipt requires actor_only or "
+            "actor_critic initialization"
+        )
+    requested_roles = (
+        ("actor",)
+        if initialization_mode == "actor_only"
+        else ("actor", "critic")
+    )
+    migration = policy_contract_migration(
+        source, target, roles=requested_roles,
+    )
+    # Older launch adapters did not pass the selected mode into this pure
+    # receipt builder.  A declared actor-only migration is still safe as a
+    # fallback because it is role-bound in the receipt and the runtime refuses
+    # to use it for actor+critic loading.  Compatibility admission remains the
+    # authority that decides whether actor_only is selectable.
+    if (
+        migration is None
+        and initialization_mode is None
+        and source != target
+    ):
+        requested_roles = ("actor",)
+        migration = policy_contract_migration(
+            source, target, roles=requested_roles,
+        )
     if source == target:
         compatibility = {
             "type": "exact_policy_contract",
@@ -1444,7 +1865,9 @@ def build_skill_warm_start_contract_receipt(
     elif migration is not None:
         compatibility = migration
     else:
-        reasons = compare_policy_contracts(source, target)
+        reasons = compare_policy_contracts(
+            source, target, roles=requested_roles,
+        )
         raise ValueError(
             "starting-skill policy contract is incompatible with the target: "
             + "; ".join(reasons)
@@ -1493,6 +1916,7 @@ def build_skill_warm_start_contract_receipt(
             "contract_sha256": target_contract_sha256,
         },
         "compatibility": compatibility,
+        "load_roles": list(requested_roles),
     }
 
 

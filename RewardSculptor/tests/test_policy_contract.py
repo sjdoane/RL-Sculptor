@@ -39,8 +39,20 @@ def _legacy_contract() -> dict:
             "shape": [2],
         },
         "policy": {
-            "actor": {"class_name": "MlpModel", "hidden_dims": [8]},
-            "critic": {"class_name": "MlpModel", "hidden_dims": [8]},
+            "actor": {
+                "class_name": "MlpModel",
+                "hidden_dims": [8],
+                "recurrent": {
+                    "type": None, "hidden_dim": 0, "num_layers": 0,
+                },
+            },
+            "critic": {
+                "class_name": "MlpModel",
+                "hidden_dims": [8],
+                "recurrent": {
+                    "type": None, "hidden_dim": 0, "num_layers": 0,
+                },
+            },
             "normalizer": {
                 "present": True,
                 "actor_present": True,
@@ -82,6 +94,76 @@ def _event_contract(source: dict) -> dict:
     target["policy"]["normalizer"]["actor_shape"] = [7]
     target["policy"]["normalizer"]["critic_shape"] = [7]
     return target
+
+
+def _reference_insertion_contracts() -> tuple[dict, dict]:
+    source = _legacy_contract()
+    source["schema"] = 4
+    source["reference_clock"] = {
+        "schema": 1,
+        "term_name": "reference_phase",
+        "source": "reference_clock_observation",
+        "shape": [1],
+        "encoding": "normalized_phase",
+        "clock": "per_environment_episode_elapsed_control_time",
+        "reset_semantics": "per_environment_episode_reset",
+        "phase_mode": "hold",
+        "phase_duration_s": 2.0,
+        "n_phase_targets": 32,
+        "reference_clip_id": "four-rail-hop",
+        "reference_robot": "g1",
+        "reference_target_sha256": "a" * 64,
+    }
+    source["observations"] = {
+        "ordered_terms": [
+            {"name": "proprio", "source": "proprioception", "shape": [99]},
+            {
+                "name": "reference_phase",
+                "source": "reference_clock_observation",
+                "shape": [1],
+            },
+        ],
+        "shape": [100],
+        "critic_ordered_terms": [
+            {
+                "name": "privileged_proprio",
+                "source": "privileged_proprioception",
+                "shape": [111],
+            },
+            {
+                "name": "reference_phase",
+                "source": "reference_clock_observation",
+                "shape": [1],
+            },
+        ],
+        "critic_shape": [112],
+    }
+    normalizer = source["policy"]["normalizer"]
+    normalizer["actor_shape"] = [100]
+    normalizer["critic_shape"] = [112]
+
+    target = copy.deepcopy(source)
+    actor_rows = target["observations"]["ordered_terms"]
+    actor_rows[1:1] = [
+        {
+            "name": "authored_regions",
+            "source": "authored_region_relative_observation",
+            "shape": [15],
+        },
+        {
+            "name": "authored_height_scan",
+            "source": "height_scan",
+            "shape": [54],
+        },
+    ]
+    critic_rows = target["observations"]["critic_ordered_terms"]
+    critic_rows[1:1] = copy.deepcopy(actor_rows[1:3])
+    target["observations"]["shape"] = [169]
+    target["observations"]["critic_shape"] = [181]
+    target_normalizer = target["policy"]["normalizer"]
+    target_normalizer["actor_shape"] = [169]
+    target_normalizer["critic_shape"] = [181]
+    return source, target
 
 
 def test_authored_region_relative_observation_has_explicit_xyz_shape() -> None:
@@ -180,6 +262,163 @@ def test_event_extension_migration_fails_closed_on_any_extra_change() -> None:
     assert policy_contract_migration(source, target) is None
 
 
+def test_reference_policy_admits_ordered_task_feature_insertions() -> None:
+    source, target = _reference_insertion_contracts()
+
+    migration = policy_contract_migration(source, target)
+
+    assert migration is not None
+    assert migration["type"] == (
+        "zero_initialized_ordered_observation_insertions"
+    )
+    assert migration["extension_width"] == 69
+    assert migration["roles"] == ["actor", "critic"]
+    actor = migration["role_migrations"]["actor"]
+    assert actor["source_width"] == 100
+    assert actor["target_width"] == 169
+    assert actor["preserved_segments"] == [
+        {
+            "term_name": "proprio",
+            "source_offset": 0,
+            "target_offset": 0,
+            "width": 99,
+        },
+        {
+            "term_name": "reference_phase",
+            "source_offset": 99,
+            "target_offset": 168,
+            "width": 1,
+        },
+    ]
+    assert [
+        segment["term_name"] for segment in actor["inserted_segments"]
+    ] == ["authored_regions", "authored_height_scan"]
+    assert compare_policy_contracts(source, target) == []
+
+
+def test_ordered_insertion_flattens_valid_multi_axis_term_shapes() -> None:
+    source, target = _reference_insertion_contracts()
+    target["observations"]["ordered_terms"][2]["shape"] = [6, 9]
+    target["observations"]["critic_ordered_terms"][2]["shape"] = [6, 9]
+
+    migration = policy_contract_migration(source, target)
+
+    assert migration is not None
+    assert migration["role_migrations"]["actor"]["inserted_segments"][1] == {
+        "term_name": "authored_height_scan",
+        "target_offset": 114,
+        "width": 54,
+    }
+
+
+def test_reference_policy_can_add_exact_authored_event_observation() -> None:
+    source, target = _reference_insertion_contracts()
+    event_term = {
+        "name": "authored_event_phase",
+        "source": "authored_event_phase_observation",
+        "shape": [3],
+    }
+    target["event_observation"] = {
+        "schema": 1,
+        "term_name": "authored_event_phase",
+        "encoding": "one_hot",
+        "ordered_phase_ids": ["route", "jump", "hold"],
+    }
+    target["observations"]["ordered_terms"].insert(3, event_term)
+    target["observations"]["critic_ordered_terms"].insert(
+        3, copy.deepcopy(event_term),
+    )
+    target["observations"]["shape"] = [172]
+    target["observations"]["critic_shape"] = [184]
+    target["policy"]["normalizer"]["actor_shape"] = [172]
+    target["policy"]["normalizer"]["critic_shape"] = [184]
+
+    migration = policy_contract_migration(source, target)
+
+    assert migration is not None
+    assert [
+        segment["term_name"]
+        for segment in migration["role_migrations"]["actor"][
+            "inserted_segments"
+        ]
+    ] == [
+        "authored_regions",
+        "authored_height_scan",
+        "authored_event_phase",
+    ]
+
+    target["observations"]["ordered_terms"][3]["source"] = "wrong_source"
+    assert policy_contract_migration(source, target) is None
+
+
+@pytest.mark.parametrize("failure", ["recurrent", "unsupported_class"])
+def test_ordered_insertion_rejects_unmappable_actor_architecture(
+    failure: str,
+) -> None:
+    source, target = _reference_insertion_contracts()
+    if failure == "recurrent":
+        target["policy"]["actor"]["recurrent"]["type"] = "lstm"
+    else:
+        target["policy"]["actor"]["class_name"] = "TransformerModel"
+
+    assert policy_contract_migration(
+        source, target, roles=("actor",),
+    ) is None
+    assert compare_policy_contracts(
+        source, target, roles=("actor",),
+    )
+
+
+def test_actor_only_insertion_does_not_require_critic_migration() -> None:
+    source, target = _reference_insertion_contracts()
+    target["policy"]["critic"]["class_name"] = "UnsupportedCritic"
+    target["observations"]["critic_ordered_terms"].reverse()
+
+    actor_migration = policy_contract_migration(
+        source, target, roles=("actor",),
+    )
+
+    assert actor_migration is not None
+    assert actor_migration["roles"] == ["actor"]
+    assert set(actor_migration["role_migrations"]) == {"actor"}
+    assert compare_policy_contracts(
+        source, target, roles=("actor",),
+    ) == []
+    assert policy_contract_migration(source, target) is None
+    assert compare_policy_contracts(source, target)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "reorder_preserved_terms",
+        "change_preserved_shape",
+        "duplicate_target_name",
+        "change_action_contract",
+    ],
+)
+def test_ordered_observation_insertion_migration_fails_closed(
+    mutation: str,
+) -> None:
+    source, target = _reference_insertion_contracts()
+    if mutation == "reorder_preserved_terms":
+        target["observations"]["ordered_terms"] = [
+            target["observations"]["ordered_terms"][-1],
+            *target["observations"]["ordered_terms"][:-1],
+        ]
+    elif mutation == "change_preserved_shape":
+        target["observations"]["ordered_terms"][0]["shape"] = [98]
+    elif mutation == "duplicate_target_name":
+        target["observations"]["ordered_terms"][1]["name"] = "proprio"
+    elif mutation == "change_action_contract":
+        target["actions"]["ordered_names"].reverse()
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(mutation)
+
+    assert policy_contract_migration(source, target) is None
+    assert compare_policy_contracts(source, target)
+
+
 def test_skill_warm_start_receipt_pins_cross_project_event_migration() -> None:
     source = _legacy_contract()
     target = _event_contract(source)
@@ -208,6 +447,64 @@ def test_skill_warm_start_receipt_pins_cross_project_event_migration() -> None:
         "zero_initialized_event_phase_observation"
     )
     assert receipt["compatibility"]["optimizer_resume"] is False
+
+
+def test_skill_receipt_binds_actor_only_observation_migration() -> None:
+    source, target = _reference_insertion_contracts()
+    target["policy"]["critic"]["class_name"] = "UnsupportedCritic"
+    target["observations"]["critic_ordered_terms"].reverse()
+
+    receipt = build_skill_warm_start_contract_receipt(
+        skill_id="abc123def456",
+        manifest_digest="a" * 64,
+        checkpoint_sha256="b" * 64,
+        tensor_signature_sha256="c" * 64,
+        source_contract=source,
+        target_contract=target,
+        target_receipt={
+            "schema": 1,
+            "adapter_class": "MjlabAdapter",
+            "task_id": "task",
+            "robot_slug": "g1",
+            "policy_contract_required": True,
+            "policy_contract_sha256": contract_fingerprint(target),
+        },
+        initialization_mode="actor_only",
+    )
+
+    assert receipt["load_roles"] == ["actor"]
+    assert receipt["compatibility"]["roles"] == ["actor"]
+    assert set(receipt["compatibility"]["role_migrations"]) == {"actor"}
+    fallback_receipt = build_skill_warm_start_contract_receipt(
+        skill_id="abc123def456",
+        manifest_digest="a" * 64,
+        checkpoint_sha256="b" * 64,
+        tensor_signature_sha256="c" * 64,
+        source_contract=source,
+        target_contract=target,
+        target_receipt={
+            "schema": 1,
+            "policy_contract_required": True,
+            "policy_contract_sha256": contract_fingerprint(target),
+        },
+    )
+    assert fallback_receipt["load_roles"] == ["actor"]
+    assert fallback_receipt["compatibility"] == receipt["compatibility"]
+    with pytest.raises(ValueError, match="incompatible"):
+        build_skill_warm_start_contract_receipt(
+            skill_id="abc123def456",
+            manifest_digest="a" * 64,
+            checkpoint_sha256="b" * 64,
+            tensor_signature_sha256="c" * 64,
+            source_contract=source,
+            target_contract=target,
+            target_receipt={
+                "schema": 1,
+                "policy_contract_required": True,
+                "policy_contract_sha256": contract_fingerprint(target),
+            },
+            initialization_mode="actor_critic",
+        )
 
 
 def _selection_pair(project_dir: Path) -> tuple[Path, Path]:

@@ -860,6 +860,7 @@ def launch_run(
                         target_receipt=(
                             starting_skill_target_receipt or {}
                         ),
+                        initialization_mode=selected_mode,
                     )
                 )
             except SkillLibraryError as exc:
@@ -1070,6 +1071,7 @@ def launch_run(
                             target_payload["compatibility_contract"] or {}
                         ),
                         target_receipt=starting_skill_target_receipt,
+                        initialization_mode=selected_mode,
                     )
                 )
             except (SkillLibraryError, TypeError, ValueError) as exc:

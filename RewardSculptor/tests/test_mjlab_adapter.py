@@ -6,6 +6,7 @@ in tests/test_mjlab_gpu.py behind `@pytest.mark.gpu`.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -494,6 +495,192 @@ def test_event_observation_extension_supports_real_batched_normalizers() -> None
         )
 
 
+def test_ordered_observation_migration_preserves_trailing_reference_phase() -> None:
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _zero_extend_observation_state_dict,
+    )
+
+    source_weight = torch.arange(200, dtype=torch.float32).reshape(2, 100)
+    source = {
+        "mlp.0.weight": source_weight,
+        "obs_normalizer._mean": torch.arange(100, dtype=torch.float32).reshape(
+            1, 100
+        ),
+        "obs_normalizer._var": torch.full((1, 100), 4.0),
+        "obs_normalizer._std": torch.full((1, 100), 2.0),
+        "obs_normalizer.count": torch.tensor(17.0),
+        "mlp.0.bias": torch.zeros(2),
+    }
+    target = {
+        **source,
+        "mlp.0.weight": torch.zeros((2, 169)),
+        "obs_normalizer._mean": torch.zeros((1, 169)),
+        "obs_normalizer._var": torch.zeros((1, 169)),
+        "obs_normalizer._std": torch.zeros((1, 169)),
+    }
+    migration = {
+        "role": "actor",
+        "source_width": 100,
+        "target_width": 169,
+        "extension_width": 69,
+        "preserved_segments": [
+            {
+                "term_name": "proprioception",
+                "source_offset": 0,
+                "target_offset": 0,
+                "width": 99,
+            },
+            {
+                "term_name": "reference_phase",
+                "source_offset": 99,
+                "target_offset": 168,
+                "width": 1,
+            },
+        ],
+        "inserted_segments": [{
+            "term_name": "task_features",
+            "target_offset": 99,
+            "width": 69,
+        }],
+    }
+
+    adapted, changed = _zero_extend_observation_state_dict(
+        source,
+        target,
+        extension_width=69,
+        role="actor",
+        column_migration=migration,
+    )
+
+    torch.testing.assert_close(
+        adapted["mlp.0.weight"][:, :99], source_weight[:, :99]
+    )
+    assert torch.all(adapted["mlp.0.weight"][:, 99:168] == 0.0)
+    torch.testing.assert_close(
+        adapted["mlp.0.weight"][:, 168], source_weight[:, 99]
+    )
+    torch.testing.assert_close(
+        adapted["obs_normalizer._mean"][:, 168],
+        source["obs_normalizer._mean"][:, 99],
+    )
+    assert torch.all(adapted["obs_normalizer._mean"][:, 99:168] == 0.0)
+    assert torch.all(adapted["obs_normalizer._var"][:, 99:168] == 1.0)
+    assert torch.all(adapted["obs_normalizer._std"][:, 99:168] == 1.0)
+    assert "mlp.0.weight" in changed
+
+    malformed = {
+        **migration,
+        "preserved_segments": [
+            migration["preserved_segments"][0],
+            {
+                **migration["preserved_segments"][1],
+                "target_offset": 167,
+            },
+        ],
+    }
+    with pytest.raises(RuntimeError, match="overlap or leave unmapped"):
+        _zero_extend_observation_state_dict(
+            source,
+            target,
+            extension_width=69,
+            role="actor",
+            column_migration=malformed,
+        )
+
+
+def test_prepare_warm_start_applies_contract_role_mapping(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _prepare_event_observation_warm_start,
+    )
+
+    source_state = {
+        "mlp.0.weight": torch.arange(
+            200, dtype=torch.float32
+        ).reshape(2, 100),
+        "mlp.0.bias": torch.zeros(2),
+    }
+    target_state = {
+        "mlp.0.weight": torch.zeros((2, 169)),
+        "mlp.0.bias": torch.zeros(2),
+    }
+    checkpoint = tmp_path / "tracker.pt"
+    torch.save({"actor_state_dict": source_state}, checkpoint)
+    runner = SimpleNamespace(alg=SimpleNamespace(
+        actor=SimpleNamespace(state_dict=lambda: target_state),
+        critic=None,
+    ))
+    actor_migration = {
+        "role": "actor",
+        "source_width": 100,
+        "target_width": 169,
+        "extension_width": 69,
+        "preserved_segments": [
+            {
+                "term_name": "proprioception",
+                "source_offset": 0,
+                "target_offset": 0,
+                "width": 99,
+            },
+            {
+                "term_name": "reference_phase",
+                "source_offset": 99,
+                "target_offset": 168,
+                "width": 1,
+            },
+        ],
+        "inserted_segments": [{
+            "term_name": "task_features",
+            "target_offset": 99,
+            "width": 69,
+        }],
+    }
+
+    adapted_path, receipt = _prepare_event_observation_warm_start(
+        runner,
+        checkpoint,
+        output_dir=tmp_path,
+        extension_width=69,
+        load_role="actor_only",
+        observation_terms=("task_features",),
+        role_migrations={"actor": actor_migration},
+    )
+
+    adapted = torch.load(adapted_path, weights_only=False, map_location="cpu")
+    weight = adapted["actor_state_dict"]["mlp.0.weight"]
+    torch.testing.assert_close(weight[:, :99], source_state["mlp.0.weight"][:, :99])
+    assert torch.all(weight[:, 99:168] == 0.0)
+    torch.testing.assert_close(weight[:, 168], source_state["mlp.0.weight"][:, 99])
+    assert receipt["adapted"] is True
+    assert receipt["role_migrations"] == {"actor": actor_migration}
+
+    actor_critic_checkpoint = tmp_path / "actor-critic.pt"
+    torch.save(
+        {
+            "actor_state_dict": source_state,
+            "critic_state_dict": source_state,
+        },
+        actor_critic_checkpoint,
+    )
+    actor_critic_runner = SimpleNamespace(alg=SimpleNamespace(
+        actor=SimpleNamespace(state_dict=lambda: target_state),
+        critic=SimpleNamespace(state_dict=lambda: target_state),
+    ))
+    with pytest.raises(RuntimeError, match="no critic mapping"):
+        _prepare_event_observation_warm_start(
+            actor_critic_runner,
+            actor_critic_checkpoint,
+            output_dir=tmp_path,
+            extension_width=69,
+            load_role="actor_critic",
+            observation_terms=("task_features",),
+            role_migrations={"actor": actor_migration},
+        )
+
+
 def test_reference_clock_is_installed_and_executed_for_actor_and_critic() -> None:
     """The admitted reference clock must reach both live policy interfaces."""
     torch = pytest.importorskip("torch")
@@ -681,6 +868,85 @@ def test_event_policy_contract_admits_exact_schema3_direct_load() -> None:
             {**exact, "optimizer_resume": True},
             effective,
             extension_width=3,
+        )
+
+
+def test_policy_contract_admits_pinned_ordered_observation_insertions() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _event_policy_contract_admission_kind,
+    )
+
+    def role_migration(role: str, source_width: int, target_width: int) -> dict:
+        return {
+            "role": role,
+            "source_width": source_width,
+            "target_width": target_width,
+            "extension_width": target_width - source_width,
+            "preserved_segments": [{
+                "term_name": "source",
+                "source_offset": 0,
+                "target_offset": 0,
+                "width": source_width,
+            }],
+            "inserted_segments": [{
+                "term_name": "task",
+                "target_offset": source_width,
+                "width": target_width - source_width,
+            }],
+        }
+
+    migration = {
+        "type": "zero_initialized_ordered_observation_insertions",
+        "from_schema": 4,
+        "to_schema": 4,
+        "roles": ["actor", "critic"],
+        "extension_width": 69,
+        "role_migrations": {
+            "actor": role_migration("actor", 100, 169),
+            "critic": role_migration("critic", 112, 181),
+        },
+        "optimizer_resume": False,
+    }
+    effective = {
+        "schema": 4,
+        "observations": {"shape": [169], "critic_shape": [181]},
+    }
+
+    assert _event_policy_contract_admission_kind(
+        migration,
+        effective,
+        # Runtime-installed clock width is not the task-feature insertion
+        # width; the immutable role mapping is the tensor authority.
+        extension_width=1,
+    ) == "zero_initialized_ordered_observation_insertions"
+
+    malformed = copy.deepcopy(migration)
+    malformed["role_migrations"]["actor"]["target_width"] = 168
+    with pytest.raises(RuntimeError, match="invalid actor mapping"):
+        _event_policy_contract_admission_kind(
+            malformed,
+            effective,
+            extension_width=1,
+        )
+
+    actor_only = copy.deepcopy(migration)
+    actor_only["roles"] = ["actor"]
+    actor_only["role_migrations"].pop("critic")
+    assert _event_policy_contract_admission_kind(
+        actor_only,
+        effective,
+        extension_width=1,
+    ) == "zero_initialized_ordered_observation_insertions"
+
+    undeclared_critic = copy.deepcopy(actor_only)
+    undeclared_critic["role_migrations"]["critic"] = role_migration(
+        "critic", 112, 181,
+    )
+    with pytest.raises(RuntimeError, match="undeclared role"):
+        _event_policy_contract_admission_kind(
+            undeclared_critic,
+            effective,
+            extension_width=1,
         )
 
 

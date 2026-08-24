@@ -1178,6 +1178,7 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
         source_contract=record.compatibility_contract or {},
         target_contract=target_payload["compatibility_contract"] or {},
         target_receipt=target_receipt,
+        initialization_mode="actor_critic",
     )
 
     # Import admission alone never claims the policy was loaded by a worker.
@@ -1351,6 +1352,7 @@ def test_selected_imported_policy_requires_runtime_load_receipt_even_on_rc_zero(
         source_contract=record.compatibility_contract or {},
         target_contract=target_payload["compatibility_contract"] or {},
         target_receipt=target_receipt,
+        initialization_mode="actor_only",
     )
 
     class _Stdout:

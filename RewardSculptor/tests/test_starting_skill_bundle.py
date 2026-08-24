@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import pickle
@@ -190,8 +191,13 @@ def _tracker_summary(
     }
 
 
-def _tracker_bundle(tmp_path: Path, *, critic: bool = False) -> tuple[Path, dict]:
-    contract = _contract()
+def _tracker_bundle(
+    tmp_path: Path,
+    *,
+    critic: bool = False,
+    contract: dict | None = None,
+) -> tuple[Path, dict]:
+    contract = contract or _contract()
     weights = tmp_path / "tracker-weights.safetensors"
     _safe_weights(weights, tensors=_safe_tensors(critic=critic))
     roles = ["actor", "critic"] if critic else ["actor"]
@@ -448,6 +454,45 @@ def test_schema3_tracker_actor_import_retains_inert_source_provenance(
     retained.write_bytes(b'{"tampered":true}')
     with pytest.raises(SkillLibraryError, match="digest mismatch"):
         library.verify_execution_provenance(record)
+
+
+def test_tracker_actor_compatibility_ignores_unloaded_critic_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _contract()
+    source["schema"] = 2
+    target = copy.deepcopy(source)
+    inserted = {
+        "name": "terrain_patch",
+        "source": "height_scan",
+        "shape": [2, 3],
+    }
+    target["observations"]["ordered_terms"].append(inserted)
+    target["observations"]["shape"] = [10]
+    # Deliberately make the unused critic impossible to migrate.  An actor-only
+    # Tier-D artifact has no critic bytes, so critic structure is not an
+    # authority for actor initialization.
+    target["policy"]["critic"]["class_name"] = "TransformerCritic"
+    target["observations"]["critic_ordered_terms"] = []
+    target["observations"]["critic_shape"] = [1]
+
+    archive, summary = _tracker_bundle(tmp_path, contract=source)
+    monkeypatch.setattr(
+        skill_bundle,
+        "validate_tierd_tracker_policy_origin",
+        lambda *_args, **_kwargs: dict(summary),
+    )
+    imported = StartingSkillBundleImporter(
+        SkillLibrary(tmp_path / "library")
+    ).import_archive(archive, target=_target_for(target))
+
+    compatibility = imported.receipt["compatibility"]
+    assert compatibility["allowed_initialization_modes"] == ["actor_only"]
+    migration = compatibility["policy_contract_migration"]
+    assert migration["roles"] == ["actor"]
+    assert set(migration["role_migrations"]) == {"actor"}
+    assert compatibility["mode_reasons"]["actor_only"] == []
 
 
 def test_schema3_tracker_bundle_rejects_critic_payload(tmp_path: Path) -> None:
@@ -1301,6 +1346,10 @@ def test_missing_contract_blocks_policy_compatibility(tmp_path: Path) -> None:
         (
             "zero_initialized_event_phase_observation",
             "event-phase observation extension",
+        ),
+        (
+            "zero_initialized_ordered_observation_insertions",
+            "task-observation insertion",
         ),
     ],
 )

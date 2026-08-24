@@ -3104,14 +3104,17 @@ def _zero_extend_observation_state_dict(
     *,
     extension_width: int,
     role: str,
+    column_migration: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     """Explicitly migrate one feed-forward observation interface.
 
-    Only the first MLP input columns and matching normalizer vectors may grow,
-    and only by the admitted observation-extension width.  Every key and
-    every other tensor shape remains exact.  New network columns are zero, so
-    the inherited policy is behaviorally identical until PPO learns to consume
-    the phase; normalizer defaults are mean=0, std/variance=1.
+    Only the first MLP input columns and matching normalizer vectors may grow.
+    ``column_migration`` is an immutable policy-contract receipt describing
+    where every preserved semantic term moves in the target interface.  The
+    legacy no-receipt path remains a strict tail append.  Every other tensor
+    shape remains exact.  New columns are zero, so the inherited policy is
+    behaviorally identical; normalizer defaults are mean=0,
+    std/variance=1.
     """
     import torch
 
@@ -3121,9 +3124,141 @@ def _zero_extend_observation_state_dict(
         raise RuntimeError(
             f"{role} checkpoint keys differ from the effective policy contract"
         )
+    input_key = "mlp.0.weight"
+    source_input = source.get(input_key)
+    target_input = target.get(input_key)
+    source_input_shape = tuple(getattr(source_input, "shape", ()))
+    target_input_shape = tuple(getattr(target_input, "shape", ()))
+    if (
+        len(source_input_shape) != 2
+        or len(target_input_shape) != 2
+        or source_input_shape[0] != target_input_shape[0]
+        or target_input_shape[1] != source_input_shape[1] + extension_width
+    ):
+        raise RuntimeError(
+            f"{role} first-layer shape does not match the admitted "
+            "observation migration"
+        )
+
+    if column_migration is None:
+        source_width = source_input_shape[1]
+        target_width = target_input_shape[1]
+        migration: Mapping[str, Any] = {
+            "role": role,
+            "source_width": source_width,
+            "target_width": target_width,
+            "extension_width": extension_width,
+            "preserved_segments": [{
+                "term_name": "legacy_observation_prefix",
+                "source_offset": 0,
+                "target_offset": 0,
+                "width": source_width,
+            }],
+            "inserted_segments": [{
+                "term_name": "legacy_observation_extension",
+                "target_offset": source_width,
+                "width": extension_width,
+            }],
+        }
+    else:
+        migration = column_migration
+
+    if (
+        migration.get("role") != role
+        or migration.get("source_width") != source_input_shape[1]
+        or migration.get("target_width") != target_input_shape[1]
+        or migration.get("extension_width") != extension_width
+    ):
+        raise RuntimeError(
+            f"{role} column migration disagrees with checkpoint tensor widths"
+        )
+    preserved = migration.get("preserved_segments")
+    inserted = migration.get("inserted_segments")
+    if not isinstance(preserved, list) or not isinstance(inserted, list):
+        raise RuntimeError(f"{role} column migration has no segment mapping")
+
+    source_cursor = 0
+    previous_preserved_target_offset = -1
+    seen_term_names: set[str] = set()
+    target_segments: list[tuple[int, int, str]] = []
+    canonical_preserved: list[tuple[int, int, int]] = []
+    for segment in preserved:
+        if not isinstance(segment, Mapping):
+            raise RuntimeError(f"{role} preserved segment is malformed")
+        term_name = segment.get("term_name")
+        source_offset = segment.get("source_offset")
+        target_offset = segment.get("target_offset")
+        width = segment.get("width")
+        if (
+            not isinstance(term_name, str)
+            or not term_name
+            or not isinstance(source_offset, int)
+            or isinstance(source_offset, bool)
+            or not isinstance(target_offset, int)
+            or isinstance(target_offset, bool)
+            or not isinstance(width, int)
+            or isinstance(width, bool)
+            or width <= 0
+            or term_name in seen_term_names
+            or source_offset != source_cursor
+            or target_offset < 0
+            or target_offset <= previous_preserved_target_offset
+            or target_offset + width > target_input_shape[1]
+        ):
+            raise RuntimeError(f"{role} preserved segment is not canonical")
+        seen_term_names.add(term_name)
+        source_cursor += width
+        previous_preserved_target_offset = target_offset
+        canonical_preserved.append((source_offset, target_offset, width))
+        target_segments.append((target_offset, width, "preserved"))
+    if source_cursor != source_input_shape[1]:
+        raise RuntimeError(
+            f"{role} preserved segments do not cover every source column"
+        )
+    inserted_width = 0
+    previous_inserted_target_offset = -1
+    for segment in inserted:
+        if not isinstance(segment, Mapping):
+            raise RuntimeError(f"{role} inserted segment is malformed")
+        term_name = segment.get("term_name")
+        target_offset = segment.get("target_offset")
+        width = segment.get("width")
+        if (
+            not isinstance(term_name, str)
+            or not term_name
+            or not isinstance(target_offset, int)
+            or isinstance(target_offset, bool)
+            or not isinstance(width, int)
+            or isinstance(width, bool)
+            or width <= 0
+            or term_name in seen_term_names
+            or target_offset < 0
+            or target_offset <= previous_inserted_target_offset
+            or target_offset + width > target_input_shape[1]
+        ):
+            raise RuntimeError(f"{role} inserted segment is not canonical")
+        seen_term_names.add(term_name)
+        inserted_width += width
+        previous_inserted_target_offset = target_offset
+        target_segments.append((target_offset, width, "inserted"))
+    if inserted_width != extension_width:
+        raise RuntimeError(
+            f"{role} inserted segments do not match the admitted width"
+        )
+    target_cursor = 0
+    for target_offset, width, _kind in sorted(target_segments):
+        if target_offset != target_cursor:
+            raise RuntimeError(
+                f"{role} target segments overlap or leave unmapped columns"
+            )
+        target_cursor += width
+    if target_cursor != target_input_shape[1]:
+        raise RuntimeError(
+            f"{role} target segments do not cover every target column"
+        )
+
     adapted = dict(source)
     changed: list[str] = []
-    input_key = "mlp.0.weight"
     normalizer_padding = {
         "obs_normalizer._mean": 0.0,
         "obs_normalizer._std": 1.0,
@@ -3136,18 +3271,17 @@ def _zero_extend_observation_state_dict(
         target_shape = tuple(getattr(target_value, "shape", ()))
         if source_shape == target_shape:
             continue
-        if key == input_key and (
-            len(source_shape) == 2
-            and len(target_shape) == 2
-            and source_shape[0] == target_shape[0]
-            and target_shape[1] == source_shape[1] + extension_width
-        ):
-            padding = torch.zeros(
-                (source_shape[0], extension_width),
+        if key == input_key:
+            remapped = torch.zeros(
+                target_shape,
                 device=source_value.device,
                 dtype=source_value.dtype,
             )
-            adapted[key] = torch.cat((source_value, padding), dim=1)
+            for source_offset, target_offset, width in canonical_preserved:
+                remapped[:, target_offset:target_offset + width] = (
+                    source_value[:, source_offset:source_offset + width]
+                )
+            adapted[key] = remapped
             changed.append(key)
             continue
         if key in normalizer_padding and (
@@ -3156,14 +3290,17 @@ def _zero_extend_observation_state_dict(
             and source_shape[:-1] == target_shape[:-1]
             and target_shape[-1] == source_shape[-1] + extension_width
         ):
-            padding_shape = source_shape[:-1] + (extension_width,)
-            padding = torch.full(
-                padding_shape,
+            remapped = torch.full(
+                target_shape,
                 normalizer_padding[key],
                 device=source_value.device,
                 dtype=source_value.dtype,
             )
-            adapted[key] = torch.cat((source_value, padding), dim=-1)
+            for source_offset, target_offset, width in canonical_preserved:
+                remapped[..., target_offset:target_offset + width] = (
+                    source_value[..., source_offset:source_offset + width]
+                )
+            adapted[key] = remapped
             changed.append(key)
             continue
         raise RuntimeError(
@@ -3192,6 +3329,7 @@ def _prepare_event_observation_warm_start(
     extension_width: int,
     load_role: str,
     observation_terms: tuple[str, ...] = ("authored_event_phase",),
+    role_migrations: Mapping[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Materialize and hash a provenance-bearing compatible checkpoint.
 
@@ -3258,11 +3396,31 @@ def _prepare_event_observation_warm_start(
         source_state = loaded.get(state_key)
         if not isinstance(source_state, Mapping):
             raise RuntimeError(f"checkpoint has no {state_key}")
+        role_migration: Mapping[str, Any] | None = None
+        role_extension_width = extension_width
+        if role_migrations is not None:
+            candidate = role_migrations.get(role)
+            if not isinstance(candidate, Mapping):
+                raise RuntimeError(
+                    f"admitted observation migration has no {role} mapping"
+                )
+            role_migration = candidate
+            declared_width = candidate.get("extension_width")
+            if (
+                not isinstance(declared_width, int)
+                or isinstance(declared_width, bool)
+                or declared_width <= 0
+            ):
+                raise RuntimeError(
+                    f"admitted {role} observation width is invalid"
+                )
+            role_extension_width = declared_width
         adapted_state, changed_keys = _zero_extend_observation_state_dict(
             source_state,
             model.state_dict(),
-            extension_width=extension_width,
+            extension_width=role_extension_width,
             role=role,
+            column_migration=role_migration,
         )
         adapted_checkpoint[state_key] = adapted_state
         changed[role] = list(changed_keys)
@@ -3289,6 +3447,11 @@ def _prepare_event_observation_warm_start(
         },
         "changed_tensors": changed,
     }
+    if role_migrations is not None:
+        extension_receipt["role_migrations"] = {
+            role: dict(role_migrations[role])
+            for role in requested_roles
+        }
     if len(observation_terms) == 1:
         extension_receipt["observation_term"] = observation_terms[0]
     return adapted_path, extension_receipt
@@ -3319,6 +3482,68 @@ def _event_policy_contract_admission_kind(
     }
     if dict(admitted_migration) == expected_migration:
         return "zero_initialized_event_phase_observation"
+
+    if admitted_migration.get("type") == (
+        "zero_initialized_ordered_observation_insertions"
+    ):
+        role_migrations = admitted_migration.get("role_migrations")
+        declared_roles = admitted_migration.get("roles")
+        observations = effective_contract.get("observations")
+        if (
+            not isinstance(role_migrations, Mapping)
+            or not isinstance(declared_roles, list)
+            or not declared_roles
+            or declared_roles
+            != [
+                role for role in ("actor", "critic")
+                if role in declared_roles
+            ]
+            or any(role not in {"actor", "critic"} for role in declared_roles)
+            or "actor" not in declared_roles
+            or not isinstance(observations, Mapping)
+        ):
+            raise RuntimeError(
+                "ordered observation migration has no role mappings"
+            )
+        shape_keys = {"actor": "shape", "critic": "critic_shape"}
+        for role in declared_roles:
+            shape_key = shape_keys[role]
+            role_migration = role_migrations.get(role)
+            target_shape = observations.get(shape_key)
+            if (
+                not isinstance(role_migration, Mapping)
+                or role_migration.get("role") != role
+                or not isinstance(target_shape, list)
+                or len(target_shape) != 1
+                or role_migration.get("target_width") != target_shape[0]
+                or not isinstance(
+                    role_migration.get("preserved_segments"), list
+                )
+                or not isinstance(
+                    role_migration.get("inserted_segments"), list
+                )
+            ):
+                raise RuntimeError(
+                    f"ordered observation migration has an invalid {role} mapping"
+                )
+        if set(role_migrations) != set(declared_roles):
+            raise RuntimeError(
+                "ordered observation migration has undeclared role mappings"
+            )
+        actor_migration = role_migrations["actor"]
+        if (
+            admitted_migration.get("extension_width")
+            != actor_migration.get("extension_width")
+            or admitted_migration.get("from_schema")
+            != effective_contract.get("schema")
+            or admitted_migration.get("to_schema")
+            != effective_contract.get("schema")
+            or admitted_migration.get("optimizer_resume") is not False
+        ):
+            raise RuntimeError(
+                "ordered observation migration metadata is inconsistent"
+            )
+        return "zero_initialized_ordered_observation_insertions"
 
     if effective_contract.get("schema") == 4:
         from sculptor.policy_contract import contract_fingerprint
@@ -3421,6 +3646,32 @@ def _observation_terms_for_contract_admission(
         if len(terms) != len(extensions):
             raise RuntimeError(
                 "combined observation migration has an unnamed extension"
+            )
+        return terms
+    if migration_type == "zero_initialized_ordered_observation_insertions":
+        role_migrations = admitted_migration.get("role_migrations")
+        actor = (
+            role_migrations.get("actor")
+            if isinstance(role_migrations, Mapping)
+            else None
+        )
+        inserted = (
+            actor.get("inserted_segments")
+            if isinstance(actor, Mapping)
+            else None
+        )
+        if not isinstance(inserted, list) or not inserted:
+            raise RuntimeError(
+                "ordered observation migration has no actor insertions"
+            )
+        terms = tuple(
+            str(segment.get("term_name"))
+            for segment in inserted
+            if isinstance(segment, Mapping) and segment.get("term_name")
+        )
+        if len(terms) != len(inserted):
+            raise RuntimeError(
+                "ordered observation migration has an unnamed insertion"
             )
         return terms
     term = admitted_migration.get("observation_term")
@@ -3750,9 +4001,15 @@ def _attest_warm_start_policy_contract(
         receipt_source_contract = receipt_source.get("contract")
         receipt_checkpoint_sha256 = receipt_source.get("checkpoint_sha256")
         if isinstance(receipt_source_contract, dict):
+            migration_roles = admitted_migration.get("roles")
             recomputed_migration = policy_contract_migration(
                 receipt_source_contract,
                 actual_contract,
+                roles=(
+                    tuple(migration_roles)
+                    if isinstance(migration_roles, list)
+                    else ("actor", "critic")
+                ),
             )
             if receipt_source_contract == actual_contract:
                 recomputed_compatibility: dict[str, Any] | None = {
@@ -4270,11 +4527,20 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 if args.reward_module_path else None
             ),
         )
+        admission_kind = contract_attestation.get("admission_kind")
+        contract_requires_adaptation = bool(
+            contract_attestation["active"]
+            and admission_kind != "exact_policy_contract"
+        )
         # Exact schema-2 warm starts have no tensor extension, but they still
         # carry the same immutable receipt/selection attestation as event
         # migrations.  Persist that proof before runner.load rather than
         # silently skipping all contract checks when extension_width == 0.
-        if contract_attestation["active"] and extension_width == 0:
+        if (
+            contract_attestation["active"]
+            and extension_width == 0
+            and not contract_requires_adaptation
+        ):
             effective_contract = contract_attestation[
                 "effective_contract"
             ]
@@ -4346,7 +4612,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 }),
                 flush=True,
             )
-        if extension_width > 0:
+        if extension_width > 0 or contract_requires_adaptation:
             from sculptor.policy_contract import contract_fingerprint
 
             pinned_contract_sha256 = os.environ.get(
@@ -4455,6 +4721,12 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 if admission_kind == "exact_policy_contract"
                 else int(admitted_migration.get("extension_width", 0))
             )
+            role_migrations = (
+                admitted_migration.get("role_migrations")
+                if admission_kind
+                == "zero_initialized_ordered_observation_insertions"
+                else None
+            )
             observation_terms = _observation_terms_for_contract_admission(
                 admitted_migration,
                 effective_contract,
@@ -4467,6 +4739,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
                     extension_width=adaptation_width,
                     load_role=load_role,
                     observation_terms=observation_terms,
+                    role_migrations=role_migrations,
                 )
             )
             if contract_pin_present:

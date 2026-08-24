@@ -1576,6 +1576,7 @@ def run_sculpt_job(
                                 ] or {}
                             ),
                             target_receipt=current_target_receipt,
+                            initialization_mode=initialization_mode,
                         )
                     )
                 except (TypeError, ValueError) as exc:

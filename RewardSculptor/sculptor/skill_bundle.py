@@ -1052,12 +1052,14 @@ def _policy_migration_observation_label(
         "zero_initialized_observation_extensions": (
             "event-phase and reference-clock observation extensions"
         ),
+        "zero_initialized_ordered_observation_insertions": (
+            "task-observation insertion"
+        ),
     }.get(migration_type, "observation interface extension")
 
 
 def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
     policy_reasons: list[str] = []
-    policy_migration: dict[str, Any] | None = None
     reason_codes: list[str] = []
     if target.robot_contract_error:
         policy_reasons.append(target.robot_contract_error)
@@ -1093,19 +1095,6 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
                 or "project_contract_missing: project target compatibility "
                 "contract is unavailable"
             )
-        else:
-            from sculptor.policy_contract import (
-                compare_policy_contracts,
-                policy_contract_migration,
-            )
-
-            policy_migration = policy_contract_migration(
-                record.compatibility_contract,
-                target.compatibility_contract,
-            )
-            policy_reasons.extend(compare_policy_contracts(
-                record.compatibility_contract, target.compatibility_contract,
-            ))
     else:
         policy_reasons.append("skill has no admitted trainable policy")
 
@@ -1125,24 +1114,71 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
         )
 
     mode_reasons: dict[str, list[str]] = {}
+    mode_migrations: dict[str, dict[str, Any] | None] = {}
     allowed: list[str] = []
     for mode in record.initialization_modes:
-        failures = list(
-            reference_reasons if mode == "reference_only" else policy_reasons
-        )
-        if (
-            policy_migration is not None
-            and mode not in {"actor_only", "actor_critic", "reference_only"}
-        ):
-            failures.append(
-                "migration for "
-                f"{_policy_migration_observation_label(policy_migration)} "
-                "supports actor or "
-                "actor+critic initialization only, not full resume"
+        if mode == "reference_only":
+            failures = list(reference_reasons)
+            mode_migrations[mode] = None
+        else:
+            failures = list(policy_reasons)
+            required_roles = (
+                ("actor",)
+                if mode == "actor_only"
+                else ("actor", "critic")
             )
+            missing_roles = [
+                role for role in required_roles
+                if role not in record.policy_roles
+            ]
+            if missing_roles:
+                failures.append(
+                    "skill has no admitted " + "/".join(missing_roles)
+                    + " policy role"
+                )
+            policy_migration: dict[str, Any] | None = None
+            if (
+                not failures
+                and isinstance(record.compatibility_contract, dict)
+                and isinstance(target.compatibility_contract, dict)
+            ):
+                from sculptor.policy_contract import (
+                    compare_policy_contracts,
+                    policy_contract_migration,
+                )
+
+                policy_migration = policy_contract_migration(
+                    record.compatibility_contract,
+                    target.compatibility_contract,
+                    roles=required_roles,
+                )
+                failures.extend(compare_policy_contracts(
+                    record.compatibility_contract,
+                    target.compatibility_contract,
+                    roles=required_roles,
+                ))
+            mode_migrations[mode] = policy_migration
+            if (
+                policy_migration is not None
+                and mode not in {"actor_only", "actor_critic"}
+            ):
+                failures.append(
+                    "migration for "
+                    f"{_policy_migration_observation_label(policy_migration)} "
+                    "supports actor or actor+critic initialization only, "
+                    "not full resume"
+                )
         mode_reasons[mode] = list(dict.fromkeys(failures))
         if not failures:
             allowed.append(mode)
+    policy_migration = next(
+        (
+            mode_migrations[mode]
+            for mode in ("actor_critic", "actor_only")
+            if mode in allowed and mode_migrations.get(mode) is not None
+        ),
+        None,
+    )
     all_reasons = list(dict.fromkeys(
         reason
         for failures in mode_reasons.values()
@@ -1162,6 +1198,7 @@ def compatibility_for(record: SkillRecord, target: ImportTarget) -> dict[str, An
         "reason_codes": list(dict.fromkeys(reason_codes)) if reasons else [],
         "mode_reasons": mode_reasons,
         "policy_contract_migration": policy_migration,
+        "policy_contract_migrations": mode_migrations,
     }
 
 
