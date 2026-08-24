@@ -1083,7 +1083,40 @@ def _abstract_objective_program(
             ))
         )
         if not staged_climb or leap:
-            phases.append("jump_off" if leap or has("onto") else "jump")
+            jump_phase = "jump_off" if leap or has("onto") else "jump"
+            # Preserve explicit repeated-motion cardinality.  A sequence such
+            # as "four distinct hops" is not equivalent to one generic jump:
+            # the independent objective must exercise four separated
+            # takeoff/landing cycles or it cannot reject a one-hop policy.
+            # Count only a numeral attached to the motion phrase itself;
+            # "jump over four boxes" describes geometry, not four jumps.
+            motion_count = 1
+            count_match = re.search(
+                r"\b(\d+|one|two|three|four|five|six)\s+"
+                r"(?:(?:distinct|separate|consecutive|phase[- ]timed)[- ]+)*"
+                r"(?:(?:one|single)[- ]+leg[- ]+)?"
+                r"(?:jumps?|hops?|leaps?)(?:[- ]+pulses?)?\b",
+                g,
+            )
+            if count_match:
+                number_words = {
+                    "one": 1, "two": 2, "three": 3, "four": 4,
+                    "five": 5, "six": 6,
+                }
+                raw_count = count_match.group(1)
+                parsed_count = (
+                    int(raw_count)
+                    if raw_count.isdigit()
+                    else number_words[raw_count]
+                )
+                # Each repeated motion emits takeoff + landing, and the
+                # declarative schema admits at most twelve phases.
+                motion_count = max(1, min(parsed_count, 6))
+            if motion_count > 1:
+                for _ in range(motion_count):
+                    phases.extend((jump_phase, "land"))
+            else:
+                phases.append(jump_phase)
     elif staged_climb and has("launch", "launches", "launching"):
         phases.append("jump_off")
     # ``jump_off`` describes the airborne transfer; an explicitly requested
@@ -1110,6 +1143,42 @@ def _abstract_objective_program(
     if wants_dwell and not staged_climb:
         phases.append("dwell")
     return phases[:12]
+
+
+def _abstract_phase_minimum_lengths(
+    clean: Sequence[str], *, final_hold_steps: int = 0,
+) -> np.ndarray:
+    """Physical lower bounds for each phase in the synthetic exemplar."""
+    minimum = np.full(len(clean), 4, dtype=int)
+    for index, phase in enumerate(clean):
+        if phase == "dwell":
+            # 0.25 s hold plus a 0.1 s smoothing margin at the synthetic
+            # probe's canonical 50 Hz sampling rate.
+            minimum[index] = 18
+        elif phase in {"land", "recover"}:
+            minimum[index] = 15
+    if clean and clean[-1] in {"dwell", "land", "recover"}:
+        # Keep the complete requested tail plus ten frames of separation from
+        # the preceding motion.  This makes a 100-frame hold test the hold,
+        # rather than partly sampling the final flight/recovery transition.
+        minimum[-1] = max(35, int(final_hold_steps) + 10)
+    return minimum
+
+
+def _abstract_probe_horizon_steps(
+    phases: Sequence[str], *, final_hold_steps: int = 0,
+) -> int:
+    """Smallest bounded horizon that can honor every real-time minimum."""
+    clean = [str(p) for p in phases if str(p) in _ABSTRACT_PHASES][:12]
+    minimum_steps = int(
+        _abstract_phase_minimum_lengths(
+            clean, final_hold_steps=final_hold_steps,
+        ).sum()
+    )
+    probe_steps = max(T, 180)
+    while probe_steps - max(5, int(0.10 * probe_steps)) < minimum_steps:
+        probe_steps += 1
+    return probe_steps
 
 
 def _abstract_phase_bounds(
@@ -1146,16 +1215,9 @@ def _abstract_phase_bounds(
         # phase and a correct final-stillness gate observes non-zero speed.
         weights[-1] = max(weights[-1], 4.0)
     available = probe_steps - start
-    minimum = np.full(len(clean), 4, dtype=int)
-    for index, phase in enumerate(clean):
-        if phase == "dwell":
-            # 0.25 s hold plus a 0.1 s smoothing margin at the synthetic
-            # probe's canonical 50 Hz sampling rate.
-            minimum[index] = 18
-        elif phase in {"land", "recover"}:
-            minimum[index] = 15
-    if clean[-1] in {"dwell", "land", "recover"}:
-        minimum[-1] = max(35, int(final_hold_steps) + 10)
+    minimum = _abstract_phase_minimum_lengths(
+        clean, final_hold_steps=final_hold_steps,
+    )
 
     if int(minimum.sum()) <= available:
         extra = available - int(minimum.sum())
@@ -1237,8 +1299,10 @@ def _abstract_objective_probe(
     the same prompt-derived oracle works for quadrupeds, bipeds, and arms whenever the
     authored metric uses their persisted universal/task channels.
     """
-    probe_steps = max(T, 180)
     final_hold_steps = _requested_terminal_hold_steps(behavior_goal)
+    probe_steps = _abstract_probe_horizon_steps(
+        phases, final_hold_steps=final_hold_steps,
+    )
     clean, bounds = _abstract_phase_bounds(
         phases,
         probe_steps=probe_steps,

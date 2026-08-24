@@ -48,6 +48,54 @@ def test_slalom_boxes_compile_as_planar_route_not_climbs():
     ]
 
 
+def test_explicit_repeated_hops_preserve_takeoff_landing_cardinality():
+    goal = (
+        "Move forward and perform four distinct one-leg hops over four low "
+        "rails, landing after each, then recover upright and hold still."
+    )
+    assert _abstract_objective_program(goal) == [
+        "move_forward",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "recover", "dwell",
+    ]
+
+
+def test_geometry_count_does_not_invent_repeated_jumps():
+    assert _abstract_objective_program(
+        "Jump over four obstacles, land, recover upright, and hold still"
+    ).count("jump_off") == 1
+
+
+def test_repeated_hop_probe_preserves_four_flights_and_full_quiet_tail():
+    goal = (
+        "Perform four distinct one-leg hops over four low rails, landing "
+        "after each, then recover upright and hold with horizontal, angular, "
+        "joint, upright, and default-pose quiet for 100 uninterrupted frames."
+    )
+    program = _abstract_objective_program(goal)
+    probe = _abstract_objective_probe(program, behavior_goal=goal)
+    assert probe is not None
+    air = (
+        (probe["left_foot_contact"][:, 0] == 0.0)
+        & (probe["right_foot_contact"][:, 0] == 0.0)
+    )
+    flight_starts = np.flatnonzero(air & ~np.r_[False, air[:-1]])
+    assert flight_starts.size == 4
+
+    tail = slice(-100, None)
+    assert np.all(probe["left_foot_contact"][tail, 0] == 1.0)
+    assert np.all(probe["right_foot_contact"][tail, 0] == 1.0)
+    root_xy = probe["root_link_pos_w"][tail, 0, :2]
+    assert np.max(np.linalg.norm(np.diff(root_xy, axis=0), axis=1)) == 0.0
+    assert np.max(np.abs(probe["root_link_ang_vel_b"][tail, 0])) == 0.0
+    assert np.max(np.abs(probe["joint_vel"][tail, 0])) == 0.0
+    assert np.max(probe["default_pose_rms"][tail, 0]) == 0.0
+    assert np.min(-probe["projected_gravity_b"][tail, 0, 2]) == 1.0
+
+
 def test_competent_route_fixture_visits_regions_in_order_and_holds_finish():
     draft = author_environment(
         "Build a slalom around four boxes with ordered waypoints and a finish zone",
