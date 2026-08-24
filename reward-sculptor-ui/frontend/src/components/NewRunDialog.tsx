@@ -9,6 +9,7 @@ import { Banner, Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives
 import { courseBreakdownText } from "@/components/WorldTab";
 import { useBehaviorDraft, useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { referenceRobotForProject } from "@/lib/referenceRobot";
+import { hasExactTierDReceipt } from "@/lib/referenceAdmission";
 import {
   interruptedSnapshotReadinessIssue,
   resolveBundleMotionUpdate,
@@ -494,9 +495,10 @@ export function NewRunDialog({
   const promotedModeCurrent = promotedModeMatches
     && modeReward?.context_current === true;
   const dynamicsAdmission = referenceDetail.data?.dynamics_admission ?? null;
+  const exactDynamicsReady = hasExactTierDReceipt(referenceDetail.data);
   const tierKInspection = dryRun
     && referenceDetail.isSuccess
-    && dynamicsAdmission?.admitted !== true;
+    && !exactDynamicsReady;
   const systemInfo = useSystemInfo();
   const gpuInfo = useSystemGpu();
   // §Ship 35: per-project generated metrics + the generate action.
@@ -883,8 +885,10 @@ export function NewRunDialog({
       ? "The motion's dynamics certificate could not be verified."
       : null,
     referenceClipId && !dryRun && !referenceDetail.isLoading
-      && !referenceDetail.isError && dynamicsAdmission?.admitted !== true
-      ? "Live training requires a verified Tier-D tracking certificate. Use Pipeline check for this Tier-K candidate or certify it first."
+      && !referenceDetail.isError && !exactDynamicsReady
+      ? dynamicsAdmission?.admitted === true
+        ? "Live training requires the complete exact Tier-D artifact, certificate, and rollout receipt. Refresh or recertify this motion."
+        : "Live training requires a verified Tier-D tracking certificate. Use Pipeline check for this Tier-K candidate or certify it first."
       : null,
   ].filter((value): value is string => Boolean(value));
   const launchBlocker = launchBlockers[0] ?? null;
@@ -1307,21 +1311,25 @@ export function NewRunDialog({
                       style={{
                         display: "flex", flexWrap: "wrap", alignItems: "center",
                         gap: 6, marginTop: 6, fontSize: 10.5,
-                        color: dynamicsAdmission?.admitted
+                        color: exactDynamicsReady
                           ? "var(--st-emerald)"
                           : "var(--st-amber)",
                       }}
                     >
-                      <span className={`rs-badge ${dynamicsAdmission?.admitted ? "emerald" : "amber"}`}>
+                      <span className={`rs-badge ${exactDynamicsReady ? "emerald" : "amber"}`}>
                         {referenceDetail.isLoading
                           ? "checking dynamics"
-                          : dynamicsAdmission?.admitted
+                          : exactDynamicsReady
                             ? "Tier D verified"
+                            : dynamicsAdmission?.admitted
+                              ? "Tier D evidence incomplete"
                             : `Tier ${dynamicsAdmission?.tier ?? "K"} candidate`}
                       </span>
                       <span>
-                        {dynamicsAdmission?.admitted
-                          ? `certificate ${dynamicsAdmission.certificate_digest?.slice(0, 10)}…`
+                        {exactDynamicsReady
+                          ? `certificate ${dynamicsAdmission?.certificate_digest?.slice(0, 10)}…`
+                          : dynamicsAdmission?.admitted
+                            ? "Exact artifact/certificate/rollout receipt is incomplete."
                           : dryRun
                             ? "Inspects clip bytes, provenance, and launch contracts only — no training, rollout, or checkpoint."
                             : "Certify with the physics tracker before live training."}

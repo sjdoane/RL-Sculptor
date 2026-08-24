@@ -1848,17 +1848,29 @@ export interface ComposeResult {
 export interface RefDetail {
   index_row: RefIndexRow;
   provenance: Record<string, unknown> | null;
+  artifact_identity?: {
+    verified: boolean;
+    clip_sha256: string | null;
+    provenance_clip_sha256: string | null;
+    source_content_sha256: string | null;
+    reason: string | null;
+  };
   dynamics_admission: {
     admitted: boolean;
     tier: string;
     certificate_digest: string | null;
     clip_sha256: string | null;
+    source_content_sha256?: string | null;
+    artifact_hash_verified?: boolean;
     rollout_sha256: string | null;
     reason: string | null;
     tracking_errors?: {
       mean_joint_err_rad: number;
       max_joint_err_rad: number;
       root_z_rmse_m: number;
+      common_joint_names?: string[];
+      static_baseline_err_rad?: number;
+      static_baseline_ratio?: number;
     };
   };
 }

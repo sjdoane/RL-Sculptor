@@ -26,8 +26,9 @@ import { usePolicies } from "@/hooks/usePolicies";
 import { useRewards } from "@/hooks/useRewards";
 import { useHasActiveRun } from "@/hooks/useRuns";
 import { useWorldSelection } from "@/hooks/useWorlds";
-import { listModeRewards } from "@/lib/api";
+import { getReference, listModeRewards } from "@/lib/api";
 import { deriveModeRewardReadiness } from "@/lib/behaviorFlow";
+import { hasExactTierDReceipt } from "@/lib/referenceAdmission";
 import { referenceRobotForProject } from "@/lib/referenceRobot";
 import type { ProjectDetail } from "@/lib/types";
 
@@ -43,6 +44,10 @@ type Step = {
   done: boolean;
   /** What is actually on disk for this step, when there is something. */
   evidence?: string;
+  /** A researcher command that must be run outside this UI. */
+  externalCommand?: string;
+  /** Full immutable identities, kept out of the plain-language primary line. */
+  technicalReceipt?: string;
   tab: FlowTab;
   action: string;
   /** True when this step is genuinely optional for a working run. */
@@ -90,17 +95,89 @@ export function BehaviorFlow({
   // someone whose run was already hours in.
   const training = useHasActiveRun(slug);
   const referenceRobot = referenceRobotForProject(project);
+  const selectedClipId = draft.data?.reference_clip_id?.trim() ?? "";
+  const selectedClipRobot =
+    draft.data?.reference_robot?.trim() || referenceRobot;
   const modeRewards = useQuery({
     queryKey: ["modeRewards", slug],
     queryFn: () => listModeRewards(slug),
     retry: false,
     staleTime: 10_000,
   });
+  const referenceDetail = useQuery({
+    queryKey: ["reference-detail", selectedClipRobot, selectedClipId],
+    queryFn: () => getReference(selectedClipRobot, selectedClipId),
+    enabled: selectedClipId.length > 0,
+    retry: false,
+    staleTime: 10_000,
+  });
 
   const steps: Step[] = useMemo(() => {
     const hasIters = project.n_iterations_completed > 0;
-    const clipId = draft.data?.reference_clip_id ?? "";
-    const clipRobot = draft.data?.reference_robot ?? referenceRobot;
+    const clipId = selectedClipId;
+    const clipRobot = selectedClipRobot;
+    const dynamicsAdmission = referenceDetail.data?.dynamics_admission ?? null;
+    const artifactIdentity = referenceDetail.data?.artifact_identity ?? null;
+    const hasExactDynamicsReceipt = hasExactTierDReceipt(referenceDetail.data);
+    const certificationDone =
+      referenceDetail.isSuccess
+      && dynamicsAdmission?.admitted === true
+      && hasExactDynamicsReceipt;
+    const certificationEvidence = certificationDone
+      ? `Tier D verified`
+        + (dynamicsAdmission.certificate_digest
+            ? ` · certificate ${dynamicsAdmission.certificate_digest.slice(0, 12)}`
+            : "")
+        + (dynamicsAdmission.rollout_sha256
+            ? ` · rollout ${dynamicsAdmission.rollout_sha256.slice(0, 12)}`
+            : "")
+      : referenceDetail.isLoading
+        ? `Checking ${clipRobot}/${clipId}…`
+        : referenceDetail.isError
+          ? `Could not verify ${clipRobot}/${clipId}`
+          : dynamicsAdmission?.admitted
+            ? "Tier D evidence is incomplete · live training blocked"
+            : `Tier ${dynamicsAdmission?.tier || "K"} candidate · live training blocked`
+              + (dynamicsAdmission?.reason
+                  ? ` · ${dynamicsAdmission.reason}`
+                  : "");
+    const certificationStep: Step[] = clipId
+      ? [{
+          key: "motion-certification",
+          label: "Certify motion",
+          hint: certificationDone
+            ? "Tier D was earned by an external physics-tracking job. This UI "
+              + "re-verifies the exact clip and tracked-rollout bytes; it does "
+              + "not issue certificates."
+            : "Live training requires Tier D from an external physics-tracking "
+              + "job. Run the command below, then re-check here; this UI verifies "
+              + "evidence but does not create certificates.",
+          done: certificationDone,
+          evidence: certificationEvidence,
+          externalCommand: certificationDone
+            ? undefined
+            : `sculpt refs track --clip-id "${clipId}" --robot "${clipRobot}" `
+              + `--donor-project "${project.project_dir}"`,
+          technicalReceipt: certificationDone
+            ? [
+                `robot=${clipRobot}`,
+                `clip_id=${clipId}`,
+                `artifact_clip_sha256=${dynamicsAdmission.clip_sha256}`,
+                `raw_source_sha256=${artifactIdentity?.source_content_sha256 || "unavailable"}`,
+                `certificate_digest=${dynamicsAdmission.certificate_digest}`,
+                `rollout_sha256=${dynamicsAdmission.rollout_sha256}`,
+              ].join("\n")
+            : undefined,
+          tab: "training",
+          action: referenceDetail.isLoading
+            ? "Checking…"
+            : certificationDone ? "Re-check evidence" : "Refresh status",
+          run: () => { void referenceDetail.refetch(); },
+          blocked: referenceDetail.isFetching
+            ? "Checking the current dynamics certificate…"
+            : undefined,
+        }]
+      : [];
     // Match the chosen clip, or — with no clip chosen — whatever is actually
     // promoted. The old `!clipId || ...` fell through to the FIRST file in an
     // mtime-sorted list, so a project with no motion chosen could show
@@ -178,7 +255,8 @@ export function BehaviorFlow({
         key: "motion",
         label: "Choose or compose a reference motion",
         hint: "A motion no single clip contains gets composed out of spans of "
-            + "several solved ones. It becomes the immutable tracking base.",
+            + "several solved ones. It becomes an immutable tracking candidate; "
+            + "the next step checks dynamics certification.",
         done: !!clipId,
         evidence: clipId || undefined,
         tab: "training",
@@ -191,12 +269,13 @@ export function BehaviorFlow({
         run: () => setPickingMotion(true),
         optional: true,
       },
+      ...certificationStep,
       {
         key: "modes",
         label: "Author phase-specific rewards",
-        hint: "A compound behavior becomes an OGMP-inspired event program. Each "
-            + "phase gets its own reward terms and advances only when its "
-            + "compiled transition predicate is satisfied.",
+        hint: "Each fixed clip-time window gets its own reward terms. Runtime "
+            + "dispatch follows immutable episode-time windows; transition guards "
+            + "are inspectable metadata only.",
         done: modeReadiness.authoredCurrent,
         evidence: modeCount
           ? `${authoredCount}/${modeCount} authored · ${modeFile?.filename}`
@@ -269,7 +348,10 @@ export function BehaviorFlow({
       },
     ];
   }, [project, robotConfigured, world.data, rewards.data, policies.data,
-      draft.data, modeRewards.data, onGoTo, training]);
+      selectedClipId, selectedClipRobot, modeRewards.data, onGoTo, training,
+      referenceDetail.data, referenceDetail.isError, referenceDetail.isFetching,
+      referenceDetail.isLoading, referenceDetail.isSuccess,
+      referenceDetail.refetch]);
 
   // Don't flash a wrong list while the queries settle.
   if (world.isLoading || rewards.isLoading || policies.isLoading) return null;
@@ -356,6 +438,7 @@ export function BehaviorFlow({
                 {s.evidence && (
                   <div
                     className="mono"
+                    role={s.key === "motion-certification" ? "status" : undefined}
                     style={{
                       fontSize: 10.5, marginTop: 3,
                       color: s.done ? "var(--st-emerald)" : "var(--rs-muted)",
@@ -366,6 +449,36 @@ export function BehaviorFlow({
                   >
                     {s.evidence}
                   </div>
+                )}
+                {s.externalCommand && (
+                  <div
+                    aria-label="External certification command"
+                    style={{ fontSize: 10.5, lineHeight: 1.45, marginTop: 5 }}
+                  >
+                    <span className="rs-sub">Run externally: </span>
+                    <code
+                      className="mono"
+                      style={{ overflowWrap: "anywhere", whiteSpace: "normal" }}
+                    >
+                      {s.externalCommand}
+                    </code>
+                  </div>
+                )}
+                {s.technicalReceipt && (
+                  <details style={{ fontSize: 10.5, marginTop: 5 }}>
+                    <summary style={{ cursor: "pointer" }}>
+                      Exact Tier-D receipt
+                    </summary>
+                    <pre
+                      className="mono"
+                      style={{
+                        margin: "5px 0 0", overflowWrap: "anywhere",
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {s.technicalReceipt}
+                    </pre>
+                  </details>
                 )}
               </div>
               <Btn

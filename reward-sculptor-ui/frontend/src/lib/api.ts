@@ -1749,6 +1749,11 @@ export type ReferenceModeGraph = {
     policy_mode_conditioning: boolean;
     rho_bounded_exploration: boolean;
     closed_loop_receding_horizon_oracle: boolean;
+    preference_conditioning: boolean;
+    implementation_status: Record<
+      string,
+      "implemented" | "metadata_only" | "unsupported"
+    >;
     summary: string;
   };
   modes: ReferenceMode[];
