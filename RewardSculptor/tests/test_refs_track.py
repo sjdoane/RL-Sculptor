@@ -3053,6 +3053,76 @@ def test_cli_exports_researcher_visible_tierd_interface_receipt(
     assert "policy weights were not loaded" in result.output
 
 
+def test_cli_exports_researcher_visible_tracker_starting_skill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    from sculptor.cli import app
+
+    tracker = tmp_path / "tracker"
+    tracker.mkdir()
+    out = tmp_path / "tracker-actor.rskill"
+    observed: list[dict[str, object]] = []
+
+    def fake_export(
+        project: Path,
+        *,
+        robot_slug: str,
+        clip_id: str,
+        out_path: Path | None,
+        name: str | None,
+    ) -> SimpleNamespace:
+        observed.append({
+            "project": Path(project),
+            "robot": robot_slug,
+            "clip": clip_id,
+            "out": Path(out_path) if out_path is not None else None,
+            "name": name,
+        })
+        assert out_path is not None
+        Path(out_path).write_bytes(b"data-only tracker actor")
+        return SimpleNamespace(
+            bundle_path=Path(out_path),
+            manifest={"starting_skill": {"policy_roles": ["actor"]}},
+            warnings=["critic and optimizer excluded"],
+        )
+
+    monkeypatch.setattr(
+        "sculptor.export.export_tierd_tracker_starting_skill_bundle",
+        fake_export,
+    )
+    result = CliRunner().invoke(app, [
+        "refs",
+        "export-tracker-skill",
+        "--tracker-project",
+        str(tracker),
+        "--clip-id",
+        "four-rail-hop",
+        "--robot",
+        "g1",
+        "--out",
+        str(out),
+        "--name",
+        "Certified hop prior",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert observed == [{
+        "project": tracker,
+        "robot": "g1",
+        "clip": "four-rail-hop",
+        "out": out,
+        "name": "Certified hop prior",
+    }]
+    assert str(out) in result.output
+    assert hashlib.sha256(out.read_bytes()).hexdigest() in result.output
+    assert "policy_roles=['actor']" in result.output
+    assert "upload/select the reference and target world independently" in result.output
+    assert "critic and optimizer excluded" in result.output
+
+
 def test_cli_refs_track_missing_clip_exits_nonzero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3093,6 +3163,22 @@ def test_cli_refs_track_help_lists_key_options():
     assert "initialization is either fresh" in compact_help
     assert "adjacent runner metrics" in compact_help
     assert "tierD_rollout_<sha256>.npz" in compact_help
+
+
+def test_cli_refs_export_tracker_skill_help_discloses_actor_only_boundary():
+    from typer.testing import CliRunner
+
+    from sculptor.cli import app
+
+    result = CliRunner().invoke(app, [
+        "refs", "export-tracker-skill", "--help",
+    ])
+    assert result.exit_code == 0, result.output
+    compact_help = " ".join(result.output.replace("│", " ").split())
+    for option in ("--tracker-project", "--clip-id", "--robot", "--out"):
+        assert option in result.output
+    assert "actor to safetensors" in compact_help
+    assert "Import remains a separate explicit UI action" in compact_help
 
 
 # ── §audit-finding close: verify_tierd_certificate ─────────────────────────

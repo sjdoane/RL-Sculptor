@@ -125,6 +125,22 @@ To share an existing registered motion without policy weights, use
 That export remains a kinematic candidate at the receiving installation until
 the target-specific Tier-D tracking chain is verified; exporting never carries
 training authorization with it.
+
+After `sculpt refs track` has admitted a trusted local tracker project and the
+exact reference as Tier D, export its actor-only starting point with:
+
+```bash
+sculpt refs export-tracker-skill \
+  --tracker-project <tracker-project> \
+  --robot <slug> --clip-id <clip-id> --out tracker-actor.rskill
+```
+
+The exporter re-verifies the current certificate, final checkpoint and
+sidecar, runtime receipt, policy contract, reward, and config before converting
+the actor to safetensors. The archive deliberately excludes the critic,
+optimizer, raw checkpoint, reference, reward, world, controller, and mode
+executor. Uploading it in **New Run** therefore initializes only the selected
+policy role; the target reference and world remain separate explicit choices.
 The command without `--portable` deliberately produces a different deployment
 ZIP containing raw checkpoints, executable inference material, reward source,
 and environment snapshots. Renaming that ZIP to `.rskill` does not make it

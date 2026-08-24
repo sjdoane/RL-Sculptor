@@ -2882,6 +2882,80 @@ def refs_export_tierd_interface(
     )
 
 
+@refs_app.command("export-tracker-skill")
+def refs_export_tracker_skill(
+    tracker_project: Path = typer.Option(
+        ...,
+        "--tracker-project",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help=(
+            "Fresh tracker project produced by refs track. Its exact final "
+            "checkpoint, runtime receipt, policy contract, reward, config, "
+            "and current Tier-D certificate are reverified before export."
+        ),
+    ),
+    clip_id: str = typer.Option(
+        ..., "--clip-id", help="Exact certified reference clip ID."),
+    robot: str = typer.Option(
+        "g1", "--robot", help="Robot namespace for the certified clip."),
+    out: Optional[Path] = typer.Option(
+        None,
+        "--out",
+        help=(
+            "Output .rskill path. Defaults to the tracker project's exports/ "
+            "directory."
+        ),
+    ),
+    name: Optional[str] = typer.Option(
+        None,
+        "--name",
+        help="Optional researcher-facing name for the portable actor.",
+    ),
+) -> None:
+    """Export a certified tracker actor as a safe uploadable ``.rskill``.
+
+    This command never places the tracker checkpoint itself in the archive.
+    It converts only the actor to safetensors, retains bounded immutable
+    provenance, and deliberately excludes critic, optimizer, reward, world,
+    reference, controller, and mode-executor bytes. Import remains a separate
+    explicit UI action and does not select the source motion automatically.
+    """
+    import hashlib as _hashlib
+
+    from sculptor.export import (
+        ExportError,
+        export_tierd_tracker_starting_skill_bundle,
+    )
+
+    try:
+        result = export_tierd_tracker_starting_skill_bundle(
+            tracker_project,
+            robot_slug=robot,
+            clip_id=clip_id,
+            out_path=out,
+            name=name,
+        )
+    except (ExportError, OSError, ValueError) as exc:
+        typer.echo(f"[refs export-tracker-skill] refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    bundle = Path(result.bundle_path)
+    digest = _hashlib.sha256(bundle.read_bytes()).hexdigest()
+    roles = result.manifest.get("starting_skill", {}).get("policy_roles")
+    typer.echo(
+        "[refs export-tracker-skill] wrote "
+        f"{bundle} artifact_sha256={digest} policy_roles={roles}"
+    )
+    typer.echo(
+        "[refs export-tracker-skill] actor weights only; upload/select the "
+        "reference and target world independently in New Run"
+    )
+    for warning in result.warnings:
+        typer.echo(f"  warning: {warning}")
+
+
 @refs_app.command("track")
 def refs_track(
     clip_id: str = typer.Option(
