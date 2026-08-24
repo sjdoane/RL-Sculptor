@@ -11,7 +11,50 @@ Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 
 Current git branch: `ship-20-ux-revamp` (do NOT work on `main`). Keep committing to this branch.
 
-## 0. Current work — research starting points and honest OGMP integration (2026-08-17)
+## 0. Active physical example — reference-guided four-rail hopping (2026-08-23)
+
+The active goal is a fresh, visible G1 project that evolves a solved stationary
+one-leg-jump motion into four forward rail hops and a verified stop. It is not
+complete until the UI-launched run produces fresh objective physical evidence.
+
+The retained parent is
+`g1/50009_one_leg_jump_poses_60_jpos`: 229 samples at 60 Hz. Its retained
+`clip.npz` SHA-256 is
+`524dcaf9ce6d1b18c96febe9f2176f8e65e25edefc194eaec2fcfab41d57022f`;
+the legacy provenance value
+`92fc2431f99969e0835a91657a040c55a0cfe5db9db536d2daed533a7b9deca0`
+identifies the upstream dataset source, not the retained NPZ. The parent must
+first be materialized under a new immutable `origin_relative` root-frame
+identity with structured evidence. The visible composition then uses six
+contiguous, zero-blend spans: `prepare`, `hop_1`, `hop_2`, `hop_3`, `hop_4`,
+and `recover`. Its sampled duration and policy clock use `(N - 1) / fps`.
+
+Before live use, the exact composite must earn fresh Tier-D exact-schedule
+joint-position/root-height tracking evidence through the trusted local
+`MjlabAdapter`. Tier D is not a general dynamics, obstacle, contact, or root-XY
+certificate. The research run must separately prove that both actor and critic
+consume the immutable reference-phase observation and that the complete frozen
+mode runtime is unchanged.
+
+The evolved world is intentionally independent of the motion: four fixed
+0.06 m rails, four ordered landing disks, then a finish. The reference does
+not track root XY; the world reward must produce forward travel. Acceptance is
+conjunctive: four distinct support-cycle rail crossings, all disks and finish
+in order, no rail contacts or sustained fall, upright/default-like posture,
+both feet retained in finish, horizontal speed below 0.12 m/s, and 100
+uninterrupted quiet post-completion frames. A plausible video or high scalar
+reward is not sufficient.
+
+The framework gate is now committed as `e82b3fc` (core reference runtime),
+`f2359e3` (backend authority/lineage), and `6beaeda` (researcher UI). Final
+integrated verification was 3,065 core tests passed (one optional JAX skip),
+783 backend tests passed, 98 frontend tests passed, plus production typecheck,
+build, scoped Ruff F/E9, compileall, and diff checks. The next step is to
+materialize and certify the exact composite, then create and launch the fresh
+UI project. During a live GPU worker, do not edit reload-watched core or run
+intermediate GPU audits.
+
+## 0a. Current work — research starting points and honest OGMP integration (2026-08-17)
 
 The active implementation adds a researcher-facing starting-point workflow
 with three independent inputs: compatible policy weights, an immutable

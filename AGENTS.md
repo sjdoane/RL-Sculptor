@@ -32,6 +32,16 @@ contract.
   Training and evaluation must consume the same immutable execution manifest.
   Do not label predicate, branching, preference-conditioned, or learned-oracle
   behavior as implemented until it is wired and tested end to end.
+- A reference-conditioned run must expose the exact immutable playback clock
+  to both actor and critic and must prove that the worker installed and used
+  that observation. A phase-indexed reward by itself is not policy
+  conditioning. Freeze the complete non-authorable mode runtime (clock,
+  windows, masks, dispatch, tracking targets, and compute entrypoints), not
+  only the numerical tracking kernels.
+- Preserve root-frame semantics through crops and compositions. A composite
+  may inherit a convention only when every exact parent agrees and its ordered
+  parent/evidence chain re-verifies; missing, mixed, or stale evidence fails
+  closed.
 - Keep objective metrics independent from generated rewards. Never relax a
   trust, calibration, physical-scene, contact, or naturalness gate to make a
   run pass.
@@ -60,6 +70,10 @@ contract.
   separate review/promotion path exists.
 - Portable imports are transfer artifacts, not exact optimizer resumes, unless
   a future trusted format proves and restores the complete training state.
+- Tier-D dry-run/preflight is a CPU/data-only operation: it must not import the
+  simulator stack, probe CUDA, load an adapter, or launch a subprocess. Live
+  certification uses only the trusted local adapter and a fresh atomically
+  claimed work directory outside the donor and retained reference library.
 
 ## Implementation discipline
 
@@ -68,6 +82,10 @@ contract.
 - Add a regression test for every corrected failure mode, including the
   negative path. Prefer fixture bundles and immutable manifests over mocks that
   bypass validation.
+- In strict lineage, a contradictory authoritative worker event is fatal.
+  Bind the requested iteration plan before launch and prove every completed
+  iteration (or a specifically authorized early-stop reason); a successful
+  process exit is not completion evidence.
 - Preserve user work and unrelated dirty-tree changes. Use `apply_patch` for
   edits. Do not modify reload-watched training code while a live worker depends
   on it.
