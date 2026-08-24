@@ -91,11 +91,11 @@ const receipt: StartingSkillReceipt = {
         "observe warm_start_loaded with the exact digest and actor role",
       ],
       reference_only: [
-        "complete a separate Tier-D physics-tracking certification job for the exact clip and target execution boundary before live launch",
+        "complete a separate Tier-D exact-schedule tracking evidence job for the exact clip and target execution boundary before live launch",
         "re-attest the exact clip, immutable provenance, rollout, certificate, execution contract, and boundary at launch",
       ],
     },
-    detail: "Import/list admission makes this starting point selectable, not trainable. A reference requires a separate Tier-D physics-tracking certification job before live launch; launch only re-verifies that existing evidence.",
+    detail: "Import/list admission makes this starting point selectable, not trainable. A reference requires a separate Tier-D exact-schedule tracking evidence job before live launch; launch only re-verifies that existing evidence.",
     policy_present: true,
   },
   compatibility: {
@@ -127,7 +127,7 @@ const receipt: StartingSkillReceipt = {
         status: "registered_candidate",
         structural_checks: ["bounded arrays"],
         training_authorized: false,
-        next_gate: "Run a separate target-specific Tier-D physics-tracking certification job before live launch; launch only re-verifies the resulting exact evidence.",
+        next_gate: "Run a separate target-specific Tier-D exact-schedule tracking evidence job before live launch; launch only re-verifies the resulting exact evidence.",
       },
     },
     world: {
@@ -226,6 +226,17 @@ function renderPicker(
   return onChange;
 }
 
+test("describes scratch as a policy-only reset while preserving independent inputs", async () => {
+  vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
+  renderPicker();
+
+  expect(screen.getByText(/No policy weights are imported/i)).toBeInTheDocument();
+  expect(screen.getByText(/Starting motion and Training environment/i))
+    .toHaveTextContent(/remain separate choices and are not cleared here/i);
+  expect(screen.queryByText(/No imported weights, motion, controller, or world/i))
+    .not.toBeInTheDocument();
+});
+
 test("supports conventional arrow-key navigation across custom radio cards", async () => {
   vi.mocked(listStartingSkills).mockResolvedValue({ skills: [] });
   vi.mocked(listPolicyRecoverySnapshots).mockResolvedValue([]);
@@ -270,7 +281,7 @@ test("makes policy, motion, world, trust, and initialization semantics explicit"
   expect(screen.getByText(/content-attested|trusted/i)).toBeInTheDocument();
   expect(screen.getAllByText(/registered candidate/i)).toHaveLength(2);
   expect(screen.getByText(
-    /Run a separate target-specific Tier-D physics-tracking certification job/i,
+    /Run a separate target-specific Tier-D exact-schedule tracking evidence job/i,
   )).toBeInTheDocument();
   expect(screen.getAllByText(/launch only re-verifies/i).length).toBeGreaterThan(0);
   expect(screen.getByText("obs 48 / actions 29 / actor 512 -> 256")).toBeInTheDocument();
@@ -425,6 +436,7 @@ const checkpoint = (
   iter_index: iterIndex,
   checkpoint: "checkpoint.pt",
   checkpoint_bytes: 4096,
+  checkpoint_sha256: "f".repeat(64),
   deployable: false,
   primary_metric: null,
   fitness: null,
@@ -438,6 +450,13 @@ const checkpoint = (
   route_evidence: null,
   contact_evidence: null,
   hold_evidence: null,
+  objective_proof_status: "incomplete",
+  objective_proof_blockers: ["objective evidence unavailable"],
+  lane_evidence_status: "unavailable",
+  requested_evidence_env_index: null,
+  resolved_evidence_env_index: null,
+  resolved_episode_percentile: null,
+  evidence_lane_selection: null,
   rollout_available: false,
   selected: false,
   selection_source: null,
@@ -471,9 +490,21 @@ test("prefers an older evidenced selection over a newer failed checkpoint", asyn
       metric_sha256: "c".repeat(64),
       criterion_status: "passed",
       evidence_status: "complete",
-      route_evidence: { key: "order_ok_frac", value: 1, kind: "fraction" },
-      contact_evidence: { key: "contact_frac", value: 0, kind: "fraction" },
-      hold_evidence: { key: "ch_hold", value: 1, kind: "score" },
+      route_evidence: {
+        key: "order_ok_frac", value: 1, kind: "fraction",
+        comparison: "gte", threshold: 1, passed: true,
+        semantics_source: "builtin:order_ok_frac",
+      },
+      contact_evidence: {
+        key: "contact_frac", value: 0, kind: "fraction",
+        comparison: "lte", threshold: 0, passed: true,
+        semantics_source: "builtin:contact_frac",
+      },
+      hold_evidence: {
+        key: "ch_hold", value: 1, kind: "score",
+        comparison: "gte", threshold: 1, passed: true,
+        semantics_source: "builtin:ch_hold",
+      },
       rollout_available: true,
       selected: true,
       selection_source: "objective_criterion",
@@ -631,7 +662,7 @@ test("admits validated reference-only data without granting policy loading", asy
     /Imports register candidates; they do not certify a reference for live training/i,
   )).toBeInTheDocument();
   expect(screen.getAllByText(
-    /separate Tier-D physics-tracking certification job/i,
+    /separate Tier-D exact-schedule tracking evidence job/i,
   ).length).toBeGreaterThan(0);
   expect(screen.getAllByText(/launch only re-verifies/i).length).toBeGreaterThan(0);
   expect(screen.getByRole("radio", { name: /^Motion only/i })).toBeEnabled();

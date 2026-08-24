@@ -230,6 +230,8 @@ function CheckpointReceipt({ checkpoint }: { checkpoint: PolicySummary }) {
         )}
       </div>
       <div className="rs-sub" style={{ fontSize: 10.5, lineHeight: 1.45 }}>
+        Checkpoint SHA-256: <DigestValue value={checkpoint.checkpoint_sha256} />.
+        {" "}
         {checkpoint.selected
           ? `Selection authority: ${checkpoint.selection_source ?? "not recorded"}. `
           : "This checkpoint is not marked selected by the project receipt. "}
@@ -1101,7 +1103,8 @@ export function StartingPointPickerDialog({
   };
 
   const checkpointValid = selectedCheckpoint !== null
-    && draft.warm_start_iteration === selectedCheckpoint.iter_index;
+    && draft.warm_start_iteration === selectedCheckpoint.iter_index
+    && /^[a-f0-9]{64}$/.test(selectedCheckpoint.checkpoint_sha256);
   const snapshotRef = draft.warm_start_snapshot ?? null;
   const interruptedSnapshotValid = selectedRecoverySnapshot?.selectable === true
     && snapshotRef?.snapshot_id === selectedRecoverySnapshot.snapshot_id
@@ -1206,7 +1209,9 @@ export function StartingPointPickerDialog({
               <div>
                 <div style={{ fontSize: 13, fontWeight: 650 }}>A clean experiment</div>
                 <div className="rs-sub" style={{ marginTop: 3, fontSize: 12, lineHeight: 1.5 }}>
-                  No imported weights, motion, controller, or world will be applied. This is the clearest baseline when you want to measure what RewardSculptor learns on its own.
+                  No policy weights are imported: actor and critic start newly
+                  initialized. The Starting motion and Training environment in
+                  New Run remain separate choices and are not cleared here.
                 </div>
               </div>
             </div>
@@ -1469,8 +1474,9 @@ export function StartingPointPickerDialog({
                   discarded and never become executable inputs. Importing a motion
                   stores its exact clip and provenance as a candidate. Before live
                   training, run a separate <code className="mono">sculpt refs track</code>{" "}
-                  Tier-D certification job; New Run only re-verifies the resulting
-                  evidence and never creates that certificate. Export
+                  Tier-D exact-schedule tracking evidence job; New Run only
+                  re-verifies the resulting evidence and never creates that
+                  certificate. Export
                   a policy bundle with <code className="mono">sculpt export --portable --robot {projectRobot ?? "<project-robot>"} --config &lt;project&gt;/config.toml</code>,
                   or a motion-only bundle with <code className="mono">sculpt refs export-skill --robot {projectRobot ?? "<project-robot>"} --clip &lt;clip&gt; --out motion.rskill</code>.
                   The normal <code className="mono">sculpt export</code> ZIP is a

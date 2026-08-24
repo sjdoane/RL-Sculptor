@@ -60,7 +60,7 @@ export function GraphModal({
           flush
           icon="network"
           title="Knowledge graph"
-          subtitle="Interactive pyvis render · drag nodes, hover for details, click a paper to see its full record"
+          subtitle="Drag nodes · hover nodes and edges for exact artifact/run receipts · click a paper for its full record"
           onClose={() => onOpenChange(false)}
         >
           {/* flex:1 wrapper so the iframe claims the body's full height

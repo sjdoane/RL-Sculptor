@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { ProjectDetail, RefDetail } from "@/lib/types";
@@ -35,7 +36,10 @@ vi.mock("@/lib/api", () => ({
   listModeRewards: mocks.listModeRewards,
 }));
 
-import { BehaviorFlow } from "@/components/BehaviorFlow";
+import {
+  BehaviorFlow,
+  tierDCertificationCommands,
+} from "@/components/BehaviorFlow";
 
 const PROJECT = {
   slug: "g1-research",
@@ -82,6 +86,31 @@ function referenceDetail(admitted: boolean): RefDetail {
       clip_sha256: admitted ? "b".repeat(64) : null,
       artifact_hash_verified: true,
       rollout_sha256: admitted ? "c".repeat(64) : null,
+      execution_contract_sha256: admitted ? "e".repeat(64) : null,
+      execution_boundary_sha256: admitted ? "f".repeat(64) : null,
+      reference_clock_sha256: admitted ? "0".repeat(64) : null,
+      certification_scope: admitted ? {
+        schema: "reward-sculptor-tier-d-scope-v1",
+        claim: "exact-schedule joint-position and root-height tracking",
+        gated_evidence: [
+          "mean_joint_position_error",
+          "root_z_rmse",
+          "duration_coverage",
+          "non_vacuous_reference_motion",
+          "beats_static_pose_baseline",
+        ],
+        measured_only: [
+          "maximum_joint_position_error",
+          "orientation_error",
+          "motion_ratio",
+        ],
+        not_certified: [
+          "root_xy_tracking",
+          "contact_safety",
+          "collision_avoidance",
+          "general_dynamics_feasibility",
+        ],
+      } : null,
       reason: admitted ? null : "no Tier-D certificate is present",
     },
   };
@@ -128,6 +157,7 @@ beforeEach(() => {
 describe("BehaviorFlow reference-motion readiness", () => {
   test("keeps a Tier-K draft visibly blocked behind external certification", async () => {
     mocks.getReference.mockResolvedValue(referenceDetail(false));
+    const user = userEvent.setup();
 
     renderFlow();
 
@@ -135,17 +165,46 @@ describe("BehaviorFlow reference-motion readiness", () => {
     expect(await screen.findByText(/Tier K candidate · live training blocked/))
       .toHaveTextContent("no Tier-D certificate is present");
     expect(screen.getByText(/It becomes an immutable tracking candidate/))
-      .toHaveTextContent(/the next step checks dynamics certification/i);
-    expect(screen.getByText(/this UI verifies evidence but does not create certificates/i))
+      .toHaveTextContent(
+        /the next step checks Tier-D exact-schedule tracking evidence/i,
+      );
+    expect(screen.getByText(/This UI verifies evidence but does not create certificates/i))
       .toBeInTheDocument();
+    expect(screen.getByText(/Choose an existing trusted donor project/i))
+      .toBeInTheDocument();
+    expect(screen.queryByLabelText("External certification command"))
+      .not.toBeInTheDocument();
+
+    await user.type(
+      screen.getByLabelText("Trusted Tier-D donor project"),
+      "/research/projects/g1-trusted-locomotion",
+    );
     expect(screen.getByLabelText("External certification command"))
       .toHaveTextContent(
-        "sculpt refs track --clip-id \"cartwheel-composite\" --robot \"g1\" "
-        + "--donor-project \"/research/projects/g1-research\"",
+        "sculpt refs export-tierd-interface --donor-project "
+        + "'/research/projects/g1-trusted-locomotion'",
       );
+    expect(screen.getByLabelText("External certification command"))
+      .toHaveTextContent("sculpt refs track --clip-id 'cartwheel-composite' --robot 'g1'");
+    expect(screen.getByLabelText("External certification command"))
+      .toHaveTextContent("--dry-run");
+    expect(screen.getByLabelText("External certification command"))
+      .not.toHaveTextContent(`--donor-project '${PROJECT.project_dir}'`);
     expect(screen.getByRole("button", { name: "Refresh status" }))
       .toBeEnabled();
     expect(mocks.getReference).toHaveBeenCalledWith("g1", "cartwheel-composite");
+  });
+
+  test("never treats the fresh target project as its own Tier-D donor", () => {
+    const result = tierDCertificationCommands({
+      clipId: "cartwheel-composite",
+      robot: "g1",
+      donorProject: PROJECT.project_dir,
+      targetProject: PROJECT.project_dir,
+    });
+
+    expect(result.commands).toEqual([]);
+    expect(result.error).toMatch(/new target project is not a donor/i);
   });
 
   test("shows exact Tier-D evidence without claiming the UI issued it", async () => {
@@ -153,14 +212,18 @@ describe("BehaviorFlow reference-motion readiness", () => {
 
     renderFlow();
 
-    expect(await screen.findByText(/Tier D verified/)).toHaveTextContent(
+    expect(await screen.findByText(/Tier-D exact-schedule tracking evidence verified/)).toHaveTextContent(
       "certificate aaaaaaaaaaaa · rollout cccccccccccc",
     );
-    expect(screen.getByText(/Tier D was earned by an external physics-tracking job/i))
-      .toBeInTheDocument();
+    expect(screen.getByText(/Tier-D evidence was earned by an external exact-schedule tracking job/i))
+      .toHaveTextContent(
+        /does not certify root-XY tracking, contact safety, collision avoidance, general dynamics feasibility/i,
+      );
     expect(screen.queryByLabelText("External certification command"))
       .not.toBeInTheDocument();
-    const receipt = screen.getByText("Exact Tier-D receipt").closest("details");
+    const receipt = screen.getByText(
+      "Exact Tier-D tracking receipt",
+    ).closest("details");
     expect(receipt).toHaveTextContent(`robot=g1`);
     expect(receipt).toHaveTextContent(`clip_id=cartwheel-composite`);
     expect(receipt).toHaveTextContent(
@@ -182,6 +245,14 @@ describe("BehaviorFlow reference-motion readiness", () => {
 
     expect(await screen.findByText(/Tier D evidence is incomplete/))
       .toHaveTextContent(/live training blocked/i);
+    expect(screen.getByLabelText("Trusted Tier-D donor project"))
+      .toBeInTheDocument();
+    expect(screen.queryByLabelText("External certification command"))
+      .not.toBeInTheDocument();
+    await userEvent.type(
+      screen.getByLabelText("Trusted Tier-D donor project"),
+      "/research/projects/g1-trusted-locomotion",
+    );
     expect(screen.getByLabelText("External certification command"))
       .toBeInTheDocument();
     expect(screen.queryByText("Exact Tier-D receipt")).not.toBeInTheDocument();
@@ -197,6 +268,10 @@ describe("BehaviorFlow reference-motion readiness", () => {
 
     expect(await screen.findByText(/Tier D evidence is incomplete/))
       .toHaveTextContent(/live training blocked/i);
+    await userEvent.type(
+      screen.getByLabelText("Trusted Tier-D donor project"),
+      "/research/projects/g1-trusted-locomotion",
+    );
     expect(screen.getByLabelText("External certification command"))
       .toBeInTheDocument();
     expect(screen.queryByText("Exact Tier-D receipt")).not.toBeInTheDocument();

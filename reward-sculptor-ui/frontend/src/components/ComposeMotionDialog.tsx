@@ -40,6 +40,14 @@ const numOrNull = (v: string): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
+/** Recover cadence from a sampled trajectory's exact `(N - 1) / fps`
+ * duration contract. This must match the runtime reference clock. */
+export function sampledTrajectoryFps(nFrames: number, durationS: number): number {
+  if (!Number.isFinite(nFrames) || nFrames < 1
+    || !Number.isFinite(durationS) || durationS <= 0) return 0;
+  return Math.max(1, nFrames - 1) / durationS;
+}
+
 /** One phase row: search the library, pick a clip, optionally trim it. */
 function SegmentRow({
   draft, index, robot, canRemove, onChange, onRemove, onMove,
@@ -145,7 +153,7 @@ function SegmentRow({
                   {m.text}
                 </div>
                 <div className="rs-sub" style={{ fontSize: 9.5 }}>
-                  tier {m.tier} · {m.duration_s.toFixed(1)}s · score {m.score.toFixed(1)}
+                  declared tier {m.tier} · {m.duration_s.toFixed(1)}s · score {m.score.toFixed(1)}
                 </div>
               </button>
             ))}
@@ -206,8 +214,12 @@ function ResultPanel(
       <div className="rs-flex rs-gap-8" style={{ alignItems: "center", marginBottom: 8 }}>
         <Icon name="check" size={15} color="var(--rs-primary)" />
         <strong style={{ fontSize: 13 }}>{result.clip_id}</strong>
-        <span className="rs-badge slate" style={{ fontSize: 9 }}>tier {result.tier}</span>
-        <span className="rs-badge amber" style={{ fontSize: 9 }}>uncertified</span>
+        <span className="rs-badge slate" style={{ fontSize: 9 }}>
+          declared tier {result.tier}
+        </span>
+        <span className="rs-badge amber" style={{ fontSize: 9 }}>
+          tracking evidence unverified
+        </span>
       </div>
       <div
         style={{
@@ -243,7 +255,7 @@ function ResultPanel(
           }))}
           seamFrames={comp.seams.map((s) => s.frame)}
           nFrames={result.qc.n_frames}
-          fps={result.qc.n_frames / Math.max(result.qc.duration_s, 1e-6)}
+          fps={sampledTrajectoryFps(result.qc.n_frames, result.qc.duration_s)}
         />
       </div>
       <div className="rs-banner" style={{ fontSize: 11 }}>
@@ -397,7 +409,8 @@ export function ComposeMotionDialog({
       <p className="rs-sub" style={{ fontSize: 11.5, marginBottom: 12 }}>
         For a goal no single clip covers. Each phase contributes real solved
         frames; seams are SE(2)-aligned and cross-faded, and the result is a
-        kinematic candidate that still needs physics certification.
+        kinematic candidate that still needs Tier-D exact-schedule tracking
+        evidence.
       </p>
 
       <label className="rs-sub" style={{ fontSize: 10.5, display: "block", marginBottom: 4 }}>
@@ -507,8 +520,10 @@ export function ComposeMotionDialog({
               or a peak joint velocity the blend is too short to cover. Widen
               the crossfade or move a phase boundary and compose again, or use{" "}
               <b>Compose anyway</b> to register it as measured. The result is
-              tier K and uncertified either way, so anything the gate flagged
-              becomes a tracking target the robot cannot physically follow.
+              declared tier K and lacks verified Tier-D exact-schedule tracking
+              evidence either way. A flagged seam is therefore a warning that
+              the exact schedule may not be trackable; it is not itself a
+              general dynamics verdict.
             </div>
           )}
         </div>

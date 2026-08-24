@@ -23,7 +23,13 @@ import {
 import { qk } from "@/lib/queryKeys";
 import { formatIterMetrics, selectionLabel, selectionSentence } from "@/lib/selection";
 import { stageLabel } from "@/lib/stageDisplay";
-import type { SelectedStage, StageIteration, StageSchema } from "@/lib/types";
+import type {
+  PolicyEvidenceValue,
+  PolicySummary,
+  SelectedStage,
+  StageIteration,
+  StageSchema,
+} from "@/lib/types";
 
 /** A report source: the project's standalone runs, or one mission. */
 type ReportSource =
@@ -31,6 +37,25 @@ type ReportSource =
   | { kind: "mission"; missionSlug: string };
 
 const PROJECT_SOURCE_VALUE = "__project__";
+
+export function canonicalSelectedPolicy(
+  policies: PolicySummary[],
+): PolicySummary | null {
+  const selected = policies.filter((policy) => policy.selected);
+  return selected.length === 1 ? selected[0] : null;
+}
+
+export function canonicalSelectedIteration(
+  iterations: StageIteration[],
+  policies: PolicySummary[],
+): StageIteration | null {
+  const selected = canonicalSelectedPolicy(policies);
+  if (!selected) return null;
+  return iterations.find(
+    (iteration) => iteration.iter_index === selected.iter_index
+      && iteration.has_checkpoint,
+  ) ?? null;
+}
 
 interface PhysicalSceneAudit {
   status: "aligned" | "misaligned" | "not_applicable" | "unavailable";
@@ -216,23 +241,13 @@ export function ReportsTab({
   const projectIters = useProjectIterations(slug, {
     enabled: source.kind === "project",
   });
-  const projectBestIter: StageIteration | null = useMemo(() => {
-    const rows = (projectIters.data ?? []).filter((row) => row.has_checkpoint);
-    if (rows.length === 0) return null;
-    const hasSteerFitness = rows.some((row) => row.steer_fitness != null);
-    const hasFitness = rows.some((row) => row.fitness != null);
-    const score = (row: StageIteration): number | null => {
-      if (hasSteerFitness) return row.steer_fitness;
-      if (hasFitness) return row.fitness;
-      return row.primary_metric;
-    };
-    return rows.reduce((best, row) => {
-      const candidate = score(row);
-      const incumbent = score(best);
-      if (candidate == null) return best;
-      return incumbent == null || candidate > incumbent ? row : best;
-    });
-  }, [projectIters.data]);
+  const projectPolicies = usePolicies(source.kind === "project" ? slug : undefined);
+  const projectSelectedIter: StageIteration | null = useMemo(
+    () => canonicalSelectedIteration(
+      projectIters.data ?? [], projectPolicies.data ?? [],
+    ),
+    [projectIters.data, projectPolicies.data],
+  );
 
   // §Increment 3: which stage within the picked mission. Sticky local
   // pick (cleared whenever the mission source changes so a stale stage
@@ -406,8 +421,8 @@ export function ReportsTab({
             <PoliciesCard slug={slug} />
             <ProjectBestPolicyCard
               slug={slug}
-              iteration={projectBestIter}
-              isLoading={projectIters.isLoading}
+              iteration={projectSelectedIter}
+              isLoading={projectIters.isLoading || projectPolicies.isLoading}
             />
           </>
         ) : (
@@ -548,11 +563,10 @@ export function ReportsTab({
   );
 }
 
-// ── Project best-policy evidence ─────────────────────────────────────
-// Standalone runs previously buried their most persuasive artifact in the
-// Training timeline while mission runs had a Results-tab hero. Rank only on
-// one declared scale (steer fitness, objective fitness, then legacy return)
-// and keep the fresh replay visually distinct from the selection rollout.
+// ── Project selected-policy evidence ─────────────────────────────────
+// The immutable selection receipt is the only authority for this hero. A
+// higher score on a criterion-failed iteration must never displace the kept
+// policy or redirect its physical-scene audit.
 function ProjectBestPolicyCard({
   slug, iteration, isLoading,
 }: {
@@ -587,7 +601,7 @@ function ProjectBestPolicyCard({
           <Icon name={sceneInvalid ? "alert-triangle" : "video"} size={16} />
           {sceneInvalid
             ? "Invalid evidence — physical scene mismatch"
-            : "Selected best-policy evidence"}
+            : "Canonical selected-policy evidence"}
           {iteration ? ` · iter ${iteration.iter_index}` : ""}
         </div>
         <span className="rs-sub" style={{ fontSize: 12 }}>
@@ -600,8 +614,8 @@ function ProjectBestPolicyCard({
         ) : !iteration ? (
           <EmptyState
             icon="video"
-            title="No trained policy evidence yet"
-            sub="Complete a standalone run to compare its selected rollout and fresh replay here."
+            title="No canonical selected-policy evidence"
+            sub="Complete selection so reports/selection.json identifies one kept iteration; Results never guesses from score or recency."
           />
         ) : (
           <>
@@ -979,32 +993,141 @@ function fmtBytes(n: number): string {
   return `${Math.max(1, Math.round(n / 1e3))} KB`;
 }
 
+function formatPolicyEvidence(value: PolicyEvidenceValue): string {
+  if (value.kind === "fraction") return `${(value.value * 100).toFixed(1)}%`;
+  if (value.kind === "frames" || value.kind === "count") {
+    return Math.round(value.value).toLocaleString();
+  }
+  return value.value.toFixed(4);
+}
+
+function formatEvidenceComparison(value: PolicyEvidenceValue): string {
+  if (value.comparison === null || value.threshold === null) {
+    return "comparison semantics unavailable";
+  }
+  const operator = value.comparison === "gte"
+    ? "≥"
+    : value.comparison === "lte" ? "≤" : "=";
+  return `${operator} ${formatPolicyEvidence({ ...value, value: value.threshold })}`;
+}
+
+/** The evaluator's immutable proof receipt for one policy rollout.
+ *
+ * This component intentionally does not turn a score into a success claim.
+ * It requires the three physical channels, a passed objective criterion, a
+ * retained rollout, and the worker-resolved precommitted lane identity. The
+ * separate physical-scene audit remains independent.
+ */
+export function PolicyEvidenceReceipt({
+  policy,
+  defaultOpen = false,
+}: {
+  policy: PolicySummary;
+  defaultOpen?: boolean;
+}) {
+  const proofStatus = policy.objective_proof_status;
+  const proofPassed = proofStatus === "passed";
+  const proofFailed = proofStatus === "failed";
+  const blockers = policy.objective_proof_blockers;
+  const laneIndex = (value: number | null) => value === null ? "missing" : String(value);
+  const lanePercentile = policy.resolved_episode_percentile === null
+    ? "missing"
+    : `percentile ${(policy.resolved_episode_percentile * 100).toFixed(1)}%`;
+
+  return (
+    <details
+      aria-label={`Iteration ${policy.iter_index} objective proof receipt`}
+      open={defaultOpen}
+      style={{
+        flexBasis: "100%",
+        width: "100%",
+        marginTop: 2,
+        paddingTop: 8,
+        borderTop: "1px solid var(--hairline)",
+      }}
+    >
+      <summary style={{ cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>
+        <span style={{ color: proofPassed ? "var(--st-emerald)" : proofFailed ? "var(--st-rose)" : "var(--st-amber)" }}>
+          Objective proof receipt · {proofStatus}
+        </span>
+      </summary>
+      <div style={{ marginTop: 9, display: "grid", gap: 8 }}>
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+          gap: 7,
+        }}>
+          {([
+            ["Route", policy.route_evidence],
+            ["Forbidden contact", policy.contact_evidence],
+            ["Terminal hold", policy.hold_evidence],
+          ] as const).map(([label, evidence]) => (
+            <div
+              key={label}
+              style={{ padding: "8px 9px", borderRadius: 7, background: "var(--surface-strong)" }}
+            >
+              <div className="rs-eyebrow">{label}</div>
+              <div style={{ marginTop: 3, fontWeight: 650 }}>
+                {evidence ? formatPolicyEvidence(evidence) : "missing"}
+              </div>
+              <div style={{
+                marginTop: 2,
+                fontSize: 10,
+                color: evidence?.passed === true
+                  ? "var(--st-emerald)"
+                  : evidence?.passed === false ? "var(--st-rose)" : "var(--st-amber)",
+              }}>
+                {evidence
+                  ? `${evidence.passed === true ? "pass" : evidence.passed === false ? "fail" : "unknown"} · ${formatEvidenceComparison(evidence)}`
+                  : "no declared comparison"}
+              </div>
+              <div className="rs-sub mono" style={{ marginTop: 2, fontSize: 10 }}>
+                {evidence?.key ?? "no evaluator field"}
+              </div>
+            </div>
+          ))}
+          <div style={{ padding: "8px 9px", borderRadius: 7, background: "var(--surface-strong)" }}>
+            <div className="rs-eyebrow">Evidence lane</div>
+            <div style={{ marginTop: 3, fontWeight: 650 }}>
+              requested {laneIndex(policy.requested_evidence_env_index)} → resolved{" "}
+              {laneIndex(policy.resolved_evidence_env_index)}
+            </div>
+            <div className="rs-sub" style={{ marginTop: 2, fontSize: 10 }}>
+              {policy.lane_evidence_status} · {policy.evidence_lane_selection ?? "selection method missing"}
+              {" · "}{lanePercentile}
+            </div>
+          </div>
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            lineHeight: 1.45,
+            color: proofPassed ? "var(--st-emerald)" : proofFailed ? "var(--st-rose)" : "var(--st-amber)",
+          }}
+        >
+          {proofPassed
+            ? "Every declared objective comparison passed, the criterion passed, and the worker-authored lane-selection receipt is verified. Aggregate objective channels are not silently attributed to the rendered lane; physical-scene alignment remains a separate required audit."
+            : `${proofFailed ? "Objective proof failed" : "Objective proof is incomplete"}: ${blockers.join(", ") || "the server receipt is inconsistent"}. Missing semantics or fields are never inferred from the score, launch settings, or video.`}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 function PoliciesCard({ slug }: { slug: string }) {
   const policies = usePolicies(slug);
   const rows = policies.data ?? [];
-  // Rank on ONE scale: fitness (0-1) when any row has it, else the reward
-  // metric — mixing the two in a single max lands "best" on the wrong row.
-  const anyFitness = rows.some((r) => r.fitness != null);
-  const rankOf = (r: (typeof rows)[number]) =>
-    anyFitness ? r.fitness : r.primary_metric;
-  const best = rows.reduce<number | null>((acc, r) => {
-    const v = rankOf(r);
-    if (v == null) return acc;
-    return acc == null || v > acc ? v : acc;
-  }, null);
-  const bestIterIndex = rows.find((row) => {
-    const metric = rankOf(row);
-    return best != null && metric != null && metric >= best;
-  })?.iter_index ?? null;
-  const bestPhysicalScene = useQuery<PhysicalSceneAudit>({
+  const selected = canonicalSelectedPolicy(rows);
+  const selectedIterIndex = selected?.iter_index ?? null;
+  const selectedPhysicalScene = useQuery<PhysicalSceneAudit>({
     queryKey: [
       ...qk.project(slug),
       "iterations",
-      bestIterIndex,
+      selectedIterIndex,
       "physical-scene-audit",
     ],
-    queryFn: () => fetchPhysicalSceneAudit(slug, bestIterIndex!),
-    enabled: bestIterIndex != null,
+    queryFn: () => fetchPhysicalSceneAudit(slug, selectedIterIndex!),
+    enabled: selectedIterIndex != null,
     staleTime: 30_000,
   });
   return (
@@ -1028,10 +1151,9 @@ function PoliciesCard({ slug }: { slug: string }) {
       ) : (
         <div className="rs-card-pad rs-vgap-8">
           {rows.map((p) => {
-            const metric = rankOf(p);
-            const isBest = best != null && metric != null && metric >= best;
-            const invalidBest = isBest
-              && bestPhysicalScene.data?.status === "misaligned";
+            const isSelected = selected?.iter_index === p.iter_index;
+            const invalidSelected = isSelected
+              && selectedPhysicalScene.data?.status === "misaligned";
             return (
               <div
                 key={p.iter_index}
@@ -1063,7 +1185,7 @@ function PoliciesCard({ slug }: { slug: string }) {
                     r {p.primary_metric.toFixed(1)}
                   </span>
                 ) : null}
-                {invalidBest ? (
+                {invalidSelected ? (
                   <span
                     className="rs-tag"
                     style={{ fontSize: 10, color: "var(--st-rose-fg)" }}
@@ -1071,14 +1193,14 @@ function PoliciesCard({ slug }: { slug: string }) {
                   >
                     invalid scene
                   </span>
-                ) : isBest && rows.length > 1 && (
-                  <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }}>best</span>
+                ) : isSelected && (
+                  <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }}>kept · {p.selection_source ?? "selection receipt"}</span>
                 )}
                 <span className="rs-sub rs-num" style={{ fontSize: 11 }}>
                   {fmtBytes(p.checkpoint_bytes)}
                 </span>
                 <span style={{ marginLeft: "auto" }}>
-                  {invalidBest ? (
+                  {invalidSelected ? (
                     <span
                       className="rs-btn rs-btn-quiet rs-btn-sm"
                       aria-disabled="true"
@@ -1098,6 +1220,10 @@ function PoliciesCard({ slug }: { slug: string }) {
                     </a>
                   )}
                 </span>
+                <PolicyEvidenceReceipt
+                  policy={p}
+                  defaultOpen={isSelected}
+                />
               </div>
             );
           })}

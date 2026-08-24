@@ -46,6 +46,8 @@ type Step = {
   evidence?: string;
   /** A researcher command that must be run outside this UI. */
   externalCommand?: string;
+  /** Why an external command cannot be formed yet. */
+  externalCommandIssue?: string;
   /** Full immutable identities, kept out of the plain-language primary line. */
   technicalReceipt?: string;
   tab: FlowTab;
@@ -60,6 +62,64 @@ type Step = {
   /** Why the button is unavailable right now; also disables it. */
   blocked?: string;
 };
+
+const CERTIFICATION_TERM_LABELS: Record<string, string> = {
+  root_xy_tracking: "root-XY tracking",
+  contact_safety: "contact safety",
+  collision_avoidance: "collision avoidance",
+  general_dynamics_feasibility: "general dynamics feasibility",
+};
+
+function certificationTermLabel(term: string): string {
+  return CERTIFICATION_TERM_LABELS[term] ?? term.replaceAll("_", " ");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function tierDCertificationCommands({
+  clipId,
+  robot,
+  donorProject,
+  targetProject,
+}: {
+  clipId: string;
+  robot: string;
+  donorProject: string;
+  targetProject: string;
+}): { commands: string[]; error: string | null } {
+  const donor = donorProject.trim();
+  if (!donor) {
+    return {
+      commands: [],
+      error: "Choose an existing trusted donor project before generating certification commands.",
+    };
+  }
+  if (!donor.startsWith("/") || /[\r\n\0]/.test(donor)) {
+    return {
+      commands: [],
+      error: "The trusted donor must be one absolute local WSL path on a single line.",
+    };
+  }
+  const normalized = (value: string) => value.trim().replace(/[\\/]+$/, "");
+  if (normalized(donor) === normalized(targetProject)) {
+    return {
+      commands: [],
+      error: "The new target project is not a donor. Choose an existing trusted project with the compatible robot/task interface.",
+    };
+  }
+  const donorArg = shellQuote(donor);
+  const base = `sculpt refs track --clip-id ${shellQuote(clipId)} --robot ${shellQuote(robot)} --donor-project ${donorArg}`;
+  return {
+    commands: [
+      `sculpt refs export-tierd-interface --donor-project ${donorArg}`,
+      `${base} --dry-run`,
+      base,
+    ],
+    error: null,
+  };
+}
 
 /** Scroll to an element that does not exist yet.
  *
@@ -90,6 +150,7 @@ export function BehaviorFlow({
   const draft = useBehaviorDraft(slug);
   const saveDraft = useSaveBehaviorDraft(slug);
   const [pickingMotion, setPickingMotion] = useState(false);
+  const [trustedDonorProject, setTrustedDonorProject] = useState("");
   // §Ship 37: the live-run signal. `project.status` is never "running" —
   // see `hasActiveRun` — so the Train row below used to offer "New run" to
   // someone whose run was already hours in.
@@ -118,13 +179,23 @@ export function BehaviorFlow({
     const clipRobot = selectedClipRobot;
     const dynamicsAdmission = referenceDetail.data?.dynamics_admission ?? null;
     const artifactIdentity = referenceDetail.data?.artifact_identity ?? null;
+    const certificationScope = dynamicsAdmission?.certification_scope ?? null;
+    const certificationExclusions = certificationScope?.not_certified
+      .map(certificationTermLabel)
+      .join(", ") || "the exclusions recorded in its exact receipt";
     const hasExactDynamicsReceipt = hasExactTierDReceipt(referenceDetail.data);
     const certificationDone =
       referenceDetail.isSuccess
       && dynamicsAdmission?.admitted === true
       && hasExactDynamicsReceipt;
+    const certificationCommands = tierDCertificationCommands({
+      clipId,
+      robot: clipRobot,
+      donorProject: trustedDonorProject,
+      targetProject: project.project_dir,
+    });
     const certificationEvidence = certificationDone
-      ? `Tier D verified`
+      ? `Tier-D exact-schedule tracking evidence verified`
         + (dynamicsAdmission.certificate_digest
             ? ` · certificate ${dynamicsAdmission.certificate_digest.slice(0, 12)}`
             : "")
@@ -146,18 +217,23 @@ export function BehaviorFlow({
           key: "motion-certification",
           label: "Certify motion",
           hint: certificationDone
-            ? "Tier D was earned by an external physics-tracking job. This UI "
-              + "re-verifies the exact clip and tracked-rollout bytes; it does "
-              + "not issue certificates."
-            : "Live training requires Tier D from an external physics-tracking "
-              + "job. Run the command below, then re-check here; this UI verifies "
+            ? "Tier-D evidence was earned by an external exact-schedule tracking job. It certifies "
+              + "exact-schedule joint-position and root-height tracking only; "
+              + `it does not certify ${certificationExclusions}. `
+              + "This UI re-verifies the exact "
+              + "clip and tracked-rollout bytes; it does not issue certificates."
+            : "Live training requires Tier-D exact-schedule tracking evidence "
+              + "from an external job. Select an existing trusted donor below, export its data-only "
+              + "interface receipt, run CPU preflight, then run certification. This UI verifies "
               + "evidence but does not create certificates.",
           done: certificationDone,
           evidence: certificationEvidence,
           externalCommand: certificationDone
             ? undefined
-            : `sculpt refs track --clip-id "${clipId}" --robot "${clipRobot}" `
-              + `--donor-project "${project.project_dir}"`,
+            : certificationCommands.commands.join("\n") || undefined,
+          externalCommandIssue: certificationDone
+            ? undefined
+            : certificationCommands.error ?? undefined,
           technicalReceipt: certificationDone
             ? [
                 `robot=${clipRobot}`,
@@ -166,6 +242,8 @@ export function BehaviorFlow({
                 `raw_source_sha256=${artifactIdentity?.source_content_sha256 || "unavailable"}`,
                 `certificate_digest=${dynamicsAdmission.certificate_digest}`,
                 `rollout_sha256=${dynamicsAdmission.rollout_sha256}`,
+                `certification_claim=${certificationScope?.claim || "unavailable"}`,
+                `not_certified=${certificationScope?.not_certified.join(",") || "unavailable"}`,
               ].join("\n")
             : undefined,
           tab: "training",
@@ -174,7 +252,7 @@ export function BehaviorFlow({
             : certificationDone ? "Re-check evidence" : "Refresh status",
           run: () => { void referenceDetail.refetch(); },
           blocked: referenceDetail.isFetching
-            ? "Checking the current dynamics certificate…"
+            ? "Checking the current Tier-D exact-schedule tracking evidence…"
             : undefined,
         }]
       : [];
@@ -256,7 +334,7 @@ export function BehaviorFlow({
         label: "Choose or compose a reference motion",
         hint: "A motion no single clip contains gets composed out of spans of "
             + "several solved ones. It becomes an immutable tracking candidate; "
-            + "the next step checks dynamics certification.",
+            + "the next step checks Tier-D exact-schedule tracking evidence.",
         done: !!clipId,
         evidence: clipId || undefined,
         tab: "training",
@@ -349,6 +427,7 @@ export function BehaviorFlow({
     ];
   }, [project, robotConfigured, world.data, rewards.data, policies.data,
       selectedClipId, selectedClipRobot, modeRewards.data, onGoTo, training,
+      trustedDonorProject,
       referenceDetail.data, referenceDetail.isError, referenceDetail.isFetching,
       referenceDetail.isLoading, referenceDetail.isSuccess,
       referenceDetail.refetch]);
@@ -450,24 +529,49 @@ export function BehaviorFlow({
                     {s.evidence}
                   </div>
                 )}
+                {s.key === "motion-certification" && !s.done && (
+                  <label
+                    style={{ display: "grid", gap: 3, marginTop: 6, maxWidth: 620 }}
+                  >
+                    <span className="rs-sub" style={{ fontSize: 10.5 }}>
+                      Trusted donor project · command input only, not yet verified
+                    </span>
+                    <input
+                      className="rs-input mono"
+                      aria-label="Trusted Tier-D donor project"
+                      placeholder="/absolute/path/to/existing-compatible-project"
+                      value={trustedDonorProject}
+                      onChange={(event) => setTrustedDonorProject(event.target.value)}
+                      spellCheck={false}
+                    />
+                  </label>
+                )}
+                {s.externalCommandIssue && (
+                  <div
+                    role="status"
+                    style={{ color: "var(--st-amber)", fontSize: 10.5, lineHeight: 1.45, marginTop: 4 }}
+                  >
+                    {s.externalCommandIssue}
+                  </div>
+                )}
                 {s.externalCommand && (
                   <div
                     aria-label="External certification command"
                     style={{ fontSize: 10.5, lineHeight: 1.45, marginTop: 5 }}
                   >
-                    <span className="rs-sub">Run externally: </span>
-                    <code
+                    <div className="rs-sub">Run externally in order:</div>
+                    <pre
                       className="mono"
-                      style={{ overflowWrap: "anywhere", whiteSpace: "normal" }}
+                      style={{ margin: "3px 0 0", overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}
                     >
                       {s.externalCommand}
-                    </code>
+                    </pre>
                   </div>
                 )}
                 {s.technicalReceipt && (
                   <details style={{ fontSize: 10.5, marginTop: 5 }}>
                     <summary style={{ cursor: "pointer" }}>
-                      Exact Tier-D receipt
+                      Exact Tier-D tracking receipt
                     </summary>
                     <pre
                       className="mono"

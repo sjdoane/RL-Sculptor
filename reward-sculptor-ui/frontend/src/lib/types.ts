@@ -636,9 +636,23 @@ export interface RunDetail extends RunSummary {
     policy_contract_required: boolean;
     policy_contract_sha256: string | null;
   } | null;
+  /** Server-derived worker pin for the exact authored world. Requested is
+   * fixed before subprocess launch; Observed is earned only from the worker's
+   * `authored_world_pinned` receipt. */
+  authored_world_execution_receipt?: {
+    requested: AuthoredWorldExecutionPin;
+    observed: AuthoredWorldExecutionPin | null;
+  } | null;
   iterations: IterEventSummary[];
   stdout_tail: string[];
   total_event_count: number;
+}
+
+export interface AuthoredWorldExecutionPin {
+  selection_version: number;
+  selection_path: string;
+  selection_sha256: string;
+  tuple_hash: string;
 }
 
 /** One exportable trained iteration (GET /projects/{slug}/policies).
@@ -647,6 +661,9 @@ export interface PolicySummary {
   iter_index: number;
   checkpoint: string; // "checkpoint.pt" | "checkpoint.zip"
   checkpoint_bytes: number;
+  /** Exact bytes selected for transfer. Missing or malformed digests fail
+   *  closed in the starting-point picker and New Run preflight. */
+  checkpoint_sha256: string;
   /** Server-authoritative completion/export decision. */
   deployable: boolean;
   primary_metric: number | null;
@@ -661,6 +678,16 @@ export interface PolicySummary {
   route_evidence: PolicyEvidenceValue | null;
   contact_evidence: PolicyEvidenceValue | null;
   hold_evidence: PolicyEvidenceValue | null;
+  objective_proof_status: "passed" | "failed" | "incomplete";
+  objective_proof_blockers: string[];
+  /** Worker-authored identity of the rendered evaluation lane. Missing
+   * behavior.json fields remain unavailable/incomplete; the UI must not infer
+   * them from the launch request. */
+  lane_evidence_status: "verified" | "incomplete" | "mismatch" | "unavailable";
+  requested_evidence_env_index: number | null;
+  resolved_evidence_env_index: number | null;
+  resolved_episode_percentile: number | null;
+  evidence_lane_selection: string | null;
   rollout_available: boolean;
   /** Earned only from a coherent immutable selection receipt. */
   selected: boolean;
@@ -707,6 +734,10 @@ export interface PolicyEvidenceValue {
   key: string;
   value: number;
   kind: "fraction" | "count" | "frames" | "score" | "value";
+  comparison: "gte" | "lte" | "eq" | null;
+  threshold: number | null;
+  passed: boolean | null;
+  semantics_source: string | null;
 }
 
 // ── Starting skills (portable policy / motion import) ───────────────
@@ -786,18 +817,26 @@ export interface StartingSkillCompatibility {
    * reason text. Older receipts may not include this field. */
   reason_codes?: string[];
   mode_reasons?: Partial<Record<StartingSkillInitializationMode, string[]>>;
-  /** The sole admitted schema-2 -> schema-3 policy-interface extension.
-   *  This is structural compatibility evidence, not launch authorization. */
+  /** The exact admitted event-phase, reference-clock, or combined
+   * policy-interface extension. This is structural compatibility evidence,
+   * not launch authorization. */
   policy_contract_migration?: PolicyContractMigration | null;
 }
 
+export type PolicyContractMigrationType =
+  | "zero_initialized_event_phase_observation"
+  | "zero_initialized_reference_clock_observation"
+  | "zero_initialized_observation_extensions";
+
 export interface PolicyContractMigration {
-  type: string;
+  type: PolicyContractMigrationType;
   from_schema: number;
   to_schema: number;
-  observation_term: string;
+  observation_term?: string;
   extension_width: number;
-  ordered_phase_ids: string[];
+  ordered_phase_ids?: string[];
+  reference_clock_sha256?: string;
+  extensions?: PolicyContractMigration[];
   optimizer_resume: false;
 }
 
@@ -928,6 +967,35 @@ export interface RunEvent {
    *  it as event-specific and validate before display. */
   source?: string;
   [extra: string]: unknown;
+}
+
+export interface StartingPolicyInitializationAuthority {
+  kind?: string;
+  id?: string | null;
+  initialization_mode: string;
+  roles: string[];
+  manifest_digest?: string | null;
+  trust_status?: string | null;
+  checkpoint?: string | null;
+  checkpoint_sha256?: string | null;
+  source_policy_contract_sha256?: string | null;
+  target_policy_contract_sha256?: string | null;
+  policy_contract_migration?: PolicyContractMigration | null;
+  source?: string;
+  source_sha256?: string;
+  loaded_checkpoint?: string;
+  loaded_checkpoint_sha256?: string;
+  adapted?: boolean;
+  load_cfg_keys?: string[];
+  reuse_kind?: string;
+  effective_policy_contract_sha256?: string | null;
+}
+
+export interface StartingPolicyInitializationReceipt {
+  schema: 1;
+  requested: StartingPolicyInitializationAuthority;
+  resolved: StartingPolicyInitializationAuthority;
+  observed: StartingPolicyInitializationAuthority;
 }
 
 // ── Dashboard + System ──────────────────────────────────────────────
@@ -1845,6 +1913,14 @@ export interface ComposeResult {
 }
 
 // GET /references/{clip_id} — provenance.json content + the index row.
+export interface TierDCertificationScope {
+  schema: string;
+  claim: string;
+  gated_evidence: string[];
+  measured_only: string[];
+  not_certified: string[];
+}
+
 export interface RefDetail {
   index_row: RefIndexRow;
   provenance: Record<string, unknown> | null;
@@ -1863,6 +1939,10 @@ export interface RefDetail {
     source_content_sha256?: string | null;
     artifact_hash_verified?: boolean;
     rollout_sha256: string | null;
+    execution_contract_sha256: string | null;
+    execution_boundary_sha256: string | null;
+    reference_clock_sha256: string | null;
+    certification_scope: TierDCertificationScope | null;
     reason: string | null;
     tracking_errors?: {
       mean_joint_err_rad: number;

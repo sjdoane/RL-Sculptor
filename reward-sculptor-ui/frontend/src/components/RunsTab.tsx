@@ -47,6 +47,9 @@ import type {
   StageObjectiveMetric,
   StageSelectionCandidate,
   StageSelectionReport,
+  StartingPolicyInitializationAuthority,
+  StartingPolicyInitializationReceipt,
+  TierDCertificationScope,
 } from "@/lib/types";
 
 // ── benign-error display mapping ────────────────────────────────────────
@@ -1720,95 +1723,19 @@ function LiveRunDetailPane({
     return { awaiting: aw, awaitingIter: awIter, mode: m };
   }, [events.events, run.data?.mode]);
 
-  // Which policy this run actually started from. A run does not begin from
-  // scratch — it inherits weights from a previous iteration unless someone
-  // names a checkpoint — and nothing here used to say so. One run silently
-  // picked up a policy whose exploration noise alone cost more per step than
-  // the task reward paid, and 470 iterations of that read as "the authored
-  // reward does nothing". Show the source, whether it was chosen or inferred,
-  // and any repair applied on the way in.
-  const startingPolicy = useMemo(() => {
-    let source: string | null = null;
-    let chosen = false;
-    let ignoredPartial: string | null = null;
-    let noise: { before: number; after: number; ceiling: number } | null = null;
-    let skill: {
-      id: string; mode: string; manifestDigest: string | null;
-      checkpointSha256: string | null;
-    } | null = null;
-    for (const ev of events.events) {
-      const e = ev as {
-        type?: string; source?: string; checkpoint?: string;
-        std_before?: number; std_after?: number; ceiling?: number;
-        starting_skill_id?: string; initialization_mode?: string;
-        manifest_digest?: string; checkpoint_sha256?: string;
-      };
-      if (e.type === "starting_skill_resolved" && e.starting_skill_id) {
-        skill = {
-          id: e.starting_skill_id,
-          mode: e.initialization_mode ?? "unknown",
-          manifestDigest: e.manifest_digest ?? null,
-          checkpointSha256: e.checkpoint_sha256 ?? null,
-        };
-        source = `portable skill ${e.starting_skill_id}`;
-        chosen = true;
-      }
-      else if (e.type === "warm_start_checkpoint_resolved") { source = e.checkpoint ?? null; chosen = true; }
-      else if (e.type === "resume_warm_start_resolved") { source = asPath(e.source) ?? null; chosen = false; }
-      else if (e.type === "partial_train_recovered") { source = e.checkpoint ?? source; chosen = false; }
-      else if (e.type === "partial_train_ignored") { ignoredPartial = e.checkpoint ?? null; }
-      else if (e.type === "warm_start_loaded") { source = asPath(e.source) ?? source; }
-      else if (e.type === "warm_start_noise_clamped"
-               && typeof e.std_before === "number" && typeof e.std_after === "number") {
-        noise = { before: e.std_before, after: e.std_after, ceiling: e.ceiling ?? 1 };
-      }
-    }
-    if (source === null) return null;
-    return { source, chosen, ignoredPartial, noise, skill };
-  }, [events.events]);
+  // Requested intent and backend path resolution are useful diagnostics, but
+  // neither proves that the runner consumed those bytes. Only the dedicated
+  // nested receipt, emitted after exact load/reuse verification, earns
+  // "Initialized from" in the UI.
+  const startingPolicy = useMemo(
+    () => deriveStartingPolicyState(events.events),
+    [events.events],
+  );
 
-  const referenceAdmission = useMemo(() => {
-    let receipt: {
-      outcome: "admitted" | "failed"; tier: string; status: string;
-      robot: string | null; clipId: string | null; clipSha256: string | null;
-      rolloutSha256: string | null; trainingAuthorized: boolean;
-      reason: string | null;
-    } | null = null;
-    for (const ev of events.events) {
-      const e = ev as {
-        type?: string; tier?: string; status?: string;
-        reference_robot?: string; reference_clip_id?: string;
-        clip_sha256?: string; rollout_sha256?: string;
-        training_authorized?: boolean; reason?: string; error?: string;
-      };
-      if (e.type === "reference_feasibility_admitted") {
-        receipt = {
-          outcome: "admitted",
-          tier: e.tier ?? "unknown",
-          status: e.status ?? "verified",
-          robot: e.reference_robot ?? null,
-          clipId: e.reference_clip_id ?? null,
-          clipSha256: e.clip_sha256 ?? null,
-          rolloutSha256: e.rollout_sha256 ?? null,
-          trainingAuthorized: e.training_authorized === true,
-          reason: e.reason ?? null,
-        };
-      } else if (e.type === "reference_feasibility_integrity_failed") {
-        receipt = {
-          outcome: "failed",
-          tier: e.tier ?? "unknown",
-          status: "integrity_failed",
-          robot: e.reference_robot ?? null,
-          clipId: e.reference_clip_id ?? null,
-          clipSha256: e.clip_sha256 ?? null,
-          rolloutSha256: e.rollout_sha256 ?? null,
-          trainingAuthorized: false,
-          reason: e.error ?? e.reason ?? "reference feasibility integrity failed",
-        };
-      }
-    }
-    return receipt;
-  }, [events.events]);
+  const referenceAdmission = useMemo(
+    () => deriveReferenceAdmissionState(events.events),
+    [events.events],
+  );
 
   // The most recent `learning_vitals`, plus where the run's exploration
   // noise started and whether it is ratcheting. Neither simpler signal
@@ -1982,6 +1909,11 @@ function LiveRunDetailPane({
             });
           }}
         />
+        {run.data?.authored_world_execution_receipt && (
+          <AuthoredWorldExecutionCard
+            receipt={run.data.authored_world_execution_receipt}
+          />
+        )}
         {startingPolicy && <StartingPolicyCard {...startingPolicy} />}
         {referenceAdmission && <ReferenceAdmissionCard {...referenceAdmission} />}
         {vitals && <LearningVitalsStrip {...vitals} />}
@@ -2263,67 +2195,331 @@ function LearningVitalsStrip({ v, stdAtStart, ratcheting }: {
   );
 }
 
-/** A checkpoint path, or null when the field carries something else.
- *
- * The event envelope overwrites a payload's own `source` with the string
- * "stdout" to mark provenance (backend run_manager `_pump_stdout`), so a
- * value from that key is only trustworthy when it still looks like a path.
- */
-function asPath(v: string | undefined): string | null {
-  return typeof v === "string" && v.includes("/") ? v : null;
+/** A checkpoint path, or null when the field carries something else. Event
+ * envelope provenance historically collided with a payload's `source`, so
+ * provisional events never treat a bare value like `stdout` as a path. */
+function asPath(v: unknown): string | null {
+  return typeof v === "string" && (v.includes("/") || v.includes("\\"))
+    ? v
+    : null;
 }
 
-/** `.../runs/iter_4/logs/model_450.pt` → `iter_4/logs/model_450.pt`.
- *  Keeps the `iter_N` segment — which iteration a checkpoint came from is
- *  the whole point of showing it. */
+/** `.../runs/iter_4/logs/model_450.pt` → `iter_4/logs/model_450.pt`. */
 function shortCkpt(path: string): string {
-  const parts = path.split("/");
-  const at = parts.findIndex((s) => /^iter_\d+$/.test(s));
+  const parts = path.replaceAll("\\", "/").split("/");
+  const at = parts.findIndex((part) => /^iter_\d+$/.test(part));
   return (at >= 0 ? parts.slice(at) : parts.slice(-2)).join("/") || path;
 }
 
-// Where this run's weights came from. Training almost never starts from
-// scratch, and which policy seeded it decides what the run can reach — so it
-// belongs next to the run, not buried in the event log.
-function StartingPolicyCard({ source, chosen, ignoredPartial, noise, skill }: {
-  source: string;
-  chosen: boolean;
+function rolesForMode(mode: string): string[] {
+  if (mode === "reference_only") return [];
+  return mode === "actor_only" ? ["actor"] : ["actor", "critic"];
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isAuthority(value: unknown): value is StartingPolicyInitializationAuthority {
+  if (value == null || typeof value !== "object") return false;
+  const authority = value as Partial<StartingPolicyInitializationAuthority>;
+  return typeof authority.initialization_mode === "string"
+    && isStringArray(authority.roles);
+}
+
+function canonicalStructuredValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalStructuredValue);
+  if (value != null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalStructuredValue(item)]),
+    );
+  }
+  return value;
+}
+
+function exactStructuredMatch(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalStructuredValue(left))
+    === JSON.stringify(canonicalStructuredValue(right));
+}
+
+function parseVerifiedInitializationReceipt(
+  value: unknown,
+): StartingPolicyInitializationReceipt | null {
+  if (value == null || typeof value !== "object") return null;
+  const receipt = value as Partial<StartingPolicyInitializationReceipt>;
+  if (
+    receipt.schema !== 1
+    || !isAuthority(receipt.requested)
+    || !isAuthority(receipt.resolved)
+    || !isAuthority(receipt.observed)
+  ) return null;
+  const requested = receipt.requested;
+  const resolved = receipt.resolved;
+  const observed = receipt.observed;
+  const checkpointSha = resolved.checkpoint_sha256;
+  const loadedSha = observed.loaded_checkpoint_sha256;
+  const adapted = observed.adapted === true;
+  const observedMigration = observed.policy_contract_migration;
+  const resolvedMigration = resolved.policy_contract_migration;
+  if (
+    requested.initialization_mode !== resolved.initialization_mode
+    || requested.initialization_mode !== observed.initialization_mode
+    || requested.roles.join("\u0000") !== resolved.roles.join("\u0000")
+    || requested.roles.join("\u0000") !== observed.roles.join("\u0000")
+    || !isStringArray(observed.load_cfg_keys)
+    || requested.roles.join("\u0000") !== observed.load_cfg_keys.join("\u0000")
+    || typeof checkpointSha !== "string"
+    || !/^[a-f0-9]{64}$/.test(checkpointSha)
+    || typeof loadedSha !== "string"
+    || !/^[a-f0-9]{64}$/.test(loadedSha)
+    || observed.source_sha256 !== checkpointSha
+    || (!adapted && loadedSha !== checkpointSha)
+    || (
+      adapted
+      && (
+        observedMigration == null
+        || resolvedMigration == null
+        || observedMigration.optimizer_resume !== false
+        || !exactStructuredMatch(observedMigration, resolvedMigration)
+        || typeof resolved.target_policy_contract_sha256 !== "string"
+        || observed.effective_policy_contract_sha256
+          !== resolved.target_policy_contract_sha256
+      )
+    )
+  ) return null;
+  return receipt as StartingPolicyInitializationReceipt;
+}
+
+export interface StartingPolicyState {
+  requested: StartingPolicyInitializationAuthority | null;
+  resolved: StartingPolicyInitializationAuthority | null;
+  observed: StartingPolicyInitializationAuthority | null;
+  verified: boolean;
+  invalidVerificationReceipt: boolean;
   ignoredPartial: string | null;
   noise: { before: number; after: number; ceiling: number } | null;
-  skill: {
-    id: string; mode: string; manifestDigest: string | null;
-    checkpointSha256: string | null;
-  } | null;
-}) {
+  /** A reference-only import is a starting-motion choice, not a policy
+   * initialization request. Keep its explicit disclosure out of the
+   * Requested/Resolved/Observed weight-verification vocabulary. */
+  referenceOnly: boolean;
+}
+
+/** Derive the three policy authorities without upgrading a path resolution or
+ * raw worker log into proof of initialization. */
+export function deriveStartingPolicyState(
+  events: RunEvent[],
+): StartingPolicyState | null {
+  let requested: StartingPolicyInitializationAuthority | null = null;
+  let resolved: StartingPolicyInitializationAuthority | null = null;
+  let observed: StartingPolicyInitializationAuthority | null = null;
+  let invalidVerificationReceipt = false;
+  let ignoredPartial: string | null = null;
+  let noise: StartingPolicyState["noise"] = null;
+  let referenceOnly = false;
+  for (const event of events) {
+    const e = event as RunEvent & Record<string, unknown>;
+    if (e.type === "starting_skill_resolved" && typeof e.starting_skill_id === "string") {
+      const mode = typeof e.initialization_mode === "string"
+        ? e.initialization_mode
+        : "unknown";
+      const roles = rolesForMode(mode);
+      referenceOnly = mode === "reference_only";
+      requested = {
+        kind: "starting_skill",
+        id: e.starting_skill_id,
+        initialization_mode: mode,
+        roles,
+        manifest_digest: typeof e.manifest_digest === "string" ? e.manifest_digest : null,
+        trust_status: typeof e.trust_status === "string" ? e.trust_status : null,
+      };
+      resolved = {
+        initialization_mode: mode,
+        roles,
+        checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+          ? e.checkpoint_sha256
+          : null,
+      };
+    } else if (e.type === "warm_start_checkpoint_resolved") {
+      referenceOnly = false;
+      const roles = ["actor", "critic"];
+      requested = {
+        kind: "project_iteration",
+        id: typeof e.iteration === "number" ? String(e.iteration) : null,
+        initialization_mode: "actor_critic",
+        roles,
+        trust_status: "verified_local",
+      };
+      resolved = {
+        initialization_mode: "actor_critic",
+        roles,
+        checkpoint: asPath(e.checkpoint),
+        checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+          ? e.checkpoint_sha256
+          : null,
+      };
+    } else if (e.type === "resume_warm_start_resolved") {
+      const path = asPath(e.source);
+      if (path) {
+        referenceOnly = false;
+        requested = {
+          kind: "automatic_resume",
+          id: null,
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+        };
+        resolved = {
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+          checkpoint: path,
+          checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+            ? e.checkpoint_sha256
+            : null,
+        };
+      }
+    } else if (e.type === "partial_train_recovered") {
+      const path = asPath(e.checkpoint);
+      if (path) {
+        referenceOnly = false;
+        requested = {
+          kind: "interrupted_snapshot",
+          id: null,
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+        };
+        resolved = {
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+          checkpoint: path,
+          checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+            ? e.checkpoint_sha256
+            : null,
+        };
+      }
+    } else if (e.type === "partial_train_ignored") {
+      ignoredPartial = asPath(e.checkpoint);
+    } else if (e.type === "starting_policy_initialization_verified") {
+      const receipt = parseVerifiedInitializationReceipt(e.receipt);
+      if (receipt) {
+        referenceOnly = false;
+        requested = receipt.requested;
+        resolved = receipt.resolved;
+        observed = receipt.observed;
+      } else {
+        invalidVerificationReceipt = true;
+      }
+    } else if (
+      e.type === "warm_start_noise_clamped"
+      && typeof e.std_before === "number"
+      && typeof e.std_after === "number"
+    ) {
+      noise = {
+        before: e.std_before,
+        after: e.std_after,
+        ceiling: typeof e.ceiling === "number" ? e.ceiling : 1,
+      };
+    }
+  }
+  if (
+    !requested && !resolved && !observed && !invalidVerificationReceipt
+    && !ignoredPartial && !noise
+  ) return null;
+  return {
+    requested,
+    resolved,
+    observed,
+    verified: observed != null,
+    invalidVerificationReceipt,
+    ignoredPartial,
+    noise,
+    referenceOnly,
+  };
+}
+
+function authorityIdentity(authority: StartingPolicyInitializationAuthority): string {
+  if (authority.kind === "starting_skill") return `portable skill ${authority.id ?? "unknown"}`;
+  if (authority.kind === "project_iteration") return `project iteration ${authority.id ?? "unknown"}`;
+  if (authority.kind === "interrupted_snapshot") return `interrupted snapshot ${authority.id ?? "unknown"}`;
+  return (authority.kind ?? "policy source").replaceAll("_", " ");
+}
+
+export function StartingPolicyCard({
+  requested,
+  resolved,
+  observed,
+  verified,
+  invalidVerificationReceipt,
+  ignoredPartial,
+  noise,
+  referenceOnly,
+}: StartingPolicyState) {
+  if (referenceOnly) {
+    return (
+      <div className="rs-card" style={{ margin: "0 16px 12px" }}>
+        <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 7 }}>
+          <Icon name="activity" size={15} color="var(--rs-muted)" />
+          <span className="rs-eyebrow">Reference-only starting point</span>
+        </div>
+        <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+          No actor or critic weights were requested, resolved, or loaded from
+          this import. Its motion is admitted separately by the reference
+          receipt below; the run initializes a fresh policy.
+        </div>
+      </div>
+    );
+  }
+  const identity = requested ? authorityIdentity(requested) : "policy source";
   return (
     <div className="rs-card" style={{ margin: "0 16px 12px" }}>
-      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
-        <Icon name="activity" size={15} color="var(--rs-muted)" />
-        <span className="rs-eyebrow">Started from</span>
-        <code className="mono" style={{ fontSize: 12 }}>{shortCkpt(source)}</code>
-        <span className="rs-sub" style={{ fontSize: 11 }}>
-          {chosen ? "you chose this" : "inherited — no warm start was named"}
-        </span>
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 7 }}>
+        <Icon name={verified ? "shield-check" : "activity"} size={15} color={verified ? "var(--st-emerald)" : "var(--rs-muted)"} />
+        <span className="rs-eyebrow">{verified ? "Initialized from" : "Starting policy verification"}</span>
+        <span style={{ fontSize: 12, fontWeight: 650 }}>{identity}</span>
+      </div>
+      <div style={{ display: "grid", gap: 5, fontSize: 11, lineHeight: 1.45 }}>
+        <div>
+          <strong>Requested:</strong>{" "}
+          {requested
+            ? <>
+                {authorityIdentity(requested)} · {requested.initialization_mode.replaceAll("_", " ")} · roles {requested.roles.join(" + ")}
+                {requested.manifest_digest && <> · manifest <code className="mono">{requested.manifest_digest.slice(0, 12)}…</code></>}
+              </>
+            : "No requested authority was recorded."}
+        </div>
+        <div>
+          <strong>Resolved:</strong>{" "}
+          {resolved
+            ? <>
+                {resolved.checkpoint && <code className="mono">{shortCkpt(resolved.checkpoint)}</code>}
+                {resolved.checkpoint_sha256 && <> · sha256 <code className="mono">{resolved.checkpoint_sha256.slice(0, 12)}…</code></>}
+                {!resolved.checkpoint && !resolved.checkpoint_sha256 && "No exact checkpoint receipt yet."}
+              </>
+            : "Waiting for backend path and digest resolution."}
+        </div>
+        <div style={{ color: verified ? "var(--st-emerald)" : "var(--rs-muted)" }}>
+          <strong>Observed:</strong>{" "}
+          {observed
+            ? <>
+                exact backend-verified {observed.load_cfg_keys?.join(" + ")} load
+                {observed.loaded_checkpoint && <> from <code className="mono">{shortCkpt(observed.loaded_checkpoint)}</code></>}
+                {observed.loaded_checkpoint_sha256 && <> · sha256 <code className="mono">{observed.loaded_checkpoint_sha256.slice(0, 12)}…</code></>}
+                {observed.adapted && " · exact admitted interface migration applied"}
+                {observed.reuse_kind && <> · {observed.reuse_kind.replaceAll("_", " ")}</>}
+              </>
+            : invalidVerificationReceipt
+              ? "A malformed initialization receipt was rejected; initialization is not proven."
+              : "Not verified. A resolved path or raw warm-start log does not prove that the weights loaded."}
+        </div>
       </div>
       {ignoredPartial && (
-        <div className="rs-sub" style={{ fontSize: 11 }}>
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>
           An interrupted attempt left <code className="mono">{shortCkpt(ignoredPartial)}</code> on
-          disk. Your choice wins; that partial was not used.
-        </div>
-      )}
-      {skill && (
-        <div className="rs-sub" style={{ fontSize: 11 }}>
-          Portable skill <code className="mono">{skill.id}</code> Â· {skill.mode.replaceAll("_", " ")}
-          {skill.manifestDigest && (
-            <> Â· manifest <code className="mono">{skill.manifestDigest.slice(0, 12)}â€¦</code></>
-          )}
-          {skill.checkpointSha256 && (
-            <> Â· weights <code className="mono">{skill.checkpointSha256.slice(0, 12)}â€¦</code></>
-          )}
+          disk. It was explicitly ignored.
         </div>
       )}
       {noise && (
-        <div className="rs-sub" style={{ fontSize: 11 }}>
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>
           Carried action-noise std {noise.before.toFixed(2)}, above this task's fresh-init{" "}
           {noise.ceiling.toFixed(2)} — clamped to {noise.after.toFixed(2)}. Inherited noise is
           paid every step through the action-rate penalty, so it is bounded rather than compounded
@@ -2334,12 +2530,78 @@ function StartingPolicyCard({ source, chosen, ignoredPartial, noise, skill }: {
   );
 }
 
+export function AuthoredWorldExecutionCard({
+  receipt,
+}: {
+  receipt: NonNullable<RunDetail["authored_world_execution_receipt"]>;
+}) {
+  const requested = receipt.requested;
+  const observed = receipt.observed;
+  const verified = observed != null && exactStructuredMatch(requested, observed);
+  const mismatch = observed != null && !verified;
+  return (
+    <div
+      className="rs-card"
+      role="status"
+      aria-label="Authored world execution receipt"
+      style={{
+        margin: "0 16px 12px",
+        border: `1px solid ${verified
+          ? "var(--st-emerald)"
+          : mismatch
+            ? "var(--st-rose)"
+            : "var(--hairline)"}`,
+      }}
+    >
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 7 }}>
+        <Icon
+          name={verified ? "shield-check" : mismatch ? "alert-triangle" : "globe"}
+          size={15}
+          color={verified ? "var(--st-emerald)" : mismatch ? "var(--st-rose)" : "var(--rs-muted)"}
+        />
+        <span className="rs-eyebrow">{verified ? "Executes in" : "Training environment verification"}</span>
+        <span style={{ fontSize: 12, fontWeight: 650 }}>
+          authored selection v{requested.selection_version}
+        </span>
+      </div>
+      <div style={{ display: "grid", gap: 5, fontSize: 11, lineHeight: 1.5 }}>
+        <div>
+          <strong>Requested:</strong> tuple <code className="mono">{requested.tuple_hash}</code>
+          {" · "}selection <code className="mono">{requested.selection_sha256}</code>
+          {" · "}<code className="mono">{requested.selection_path}</code>
+        </div>
+        <div style={{ color: verified ? "var(--st-emerald)" : mismatch ? "var(--st-rose)" : "var(--rs-muted)" }}>
+          <strong>Observed:</strong>{" "}
+          {verified
+            ? <>worker pinned the exact requested tuple and selection bytes</>
+            : mismatch
+              ? <>worker receipt differs from the requested world; execution is not proven</>
+              : <>pending or unavailable; a requested world does not prove worker execution</>}
+          {observed && (
+            <>
+              {" · "}tuple <code className="mono">{observed.tuple_hash}</code>
+              {" · "}selection <code className="mono">{observed.selection_sha256}</code>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // §Ship 39 (H1): the inline feedback prompt shown when the loop is paused
 // awaiting the human's observation (manual mode).
-function ReferenceAdmissionCard({
-  outcome, tier, status, robot, clipId, clipSha256, rolloutSha256,
-  trainingAuthorized, reason,
-}: {
+export interface ReferenceRuntimeScheduleObservation {
+  robot: string | null;
+  clipId: string | null;
+  targetSha256: string | null;
+  phaseMode: string | null;
+  phaseDurationS: number | null;
+  nPhaseTargets: number | null;
+  trackingBackboneSha256: string | null;
+}
+
+export interface ReferenceAdmissionState {
   outcome: "admitted" | "failed";
   tier: string;
   status: string;
@@ -2347,10 +2609,117 @@ function ReferenceAdmissionCard({
   clipId: string | null;
   clipSha256: string | null;
   rolloutSha256: string | null;
+  certificateSha256: string | null;
+  executionContractSha256: string | null;
+  executionBoundarySha256: string | null;
   trainingAuthorized: boolean;
+  certificationScope: TierDCertificationScope | null;
   reason: string | null;
-}) {
+  observedSchedule: ReferenceRuntimeScheduleObservation | null;
+  observedScheduleMatchesAdmission: boolean | null;
+  completionProofSha256: string | null;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function numberField(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Keep launch admission and worker observation as separate authorities. */
+export function deriveReferenceAdmissionState(
+  events: RunEvent[],
+): ReferenceAdmissionState | null {
+  let admission: Omit<ReferenceAdmissionState,
+    "observedSchedule" | "observedScheduleMatchesAdmission" | "completionProofSha256"
+  > | null = null;
+  let observedSchedule: ReferenceRuntimeScheduleObservation | null = null;
+  let completionProofSha256: string | null = null;
+  for (const event of events) {
+    const e = event as RunEvent & Record<string, unknown>;
+    if (e.type === "reference_feasibility_admitted") {
+      admission = {
+        outcome: "admitted",
+        tier: stringField(e.tier) ?? "unknown",
+        status: stringField(e.status) ?? "verified",
+        robot: stringField(e.reference_robot),
+        clipId: stringField(e.reference_clip_id),
+        clipSha256: stringField(e.clip_sha256),
+        rolloutSha256: stringField(e.rollout_sha256),
+        certificateSha256: stringField(e.certificate_sha256),
+        executionContractSha256: stringField(e.execution_contract_sha256),
+        executionBoundarySha256: stringField(e.execution_boundary_sha256),
+        trainingAuthorized: e.training_authorized === true,
+        certificationScope: (e.certification_scope ?? null) as TierDCertificationScope | null,
+        reason: stringField(e.reason),
+      };
+    } else if (e.type === "reference_feasibility_integrity_failed") {
+      admission = {
+        outcome: "failed",
+        tier: stringField(e.tier) ?? "unknown",
+        status: "integrity_failed",
+        robot: stringField(e.reference_robot),
+        clipId: stringField(e.reference_clip_id),
+        clipSha256: stringField(e.clip_sha256),
+        rolloutSha256: stringField(e.rollout_sha256),
+        certificateSha256: stringField(e.certificate_sha256),
+        executionContractSha256: stringField(e.execution_contract_sha256),
+        executionBoundarySha256: stringField(e.execution_boundary_sha256),
+        trainingAuthorized: false,
+        certificationScope: null,
+        reason: stringField(e.error) ?? stringField(e.reason)
+          ?? "reference feasibility integrity failed",
+      };
+    } else if (e.type === "reference_runtime_schedule_admitted") {
+      observedSchedule = {
+        robot: stringField(e.reference_robot),
+        clipId: stringField(e.reference_clip_id),
+        targetSha256: stringField(e.reference_target_sha256),
+        phaseMode: stringField(e.phase_mode),
+        phaseDurationS: numberField(e.phase_duration_s),
+        nPhaseTargets: numberField(e.n_phase_targets),
+        trackingBackboneSha256: stringField(e.tracking_backbone_sha256),
+      };
+    } else if (e.type === "run_lineage_proof_verified") {
+      const proof = e.proof;
+      if (proof != null && typeof proof === "object") {
+        const candidate = proof as Record<string, unknown>;
+        if (
+          candidate.schema === 1
+          && candidate.strict_reference_lineage === true
+          && candidate.authority === "reference_guided_completion_verified"
+          && typeof candidate.proof_sha256 === "string"
+          && /^[a-f0-9]{64}$/.test(candidate.proof_sha256)
+        ) {
+          completionProofSha256 = candidate.proof_sha256;
+        }
+      }
+    }
+  }
+  if (!admission) return null;
+  const observedScheduleMatchesAdmission = observedSchedule == null
+    ? null
+    : observedSchedule.robot === admission.robot
+      && observedSchedule.clipId === admission.clipId;
+  return {
+    ...admission,
+    observedSchedule,
+    observedScheduleMatchesAdmission,
+    completionProofSha256,
+  };
+}
+
+export function ReferenceAdmissionCard({
+  outcome, tier, status, robot, clipId, clipSha256, rolloutSha256,
+  certificateSha256, executionContractSha256, executionBoundarySha256,
+  trainingAuthorized, certificationScope, reason, observedSchedule,
+  observedScheduleMatchesAdmission, completionProofSha256,
+}: ReferenceAdmissionState) {
   const good = outcome === "admitted";
+  const isTrackingCertificate = good && tier === "D";
+  const readableScope = (value: string) => value.replaceAll("_", " ");
   return (
     <div
       className="rs-card"
@@ -2361,21 +2730,73 @@ function ReferenceAdmissionCard({
     >
       <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
         <Icon name={good ? "shield-check" : "alert-triangle"} size={15} color={good ? "var(--st-emerald)" : "var(--st-rose)"} />
-        <span className="rs-eyebrow">Reference feasibility</span>
+        <span className="rs-eyebrow">
+          {isTrackingCertificate ? "Reference launch admission" : "Reference admission"}
+        </span>
         <span className={`rs-badge ${good ? "emerald" : "rose"}`}>Tier {tier}</span>
         <span style={{ fontSize: 11.5, fontWeight: 650 }}>
           {good
-            ? trainingAuthorized ? "live training authorized" : "inspection only · no policy output"
+            ? trainingAuthorized ? "launch authorized" : "inspection only · no policy output"
             : "integrity check failed"}
         </span>
       </div>
-      <div className="rs-sub" style={{ fontSize: 11, lineHeight: 1.5 }}>
-        {robot && clipId && <><code className="mono">{robot}/{clipId}</code> Â· </>}
-        {status.replaceAll("_", " ")}
-        {clipSha256 && <> Â· clip <code className="mono">{clipSha256.slice(0, 12)}â€¦</code></>}
-        {rolloutSha256 && <> Â· tracked rollout <code className="mono">{rolloutSha256.slice(0, 12)}â€¦</code></>}
-        {reason && <> Â· {reason}</>}
+      <div style={{ display: "grid", gap: 5, fontSize: 11, lineHeight: 1.5 }}>
+        <div>
+          <strong>Requested:</strong>{" "}
+          {robot && clipId
+            ? <code className="mono">{robot}/{clipId}</code>
+            : "Reference identity was not recorded."}
+        </div>
+        <div>
+          <strong>Resolved admission:</strong> {status.replaceAll("_", " ")}
+          {clipSha256 && <> · clip <code className="mono">{clipSha256}</code></>}
+          {rolloutSha256 && <> · rollout <code className="mono">{rolloutSha256}</code></>}
+          {certificateSha256 && <> · certificate <code className="mono">{certificateSha256}</code></>}
+          {executionContractSha256 && <> · execution contract <code className="mono">{executionContractSha256}</code></>}
+          {executionBoundarySha256 && <> · execution boundary <code className="mono">{executionBoundarySha256}</code></>}
+          {reason && <> · {reason}</>}
+        </div>
+        <div style={{ color: observedScheduleMatchesAdmission === false ? "var(--st-rose)" : "var(--rs-muted)" }}>
+          <strong>Observed runtime:</strong>{" "}
+          {completionProofSha256
+            ? <>worker completion lineage verified · proof <code className="mono">{completionProofSha256}</code></>
+            : observedScheduleMatchesAdmission === false
+              ? "The worker schedule identity conflicts with this launch admission; runtime consumption is not proven."
+              : observedSchedule
+                ? <>
+                    worker admitted the exact schedule at the sculpt-run boundary
+                    {observedSchedule.targetSha256 && <> · target <code className="mono">{observedSchedule.targetSha256}</code></>}
+                    {observedSchedule.phaseMode && <> · {observedSchedule.phaseMode.replaceAll("_", " ")}</>}
+                    {observedSchedule.nPhaseTargets != null && <> · {observedSchedule.nPhaseTargets} targets</>}
+                    {observedSchedule.trackingBackboneSha256 && <> · backbone <code className="mono">{observedSchedule.trackingBackboneSha256}</code></>}
+                  </>
+                : "Pending or unavailable. Launch admission alone does not prove that the worker consumed the reference schedule."}
+        </div>
       </div>
+      {isTrackingCertificate && certificationScope && (
+        <div
+          aria-label="Tier-D certification scope"
+          className="rs-sub"
+          style={{ fontSize: 11, lineHeight: 1.5, marginTop: 5 }}
+        >
+          <div>Claim: {certificationScope.claim}.</div>
+          <div>
+            Gated evidence: {certificationScope.gated_evidence.map(readableScope).join(", ")}.
+          </div>
+          <div>
+            Measured, not gated: {certificationScope.measured_only.map(readableScope).join(", ")}.
+          </div>
+          <div>
+            Not certified: {certificationScope.not_certified.map(readableScope).join(", ")}.
+          </div>
+        </div>
+      )}
+      {isTrackingCertificate && !certificationScope && (
+        <div className="rs-sub" style={{ fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
+          Certificate scope is missing from this event; do not interpret it as
+          contact, collision, or general dynamics evidence.
+        </div>
+      )}
     </div>
   );
 }

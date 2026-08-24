@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { ComposeMotionDialog } from "@/components/ComposeMotionDialog";
@@ -9,7 +10,13 @@ import {
   useReferenceIndex,
   useReferenceSearch,
 } from "@/hooks/useReferences";
-import { ApiError, getReferenceClipUrl, getReferencePreviewUrl } from "@/lib/api";
+import {
+  ApiError,
+  getReference,
+  getReferenceClipUrl,
+  getReferencePreviewUrl,
+} from "@/lib/api";
+import { hasExactTierDReceipt } from "@/lib/referenceAdmission";
 import type { RefIndexRow, RefMatch } from "@/lib/types";
 
 // Search-as-you-type debounce. Deterministic endpoint (llm=0) is cheap,
@@ -21,6 +28,17 @@ function fmtDuration(s: number): string {
   const m = Math.floor(s / 60);
   const rem = Math.round(s - m * 60);
   return `${m}:${String(rem).padStart(2, "0")}`;
+}
+
+const EVIDENCE_TERM_LABELS: Record<string, string> = {
+  root_xy_tracking: "root-XY tracking",
+  contact_safety: "contact safety",
+  collision_avoidance: "collision avoidance",
+  general_dynamics_feasibility: "general dynamics feasibility",
+};
+
+function evidenceTermLabel(term: string): string {
+  return EVIDENCE_TERM_LABELS[term] ?? term.replaceAll("_", " ");
 }
 
 /** Normalize a search hit or a plain index row into the shape the row
@@ -92,7 +110,9 @@ function ResultRow({
         </div>
         <div className="rs-sub" style={{ marginTop: 3, fontSize: 10.5, display: "flex", flexWrap: "wrap", gap: 8 }}>
           <span>{fmtDuration(row.duration_s)}</span>
-          <span className="rs-badge slate" style={{ fontSize: 9 }}>tier {row.tier}</span>
+          <span className="rs-badge slate" style={{ fontSize: 9 }}>
+            declared tier {row.tier}
+          </span>
           <span>{row.license}</span>
           {row.score != null && <span>score {row.score.toFixed(2)}</span>}
           {row.match_confidence != null && <span>confidence {row.match_confidence.toFixed(2)}</span>}
@@ -207,10 +227,9 @@ export function ReferencePickerDialog({
   const labelOptions = Object.entries(facets?.labels ?? {})
     .filter(([l]) => l.length > 2 && !/^\d+$/.test(l))
     .sort((a, b) => b[1] - a[1]).slice(0, 24);
-  // One distinct tier means the control can only ever be a no-op. Today the
-  // whole corpus is tier K (kinematic-only); it earns its place as soon as a
-  // clip is dynamics-certified, so the control appears then rather than
-  // sitting there inert.
+  // One distinct declared tier means the control can only ever be a no-op.
+  // The detail endpoint — not this index facet — decides whether exact Tier-D
+  // evidence verifies for a selected robot-scoped clip.
   const showTier = tierOptions.length > 1 || !!tier;
 
   const rows: PickerRow[] = trimmed.length > 0
@@ -228,6 +247,23 @@ export function ReferencePickerDialog({
   const attach = useAttachStageReference(slug);
   const isStandalone = onPick !== undefined;
   const isCommitting = !isStandalone && attach.isPending;
+  const selectedDetail = useQuery({
+    queryKey: ["reference-detail", robot, selectedClipId],
+    queryFn: () => getReference(robot, selectedClipId as string),
+    enabled: selectedClipId !== null && selectedClipId.length > 0,
+    retry: false,
+    staleTime: 10_000,
+  });
+  const verifiedTierD = hasExactTierDReceipt(selectedDetail.data);
+  const selectedAdmission = selectedDetail.data?.dynamics_admission ?? null;
+  const selectedScope = selectedAdmission?.certification_scope ?? null;
+  const selectedArtifact = selectedDetail.data?.artifact_identity ?? null;
+  const selectedDeclaredTier = selectedDetail.data?.index_row.tier
+    ?? rows.find((row) => row.clip_id === selectedClipId)?.tier
+    ?? "unknown";
+  const unavailableReason = selectedAdmission?.reason?.trim()
+    || selectedArtifact?.reason?.trim()
+    || "The exact detail response did not contain a complete verified Tier-D receipt.";
 
   const doAttach = () => {
     if (!selectedClipId) return;
@@ -354,11 +390,11 @@ export function ReferencePickerDialog({
               value={tier}
               onChange={(e) => setTier(e.target.value)}
               disabled={trimmed.length > 0}
-              aria-label="Filter by retarget tier"
+              aria-label="Filter by declared tier"
             >
-              <option value="">Any tier</option>
+              <option value="">Any declared tier</option>
               {tierOptions.map(([t, n]) => (
-                <option key={t} value={t}>Tier {t} ({n})</option>
+                <option key={t} value={t}>Declared tier {t} ({n})</option>
               ))}
             </select>
           </div>
@@ -521,6 +557,71 @@ export function ReferencePickerDialog({
             </a>
           </div>
           <PreviewImage robot={robot} clipId={selectedClipId} />
+          <div style={{ marginTop: 9 }}>
+            {selectedDetail.isLoading || selectedDetail.isFetching ? (
+              <div className="rs-banner info" role="status">
+                <Icon name="loader" size={15} className="rs-spin" />
+                <span>
+                  Checking exact evidence for <code>{robot}/{selectedClipId}</code>…
+                </span>
+              </div>
+            ) : selectedDetail.isError ? (
+              <div className="rs-banner err" role="alert">
+                <Icon name="alert-triangle" size={15} />
+                <span>
+                  Evidence unavailable for <code>{robot}/{selectedClipId}</code>.
+                  You can still select and preview this candidate, but live
+                  training will block until exact Tier-D evidence verifies.
+                </span>
+              </div>
+            ) : verifiedTierD ? (
+              <div
+                className="rs-banner"
+                role="status"
+                style={{
+                  alignItems: "flex-start",
+                  background: "var(--st-emerald-bg)",
+                  color: "var(--st-emerald-fg)",
+                }}
+              >
+                <Icon name="check-circle" size={15} />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 650 }}>
+                    Tier-D exact-schedule tracking evidence verified
+                  </div>
+                  <div style={{ marginTop: 3, fontSize: 10.8, lineHeight: 1.45 }}>
+                    Current exact bytes for <code>{robot}/{selectedClipId}</code>{" "}
+                    passed {selectedScope?.claim}. This evidence does not certify{" "}
+                    {selectedScope?.not_certified.map(evidenceTermLabel).join(", ")}.
+                  </div>
+                  <details style={{ marginTop: 5, fontSize: 10.5 }}>
+                    <summary style={{ cursor: "pointer" }}>Exact evidence receipt</summary>
+                    <div className="mono" style={{ marginTop: 4, overflowWrap: "anywhere" }}>
+                      declared_tier={selectedDeclaredTier}<br />
+                      clip_sha256={selectedAdmission?.clip_sha256}<br />
+                      certificate_sha256={selectedAdmission?.certificate_digest}<br />
+                      rollout_sha256={selectedAdmission?.rollout_sha256}
+                    </div>
+                  </details>
+                </div>
+              </div>
+            ) : (
+              <div className="rs-banner warn" role="status" style={{ alignItems: "flex-start" }}>
+                <Icon name="alert-triangle" size={15} />
+                <div>
+                  <div style={{ fontWeight: 650 }}>
+                    Declared tier {selectedDeclaredTier} is not verified launch authority
+                  </div>
+                  <div style={{ marginTop: 3, fontSize: 10.8, lineHeight: 1.45 }}>
+                    {unavailableReason} You can still select and preview this
+                    kinematic candidate. Live training will block until current
+                    Tier-D exact-schedule tracking evidence verifies for these
+                    exact robot-scoped bytes.
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

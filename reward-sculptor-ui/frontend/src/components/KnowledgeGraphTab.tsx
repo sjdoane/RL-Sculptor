@@ -299,7 +299,11 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
                 style={{ width: "100%", border: 0, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
                 aria-label="Open interactive knowledge graph"
               >
-                <EmptyState icon="network" title="Interactive graph" sub="Click to open the full force-directed graph of papers, techniques, and failure modes." />
+                <EmptyState
+                  icon="network"
+                  title="Interactive graph"
+                  sub="Explore papers, techniques, failures, and the exact policy/reference/world/run artifact lineage. Hover edges for structured receipts."
+                />
               </button>
             </div>
           </div>
