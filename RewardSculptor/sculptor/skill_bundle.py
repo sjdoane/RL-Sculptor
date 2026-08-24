@@ -17,13 +17,19 @@ import shutil
 import stat
 import tempfile
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from sculptor.skill_library import SkillLibrary, SkillRecord
+from sculptor.tierd_tracker_policy import (
+    TIERD_TRACKER_POLICY_ORIGIN_KIND,
+    TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+    TierDTrackerPolicyError,
+    validate_tierd_tracker_policy_origin,
+)
 
 
 # Portable starting skills and deployment packages are deliberately different
@@ -34,7 +40,7 @@ from sculptor.skill_library import SkillLibrary, SkillRecord
 BUNDLE_KIND = "reward-sculptor-starting-skill"
 DEPLOYMENT_BUNDLE_KIND = "reward-sculptor-deployment-bundle"
 LEGACY_DEPLOYMENT_BUNDLE_KIND = "reward-sculptor-policy-bundle"
-SUPPORTED_BUNDLE_SCHEMAS = {2}
+SUPPORTED_BUNDLE_SCHEMAS = {2, 3}
 MAX_ARCHIVE_BYTES = 2 * 1024**3
 MAX_MEMBERS = 256
 MAX_EXPANDED_BYTES = 4 * 1024**3
@@ -88,6 +94,7 @@ _PORTABLE_MEMBER_LIMITS = {
     "provenance/source_config.toml": MAX_MANIFEST_BYTES,
     "provenance/selection_source.json": MAX_MANIFEST_BYTES,
     "provenance/selection_observed.json": MAX_MANIFEST_BYTES,
+    TIERD_TRACKER_POLICY_ORIGIN_MEMBER: 64 * 1024**2,
 }
 _PORTABLE_DIRECTORIES = {
     "policy", "motion", "reference", "controller", "world", "provenance",
@@ -1261,6 +1268,10 @@ def receipt_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
             "manifest_digest": record.manifest_digest,
             "identity_digest": record.identity_digest,
             "source_weights_sha256": record.source_weights_sha256,
+            "source_training_provenance": record.source_training_provenance,
+            "source_training_provenance_sha256": (
+                record.source_training_provenance_sha256
+            ),
             "reference_clip_id": record.reference_clip_id,
             "reference_robot": record.reference_robot,
             "reference_sha256": record.reference_sha256,
@@ -1340,9 +1351,34 @@ def receipt_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
             "tensor_contract_verified": record.tensor_contract_verified,
             "tensor_signature_sha256": record.tensor_signature_sha256,
             "checkpoint_sha256": record.checkpoint_sha256,
+            "source_training_provenance_sha256": (
+                record.source_training_provenance_sha256
+            ),
         },
         "components": {
             "policy_roles": list(record.policy_roles),
+            "source_training": (
+                {
+                    "kind": record.source_training_provenance.get("kind"),
+                    "status": "retained_unverified_origin_claim",
+                    "authenticity_verified": False,
+                    "bytes_retained": True,
+                    "activatable": False,
+                    "sha256": record.source_training_provenance_sha256,
+                    "summary": dict(record.source_training_provenance),
+                    "detail": (
+                        "The uploaded bundle claims these actor weights came "
+                        "from the described Tier-D tracker, and its retained "
+                        "hash chain is internally consistent. No trusted "
+                        "issuer or local Tier-D re-admission authenticates "
+                        "that claim. Its reference, reward, world, controller, "
+                        "optimizer, and mode executor remain independently "
+                        "selectable and are not activated by this skill."
+                    ),
+                }
+                if record.source_training_provenance is not None
+                else None
+            ),
             "reference": (
                 {
                     "clip_id": record.reference_clip_id,
@@ -1508,7 +1544,56 @@ class StartingSkillBundleImporter:
                 raise SkillBundleError(
                     f"unsupported bundle kind/schema: {kind!r}/{schema!r}"
                 )
+            source_training_claim = manifest.get("source_training_provenance")
+            if schema == 2:
+                if (
+                    TIERD_TRACKER_POLICY_ORIGIN_MEMBER in infos
+                    or source_training_claim is not None
+                ):
+                    raise SkillBundleError(
+                        "schema-v2 bundles cannot claim Tier-D tracker provenance",
+                        code="unsupported_member",
+                    )
+            else:
+                expected_members = {
+                    "manifest.json",
+                    "policy/weights.safetensors",
+                    "provenance/origin_policy_contract.json",
+                    TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                }
+                if set(infos) != expected_members:
+                    raise SkillBundleError(
+                        "schema-v3 tracker bundles must contain exactly actor "
+                        "safetensors, the origin policy contract, and Tier-D "
+                        "tracker provenance",
+                        code="unsupported_member",
+                    )
+                if (
+                    not isinstance(source_training_claim, dict)
+                    or set(source_training_claim) != {"kind", "member", "sha256"}
+                    or source_training_claim.get("kind")
+                    != TIERD_TRACKER_POLICY_ORIGIN_KIND
+                    or source_training_claim.get("member")
+                    != TIERD_TRACKER_POLICY_ORIGIN_MEMBER
+                ):
+                    raise SkillBundleError(
+                        "schema-v3 bundle has no canonical Tier-D tracker "
+                        "provenance descriptor",
+                        code="source_training_provenance_invalid",
+                    )
             descriptors = _parse_descriptors(manifest, set(infos))
+            if schema == 3:
+                claimed_sha = _validated_sha256(
+                    source_training_claim.get("sha256"),
+                    label="source_training_provenance.sha256",
+                )
+                if claimed_sha != descriptors[
+                    TIERD_TRACKER_POLICY_ORIGIN_MEMBER
+                ][0]:
+                    raise SkillBundleError(
+                        "source training provenance descriptor digest mismatch",
+                        code="descriptor_mismatch",
+                    )
             # Attest every described data member before any library mutation.
             # Executable/serialized/unknown formats have already failed the
             # closed member allowlist above.
@@ -1624,6 +1709,7 @@ class StartingSkillBundleImporter:
                     )
                 from sculptor.compatibility_provenance import (
                     CompatibilityProvenanceError,
+                    ORIGIN_PERSISTED,
                     provenance_fingerprint,
                     validate_compatibility_contract_provenance,
                 )
@@ -1689,6 +1775,15 @@ class StartingSkillBundleImporter:
                         expected_size=size,
                     )
                     compatibility_provenance_sources[evidence_role] = source_path
+                if schema == 3 and (
+                    actual_roles != ["actor"]
+                    or contract_provenance_status != ORIGIN_PERSISTED
+                ):
+                    raise SkillBundleError(
+                        "schema-v3 Tier-D tracker transfer permits only an "
+                        "origin-persisted actor and actor_only initialization",
+                        code="source_training_provenance_invalid",
+                    )
             elif source_contract is not None or source_contract_digest is not None:
                 if not isinstance(source_contract, dict):
                     raise SkillBundleError(
@@ -1836,6 +1931,9 @@ class StartingSkillBundleImporter:
                     ).encode("utf-8")
                 ).hexdigest()
             original_checkpoint_sha: Optional[str] = None
+            source_training_provenance: dict[str, Any] | None = None
+            source_training_provenance_sha256: str | None = None
+            source_training_provenance_source: Path | None = None
             checkpoint_meta = manifest.get("checkpoint")
             if checkpoint_meta is not None and not isinstance(checkpoint_meta, dict):
                 raise SkillBundleError("manifest.checkpoint must be an object")
@@ -1845,6 +1943,53 @@ class StartingSkillBundleImporter:
                     original_checkpoint_sha = _validated_sha256(
                         raw_sha, label="manifest.checkpoint.sha256",
                     )
+            if schema == 3:
+                if original_checkpoint_sha is None:
+                    raise SkillBundleError(
+                        "schema-v3 tracker bundle must pin its excluded raw "
+                        "source checkpoint",
+                        code="source_training_provenance_invalid",
+                    )
+                origin_member_sha, origin_member_size = descriptors[
+                    TIERD_TRACKER_POLICY_ORIGIN_MEMBER
+                ]
+                source_training_provenance_source = (
+                    workdir / "retained-source-training" / "tierd_tracker_origin.json"
+                )
+                _copy_member_verified(
+                    archive,
+                    infos[TIERD_TRACKER_POLICY_ORIGIN_MEMBER],
+                    source_training_provenance_source,
+                    expected_sha256=origin_member_sha,
+                    expected_size=origin_member_size,
+                )
+                origin_payload = _load_strict_json(
+                    source_training_provenance_source.read_bytes(),
+                    label=TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                )
+                try:
+                    source_training_provenance = (
+                        validate_tierd_tracker_policy_origin(
+                            origin_payload,
+                            source_contract=source_contract,
+                            source_checkpoint_sha256=original_checkpoint_sha,
+                            portable_actor_safetensors_sha256=str(
+                                source_weights_sha256
+                            ),
+                        )
+                    )
+                except TierDTrackerPolicyError as exc:
+                    raise SkillBundleError(
+                        f"Tier-D tracker source provenance failed verification: {exc}",
+                        code="source_training_provenance_invalid",
+                    ) from exc
+                if source_training_provenance.get("robot") != robot_slug:
+                    raise SkillBundleError(
+                        "Tier-D tracker provenance robot differs from the "
+                        "portable policy robot",
+                        code="robot_identity_invalid",
+                    )
+                source_training_provenance_sha256 = origin_member_sha
             raw_warnings = manifest.get("warnings")
             if raw_warnings is None:
                 warnings: list[str] = []
@@ -1854,6 +1999,14 @@ class StartingSkillBundleImporter:
                 raise SkillBundleError("manifest.warnings must be a list of strings")
             else:
                 warnings = list(raw_warnings)
+            if schema == 3:
+                warnings.append(
+                    "The bundle's Tier-D tracker origin is an unauthenticated "
+                    "source claim with an internally consistent hash chain. "
+                    "It is retained as provenance only; no source reference, "
+                    "reward, world, controller, or mode executor is selected "
+                    "by this import."
+                )
             raw_source_iter_index = manifest.get("iter_index", -1)
             if raw_source_iter_index is None:
                 source_iter_index = -1
@@ -1938,6 +2091,15 @@ class StartingSkillBundleImporter:
                         ),
                         compatibility_provenance_sources=(
                             compatibility_provenance_sources
+                        ),
+                        source_training_provenance=(
+                            source_training_provenance
+                        ),
+                        source_training_provenance_sha256=(
+                            source_training_provenance_sha256
+                        ),
+                        source_training_provenance_source=(
+                            source_training_provenance_source
                         ),
                         tensor_contract_verified=bool(actual_roles),
                         tensor_signature_sha256=tensor_signature_sha256,

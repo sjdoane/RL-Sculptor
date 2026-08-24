@@ -55,7 +55,7 @@ from typing import Any, Callable, Iterator, Optional
 from sculptor.mission import Mission, Stage
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # ── Defaults / constants ─────────────────────────────────────────────
 
@@ -234,6 +234,12 @@ class SkillRecord:
     manifest_schema_version: Optional[int] = None
     original_checkpoint_sha256: Optional[str] = None
     source_weights_sha256: Optional[str] = None
+    # Schema v4: an actor may come from a trusted-local Tier-D tracker export.
+    # This compact summary and its retained full origin document describe how
+    # the weights were trained; they never select the source reference/world/
+    # controller/reward or imply optimizer/exact resume.
+    source_training_provenance: Optional[dict[str, Any]] = None
+    source_training_provenance_sha256: Optional[str] = None
     reference_clip_id: Optional[str] = None
     reference_robot: Optional[str] = None
     reference_sha256: Optional[str] = None
@@ -342,6 +348,19 @@ def _import_identity_digest(record: SkillRecord) -> str:
         "initialization_modes": record.initialization_modes,
         "policy_roles": record.policy_roles,
     }
+    # Preserve schema-v2 import identities exactly.  New tracker-origin fields
+    # enter identity only when present, so existing immutable records remain
+    # readable without changing their derived skill ids.
+    if (
+        record.source_training_provenance is not None
+        or record.source_training_provenance_sha256 is not None
+    ):
+        payload["source_training_provenance"] = (
+            record.source_training_provenance
+        )
+        payload["source_training_provenance_sha256"] = (
+            record.source_training_provenance_sha256
+        )
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -647,6 +666,97 @@ def _validate_skill_record(
         if retained_roles != expected_roles:
             raise SkillLibraryError(
                 "compatibility contract evidence has no exact retained byte set"
+            )
+    source_training_file = provenance_files.get("source_training")
+    if record.source_training_provenance is None:
+        if (
+            record.source_training_provenance_sha256 is not None
+            or source_training_file is not None
+        ):
+            raise SkillLibraryError(
+                "source training provenance metadata is incomplete"
+            )
+    else:
+        if not isinstance(record.source_training_provenance, dict):
+            raise SkillLibraryError(
+                "source_training_provenance must be an object"
+            )
+        if (
+            not _is_sha256(record.source_training_provenance_sha256)
+            or source_training_file is None
+            or source_training_file["sha256"]
+            != record.source_training_provenance_sha256
+        ):
+            raise SkillLibraryError(
+                "source training provenance has no exact retained byte artifact"
+            )
+        if (
+            record.source != "imported_bundle"
+            or roles != ["actor"]
+            or modes != ["actor_only"]
+            or record.compatibility_status != "transfer_actor"
+            or record.compatibility_contract is None
+            or record.compatibility_contract_provenance_status
+            != "origin_persisted"
+            or not _is_sha256(record.original_checkpoint_sha256)
+            or record.execution_model != "policy_checkpoint"
+            or record.mode_reuse_supported
+        ):
+            raise SkillLibraryError(
+                "Tier-D tracker provenance permits imported actor-only "
+                "initialization, not resume or executor reuse"
+            )
+        forbidden_source_components = (
+            record.reference_clip_id,
+            record.reference_robot,
+            record.reference_sha256,
+            record.reference_provenance_sha256,
+            record.reference_dynamics_certificate_sha256,
+            record.reference_rollout_sha256,
+            record.reference_execution_contract_sha256,
+            record.reference_execution_boundary_sha256,
+            record.world_bundle_sha256,
+            record.world_tuple_hash,
+            record.world_selection_sha256,
+            record.active_reward_sha256,
+            record.mode_execution_manifest_digest,
+            record.controller_kind,
+            record.controller_sha256,
+        )
+        if (
+            any(value is not None for value in forbidden_source_components)
+            or record.world_artifact_sha256
+            or record.bundled_world
+        ):
+            raise SkillLibraryError(
+                "Tier-D tracker provenance cannot activate or bundle its "
+                "source reference, world, or controller"
+            )
+        try:
+            from sculptor.tierd_tracker_policy import (
+                TierDTrackerPolicyError,
+                validate_tierd_tracker_policy_summary,
+            )
+
+            summary = validate_tierd_tracker_policy_summary(
+                record.source_training_provenance,
+                source_contract=record.compatibility_contract,
+                source_checkpoint_sha256=str(record.original_checkpoint_sha256),
+                portable_actor_safetensors_sha256=str(
+                    record.source_weights_sha256
+                ),
+            )
+        except TierDTrackerPolicyError as exc:
+            raise SkillLibraryError(
+                f"source training provenance summary is invalid: {exc}"
+            ) from exc
+        if (
+            summary != record.source_training_provenance
+            or summary.get("robot") != record.robot_slug
+            or summary.get("tracker_iterations") != record.source_iter_index
+        ):
+            raise SkillLibraryError(
+                "source training provenance summary differs from skill metadata"
             )
     for field_name in (
         "reference_dynamics_certificate_sha256",
@@ -1331,6 +1441,44 @@ class SkillLibrary:
                     f"{descriptor['sha256']}, got {actual}"
                 )
 
+        if record.source_training_provenance is not None:
+            source_training_file = record.provenance_files["source_training"]
+            source_training_path = (
+                record_dir / source_training_file["filename"]
+            )
+            if source_training_path.stat().st_size > 64 * 1024**2:
+                raise SkillLibraryError(
+                    "retained source training provenance exceeds 64 MiB"
+                )
+            try:
+                from sculptor.tierd_tracker_policy import (
+                    TierDTrackerPolicyError,
+                    parse_tierd_tracker_policy_origin,
+                    validate_tierd_tracker_policy_origin,
+                )
+
+                origin = parse_tierd_tracker_policy_origin(
+                    source_training_path.read_bytes()
+                )
+                summary = validate_tierd_tracker_policy_origin(
+                    origin,
+                    source_contract=record.compatibility_contract,
+                    source_checkpoint_sha256=str(
+                        record.original_checkpoint_sha256
+                    ),
+                    portable_actor_safetensors_sha256=str(
+                        record.source_weights_sha256
+                    ),
+                )
+            except (OSError, TierDTrackerPolicyError) as exc:
+                raise SkillLibraryError(
+                    f"retained source training provenance is invalid: {exc}"
+                ) from exc
+            if summary != record.source_training_provenance:
+                raise SkillLibraryError(
+                    "retained source training provenance differs from metadata"
+                )
+
         if record.active_reward_sha256 is not None:
             reward_file = record.provenance_files["active_reward"]
             reward_path = record_dir / reward_file["filename"]
@@ -1441,6 +1589,9 @@ class SkillLibrary:
         compatibility_contract_provenance_digest: Optional[str] = None,
         compatibility_contract_provenance_status: Optional[str] = None,
         compatibility_provenance_sources: Optional[dict[str, Path]] = None,
+        source_training_provenance: Optional[dict[str, Any]] = None,
+        source_training_provenance_sha256: Optional[str] = None,
+        source_training_provenance_source: Optional[Path] = None,
         tensor_contract_verified: bool = False,
         tensor_signature_sha256: Optional[str] = None,
         compatibility_status: str,
@@ -1475,6 +1626,55 @@ class SkillLibrary:
             ckpt_sha = _file_sha256(checkpoint_path)
         else:
             ckpt_sha = ""
+        source_training_values = (
+            source_training_provenance,
+            source_training_provenance_sha256,
+            source_training_provenance_source,
+        )
+        if any(value is not None for value in source_training_values):
+            if not all(value is not None for value in source_training_values):
+                raise SkillLibraryError(
+                    "source training provenance object, digest, and bytes are "
+                    "required together"
+                )
+            assert source_training_provenance is not None
+            assert source_training_provenance_sha256 is not None
+            assert source_training_provenance_source is not None
+            source_training_provenance_source = Path(
+                source_training_provenance_source
+            )
+            if (
+                not source_training_provenance_source.is_file()
+                or source_training_provenance_source.is_symlink()
+                or not _is_sha256(source_training_provenance_sha256)
+                or _file_sha256(source_training_provenance_source)
+                != source_training_provenance_sha256
+                or compatibility_contract is None
+                or original_checkpoint_sha256 is None
+            ):
+                raise SkillLibraryError(
+                    "source training provenance bytes or binding are invalid"
+                )
+            try:
+                from sculptor.tierd_tracker_policy import (
+                    TierDTrackerPolicyError,
+                    validate_tierd_tracker_policy_summary,
+                )
+
+                source_training_provenance = (
+                    validate_tierd_tracker_policy_summary(
+                        source_training_provenance,
+                        source_contract=compatibility_contract,
+                        source_checkpoint_sha256=original_checkpoint_sha256,
+                        portable_actor_safetensors_sha256=str(
+                            source_weights_sha256
+                        ),
+                    )
+                )
+            except TierDTrackerPolicyError as exc:
+                raise SkillLibraryError(
+                    f"source training provenance summary is invalid: {exc}"
+                ) from exc
         identity_payload = {
             "manifest_digest": manifest_digest,
             "manifest_schema_version": int(manifest_schema_version),
@@ -1497,6 +1697,13 @@ class SkillLibrary:
             "initialization_modes": initialization_modes,
             "policy_roles": policy_roles,
         }
+        if source_training_provenance is not None:
+            identity_payload["source_training_provenance"] = (
+                source_training_provenance
+            )
+            identity_payload["source_training_provenance_sha256"] = (
+                source_training_provenance_sha256
+            )
         identity_digest = hashlib.sha256(
             json.dumps(
                 identity_payload, sort_keys=True, separators=(",", ":"),
@@ -1567,6 +1774,26 @@ class SkillLibrary:
                             "filename": filename,
                             "sha256": _file_sha256(stage_dir / filename),
                         }
+                    if source_training_provenance_source is not None:
+                        source_training_filename = "tierd_tracker_origin.json"
+                        source_training_destination = (
+                            stage_dir / source_training_filename
+                        )
+                        _atomic_copy(
+                            source_training_provenance_source,
+                            source_training_destination,
+                        )
+                        retained_source_sha = _file_sha256(
+                            source_training_destination
+                        )
+                        if retained_source_sha != source_training_provenance_sha256:
+                            raise SkillLibraryError(
+                                "retained source training provenance digest mismatch"
+                            )
+                        retained_provenance["source_training"] = {
+                            "filename": source_training_filename,
+                            "sha256": retained_source_sha,
+                        }
                     rec = SkillRecord(
                         schema_version=SCHEMA_VERSION,
                         skill_id=skill_id,
@@ -1604,6 +1831,14 @@ class SkillLibrary:
                         manifest_schema_version=int(manifest_schema_version),
                         original_checkpoint_sha256=original_checkpoint_sha256,
                         source_weights_sha256=source_weights_sha256,
+                        source_training_provenance=(
+                            dict(source_training_provenance)
+                            if source_training_provenance is not None
+                            else None
+                        ),
+                        source_training_provenance_sha256=(
+                            source_training_provenance_sha256
+                        ),
                         reference_clip_id=reference_clip_id,
                         reference_robot=reference_robot,
                         reference_sha256=reference_sha256,

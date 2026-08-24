@@ -65,6 +65,7 @@ from typing import Any, Optional
 EXPORT_SCHEMA_VERSION = 1
 DEPLOYMENT_BUNDLE_KIND = "reward-sculptor-deployment-bundle"
 PORTABLE_SKILL_SCHEMA_VERSION = 2
+PORTABLE_TRACKER_SKILL_SCHEMA_VERSION = 3
 PORTABLE_SKILL_BUNDLE_KIND = "reward-sculptor-starting-skill"
 
 _PORTABLE_ROBOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -701,6 +702,468 @@ def export_starting_skill_bundle(
     )
 
 
+def export_tierd_tracker_starting_skill_bundle(
+    tracker_project_dir: Path | str,
+    *,
+    robot_slug: str,
+    clip_id: str,
+    out_path: Path | str | None = None,
+    name: str | None = None,
+    references_root: Path | str | None = None,
+) -> ExportResult:
+    """Export one certified tracker checkpoint as an actor-only ``.rskill``.
+
+    The raw local ``checkpoint.pt`` is loaded only by this trusted exporter.
+    The portable archive contains canonical safetensors and immutable source
+    evidence; it excludes critic/optimizer state and does not bundle or select
+    the source reference, controller, reward, world, or phase executor.
+    """
+    from sculptor.compatibility_provenance import (
+        ORIGIN_CONTRACT_MEMBER,
+        build_origin_persisted_provenance,
+        evidence_member_paths,
+        provenance_fingerprint,
+    )
+    from sculptor.policy_contract import contract_fingerprint
+    from sculptor.refs import library as refs
+    from sculptor.refs.track import (
+        TIER_D_CERTIFICATE_SCHEMA,
+        _read_tierd_train_runtime_receipt,
+        _verify_checkpoint_policy_contract_sidecar,
+        require_tierd_admission,
+    )
+    from sculptor.tierd_tracker_policy import (
+        TIERD_TRACKER_POLICY_ORIGIN_KIND,
+        TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+        build_tierd_tracker_policy_origin,
+        canonical_json_bytes,
+    )
+
+    try:
+        from sculptor.project_robot import validate_robot_namespace
+
+        robot_slug = validate_robot_namespace(robot_slug)
+        refs.validate_clip_id(clip_id)
+    except (TypeError, ValueError) as exc:
+        raise ExportError(f"invalid Tier-D tracker source identity: {exc}") from exc
+    if out_path is not None and Path(out_path).suffix.lower() != ".rskill":
+        raise ExportError("portable starting-skill output must end in .rskill")
+
+    raw_project = Path(tracker_project_dir).expanduser()
+    if raw_project.is_symlink():
+        raise ExportError("Tier-D tracker project directory must not be a symlink")
+    try:
+        project = raw_project.resolve(strict=True)
+    except OSError as exc:
+        raise ExportError(f"Tier-D tracker project is unavailable: {exc}") from exc
+    if not project.is_dir():
+        raise ExportError("Tier-D tracker project path is not a directory")
+
+    def required_file(relative: str, *, label: str, max_bytes: int) -> Path:
+        relative_path = Path(relative)
+        candidate = project
+        for part in relative_path.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise ExportError(f"{label} must not traverse a symlink")
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(project)
+        except (OSError, ValueError) as exc:
+            raise ExportError(f"{label} is missing or escapes the tracker project") from exc
+        if not resolved.is_file():
+            raise ExportError(f"{label} is not a regular file")
+        size = resolved.stat().st_size
+        if size <= 0 or size > max_bytes:
+            raise ExportError(
+                f"{label} must contain 1..{max_bytes} bytes (found {size})"
+            )
+        return resolved
+
+    checkpoint_path = required_file(
+        "train/checkpoint.pt",
+        label="Tier-D tracker checkpoint",
+        max_bytes=2 * 1024**3,
+    )
+    checkpoint_sidecar_path = required_file(
+        "train/checkpoint.pt.policy_contract.json",
+        label="Tier-D tracker checkpoint policy-contract sidecar",
+        max_bytes=2 * 1024**2,
+    )
+    origin_contract_path = required_file(
+        "train/warm_start_effective_policy_contract.json",
+        label="Tier-D tracker origin policy contract",
+        max_bytes=2 * 1024**2,
+    )
+    metrics_path = required_file(
+        "train/metrics.json",
+        label="Tier-D tracker metrics receipt",
+        max_bytes=64 * 1024**2,
+    )
+    config_path = required_file(
+        "config.toml",
+        label="Tier-D certification config",
+        max_bytes=2 * 1024**2,
+    )
+    reward_path = required_file(
+        "rewards/current.py",
+        label="Tier-D tracker reward",
+        max_bytes=256 * 1024**2,
+    )
+
+    library_root = Path(
+        references_root if references_root is not None else refs.references_root()
+    ).expanduser().resolve()
+    try:
+        certificate = require_tierd_admission(
+            robot_slug, clip_id, root=library_root,
+        )
+        clip_dir = refs.require_confined_clip_dir(
+            robot_slug, clip_id, root=library_root,
+        )
+    except Exception as exc:  # normalize the researcher-facing export boundary
+        raise ExportError(
+            "tracker actor export requires a currently verified Tier-D "
+            f"certificate for {robot_slug}/{clip_id}: {exc}"
+        ) from exc
+    provenance_path = clip_dir / refs.PROVENANCE_FILENAME
+    if (
+        not provenance_path.is_file()
+        or provenance_path.is_symlink()
+        or provenance_path.stat().st_size > 64 * 1024**2
+    ):
+        raise ExportError("Tier-D source provenance is missing, linked, or oversized")
+    try:
+        provenance = _load_strict_json_object(
+            provenance_path.read_bytes(), label="Tier-D source provenance",
+        )
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"Tier-D source provenance is unreadable: {exc}") from exc
+    tier_d = provenance.get("tierD")
+    if not isinstance(tier_d, dict):
+        raise ExportError("Tier-D source provenance has no certificate block")
+    if certificate.certificate_sha256 != hashlib.sha256(
+        canonical_json_bytes({
+            "schema": TIER_D_CERTIFICATE_SCHEMA,
+            "robot": robot_slug,
+            "clip_id": clip_id,
+            "tierD": tier_d,
+        })
+    ).hexdigest():
+        raise ExportError(
+            "Tier-D source provenance changed after certificate admission"
+        )
+
+    execution_contract = certificate.execution_contract
+    if tier_d.get("execution_contract") != execution_contract:
+        raise ExportError(
+            "Tier-D provenance execution contract differs from admission"
+        )
+    donor = execution_contract.get("donor") or {}
+    runtime = execution_contract.get("runtime_artifacts") or {}
+    observations = runtime.get("train_observations") or []
+    if not isinstance(donor, dict) or not isinstance(runtime, dict) or not observations:
+        raise ExportError("Tier-D certificate has no complete tracker runtime chain")
+    source_contract = donor.get("policy_contract")
+    if not isinstance(source_contract, dict):
+        raise ExportError("Tier-D certificate has no tracker policy contract")
+    source_contract_digest = contract_fingerprint(source_contract)
+    identity = source_contract.get("identity") or {}
+    adapter_class = identity.get("adapter_class")
+    task_id = identity.get("task_id")
+    if not isinstance(adapter_class, str) or not adapter_class:
+        raise ExportError("Tier-D tracker policy contract has no adapter identity")
+    if not isinstance(task_id, str) or not task_id:
+        raise ExportError("Tier-D tracker policy contract has no task identity")
+
+    checkpoint_sha = _sha256(checkpoint_path)
+    config_sha = _sha256(config_path)
+    reward_sha = _sha256(reward_path)
+    sidecar_sha = _sha256(checkpoint_sidecar_path)
+    if checkpoint_sha != runtime.get("final_checkpoint_sha256"):
+        raise ExportError(
+            "tracker checkpoint bytes differ from the certified final checkpoint"
+        )
+    if config_sha != donor.get("certification_config_sha256"):
+        raise ExportError(
+            "tracker config bytes differ from the Tier-D certification config"
+        )
+    if reward_sha != runtime.get("requested_reward_module_sha256"):
+        raise ExportError(
+            "tracker reward bytes differ from the certified reward module"
+        )
+    last_observation = observations[-1]
+    if not isinstance(last_observation, dict):
+        raise ExportError("Tier-D final training observation is invalid")
+    expected_sidecar_sha = last_observation.get(
+        "output_policy_contract_sidecar_sha256"
+    )
+    if sidecar_sha != expected_sidecar_sha:
+        raise ExportError(
+            "tracker checkpoint sidecar bytes differ from the certified output"
+        )
+    try:
+        runtime_receipt = _read_tierd_train_runtime_receipt(
+            metrics_path, iteration=certificate.iterations,
+        )
+        if runtime_receipt != last_observation:
+            raise ExportError(
+                "tracker metrics receipt is not the certified final observation"
+            )
+        _verify_checkpoint_policy_contract_sidecar(
+            checkpoint_path,
+            checkpoint_sha256=checkpoint_sha,
+            expected_policy_contract=source_contract,
+            expected_policy_contract_sha256=source_contract_digest,
+            expected_sidecar_sha256=sidecar_sha,
+        )
+    except ExportError:
+        raise
+    except Exception as exc:
+        raise ExportError(
+            f"tracker runtime evidence failed verification: {exc}"
+        ) from exc
+    try:
+        checkpoint_sidecar_bytes = checkpoint_sidecar_path.read_bytes()
+        checkpoint_sidecar = _load_strict_json_object(
+            checkpoint_sidecar_bytes,
+            label="Tier-D checkpoint policy-contract sidecar",
+        )
+        origin_contract_bytes = origin_contract_path.read_bytes()
+        origin_contract = _load_strict_json_object(
+            origin_contract_bytes,
+            label="Tier-D origin policy contract",
+        )
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"tracker policy-contract evidence is unreadable: {exc}") from exc
+    if origin_contract != source_contract:
+        raise ExportError(
+            "tracker origin policy contract differs from the certified interface"
+        )
+
+    contract_provenance = build_origin_persisted_provenance(
+        contract_bytes=origin_contract_bytes,
+        policy_roles=["actor"],
+    )
+    contract_provenance_digest = provenance_fingerprint(contract_provenance)
+    if name is None:
+        display_name = f"{robot_slug}/{clip_id} Tier-D tracker actor"
+    elif not isinstance(name, str) or not name.strip():
+        raise ExportError("starting-skill name must be non-empty")
+    else:
+        display_name = name.strip()
+    if len(display_name) > 160 or any(ord(char) < 32 for char in display_name):
+        raise ExportError(
+            "starting-skill name must be at most 160 printable characters"
+        )
+
+    portable_warnings = [
+        (
+            "This artifact initializes actor weights only. Critic and optimizer "
+            "state are excluded; it is not an exact training resume."
+        ),
+        (
+            "The Tier-D certificate is retained as source-training provenance "
+            "only. Its reference, reward, world, controller, and phase executor "
+            "are not bundled, selected, or activated in the importing project."
+        ),
+        (
+            "The raw trusted-local checkpoint.pt is excluded. Upload admission "
+            "consumes only canonical safetensors and bounded JSON evidence."
+        ),
+    ]
+    if out_path is None:
+        out_dir = project / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"skill_tierd_tracker_{robot_slug}_{clip_id}.rskill"
+    else:
+        out = Path(out_path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out = out.resolve(strict=False)
+
+    with tempfile.TemporaryDirectory(prefix="rs_tierd_tracker_export_") as td:
+        stage = Path(td)
+        generated_files: list[tuple[Path, str]] = []
+        conversion_warnings: list[str] = []
+        trainable = _export_rsl_rl_safetensors(
+            checkpoint_path,
+            stage,
+            generated_files,
+            conversion_warnings,
+            include_roles=("actor",),
+        )
+        if (
+            trainable.get("file") != "policy/weights.safetensors"
+            or trainable.get("policy_roles") != ["actor"]
+            or len(generated_files) != 1
+        ):
+            detail = "; ".join(conversion_warnings) or "actor tensors unavailable"
+            raise ExportError(
+                f"Tier-D tracker checkpoint cannot produce an actor-only export: {detail}"
+            )
+        weights_path, weights_member = generated_files[0]
+        weights_sha = _sha256(weights_path)
+        weights_size = weights_path.stat().st_size
+        tracker_origin = build_tierd_tracker_policy_origin(
+            robot=robot_slug,
+            clip_id=clip_id,
+            tier_d=tier_d,
+            certificate_sha256=certificate.certificate_sha256,
+            checkpoint_policy_contract_sidecar=checkpoint_sidecar,
+            checkpoint_policy_contract_sidecar_sha256=sidecar_sha,
+            certification_config_sha256=config_sha,
+            reward_module_sha256=reward_sha,
+            portable_actor_safetensors_sha256=weights_sha,
+        )
+        tracker_origin_bytes = canonical_json_bytes(tracker_origin)
+
+        # Conversion deserializes trusted local bytes and can take time. Re-pin
+        # every source artifact and the external admission before publication.
+        expected_files = {
+            checkpoint_path: checkpoint_sha,
+            checkpoint_sidecar_path: sidecar_sha,
+            origin_contract_path: hashlib.sha256(
+                origin_contract_bytes
+            ).hexdigest(),
+            config_path: config_sha,
+            reward_path: reward_sha,
+        }
+        for source_path, expected_sha in expected_files.items():
+            if source_path.is_symlink() or _sha256(source_path) != expected_sha:
+                raise ExportError(
+                    "Tier-D tracker source bytes changed during actor conversion"
+                )
+        try:
+            require_tierd_admission(
+                robot_slug,
+                clip_id,
+                expected_clip_sha256=certificate.clip_content_sha256,
+                expected_certificate_sha256=certificate.certificate_sha256,
+                expected_rollout_sha256=certificate.rollout_sha256,
+                expected_execution_contract_sha256=(
+                    certificate.execution_contract_sha256
+                ),
+                expected_execution_boundary_sha256=(
+                    certificate.execution_boundary_sha256
+                ),
+                root=library_root,
+            )
+        except Exception as exc:
+            raise ExportError(
+                "Tier-D admission changed during actor conversion"
+            ) from exc
+
+        tracker_origin_sha = hashlib.sha256(tracker_origin_bytes).hexdigest()
+        contract_payloads = {
+            ORIGIN_CONTRACT_MEMBER: origin_contract_bytes,
+        }
+        manifest: dict[str, Any] = {
+            "schema_version": PORTABLE_TRACKER_SKILL_SCHEMA_VERSION,
+            "kind": PORTABLE_SKILL_BUNDLE_KIND,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "sculptor_version": _sculptor_version(),
+            "project": f"tierd-tracker:{robot_slug}/{clip_id}",
+            "iter_index": certificate.iterations,
+            "starting_skill": {
+                "name": display_name,
+                "weights_file": weights_member,
+                "policy_roles": ["actor"],
+                "adapter_class": adapter_class,
+                "task_id": task_id,
+                "robot_slug": robot_slug,
+            },
+            "deployment": {
+                "task_id": task_id,
+                "robot_slug": robot_slug,
+            },
+            "checkpoint": {
+                "format": "rsl_rl_pt",
+                "sha256": checkpoint_sha,
+                "included": False,
+            },
+            "network": {"trainable_checkpoint": trainable},
+            "compatibility_contract": source_contract,
+            "compatibility_contract_digest": source_contract_digest,
+            "compatibility_contract_provenance": contract_provenance,
+            "compatibility_contract_provenance_digest": (
+                contract_provenance_digest
+            ),
+            "source_training_provenance": {
+                "kind": TIERD_TRACKER_POLICY_ORIGIN_KIND,
+                "member": TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                "sha256": tracker_origin_sha,
+            },
+            "warnings": portable_warnings,
+            "files": [
+                {
+                    "path": weights_member,
+                    "sha256": weights_sha,
+                    "bytes": weights_size,
+                },
+                {
+                    "path": ORIGIN_CONTRACT_MEMBER,
+                    "sha256": hashlib.sha256(origin_contract_bytes).hexdigest(),
+                    "bytes": len(origin_contract_bytes),
+                },
+                {
+                    "path": TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                    "sha256": tracker_origin_sha,
+                    "bytes": len(tracker_origin_bytes),
+                },
+            ],
+        }
+        if evidence_member_paths(contract_provenance) != [ORIGIN_CONTRACT_MEMBER]:
+            raise ExportError(
+                "tracker compatibility provenance member set is non-canonical"
+            )
+        manifest_bytes = json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+        fd, pending_name = tempfile.mkstemp(
+            prefix=f".{out.name}.", suffix=".tmp", dir=out.parent,
+        )
+        os.close(fd)
+        pending = Path(pending_name)
+        try:
+            with zipfile.ZipFile(
+                pending,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+            ) as archive:
+                archive.writestr("manifest.json", manifest_bytes)
+                _write_zip_member_verified(
+                    archive,
+                    weights_path,
+                    weights_member,
+                    expected_sha256=weights_sha,
+                    expected_bytes=weights_size,
+                )
+                for member_name, payload in contract_payloads.items():
+                    archive.writestr(member_name, payload)
+                archive.writestr(
+                    TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                    tracker_origin_bytes,
+                )
+            with pending.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(pending, out)
+        except Exception:
+            pending.unlink(missing_ok=True)
+            raise
+
+    return ExportResult(
+        bundle_path=out,
+        manifest=manifest,
+        warnings=portable_warnings,
+    )
+
+
 def export_reference_starting_skill_bundle(
     *,
     robot_slug: str,
@@ -917,6 +1380,8 @@ def _export_rsl_rl_safetensors(
     stage: Path,
     files: list[tuple[Path, str]],
     warnings: list[str],
+    *,
+    include_roles: tuple[str, ...] = ("actor", "critic"),
 ) -> dict[str, Any]:
     """Export the trainable actor/critic maps without Python pickle.
 
@@ -943,12 +1408,24 @@ def _export_rsl_rl_safetensors(
         return {}
     if not isinstance(payload, dict):
         return {}
-    allowed = (
-        "actor_state_dict",
-        "critic_state_dict",
-        "actor_obs_normalizer_state_dict",
-        "critic_obs_normalizer_state_dict",
-    )
+    if (
+        not include_roles
+        or len(include_roles) != len(set(include_roles))
+        or any(role not in {"actor", "critic"} for role in include_roles)
+    ):
+        warnings.append("invalid safetensors policy-role export request")
+        return {}
+    allowed: list[str] = []
+    if "actor" in include_roles:
+        allowed.extend((
+            "actor_state_dict",
+            "actor_obs_normalizer_state_dict",
+        ))
+    if "critic" in include_roles:
+        allowed.extend((
+            "critic_state_dict",
+            "critic_obs_normalizer_state_dict",
+        ))
     tensors: dict[str, Any] = {}
     roles: list[str] = []
     for group in allowed:
@@ -971,7 +1448,7 @@ def _export_rsl_rl_safetensors(
     # The strict actor-export gate above has already validated this mapping;
     # preserve its tensor stats under the canonical data-only group name.
     legacy_norm = payload.get("obs_norm_state_dict")
-    if isinstance(legacy_norm, dict):
+    if "actor" in include_roles and isinstance(legacy_norm, dict):
         for key, value in legacy_norm.items():
             if isinstance(key, str) and torch.is_tensor(value):
                 tensors[

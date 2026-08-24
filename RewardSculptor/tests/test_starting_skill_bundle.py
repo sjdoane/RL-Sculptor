@@ -35,6 +35,10 @@ from sculptor.skill_bundle import (
     compatibility_for,
 )
 from sculptor.skill_library import SkillLibrary, SkillLibraryError
+from sculptor.tierd_tracker_policy import (
+    TIERD_TRACKER_POLICY_ORIGIN_KIND,
+    TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+)
 
 
 def _contract() -> dict:
@@ -153,6 +157,108 @@ def _bundle(
         for name, body in payloads.items():
             archive.writestr(name, body)
     return path
+
+
+def _tracker_summary(
+    *, contract: dict, checkpoint_sha256: str,
+    portable_actor_sha256: str, iterations: int = 2,
+) -> dict:
+    return {
+        "schema": 1,
+        "kind": TIERD_TRACKER_POLICY_ORIGIN_KIND,
+        "robot": "g1",
+        "clip_id": "certified_source",
+        "policy_roles": ["actor"],
+        "initialization_modes": ["actor_only"],
+        "optimizer_resume": False,
+        "exact_resume": False,
+        "reference_activation": False,
+        "world_activation": False,
+        "controller_activation": False,
+        "mode_reuse_supported": False,
+        "source_checkpoint_sha256": checkpoint_sha256,
+        "source_policy_contract_sha256": contract_fingerprint(contract),
+        "portable_actor_safetensors_sha256": portable_actor_sha256,
+        "checkpoint_policy_contract_sidecar_sha256": "1" * 64,
+        "certificate_sha256": "2" * 64,
+        "reference_clip_sha256": "3" * 64,
+        "rollout_sha256": "4" * 64,
+        "execution_contract_sha256": "5" * 64,
+        "execution_boundary_sha256": "6" * 64,
+        "tracker_iterations": iterations,
+        "tracked_at": "2026-08-24T00:00:00Z",
+    }
+
+
+def _tracker_bundle(tmp_path: Path, *, critic: bool = False) -> tuple[Path, dict]:
+    contract = _contract()
+    weights = tmp_path / "tracker-weights.safetensors"
+    _safe_weights(weights, tensors=_safe_tensors(critic=critic))
+    roles = ["actor", "critic"] if critic else ["actor"]
+    contract_bytes = json.dumps(contract, sort_keys=True).encode("utf-8")
+    origin_bytes = b"{}"
+    checkpoint_sha = "a" * 64
+    contract_provenance = build_origin_persisted_provenance(
+        contract_bytes=contract_bytes,
+        policy_roles=roles,
+    )
+    payloads = {
+        "policy/weights.safetensors": weights.read_bytes(),
+        ORIGIN_CONTRACT_MEMBER: contract_bytes,
+        TIERD_TRACKER_POLICY_ORIGIN_MEMBER: origin_bytes,
+    }
+    origin_sha = hashlib.sha256(origin_bytes).hexdigest()
+    manifest = {
+        "schema_version": 3,
+        "kind": BUNDLE_KIND,
+        "project": "Tier-D tracker source",
+        "iter_index": 2,
+        "starting_skill": {
+            "name": "Certified tracker actor",
+            "weights_file": "policy/weights.safetensors",
+            "policy_roles": roles,
+            "adapter_class": "A",
+            "task_id": "T",
+            "robot_slug": "g1",
+        },
+        "deployment": {"task_id": "T", "robot_slug": "g1"},
+        "checkpoint": {
+            "format": "rsl_rl_pt",
+            "sha256": checkpoint_sha,
+            "included": False,
+        },
+        "compatibility_contract": contract,
+        "compatibility_contract_digest": contract_fingerprint(contract),
+        "compatibility_contract_provenance": contract_provenance,
+        "compatibility_contract_provenance_digest": provenance_fingerprint(
+            contract_provenance
+        ),
+        "source_training_provenance": {
+            "kind": TIERD_TRACKER_POLICY_ORIGIN_KIND,
+            "member": TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+            "sha256": origin_sha,
+        },
+        "files": [
+            {
+                "path": name,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "bytes": len(body),
+            }
+            for name, body in payloads.items()
+        ],
+    }
+    path = tmp_path / "tracker-skill.rskill"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        for member_name, body in payloads.items():
+            archive.writestr(member_name, body)
+    return path, _tracker_summary(
+        contract=contract,
+        checkpoint_sha256=checkpoint_sha,
+        portable_actor_sha256=hashlib.sha256(
+            payloads["policy/weights.safetensors"]
+        ).hexdigest(),
+    )
 
 
 def _reference_payloads(
@@ -294,6 +400,85 @@ def test_safe_bundle_round_trip(tmp_path: Path) -> None:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     assert set(payload) >= {"actor_state_dict", "critic_state_dict"}
     assert record.compatibility_contract_digest == contract_fingerprint(_contract())
+
+
+def test_schema3_tracker_actor_import_retains_inert_source_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, summary = _tracker_bundle(tmp_path)
+    monkeypatch.setattr(
+        skill_bundle,
+        "validate_tierd_tracker_policy_origin",
+        lambda *_args, **_kwargs: dict(summary),
+    )
+    library = SkillLibrary(tmp_path / "library")
+
+    imported = StartingSkillBundleImporter(library).import_archive(
+        archive, target=_target(),
+    )
+    record = imported.record
+
+    assert record.policy_roles == ["actor"]
+    assert record.initialization_modes == ["actor_only"]
+    assert record.compatibility_status == "transfer_actor"
+    assert record.source_training_provenance == summary
+    assert record.reference_clip_id is None
+    assert record.reference_robot is None
+    assert record.controller_kind is None
+    assert record.bundled_world is False
+    assert imported.receipt["components"]["reference"] is None
+    source_component = imported.receipt["components"]["source_training"]
+    assert source_component["activatable"] is False
+    assert source_component["bytes_retained"] is True
+    assert source_component["status"] == "retained_unverified_origin_claim"
+    assert source_component["authenticity_verified"] is False
+    assert "No trusted issuer" in source_component["detail"]
+    assert any(
+        "unauthenticated source claim" in warning
+        for warning in imported.record.import_warnings
+    )
+    retained = (
+        library.root
+        / record.skill_id
+        / record.provenance_files["source_training"]["filename"]
+    )
+    assert retained.read_bytes() == b"{}"
+
+    retained.write_bytes(b'{"tampered":true}')
+    with pytest.raises(SkillLibraryError, match="digest mismatch"):
+        library.verify_execution_provenance(record)
+
+
+def test_schema3_tracker_bundle_rejects_critic_payload(tmp_path: Path) -> None:
+    archive, _ = _tracker_bundle(tmp_path, critic=True)
+
+    with pytest.raises(
+        SkillBundleError,
+        match="permits only an origin-persisted actor",
+    ) as exc_info:
+        StartingSkillBundleImporter(
+            SkillLibrary(tmp_path / "library")
+        ).import_archive(archive, target=_target())
+
+    assert exc_info.value.code == "source_training_provenance_invalid"
+
+
+def test_schema2_bundle_cannot_smuggle_tracker_origin_member(
+    tmp_path: Path,
+) -> None:
+    archive = _bundle(
+        tmp_path,
+        members={TIERD_TRACKER_POLICY_ORIGIN_MEMBER: b"{}"},
+    )
+
+    with pytest.raises(
+        SkillBundleError,
+        match="schema-v2 bundles cannot claim Tier-D tracker provenance",
+    ):
+        StartingSkillBundleImporter(
+            SkillLibrary(tmp_path / "library")
+        ).import_archive(archive, target=_target())
 
 
 def test_trainable_bundle_without_contract_origin_evidence_fails_closed(

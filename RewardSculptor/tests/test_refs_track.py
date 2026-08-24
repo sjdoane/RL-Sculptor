@@ -17,13 +17,19 @@ import os
 import re
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
+import sculptor.export as export_module
+import sculptor.refs.track as track_module
 from sculptor.reference import save_clip
 from sculptor.reference_clock import (
     reference_clock_from_reward_source,
@@ -61,6 +67,7 @@ from sculptor.refs.track import (
     select_tracking_phase_window,
     track_clip,
     update_provenance_tier_d,
+    validate_tierd_execution_contract,
     verify_tierd_certificate,
     write_project_config_toml,
     _build_generated_tracker_policy_contract,
@@ -68,8 +75,16 @@ from sculptor.refs.track import (
     _materialize_tierd_rollout_artifact,
     _prepare_tierd_tracking_preflight,
     _publish_and_verify_tierd_verdict,
+    _retain_verified_tierd_initial_checkpoint,
     _score_tierd_rollout_artifact,
     _verify_checkpoint_policy_contract_sidecar,
+)
+from sculptor.tierd_tracker_policy import (
+    TierDTrackerPolicyError,
+    build_tierd_tracker_policy_origin,
+    canonical_json_bytes as canonical_tracker_json_bytes,
+    parse_tierd_tracker_policy_origin,
+    validate_tierd_tracker_policy_origin,
 )
 
 
@@ -543,6 +558,148 @@ def test_generate_tracking_reward_source_compiles_and_is_callable():
     assert set(components) == {"joint_tracking", "root_tracking"}
     # Near-perfect match at phase 0 -> both kernels near 1.0.
     assert reward > 1.9
+
+
+def test_tracking_reward_scales_gated_joint_signal_in_scalar_and_batch():
+    torch = pytest.importorskip("torch")
+    src = generate_tracking_reward_source(
+        clip_id="scaled",
+        robot="g1",
+        joint_names=["knee_joint"],
+        target_joint_pos=np.zeros((2, 1)),
+        target_root_z=np.zeros(2),
+        episode_len_steps=10,
+        target_gravity=np.tile([0.0, 0.0, -1.0], (2, 1)),
+        joint_term_scale=4.0,
+        root_term_scale=1.0,
+        orientation_term_scale=0.25,
+    )
+    ns: dict = {}
+    exec(compile(src, "scaled_reward", "exec"), ns)  # noqa: S102
+
+    expected = 3.0
+    scalar, scalar_components = ns["compute_reward"](
+        {},
+        None,
+        {
+            "qpos": np.zeros(8),
+            "projected_gravity_b": np.array([0.0, 0.0, -1.0]),
+        },
+        {"episode_length": 0},
+    )
+    batched, batch_components = ns["compute_reward_batched"](
+        None,
+        None,
+        {
+            "qpos": torch.zeros(3, 1),
+            "projected_gravity_b": torch.tensor(
+                [[0.0, 0.0, -1.0]] * 3,
+            ),
+        },
+        {"episode_length": torch.zeros(3)},
+    )
+
+    assert scalar == pytest.approx(expected)
+    assert torch.allclose(batched, torch.full((3,), expected))
+    joint_coefficient = expected * 4.0 / 5.25
+    assert scalar_components["joint_tracking"] == pytest.approx(
+        joint_coefficient
+    )
+    assert float(batch_components["joint_tracking"].mean()) == pytest.approx(
+        joint_coefficient
+    )
+    hyperparameters = ns["REWARD_SPEC"]["hyperparameters"]
+    assert hyperparameters["joint_term_scale"] == 4.0
+    assert hyperparameters["root_term_scale"] == 1.0
+    assert hyperparameters["orientation_term_scale"] == 0.25
+    assert hyperparameters["reward_total_scale"] == 3.0
+    assert hyperparameters["joint_term_coefficient"] == pytest.approx(
+        joint_coefficient
+    )
+    assert ns["REWARD_SPEC"]["version"] == "tierD-track-v2"
+
+
+def test_tracking_reward_prioritizes_motion_without_rescaling_return():
+    target_gravity = np.tile([0.0, 0.0, -1.0], (2, 1))
+    src = generate_tracking_reward_source(
+        clip_id="anti-static",
+        robot="g1",
+        joint_names=["knee_joint"],
+        target_joint_pos=np.ones((2, 1)),
+        target_root_z=np.zeros(2),
+        target_gravity=target_gravity,
+        episode_len_steps=10,
+    )
+    ns: dict = {}
+    exec(compile(src, "anti_static_reward", "exec"), ns)  # noqa: S102
+
+    perfect, perfect_components = ns["compute_reward"](
+        {}, None,
+        {
+            "qpos": np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+            "projected_gravity_b": target_gravity[0],
+        },
+        {"episode_length": 0},
+    )
+    static_upright, _ = ns["compute_reward"](
+        {}, None,
+        {
+            "qpos": np.zeros(8),
+            "projected_gravity_b": target_gravity[0],
+        },
+        {"episode_length": 0},
+    )
+    joint_match_bad_root, _ = ns["compute_reward"](
+        {}, None,
+        {
+            "qpos": np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+            "projected_gravity_b": target_gravity[0],
+        },
+        {"episode_length": 0},
+    )
+
+    assert perfect == pytest.approx(3.0)
+    assert sum(perfect_components.values()) == pytest.approx(perfect)
+    assert joint_match_bad_root > static_upright
+
+    no_orientation = generate_tracking_reward_source(
+        clip_id="stable-scale",
+        robot="g1",
+        joint_names=["knee_joint"],
+        target_joint_pos=np.zeros((2, 1)),
+        target_root_z=np.zeros(2),
+        episode_len_steps=10,
+    )
+    no_orientation_ns: dict = {}
+    exec(compile(
+        no_orientation, "no_orientation_reward", "exec",
+    ), no_orientation_ns)  # noqa: S102
+    maximum, components = no_orientation_ns["compute_reward"](
+        {}, None, {"qpos": np.zeros(8)}, {"episode_length": 0},
+    )
+    assert maximum == pytest.approx(2.0)
+    assert sum(components.values()) == pytest.approx(maximum)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"joint_term_scale": 0.0}, "joint/root term scales"),
+        ({"root_term_scale": -1.0}, "root_term_scale"),
+        ({"orientation_term_scale": float("nan")}, "orientation_term_scale"),
+    ],
+)
+def test_tracking_reward_rejects_invalid_term_scales(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        generate_tracking_reward_source(
+            clip_id="scaled",
+            robot="g1",
+            joint_names=["knee_joint"],
+            target_joint_pos=np.zeros((2, 1)),
+            target_root_z=np.zeros(2),
+            episode_len_steps=10,
+            **kwargs,
+        )
 
 
 def test_generate_tracking_reward_source_phase_clocks_through_episode():
@@ -2033,6 +2190,266 @@ def test_track_clip_dry_run_completes_cpu_preflight_without_weights_or_gpu(
     assert "tierD" not in result.provenance
 
 
+def _continuation_runtime_receipt(
+    contract: dict,
+    *,
+    checkpoint_sha: str,
+    sidecar_sha: str,
+    environment_artifacts: dict | None = None,
+) -> dict:
+    receipt = copy.deepcopy(
+        contract["runtime_artifacts"]["train_observations"][0]
+    )
+    receipt.pop("iteration")
+    receipt["output_checkpoint_sha256"] = checkpoint_sha
+    receipt["output_policy_contract_sha256"] = contract["donor"][
+        "policy_contract_sha256"
+    ]
+    receipt["output_policy_contract_sidecar_sha256"] = sidecar_sha
+    if environment_artifacts is not None:
+        receipt["environment_artifacts"] = environment_artifacts
+    return receipt
+
+
+def test_verified_tracker_continuation_is_retained_and_receipted(
+    tmp_path: Path,
+) -> None:
+    clip = _make_getup_clip()
+    contract = _execution_contract(tmp_path, clip)
+    policy_contract = contract["donor"]["policy_contract"]
+    policy_contract_sha = contract["donor"]["policy_contract_sha256"]
+    expected_environment = environment_artifacts_for_phase(
+        contract["environment_artifacts"], "train",
+    )
+
+    source_dir = tmp_path / "prior" / "train"
+    source_dir.mkdir(parents=True)
+    checkpoint = source_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"trusted local tracker checkpoint")
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    sidecar = Path(str(checkpoint) + ".policy_contract.json")
+    sidecar.write_text(json.dumps({
+        "schema": 1,
+        "checkpoint_sha256": checkpoint_sha,
+        "policy_contract": policy_contract,
+        "policy_contract_sha256": policy_contract_sha,
+    }, indent=2), encoding="utf-8")
+    sidecar_sha = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    metrics = source_dir / "metrics.json"
+    source_runtime = _continuation_runtime_receipt(
+        contract,
+        checkpoint_sha=checkpoint_sha,
+        sidecar_sha=sidecar_sha,
+    )
+    metrics.write_text(json.dumps({
+        "runtime_artifacts": source_runtime,
+    }), encoding="utf-8")
+
+    work = tmp_path / "fresh-work"
+    work.mkdir()
+    retained, receipt = _retain_verified_tierd_initial_checkpoint(
+        checkpoint,
+        project_dir=work,
+        expected_policy_contract=policy_contract,
+        expected_policy_contract_sha256=policy_contract_sha,
+        expected_environment_artifacts=expected_environment,
+    )
+
+    assert retained == work / "initialization" / "checkpoint.pt"
+    assert retained.read_bytes() == checkpoint.read_bytes()
+    assert receipt["checkpoint_sha256"] == checkpoint_sha
+    assert receipt["policy_contract_sha256"] == policy_contract_sha
+    assert receipt["source_reward_module_sha256"] == source_runtime[
+        "reward_module_sha256"
+    ]
+    assert "source_checkpoint_path" not in receipt
+    assert receipt["retained_checkpoint_relpath"] == (
+        "initialization/checkpoint.pt"
+    )
+
+    checkpoint.write_bytes(b"mutated after retention")
+    assert hashlib.sha256(retained.read_bytes()).hexdigest() == checkpoint_sha
+
+
+def test_bound_runtime_contract_starts_chain_at_verified_continuation(
+    tmp_path: Path,
+) -> None:
+    contract = _execution_contract(tmp_path, _make_getup_clip())
+    runtime = contract["runtime_artifacts"]
+    receipts = copy.deepcopy(runtime["train_observations"])
+    initial_sha = "9" * 64
+    receipts[0]["input_checkpoint_requested_sha256"] = initial_sha
+    receipts[0]["input_checkpoint_loaded_sha256"] = initial_sha
+    receipts[0]["input_checkpoint_load_completed"] = True
+    initial = {
+        "schema": "reward-sculptor-tier-d-continuation-v1",
+        "checkpoint_sha256": initial_sha,
+        "checkpoint_size_bytes": 123,
+        "source_reward_module_sha256": "6" * 64,
+        "policy_contract_sha256": contract["donor"][
+            "policy_contract_sha256"
+        ],
+        "policy_contract_sidecar_sha256": "8" * 64,
+        "source_metrics_sha256": "7" * 64,
+        "retained_checkpoint_relpath": "initialization/checkpoint.pt",
+        "retained_policy_contract_sidecar_relpath": (
+            "initialization/checkpoint.pt.policy_contract.json"
+        ),
+        "retained_metrics_relpath": "initialization/source_metrics.json",
+    }
+
+    rebound = bind_tierd_runtime_artifacts(
+        contract,
+        requested_reward_module_sha256=runtime[
+            "requested_reward_module_sha256"
+        ],
+        train_receipts=receipts,
+        final_checkpoint_sha256=runtime["final_checkpoint_sha256"],
+        requested_steps_per_iteration=runtime["requested_training"][
+            "steps_per_iteration"
+        ],
+        requested_seed=runtime["requested_training"]["seed"],
+        requested_num_envs=runtime["requested_training"]["num_envs"],
+        initial_checkpoint=initial,
+    )
+
+    assert rebound["runtime_artifacts"]["initial_checkpoint"] == initial
+    assert validate_tierd_execution_contract(rebound) == []
+
+    stale = copy.deepcopy(receipts)
+    stale[0]["input_checkpoint_requested_sha256"] = None
+    stale[0]["input_checkpoint_loaded_sha256"] = None
+    stale[0]["input_checkpoint_load_completed"] = False
+    with pytest.raises(TrackError, match="stale requested/loaded"):
+        bind_tierd_runtime_artifacts(
+            contract,
+            requested_reward_module_sha256=runtime[
+                "requested_reward_module_sha256"
+            ],
+            train_receipts=stale,
+            final_checkpoint_sha256=runtime["final_checkpoint_sha256"],
+            requested_steps_per_iteration=runtime["requested_training"][
+                "steps_per_iteration"
+            ],
+            requested_seed=runtime["requested_training"]["seed"],
+            requested_num_envs=runtime["requested_training"]["num_envs"],
+            initial_checkpoint=initial,
+        )
+
+
+def test_tracker_continuation_rejects_environment_mismatch(
+    tmp_path: Path,
+) -> None:
+    clip = _make_getup_clip()
+    contract = _execution_contract(tmp_path, clip)
+    policy_contract = contract["donor"]["policy_contract"]
+    policy_contract_sha = contract["donor"]["policy_contract_sha256"]
+    expected_environment = environment_artifacts_for_phase(
+        contract["environment_artifacts"], "train",
+    )
+    wrong_environment = copy.deepcopy(expected_environment)
+    wrong_environment["env_spec"]["present"] = True
+    wrong_environment["env_spec"]["sha256"] = "f" * 64
+
+    source_dir = tmp_path / "prior" / "train"
+    source_dir.mkdir(parents=True)
+    checkpoint = source_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"tracker checkpoint")
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    sidecar = Path(str(checkpoint) + ".policy_contract.json")
+    sidecar.write_text(json.dumps({
+        "schema": 1,
+        "checkpoint_sha256": checkpoint_sha,
+        "policy_contract": policy_contract,
+        "policy_contract_sha256": policy_contract_sha,
+    }), encoding="utf-8")
+    sidecar_sha = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    source_runtime = _continuation_runtime_receipt(
+        contract,
+        checkpoint_sha=checkpoint_sha,
+        sidecar_sha=sidecar_sha,
+        environment_artifacts=wrong_environment,
+    )
+    (source_dir / "metrics.json").write_text(json.dumps({
+        "runtime_artifacts": source_runtime,
+    }), encoding="utf-8")
+    work = tmp_path / "fresh-work"
+    work.mkdir()
+
+    with pytest.raises(TrackError, match="different environment artifacts"):
+        _retain_verified_tierd_initial_checkpoint(
+            checkpoint,
+            project_dir=work,
+            expected_policy_contract=policy_contract,
+            expected_policy_contract_sha256=policy_contract_sha,
+            expected_environment_artifacts=expected_environment,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("schema", "schema/phase"),
+        ("reward", "source reward"),
+        ("seed", "seed-application"),
+        ("input_chain", "load receipt is incoherent"),
+    ],
+)
+def test_tracker_continuation_rejects_malformed_runtime_authority(
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    contract = _execution_contract(tmp_path, _make_getup_clip())
+    policy_contract = contract["donor"]["policy_contract"]
+    policy_contract_sha = contract["donor"]["policy_contract_sha256"]
+    expected_environment = environment_artifacts_for_phase(
+        contract["environment_artifacts"], "train",
+    )
+    source_dir = tmp_path / "prior" / "train"
+    source_dir.mkdir(parents=True)
+    checkpoint = source_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"tracker checkpoint")
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    sidecar = Path(str(checkpoint) + ".policy_contract.json")
+    sidecar.write_text(json.dumps({
+        "schema": 1,
+        "checkpoint_sha256": checkpoint_sha,
+        "policy_contract": policy_contract,
+        "policy_contract_sha256": policy_contract_sha,
+    }), encoding="utf-8")
+    sidecar_sha = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    runtime = _continuation_runtime_receipt(
+        contract,
+        checkpoint_sha=checkpoint_sha,
+        sidecar_sha=sidecar_sha,
+    )
+    if case == "schema":
+        runtime["schema"] = "untrusted-runner"
+    elif case == "reward":
+        runtime["reward_module_sha256"] = "not-a-sha"
+    elif case == "seed":
+        runtime["seed_application"] = {}
+    else:
+        runtime["input_checkpoint_requested_sha256"] = "b" * 64
+        runtime["input_checkpoint_loaded_sha256"] = "c" * 64
+        runtime["input_checkpoint_load_completed"] = True
+    (source_dir / "metrics.json").write_text(json.dumps({
+        "runtime_artifacts": runtime,
+    }), encoding="utf-8")
+    work = tmp_path / "fresh-work"
+    work.mkdir()
+
+    with pytest.raises(TrackError, match=message):
+        _retain_verified_tierd_initial_checkpoint(
+            checkpoint,
+            project_dir=work,
+            expected_policy_contract=policy_contract,
+            expected_policy_contract_sha256=policy_contract_sha,
+            expected_environment_artifacts=expected_environment,
+        )
+
+
 def test_track_clip_missing_clip_raises(tmp_path: Path):
     root = tmp_path / "lib"
     donor = _write_donor_project(tmp_path / "donor")
@@ -2663,11 +3080,18 @@ def test_cli_refs_track_help_lists_key_options():
     runner = CliRunner()
     result = runner.invoke(app, ["refs", "track", "--help"])
     assert result.exit_code == 0
-    for opt in ("--clip-id", "--donor-project", "--iterations", "--dry-run"):
+    for opt in (
+        "--clip-id",
+        "--donor-project",
+        "--iterations",
+        "--resume-checkpoint",
+        "--dry-run",
+    ):
         assert opt in result.output
     compact_help = " ".join(result.output.replace("│", " ").split())
     assert "donor policy weights are never loaded" in compact_help.lower()
-    assert "first tracker training starts fresh" in compact_help
+    assert "initialization is either fresh" in compact_help
+    assert "adjacent runner metrics" in compact_help
     assert "tierD_rollout_<sha256>.npz" in compact_help
 
 
@@ -2996,6 +3420,240 @@ def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
         rollout_path=rollout_path,
         execution_contract=execution_contract,
         root=root)
+
+
+def test_tierd_tracker_actor_origin_binds_checkpoint_contract_and_certificate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    provenance = _certify_valid_tier_d(tmp_path, root)
+    tier_d = provenance["tierD"]
+    execution_contract = tier_d["execution_contract"]
+    source_contract = execution_contract["donor"]["policy_contract"]
+    runtime = execution_contract["runtime_artifacts"]
+    checkpoint_sha = runtime["final_checkpoint_sha256"]
+    sidecar_sha = runtime["train_observations"][-1][
+        "output_policy_contract_sidecar_sha256"
+    ]
+    source_contract_sha = execution_contract["donor"][
+        "policy_contract_sha256"
+    ]
+    sidecar = {
+        "schema": 1,
+        "checkpoint_sha256": checkpoint_sha,
+        "policy_contract": source_contract,
+        "policy_contract_sha256": source_contract_sha,
+    }
+    certificate_payload = {
+        "schema": "reward-sculptor-tier-d-certificate-v4",
+        "robot": "g1",
+        "clip_id": "getup1",
+        "tierD": tier_d,
+    }
+    certificate_sha = hashlib.sha256(
+        canonical_tracker_json_bytes(certificate_payload)
+    ).hexdigest()
+
+    origin = build_tierd_tracker_policy_origin(
+        robot="g1",
+        clip_id="getup1",
+        tier_d=tier_d,
+        certificate_sha256=certificate_sha,
+        checkpoint_policy_contract_sidecar=sidecar,
+        checkpoint_policy_contract_sidecar_sha256=sidecar_sha,
+        certification_config_sha256=execution_contract["donor"][
+            "certification_config_sha256"
+        ],
+        reward_module_sha256=runtime["requested_reward_module_sha256"],
+        portable_actor_safetensors_sha256="7" * 64,
+    )
+    parsed = parse_tierd_tracker_policy_origin(
+        canonical_tracker_json_bytes(origin)
+    )
+    summary = validate_tierd_tracker_policy_origin(
+        parsed,
+        source_contract=source_contract,
+        source_checkpoint_sha256=checkpoint_sha,
+        portable_actor_safetensors_sha256="7" * 64,
+    )
+
+    assert summary["policy_roles"] == ["actor"]
+    assert summary["initialization_modes"] == ["actor_only"]
+    assert summary["source_checkpoint_sha256"] == checkpoint_sha
+    assert summary["certificate_sha256"] == certificate_sha
+    assert summary["reference_activation"] is False
+    assert summary["world_activation"] is False
+    assert summary["controller_activation"] is False
+    assert summary["tracker_iterations"] == 2
+
+    with pytest.raises(TierDTrackerPolicyError, match="portable actor bytes"):
+        validate_tierd_tracker_policy_origin(
+            origin,
+            source_contract=source_contract,
+            source_checkpoint_sha256=checkpoint_sha,
+            portable_actor_safetensors_sha256="8" * 64,
+        )
+
+    tampered = copy.deepcopy(origin)
+    tampered["capabilities"]["reference_activation"] = True
+    with pytest.raises(TierDTrackerPolicyError, match="actor-only"):
+        validate_tierd_tracker_policy_origin(
+            tampered,
+            source_contract=source_contract,
+            source_checkpoint_sha256=checkpoint_sha,
+            portable_actor_safetensors_sha256="7" * 64,
+        )
+
+
+def test_tierd_tracker_origin_parser_rejects_duplicate_authoritative_keys() -> None:
+    with pytest.raises(TierDTrackerPolicyError, match="duplicate key"):
+        parse_tierd_tracker_policy_origin(
+            '{"schema":1,"schema":2}'
+        )
+
+
+def test_tierd_tracker_export_is_actor_only_and_excludes_source_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference_root = tmp_path / "references"
+    provenance = _certify_valid_tier_d(tmp_path, reference_root)
+    tier_d = provenance["tierD"]
+    execution_contract = tier_d["execution_contract"]
+    source_contract = execution_contract["donor"]["policy_contract"]
+    runtime = execution_contract["runtime_artifacts"]
+    last_observation = runtime["train_observations"][-1]
+
+    tracker_project = tmp_path / "tracker"
+    (tracker_project / "train").mkdir(parents=True)
+    (tracker_project / "rewards").mkdir()
+    checkpoint = tracker_project / "train" / "checkpoint.pt"
+    checkpoint.write_bytes(b"trusted-local-checkpoint")
+    sidecar = tracker_project / "train" / "checkpoint.pt.policy_contract.json"
+    sidecar.write_text(json.dumps({
+        "schema": 1,
+        "checkpoint_sha256": runtime["final_checkpoint_sha256"],
+        "policy_contract": source_contract,
+        "policy_contract_sha256": execution_contract["donor"][
+            "policy_contract_sha256"
+        ],
+    }), encoding="utf-8")
+    origin_contract = (
+        tracker_project / "train" / "warm_start_effective_policy_contract.json"
+    )
+    origin_contract.write_text(json.dumps(source_contract), encoding="utf-8")
+    (tracker_project / "train" / "metrics.json").write_text(
+        json.dumps({
+            "runtime_artifacts": {
+                key: value
+                for key, value in last_observation.items()
+                if key != "iteration"
+            }
+        }),
+        encoding="utf-8",
+    )
+    config = tracker_project / "config.toml"
+    config.write_text("[adapter]\n", encoding="utf-8")
+    reward = tracker_project / "rewards" / "current.py"
+    reward.write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+
+    real_sha256 = export_module._sha256
+    pinned_hashes = {
+        checkpoint.resolve(): runtime["final_checkpoint_sha256"],
+        sidecar.resolve(): last_observation[
+            "output_policy_contract_sidecar_sha256"
+        ],
+        config.resolve(): execution_contract["donor"][
+            "certification_config_sha256"
+        ],
+        reward.resolve(): runtime["requested_reward_module_sha256"],
+    }
+
+    def pinned_sha256(path: Path) -> str:
+        return pinned_hashes.get(Path(path).resolve(), real_sha256(Path(path)))
+
+    def actor_only_safetensors(
+        _checkpoint: Path,
+        stage: Path,
+        files: list[tuple[Path, str]],
+        _warnings: list[str],
+        *,
+        include_roles: tuple[str, ...] = ("actor", "critic"),
+    ) -> dict:
+        assert include_roles == ("actor",)
+        actor = source_contract["policy"]["actor"]
+        dimensions = [
+            source_contract["observations"]["shape"][0],
+            *actor["hidden_dims"],
+            source_contract["actions"]["shape"][0],
+        ]
+        tensors: dict[str, torch.Tensor] = {}
+        for index, (input_dim, output_dim) in enumerate(
+            zip(dimensions, dimensions[1:])
+        ):
+            layer = index * 2
+            tensors[f"actor_state_dict::mlp.{layer}.weight"] = torch.zeros(
+                output_dim, input_dim,
+            )
+            tensors[f"actor_state_dict::mlp.{layer}.bias"] = torch.zeros(
+                output_dim,
+            )
+        tensors["actor_state_dict::distribution.std_param"] = torch.ones(
+            dimensions[-1],
+        )
+        weights = stage / "policy_weights.safetensors"
+        save_file(
+            tensors,
+            str(weights),
+            metadata={"format": "reward-sculptor-rsl-rl-v1"},
+        )
+        files.append((weights, "policy/weights.safetensors"))
+        return {
+            "file": "policy/weights.safetensors",
+            "format": "reward-sculptor-rsl-rl-v1",
+            "policy_roles": ["actor"],
+        }
+
+    monkeypatch.setattr(export_module, "_sha256", pinned_sha256)
+    monkeypatch.setattr(
+        export_module,
+        "_export_rsl_rl_safetensors",
+        actor_only_safetensors,
+    )
+    monkeypatch.setattr(
+        track_module,
+        "_verify_checkpoint_policy_contract_sidecar",
+        lambda *_args, **_kwargs: None,
+    )
+    out = tmp_path / "tracker-actor.rskill"
+
+    result = export_module.export_tierd_tracker_starting_skill_bundle(
+        tracker_project,
+        robot_slug="g1",
+        clip_id="getup1",
+        out_path=out,
+        references_root=reference_root,
+    )
+
+    assert result.manifest["schema_version"] == 3
+    assert result.manifest["starting_skill"]["policy_roles"] == ["actor"]
+    with zipfile.ZipFile(out, "r") as archive:
+        members = set(archive.namelist())
+        assert members == {
+            "manifest.json",
+            "policy/weights.safetensors",
+            "provenance/origin_policy_contract.json",
+            "provenance/tierd_tracker_origin.json",
+        }
+        assert not any(name.endswith(".pt") for name in members)
+        assert not any(name.startswith("motion/") for name in members)
+        exported_weights = tmp_path / "exported-weights.safetensors"
+        exported_weights.write_bytes(
+            archive.read("policy/weights.safetensors")
+        )
+    with safe_open(exported_weights, framework="pt", device="cpu") as handle:
+        assert handle.keys()
+        assert all(key.startswith("actor_") for key in handle.keys())
 
 
 def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Path):
@@ -3677,8 +4335,12 @@ def test_orientation_term_rewards_matching_attitude(tmp_path):
     tipped = {"qpos": np.zeros(11), "projected_gravity_b": np.array([1.0, 0.0, 0.0])}
     _, c_up = mod.compute_reward(None, None, upright, info)
     _, c_tip = mod.compute_reward(None, None, tipped, info)
-    assert c_up["orientation_tracking"] == pytest.approx(1.0)
-    assert c_tip["orientation_tracking"] < 0.2
+    assert c_up["orientation_tracking"] == pytest.approx(
+        mod.ORIENTATION_TERM_COEFFICIENT
+    )
+    assert c_tip["orientation_tracking"] < (
+        0.2 * mod.ORIENTATION_TERM_COEFFICIENT
+    )
 
 
 def test_scalar_and_batched_orientation_agree(tmp_path):

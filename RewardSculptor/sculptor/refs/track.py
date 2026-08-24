@@ -124,6 +124,20 @@ ROOT_ERR_WEIGHT = 40.0
 #: reward also tracks joints, so orientation is one of three terms, not half.
 ORIENTATION_ERR_WEIGHT = 4.0
 
+# Relative masses for the generated Tier-D imitation terms.  The certificate
+# gates joint-position and root-height tracking; projected orientation is
+# useful stabilizing supervision but is deliberately measured-only.  Earlier
+# equal additive masses let a policy collect most of the available reward by
+# staying upright near the correct height while holding the support leg close
+# to a static pose.  Give the gated joint trajectory the dominant mass while
+# retaining root and orientation guidance.  These are reward-shaping values,
+# never certification thresholds.  The generator normalizes them back to the
+# historical perfect-return scale (2 without orientation, 3 with it), so the
+# change reallocates credit without also changing PPO/value-target scale.
+JOINT_TERM_SCALE = 4.0
+ROOT_TERM_SCALE = 1.0
+ORIENTATION_TERM_SCALE = 0.25
+
 #: Default training budget — small iteration count x modest steps/iter,
 #: comfortably under an hour on an RTX 5070 (§mission: "1500-3000 steps
 #: x 2-3 iters"). `--iterations` overrides the iteration count only;
@@ -167,6 +181,7 @@ TIER_D_REFERENCE_CADENCE = "generated-target-control-phase-clock-v3"
 REFERENCE_TARGET_SAMPLING = "nearest_frame_endpoint_inclusive"
 TIER_D_RUNTIME_ARTIFACT_SCHEMA = "reward-sculptor-tier-d-runtime-artifacts-v2"
 RUNNER_RUNTIME_ARTIFACT_SCHEMA = "reward-sculptor-runner-artifacts-v2"
+TIER_D_CONTINUATION_SCHEMA = "reward-sculptor-tier-d-continuation-v1"
 _TIER_D_VERSION_KEYS = ("torch", "mjlab", "rsl_rl", "adapter")
 
 TIER_D_CERTIFICATION_SCOPE: dict[str, Any] = {
@@ -1142,6 +1157,64 @@ def build_tierd_execution_contract(
     return base
 
 
+def _canonical_tierd_initial_checkpoint(value: Any) -> dict[str, Any]:
+    """Validate the immutable receipt for a trusted local continuation.
+
+    A continuation is not an optimizer resume claim.  It is an exact,
+    policy-contract-compatible tracker checkpoint used to initialize the next
+    bounded certification attempt.  The source and retained copies are both
+    content addressed so moving the original work directory cannot change the
+    scientific identity of the new run.
+    """
+    if not isinstance(value, dict):
+        raise TrackError("Tier-D initial checkpoint receipt must be an object")
+    required = {
+        "schema",
+        "checkpoint_sha256",
+        "checkpoint_size_bytes",
+        "source_reward_module_sha256",
+        "policy_contract_sha256",
+        "policy_contract_sidecar_sha256",
+        "source_metrics_sha256",
+        "retained_checkpoint_relpath",
+        "retained_policy_contract_sidecar_relpath",
+        "retained_metrics_relpath",
+    }
+    if set(value) != required:
+        raise TrackError("Tier-D initial checkpoint receipt is non-canonical")
+    canonical = {key: value.get(key) for key in sorted(required)}
+    if canonical["schema"] != TIER_D_CONTINUATION_SCHEMA:
+        raise TrackError("Tier-D initial checkpoint schema is unsupported")
+    for key in (
+        "checkpoint_sha256",
+        "source_reward_module_sha256",
+        "policy_contract_sha256",
+        "policy_contract_sidecar_sha256",
+        "source_metrics_sha256",
+    ):
+        if not _is_sha256(canonical[key]):
+            raise TrackError(f"Tier-D initial checkpoint {key} is invalid")
+    if (
+        not isinstance(canonical["checkpoint_size_bytes"], int)
+        or isinstance(canonical["checkpoint_size_bytes"], bool)
+        or canonical["checkpoint_size_bytes"] < 1
+    ):
+        raise TrackError("Tier-D initial checkpoint size is invalid")
+    expected_relpaths = {
+        "retained_checkpoint_relpath": "initialization/checkpoint.pt",
+        "retained_policy_contract_sidecar_relpath": (
+            "initialization/checkpoint.pt.policy_contract.json"
+        ),
+        "retained_metrics_relpath": "initialization/source_metrics.json",
+    }
+    for key, expected in expected_relpaths.items():
+        if canonical[key] != expected:
+            raise TrackError(
+                f"Tier-D initial checkpoint {key} is non-canonical"
+            )
+    return canonical
+
+
 def bind_tierd_runtime_artifacts(
     execution_contract: dict[str, Any],
     *,
@@ -1155,6 +1228,7 @@ def bind_tierd_runtime_artifacts(
     requested_rollout_episodes: int = 1,
     requested_rollout_max_steps: Optional[int] = None,
     requested_rollout_task_id: Optional[str] = None,
+    initial_checkpoint: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Bind training outputs and rollout inputs to one Tier-D receipt.
 
@@ -1223,8 +1297,27 @@ def bind_tierd_runtime_artifacts(
     ):
         raise TrackError("Tier-D requested rollout settings are invalid")
 
+    canonical_initial = (
+        _canonical_tierd_initial_checkpoint(initial_checkpoint)
+        if initial_checkpoint is not None
+        else None
+    )
+    if (
+        canonical_initial is not None
+        and canonical_initial["policy_contract_sha256"]
+        != execution_contract["donor"]["policy_contract_sha256"]
+    ):
+        raise TrackError(
+            "Tier-D initial checkpoint policy contract differs from the "
+            "generated tracker execution boundary"
+        )
+
     canonical_train: list[dict[str, Any]] = []
-    prior_checkpoint_sha: Optional[str] = None
+    prior_checkpoint_sha: Optional[str] = (
+        str(canonical_initial["checkpoint_sha256"])
+        if canonical_initial is not None
+        else None
+    )
     for expected_index, raw in enumerate(train_receipts, start=1):
         if not isinstance(raw, dict):
             raise TrackError("Tier-D training receipt must be an object")
@@ -1353,6 +1446,8 @@ def bind_tierd_runtime_artifacts(
             "requested_lane": int(execution_contract["reference"]["rollout_lane"]),
         },
     }
+    if canonical_initial is not None:
+        bound["runtime_artifacts"]["initial_checkpoint"] = canonical_initial
     bound["contract_sha256"] = _canonical_sha256(bound)
     issues = validate_tierd_execution_contract(bound)
     if issues:
@@ -1586,6 +1681,25 @@ def validate_tierd_execution_contract(contract: Any) -> list[str]:
                 ):
                     issues.append("requested training settings are invalid")
             observations = runtime_artifacts.get("train_observations")
+            initial_checkpoint = runtime_artifacts.get("initial_checkpoint")
+            if initial_checkpoint is not None:
+                try:
+                    canonical_initial = _canonical_tierd_initial_checkpoint(
+                        initial_checkpoint
+                    )
+                except TrackError as exc:
+                    issues.append(str(exc))
+                    canonical_initial = None
+                if (
+                    canonical_initial is not None
+                    and canonical_initial["policy_contract_sha256"]
+                    != donor.get("policy_contract_sha256")
+                ):
+                    issues.append(
+                        "initial checkpoint policy contract differs from donor"
+                    )
+            else:
+                canonical_initial = None
             if not isinstance(observations, list) or not observations:
                 issues.append("training runtime observations are missing")
             else:
@@ -1594,7 +1708,11 @@ def validate_tierd_execution_contract(contract: Any) -> list[str]:
                         "training observation count differs from requested "
                         "iterations"
                     )
-                prior_checkpoint_sha = None
+                prior_checkpoint_sha = (
+                    canonical_initial["checkpoint_sha256"]
+                    if canonical_initial is not None
+                    else None
+                )
                 for index, observation in enumerate(observations, start=1):
                     if not isinstance(observation, dict):
                         issues.append("training runtime observation is invalid")
@@ -2036,6 +2154,9 @@ def generate_tracking_reward_source(
     joint_err_weight: float = JOINT_ERR_WEIGHT,
     root_err_weight: float = ROOT_ERR_WEIGHT,
     orientation_err_weight: float = ORIENTATION_ERR_WEIGHT,
+    joint_term_scale: float = JOINT_TERM_SCALE,
+    root_term_scale: float = ROOT_TERM_SCALE,
+    orientation_term_scale: float = ORIENTATION_TERM_SCALE,
     root_frame: str = "origin_relative",
 ) -> str:
     """Build the PROGRAMMATIC (non-LLM) tracking reward module source.
@@ -2059,9 +2180,10 @@ def generate_tracking_reward_source(
     the module source itself rather than as a sibling file the reward
     reads at runtime.
 
-    reward = exp(-joint_err_weight * mean_joint_err_rad**2)
-           + exp(-root_err_weight  * root_z_err_m**2)
-    (§mission spec's exact two-Gaussian-kernel formula.) `joint_names` is
+    reward = joint_term_scale * exp(-joint_err_weight * mean_joint_err_rad**2)
+           + root_term_scale  * exp(-root_err_weight  * root_z_err_m**2)
+    with an optional lower-mass orientation kernel, normalized back to the
+    historical maximum return. `joint_names` is
     the SAME order as `target_joint_pos` columns and is asserted against
     `qpos`'s trailing (actuated-joint) slice length at reward-call time
     via `len(joint_names)` — a project.joint-count mismatch raises inside
@@ -2074,6 +2196,23 @@ def generate_tracking_reward_source(
     if root_frame not in {"absolute", "origin_relative"}:
         raise ValueError(
             "tracking reward root_frame must be absolute or origin_relative"
+        )
+    term_scales = {
+        "joint_term_scale": joint_term_scale,
+        "root_term_scale": root_term_scale,
+        "orientation_term_scale": orientation_term_scale,
+    }
+    for label, value in term_scales.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(f"tracking reward {label} must be finite and non-negative")
+    if float(joint_term_scale) <= 0.0 or float(root_term_scale) <= 0.0:
+        raise ValueError(
+            "tracking reward joint/root term scales must be positive"
         )
     if target_joint_pos.shape[0] != target_root_z.shape[0]:
         raise ValueError(
@@ -2102,6 +2241,22 @@ def generate_tracking_reward_source(
     # Zero weight collapses the term to a no-op for clips with no orientation
     # data, so the reward shape is identical to before for those.
     orientation_weight = orientation_err_weight if target_gravity is not None else 0.0
+    orientation_mass = (
+        float(orientation_term_scale) if target_gravity is not None else 0.0
+    )
+    term_mass_sum = (
+        float(joint_term_scale) + float(root_term_scale) + orientation_mass
+    )
+    reward_total_scale = 3.0 if target_gravity is not None else 2.0
+    joint_term_coefficient = (
+        reward_total_scale * float(joint_term_scale) / term_mass_sum
+    )
+    root_term_coefficient = (
+        reward_total_scale * float(root_term_scale) / term_mass_sum
+    )
+    orientation_term_coefficient = (
+        reward_total_scale * orientation_mass / term_mass_sum
+    )
     from sculptor.reference_clock import (
         build_reference_clock,
         reference_target_sha256,
@@ -2143,7 +2298,7 @@ from __future__ import annotations
 import numpy as np
 
 REWARD_SPEC: dict = {{
-    "version": "tierD-track-v1",
+    "version": "tierD-track-v2",
     "description": "DeepMimic-style phase-indexed tracking reward for "
                     "Tier-D certification of clip {clip_id!r}.",
     "author": "sculptor",
@@ -2164,6 +2319,13 @@ REWARD_SPEC: dict = {{
         "joint_err_weight": {joint_err_weight!r},
         "root_err_weight": {root_err_weight!r},
         "orientation_err_weight": {orientation_weight!r},
+        "joint_term_scale": {float(joint_term_scale)!r},
+        "root_term_scale": {float(root_term_scale)!r},
+        "orientation_term_scale": {float(orientation_term_scale)!r},
+        "reward_total_scale": {reward_total_scale!r},
+        "joint_term_coefficient": {joint_term_coefficient!r},
+        "root_term_coefficient": {root_term_coefficient!r},
+        "orientation_term_coefficient": {orientation_term_coefficient!r},
         "n_phase_targets": {n_phase},
         "episode_len_steps": {episode_len_steps!r},
     }},
@@ -2188,6 +2350,13 @@ ROOT_ERR_WEIGHT = {root_err_weight!r}
 # 0.0 when the clip carries no root orientation, which makes the orientation
 # term an exact no-op rather than a silently-wrong constant.
 ORIENTATION_ERR_WEIGHT = {orientation_weight!r}
+JOINT_TERM_SCALE = {float(joint_term_scale)!r}
+ROOT_TERM_SCALE = {float(root_term_scale)!r}
+ORIENTATION_TERM_SCALE = {float(orientation_term_scale)!r}
+REWARD_TOTAL_SCALE = {reward_total_scale!r}
+JOINT_TERM_COEFFICIENT = {joint_term_coefficient!r}
+ROOT_TERM_COEFFICIENT = {root_term_coefficient!r}
+ORIENTATION_TERM_COEFFICIENT = {orientation_term_coefficient!r}
 
 # Phase-indexed targets, shape (N_PHASE, N_JOINTS) / (N_PHASE,).
 TARGET_JOINT_POS = np.asarray({joint_pos_literal}, dtype=np.float64).reshape(N_PHASE, N_JOINTS)
@@ -2263,18 +2432,21 @@ def compute_reward(state, action, next_state, info):
     joint_term = float(np.exp(-JOINT_ERR_WEIGHT * mean_joint_err_sq))
     root_term = float(np.exp(-ROOT_ERR_WEIGHT * (root_err ** 2)))
 
+    joint_contribution = JOINT_TERM_COEFFICIENT * joint_term
+    root_contribution = ROOT_TERM_COEFFICIENT * root_term
     components = {{
-        "joint_tracking": joint_term,
-        "root_tracking": root_term,
+        "joint_tracking": joint_contribution,
+        "root_tracking": root_contribution,
     }}
-    reward = joint_term + root_term
+    reward = joint_contribution + root_contribution
     if TARGET_GRAVITY is not None:
         gravity = np.asarray(
             next_state["projected_gravity_b"], dtype=np.float64).reshape(-1)[-3:]
         orient_err_sq = float(np.mean((gravity - TARGET_GRAVITY[i]) ** 2))
         orient_term = float(np.exp(-ORIENTATION_ERR_WEIGHT * orient_err_sq))
-        components["orientation_tracking"] = orient_term
-        reward += orient_term
+        orientation_contribution = ORIENTATION_TERM_COEFFICIENT * orient_term
+        components["orientation_tracking"] = orientation_contribution
+        reward += orientation_contribution
     return float(reward), components
 
 
@@ -2323,10 +2495,12 @@ def compute_reward_batched(state, action, next_state, info):
         root_err = actual_delta - (target_root - root0)
     root_term = torch.exp(-ROOT_ERR_WEIGHT * root_err ** 2)
 
-    total = joint_term + root_term
+    joint_contribution = JOINT_TERM_COEFFICIENT * joint_term
+    root_contribution = ROOT_TERM_COEFFICIENT * root_term
+    total = joint_contribution + root_contribution
     components = {{
-        "joint_tracking": joint_term,
-        "root_tracking": root_term,
+        "joint_tracking": joint_contribution,
+        "root_tracking": root_contribution,
     }}
     if TARGET_GRAVITY is not None:
         target_gravity = torch.as_tensor(
@@ -2334,8 +2508,9 @@ def compute_reward_batched(state, action, next_state, info):
         gravity = next_state["projected_gravity_b"][:, -3:]
         orient_term = torch.exp(-ORIENTATION_ERR_WEIGHT * torch.mean(
             (gravity - target_gravity) ** 2, dim=-1))
-        components["orientation_tracking"] = orient_term
-        total = total + orient_term
+        orientation_contribution = ORIENTATION_TERM_COEFFICIENT * orient_term
+        components["orientation_tracking"] = orientation_contribution
+        total = total + orientation_contribution
     return total, components
 '''
 
@@ -4433,6 +4608,10 @@ class _TierDTrackingPreflight:
     requested_reward_sha256: str
     requested_num_envs: int
     receipt: dict[str, Any] = field(repr=False)
+    retained_initial_checkpoint_path: Optional[Path] = None
+    initial_checkpoint_receipt: Optional[dict[str, Any]] = field(
+        default=None, repr=False,
+    )
 
 
 def _prepare_tierd_tracking_preflight(
@@ -4447,6 +4626,7 @@ def _prepare_tierd_tracking_preflight(
     steps_per_iteration: int,
     n_episodes: int,
     seed: int,
+    resume_checkpoint: Optional[Path] = None,
     protected_paths: tuple[Path, ...] = (),
     root_frame_declaration_evidence: Optional[dict[str, Any]] = None,
     root_frame_inheritance: Optional[dict[str, Any]] = None,
@@ -4583,14 +4763,39 @@ def _prepare_tierd_tracking_preflight(
             "Tier-D adapter does not expose an exact requested num_envs"
         )
 
+    retained_initial_checkpoint_path: Optional[Path] = None
+    initial_checkpoint_receipt: Optional[dict[str, Any]] = None
+    if resume_checkpoint is not None:
+        retained_initial_checkpoint_path, initial_checkpoint_receipt = (
+            _retain_verified_tierd_initial_checkpoint(
+                resume_checkpoint,
+                project_dir=plan.project_dir,
+                expected_policy_contract=policy_contract,
+                expected_policy_contract_sha256=execution_contract["donor"][
+                    "policy_contract_sha256"
+                ],
+                expected_environment_artifacts=environment_artifacts_for_phase(
+                    environment_artifacts, "train",
+                ),
+            )
+        )
+
+    initialization: dict[str, Any] = {
+        "donor_project_role": "adapter_interface_and_config_only",
+        "first_tracker_training": "fresh_random_policy",
+        "donor_policy_weights_loaded": False,
+    }
+    if initial_checkpoint_receipt is not None:
+        initialization = {
+            "donor_project_role": "adapter_interface_and_config_only",
+            "first_tracker_training": "verified_tracker_checkpoint",
+            "donor_policy_weights_loaded": False,
+            "continuation": initial_checkpoint_receipt,
+        }
     receipt: dict[str, Any] = {
         "schema": TIER_D_PREFLIGHT_SCHEMA,
         "status": "ready",
-        "initialization": {
-            "donor_project_role": "adapter_interface_and_config_only",
-            "first_tracker_training": "fresh_random_policy",
-            "donor_policy_weights_loaded": False,
-        },
+        "initialization": initialization,
         "request": {
             "robot": robot,
             "clip_id": clip_id,
@@ -4632,6 +4837,8 @@ def _prepare_tierd_tracking_preflight(
         execution_contract=execution_contract,
         requested_reward_sha256=requested_reward_sha256,
         requested_num_envs=requested_num_envs,
+        retained_initial_checkpoint_path=retained_initial_checkpoint_path,
+        initial_checkpoint_receipt=initial_checkpoint_receipt,
         receipt=receipt,
     )
 
@@ -4715,6 +4922,188 @@ def _verify_checkpoint_policy_contract_sidecar(
         )
 
 
+def _retain_verified_tierd_initial_checkpoint(
+    checkpoint_path: Path,
+    *,
+    project_dir: Path,
+    expected_policy_contract: dict[str, Any],
+    expected_policy_contract_sha256: str,
+    expected_environment_artifacts: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    """Verify and retain a prior tracker checkpoint before GPU allocation.
+
+    Only an exact runner-produced checkpoint chain is eligible: the adjacent
+    policy-contract sidecar must bind the checkpoint bytes to the freshly
+    generated tracker interface, and the adjacent metrics receipt must bind
+    the same output bytes, sidecar, and training environment.  The three
+    inputs are copied into the fresh work directory and re-hashed so a later
+    source mutation cannot alter this run.
+    """
+
+    def _source_file(path: Path, *, label: str, max_bytes: int) -> Path:
+        candidate = Path(path).expanduser()
+        if candidate.is_symlink():
+            raise TrackError(f"{label} must not be a symlink")
+        try:
+            resolved = candidate.resolve(strict=True)
+            stat = resolved.stat()
+        except OSError as exc:
+            raise TrackError(f"cannot resolve {label}: {exc}") from exc
+        if not resolved.is_file() or stat.st_size < 1:
+            raise TrackError(f"{label} must be a non-empty regular file")
+        if stat.st_size > max_bytes:
+            raise TrackError(f"{label} exceeds the trusted local size limit")
+        return resolved
+
+    source_checkpoint = _source_file(
+        checkpoint_path,
+        label="Tier-D continuation checkpoint",
+        max_bytes=2 * 1024 * 1024 * 1024,
+    )
+    source_sidecar = _source_file(
+        Path(str(source_checkpoint) + ".policy_contract.json"),
+        label="Tier-D continuation policy-contract sidecar",
+        max_bytes=16 * 1024 * 1024,
+    )
+    source_metrics = _source_file(
+        source_checkpoint.parent / "metrics.json",
+        label="Tier-D continuation metrics receipt",
+        max_bytes=16 * 1024 * 1024,
+    )
+
+    checkpoint_sha = _file_sha256(
+        source_checkpoint, label="Tier-D continuation checkpoint",
+    )
+    sidecar_sha = _file_sha256(
+        source_sidecar, label="Tier-D continuation policy-contract sidecar",
+    )
+    metrics_sha = _file_sha256(
+        source_metrics, label="Tier-D continuation metrics receipt",
+    )
+    runtime = _read_tierd_train_runtime_receipt(source_metrics, iteration=0)
+    if (
+        runtime["schema"] != RUNNER_RUNTIME_ARTIFACT_SCHEMA
+        or runtime["phase"] != "train"
+    ):
+        raise TrackError(
+            "Tier-D continuation runtime receipt schema/phase is invalid"
+        )
+    if not _is_sha256(runtime["reward_module_sha256"]):
+        raise TrackError(
+            "Tier-D continuation source reward sha256 is invalid"
+        )
+    requested_iterations = runtime["requested_max_iterations"]
+    requested_seed = runtime["requested_seed"]
+    requested_num_envs = runtime["requested_num_envs"]
+    if (
+        not isinstance(requested_iterations, int)
+        or isinstance(requested_iterations, bool)
+        or requested_iterations < 1
+        or not _is_runtime_seed(requested_seed)
+        or not isinstance(requested_num_envs, int)
+        or isinstance(requested_num_envs, bool)
+        or requested_num_envs < 1
+    ):
+        raise TrackError(
+            "Tier-D continuation runtime training settings are invalid"
+        )
+    _canonical_seed_application(
+        runtime["seed_application"], requested_seed=requested_seed,
+    )
+    _canonical_application_receipt(
+        runtime["env_spec_application"],
+        schema="reward-sculptor-env-spec-application-v1",
+        phase="train",
+    )
+    input_requested = runtime["input_checkpoint_requested_sha256"]
+    input_loaded = runtime["input_checkpoint_loaded_sha256"]
+    input_completed = runtime["input_checkpoint_load_completed"]
+    if input_requested is None:
+        expected_input = (None, None, False)
+    elif _is_sha256(input_requested):
+        expected_input = (input_requested, input_requested, True)
+    else:
+        raise TrackError(
+            "Tier-D continuation prior checkpoint sha256 is invalid"
+        )
+    if (input_requested, input_loaded, input_completed) != expected_input:
+        raise TrackError(
+            "Tier-D continuation prior checkpoint load receipt is incoherent"
+        )
+    if runtime["output_checkpoint_sha256"] != checkpoint_sha:
+        raise TrackError(
+            "Tier-D continuation metrics do not bind the requested checkpoint"
+        )
+    if runtime["output_policy_contract_sidecar_sha256"] != sidecar_sha:
+        raise TrackError(
+            "Tier-D continuation metrics do not bind the policy-contract "
+            "sidecar"
+        )
+    if runtime["output_policy_contract_sha256"] != expected_policy_contract_sha256:
+        raise TrackError(
+            "Tier-D continuation checkpoint uses a different policy contract"
+        )
+    if runtime["environment_artifacts"] != expected_environment_artifacts:
+        raise TrackError(
+            "Tier-D continuation checkpoint was trained with different "
+            "environment artifacts"
+        )
+    _verify_checkpoint_policy_contract_sidecar(
+        source_checkpoint,
+        checkpoint_sha256=checkpoint_sha,
+        expected_policy_contract=expected_policy_contract,
+        expected_policy_contract_sha256=expected_policy_contract_sha256,
+        expected_sidecar_sha256=sidecar_sha,
+    )
+
+    retained_dir = project_dir / "initialization"
+    try:
+        retained_dir.mkdir(exist_ok=False)
+        retained_checkpoint = retained_dir / "checkpoint.pt"
+        retained_sidecar = Path(
+            str(retained_checkpoint) + ".policy_contract.json"
+        )
+        retained_metrics = retained_dir / "source_metrics.json"
+        shutil.copyfile(source_checkpoint, retained_checkpoint)
+        shutil.copyfile(source_sidecar, retained_sidecar)
+        shutil.copyfile(source_metrics, retained_metrics)
+    except OSError as exc:
+        raise TrackError(
+            f"cannot retain Tier-D continuation artifacts: {exc}"
+        ) from exc
+
+    expected_copies = (
+        (source_checkpoint, retained_checkpoint, checkpoint_sha),
+        (source_sidecar, retained_sidecar, sidecar_sha),
+        (source_metrics, retained_metrics, metrics_sha),
+    )
+    for source, retained, expected_sha in expected_copies:
+        if _file_sha256(source, label="Tier-D continuation source") != expected_sha:
+            raise TrackError(
+                "Tier-D continuation source changed while it was retained"
+            )
+        if _file_sha256(retained, label="retained Tier-D continuation") != expected_sha:
+            raise TrackError(
+                "retained Tier-D continuation bytes differ from the source"
+            )
+
+    receipt = _canonical_tierd_initial_checkpoint({
+        "schema": TIER_D_CONTINUATION_SCHEMA,
+        "checkpoint_sha256": checkpoint_sha,
+        "checkpoint_size_bytes": source_checkpoint.stat().st_size,
+        "source_reward_module_sha256": runtime["reward_module_sha256"],
+        "policy_contract_sha256": expected_policy_contract_sha256,
+        "policy_contract_sidecar_sha256": sidecar_sha,
+        "source_metrics_sha256": metrics_sha,
+        "retained_checkpoint_relpath": "initialization/checkpoint.pt",
+        "retained_policy_contract_sidecar_relpath": (
+            "initialization/checkpoint.pt.policy_contract.json"
+        ),
+        "retained_metrics_relpath": "initialization/source_metrics.json",
+    })
+    return retained_checkpoint, receipt
+
+
 def track_clip(
     *,
     clip_id: str,
@@ -4725,6 +5114,7 @@ def track_clip(
     n_episodes: int = DEFAULT_N_EPISODES,
     seed: int = 0,
     project_dir: Optional[Path] = None,
+    resume_checkpoint: Optional[Path] = None,
     dry_run: bool = False,
     library_root: Optional[Path] = None,
     progress: Optional[Any] = None,
@@ -4874,6 +5264,7 @@ def track_clip(
         steps_per_iteration=steps_per_iteration,
         n_episodes=n_episodes,
         seed=seed,
+        resume_checkpoint=resume_checkpoint,
         protected_paths=(effective_library_root, source_clip_dir),
         root_frame_declaration_evidence=declaration_evidence,
         root_frame_inheritance=root_frame_inheritance,
@@ -4932,12 +5323,24 @@ def track_clip(
 
     train_accepts_init_policy = "init_policy_path" in inspect.signature(
         adapter.train).parameters
+    if (
+        preflight.retained_initial_checkpoint_path is not None
+        and not train_accepts_init_policy
+    ):
+        raise TrackError(
+            "Tier-D adapter cannot load the verified continuation checkpoint"
+        )
 
     train_dir = project_dir / "train"
     _log(
         f"[track] training {plan.iterations} iteration(s) x "
         f"{plan.steps_per_iteration} steps -> {train_dir}")
-    ckpt_path = None
+    ckpt_path = preflight.retained_initial_checkpoint_path
+    retained_initial_sha = (
+        preflight.initial_checkpoint_receipt["checkpoint_sha256"]
+        if preflight.initial_checkpoint_receipt is not None
+        else None
+    )
     train_receipts: list[dict[str, Any]] = []
     for i in range(plan.iterations):
         _assert_local_tierd_adapter(adapter)
@@ -4948,6 +5351,16 @@ def track_clip(
         extra: dict[str, Any] = {}
         if ckpt_path is not None and train_accepts_init_policy:
             extra["init_policy_path"] = ckpt_path
+        if (
+            i == 0
+            and retained_initial_sha is not None
+            and _file_sha256(
+                ckpt_path, label="retained Tier-D continuation checkpoint",
+            ) != retained_initial_sha
+        ):
+            raise TrackError(
+                "retained Tier-D continuation changed before training"
+            )
         result = adapter.train(
             reward_module_path=plan.reward_path,
             output_dir=train_dir,
@@ -4955,6 +5368,17 @@ def track_clip(
             seed=seed,
             **extra,
         )
+        if (
+            i == 0
+            and retained_initial_sha is not None
+            and _file_sha256(
+                preflight.retained_initial_checkpoint_path,
+                label="retained Tier-D continuation checkpoint",
+            ) != retained_initial_sha
+        ):
+            raise TrackError(
+                "retained Tier-D continuation changed during training"
+            )
         ckpt_path = result.checkpoint_path
         observed_checkpoint_sha = _file_sha256(
             ckpt_path, label="Tier-D training checkpoint",
@@ -5023,6 +5447,7 @@ def track_clip(
         requested_rollout_episodes=plan.n_episodes,
         requested_rollout_max_steps=rollout_max_steps,
         requested_rollout_task_id=rollout_task_id,
+        initial_checkpoint=preflight.initial_checkpoint_receipt,
     )
 
     rollout_extra: dict[str, Any] = {

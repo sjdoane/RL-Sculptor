@@ -2891,11 +2891,12 @@ def refs_track(
         ..., "--donor-project",
         help="Existing sculpt project supplying adapter class, task/policy "
              "interface, and config only. Donor policy weights are never "
-             "loaded; the first tracker training starts fresh."),
+             "loaded; initialization is either fresh or the separately "
+             "verified --resume-checkpoint."),
     iterations: int = typer.Option(
         3, "--iterations", help="Number of adapter.train() calls "
-        "(the first starts fresh; later calls warm-start from the prior "
-        "tracker checkpoint)."),
+        "(the first starts fresh unless --resume-checkpoint is supplied; "
+        "later calls warm-start from the prior tracker checkpoint)."),
     steps_per_iteration: int = typer.Option(
         2000, "--steps-per-iteration", help="mjlab max_iterations per "
         "adapter.train() call (see MjlabAdapter.train's docstring: "
@@ -2910,6 +2911,14 @@ def refs_track(
         None, "--project-dir",
         help="Fresh non-existing throwaway project directory (default: a "
              "unique directory outside the retained reference library)."),
+    resume_checkpoint: Optional[Path] = typer.Option(
+        None,
+        "--resume-checkpoint",
+        help="Trusted local checkpoint.pt from an earlier Tier-D tracker "
+             "attempt. Its adjacent runner metrics and policy-contract "
+             "sidecar must bind the exact bytes and match this policy and "
+             "environment interface; the source reward is disclosed and the "
+             "verified artifacts are copied into the fresh work directory."),
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help="Run the complete CPU/pre-GPU donor, interface, environment, "
@@ -2924,9 +2933,12 @@ def refs_track(
     ``tierD_rollout_<sha256>.npz``; failure records ``tierD.feasible=false``
     (a useful verdict, not an error) and leaves the tier unchanged.
 
-    ``--donor-project`` contributes adapter/interface/config facts only. The
-    first generated tracker is trained from a fresh policy; this command never
-    inherits donor policy weights.
+    ``--donor-project`` contributes adapter/interface/config facts only; this
+    command never inherits donor policy weights. By default the first generated
+    tracker starts fresh. ``--resume-checkpoint`` instead permits an explicit,
+    hash-verified continuation from a prior tracker attempt with the exact same
+    policy and environment contracts; it is initialization, not a portable
+    optimizer-resume claim.
 
     The certificate is limited to exact-schedule joint-position/root-height
     tracking. It does not certify root-XY tracking, contact safety, collision
@@ -2942,6 +2954,7 @@ def refs_track(
             clip_id=clip_id, robot=robot, donor_project=donor_project,
             iterations=iterations, steps_per_iteration=steps_per_iteration,
             n_episodes=n_episodes, seed=seed, project_dir=project_dir,
+            resume_checkpoint=resume_checkpoint,
             dry_run=dry_run, progress=lambda msg: typer.echo(msg))
     except TrackError as e:
         typer.echo(f"[refs track] FAILED: {e}", err=True)
