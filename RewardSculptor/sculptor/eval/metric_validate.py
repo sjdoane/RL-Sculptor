@@ -1094,7 +1094,7 @@ def _abstract_objective_program(
             count_match = re.search(
                 r"\b(\d+|one|two|three|four|five|six)\s+"
                 r"(?:(?:distinct|separate|consecutive|phase[- ]timed)[- ]+)*"
-                r"(?:(?:one|single)[- ]+leg[- ]+)?"
+                r"(?:(?:(?:one|single)[- ]+leg|support[- ]+cycle)[- ]+)?"
                 r"(?:jumps?|hops?|leaps?)(?:[- ]+pulses?)?\b",
                 g,
             )

@@ -273,10 +273,13 @@ def _descriptor_for(
 def _required_capabilities(prompt: str) -> frozenset[str]:
     text = prompt.casefold()
     required: set[str] = set()
-    if any(token in text for token in (
+    compact_low_rails = _requests_compact_low_rail_course(prompt)
+    if compact_low_rails or any(token in text for token in (
             "walk", "run", "terrain", "parkour", "jump", "humanoid")):
         required.add("locomotion")
-    if any(token in text for token in ("jump", "parkour", "vault", "hurdle")):
+    if compact_low_rails or any(
+        token in text for token in ("jump", "parkour", "vault", "hurdle")
+    ):
         required.add("jump")
     grasp_intent = (
         any(token in text for token in (
@@ -398,11 +401,13 @@ _NUMBER_WORDS = {
     "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
     "eleven": 11, "twelve": 12,
 }
-_COURSE_NOUNS = r"(?:boxes|box|platforms?|steps?|obstacles?|blocks?|stairs?|hurdles?)"
+_COURSE_NOUNS = (
+    r"(?:boxes|box|platforms?|steps?|obstacles?|blocks?|stairs?|hurdles?|rails?)"
+)
 _COURSE_COUNT_MODIFIER = (
     r"(?:progressively|more|high-friction|low-friction|taller|higher|lower|"
     r"shorter|wider|narrower|tall|high|low|raised|staggered|ascending|"
-    r"descending|identical|small|large)"
+    r"descending|identical|fixed|small|large)"
 )
 _COUNT_RE = re.compile(
     r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")\b\s+"
@@ -437,6 +442,20 @@ def _requests_post_route_jump(prompt: str) -> bool:
     ))
 
 
+def _requests_compact_low_rail_course(prompt: str) -> bool:
+    """Recognize the named, deterministic low-rail course profile.
+
+    Keep this cue narrow so ordinary references to rails or generic hurdle
+    courses retain their existing parkour semantics.  Both forms below are
+    natural researcher-facing ways to request the profile in the UI.
+    """
+    text = prompt.casefold()
+    return bool(
+        re.search(r"\bcompact\s+low[- ]rail(?:\s+course)?\b", text)
+        or re.search(r"\blow[- ]rails?\b", text)
+    )
+
+
 def _intent(prompt: str) -> str:
     text = prompt.casefold()
     is_object = (
@@ -445,6 +464,12 @@ def _intent(prompt: str) -> str:
         and any(token in text for token in
                 ("goal", "region", "score", "into", "onto", "place", "move",
                  "push", "put", "drop", "kick", "throw", "roll", "carry")))
+    # A compact low-rail course is a deterministic reference-motion evolution
+    # profile, not a generic platform course. Route it before the broad
+    # parkour/hurdle vocabulary so the offline path preserves its exact short
+    # horizon geometry and observation interface.
+    if _requests_compact_low_rail_course(prompt):
+        return "compact_low_rails"
     # Planar obstacle-navigation cues are not parkour.  Route these before the
     # generic box/obstacle checks below so "slalom around four boxes" cannot be
     # silently rewritten as "climb three platforms" by the offline fallback.
@@ -701,6 +726,133 @@ def _author_parkour(
         },
     }
     task["shared"]["observations"]["height_scan"] = True
+
+
+_COMPACT_RAIL_FIRST_X_M = 0.35
+_COMPACT_RAIL_SPACING_M = 0.50
+_COMPACT_RAIL_SIZE_M = (0.10, 0.60, 0.06)
+_COMPACT_RAIL_FIRST_LANDING_X_M = 0.65
+_COMPACT_RAIL_LANDING_RADIUS_M = 0.30
+_COMPACT_RAIL_FINISH_OFFSET_M = 0.40
+_COMPACT_RAIL_FINISH_RADIUS_M = 0.45
+_COMPACT_RAIL_EPISODE_S = 8.0
+_COMPACT_RAIL_HOLD_S = 2.0
+
+
+def _compact_low_rail_geometry(
+    count: int,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Return the immutable geometry/topology of the compact rail profile.
+
+    The profile is deliberately expressed in ordinary fixed objects and disk
+    zones.  It does not add an event-phase observation or a second success
+    authority, so a compatible policy keeps the same height-scan plus ordered
+    region observation interface it already uses for waypoint locomotion.
+    """
+    n = max(1, min(12, int(count)))
+    objects: dict[str, Any] = {}
+    zones: dict[str, Any] = {}
+    waypoints: list[str] = []
+    rail_height = _COMPACT_RAIL_SIZE_M[2]
+    for index in range(n):
+        number = index + 1
+        rail_id = f"rail_{number:02d}"
+        waypoint_id = f"waypoint_{number:02d}"
+        rail_x = round(
+            _COMPACT_RAIL_FIRST_X_M + index * _COMPACT_RAIL_SPACING_M,
+            4,
+        )
+        landing_x = round(
+            _COMPACT_RAIL_FIRST_LANDING_X_M
+            + index * _COMPACT_RAIL_SPACING_M,
+            4,
+        )
+        objects[rail_id] = {
+            "shape": "box",
+            "fixed": True,
+            "nominal": {
+                "size_m": list(_COMPACT_RAIL_SIZE_M),
+                "rgba": [0.95, 0.18, 0.04, 1.0],
+                "pose": {
+                    "position_m": [rail_x, 0.0, rail_height / 2.0],
+                },
+            },
+        }
+        zones[waypoint_id] = {
+            "kind": "disk",
+            "center_m": [landing_x, 0.0],
+            "radius_m": _COMPACT_RAIL_LANDING_RADIUS_M,
+        }
+        waypoints.append(waypoint_id)
+
+    finish_x = round(
+        _COMPACT_RAIL_FIRST_LANDING_X_M
+        + (n - 1) * _COMPACT_RAIL_SPACING_M
+        + _COMPACT_RAIL_FINISH_OFFSET_M,
+        4,
+    )
+    zones["finish"] = {
+        "kind": "disk",
+        "center_m": [finish_x, 0.0],
+        "radius_m": _COMPACT_RAIL_FINISH_RADIUS_M,
+    }
+    waypoints.append("finish")
+    return objects, zones, waypoints
+
+
+def _author_compact_low_rails(
+    world: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    count: int = 4,
+) -> None:
+    """Author a short deterministic sequence of low transverse rails.
+
+    This is a reusable course profile rather than a robot- or policy-specific
+    environment.  The selected capability is validated elsewhere; here the
+    physical task remains ordinary ordered disk traversal with literal
+    forbidden object contacts and terminal dwell.
+    """
+    objects, zones, waypoints = _compact_low_rail_geometry(count)
+    world["shared"]["objects"] = objects
+    world["shared"]["zones"] = zones
+    world["train"] = {
+        "variations": [],
+        "curriculum": {
+            "difficulty_range": [0.0, 1.0],
+            "promotion": {
+                "signal": "waypoint_success",
+                "promote_above": 0.75,
+                "demote_below": 0.50,
+            },
+        },
+    }
+
+    task["shared"]["control_mode"] = "waypoint_following"
+    task["shared"]["goal"] = {
+        "id": "complete_compact_rail_course",
+        "type": "waypoint_sequence",
+        "waypoints": list(waypoints),
+        "success": {
+            "predicate": "sequence_complete",
+            "hold_s": _COMPACT_RAIL_HOLD_S,
+            "tolerance_m": _COMPACT_RAIL_LANDING_RADIUS_M,
+            "ordered": True,
+        },
+    }
+    task["shared"]["contacts"]["forbidden"] = [
+        ["robot:any", f"object:rail_{index + 1:02d}"]
+        for index in range(len(objects))
+    ]
+    task["shared"]["termination"].update({
+        "success_ends_episode": False,
+        "episode_length_s": _COMPACT_RAIL_EPISODE_S,
+    })
+    task["shared"]["observations"].update({
+        "height_scan": True,
+        "object_relative": [],
+        "region_relative": list(waypoints),
+    })
 
 
 def _author_slalom(
@@ -1013,6 +1165,12 @@ def _offline_author(
     )
     if intent == "uneven_terrain":
         _author_uneven(world, task)
+    elif intent == "compact_low_rails":
+        _author_compact_low_rails(
+            world,
+            task,
+            count=_parse_count(prompt, default=4),
+        )
     elif intent == "slalom":
         _author_slalom(
             world,
@@ -1042,6 +1200,63 @@ def _offline_author(
         "/task/shared/goal/waypoints": "prompt",
         "/task/shared/goal/success/predicate": "prompt",
     }
+    if intent == "compact_low_rails":
+        # The named profile and parsed cardinality determine topology. Exact
+        # geometry remains a disclosed default unless the researcher includes
+        # the values in the prompt; that keeps clarification provenance honest.
+        provenance["/world/shared/objects"] = "prompt"
+        text = prompt.casefold()
+        explicit_size = all(
+            token in text for token in ("0.10", "0.60", "0.06")
+        )
+        explicit_positions = all(
+            token in text
+            for token in ("0.35", "0.85", "1.35", "1.85")
+        )
+        explicit_landings = all(
+            token in text
+            for token in ("0.65", "1.15", "1.65", "2.15")
+        )
+        explicit_finish = "2.55" in text and "finish" in text
+        explicit_radii = "0.30" in text and "0.45" in text
+        explicit_dwell = bool(re.search(
+            r"\b(?:2|two)(?:\.0)?\s*(?:s|sec|second)", text
+        ))
+        explicit_collision_avoidance = any(token in text for token in (
+            "without touching", "avoid contact", "without contact",
+            "forbidden contact", "zero contact",
+        ))
+        for name in world["shared"]["objects"]:
+            prefix = f"/world/shared/objects/{name}"
+            if explicit_size:
+                provenance[f"{prefix}/nominal/size_m"] = "prompt"
+            if explicit_positions:
+                provenance[f"{prefix}/nominal/pose/position_m"] = "prompt"
+        for name in world["shared"]["zones"]:
+            prefix = f"/world/shared/zones/{name}"
+            if ((name == "finish" and explicit_finish)
+                    or (name != "finish" and explicit_landings)):
+                provenance[f"{prefix}/center_m"] = "prompt"
+            if explicit_radii:
+                provenance[f"{prefix}/radius_m"] = "prompt"
+        if explicit_dwell:
+            provenance["/task/shared/goal/success/hold_s"] = "prompt"
+        if explicit_radii:
+            provenance[
+                "/task/shared/goal/success/tolerance_m"
+            ] = "prompt"
+        if explicit_collision_avoidance:
+            provenance["/task/shared/contacts/forbidden"] = "prompt"
+            provenance["/task/shared/contacts/desired"] = "prompt"
+            provenance["/task/shared/contacts/terminate_on"] = "prompt"
+        if "ordered" in text:
+            provenance["/task/shared/goal/success/ordered"] = "prompt"
+        if "8" in text and any(token in text for token in (
+            "episode", "horizon", "seconds", "second", "sec",
+        )):
+            provenance[
+                "/task/shared/termination/episode_length_s"
+            ] = "prompt"
     if intent == "slalom":
         # The slalom cue and parsed cardinality directly determine object
         # topology.  Treating the collection itself as an omitted default
@@ -1544,6 +1759,161 @@ def _raise_validation(world: dict[str, Any], task: dict[str, Any]) -> None:
         raise AuthoringError("invalid authored environment:\n- " + "\n- ".join(errors))
 
 
+def _semantic_float_matches(actual: Any, expected: float) -> bool:
+    return (
+        isinstance(actual, (int, float))
+        and not isinstance(actual, bool)
+        and abs(float(actual) - float(expected)) <= 1e-9
+    )
+
+
+def _semantic_vector_matches(actual: Any, expected: Sequence[float]) -> bool:
+    return (
+        isinstance(actual, (list, tuple))
+        and len(actual) == len(expected)
+        and all(
+            _semantic_float_matches(item, target)
+            for item, target in zip(actual, expected, strict=True)
+        )
+    )
+
+
+def _raise_compact_low_rail_drift(
+    world: Mapping[str, Any],
+    task: Mapping[str, Any],
+    *,
+    requested: int,
+) -> None:
+    """Protect the named compact course from schema-valid semantic drift."""
+    expected_objects, expected_zones, waypoints = (
+        _compact_low_rail_geometry(requested)
+    )
+    shared = world.get("shared")
+    objects = shared.get("objects") if isinstance(shared, Mapping) else None
+    zones = shared.get("zones") if isinstance(shared, Mapping) else None
+    if not isinstance(objects, Mapping) or set(objects) != set(expected_objects):
+        raise AuthoringError(
+            "author model changed compact low-rail object cardinality or IDs"
+        )
+    if not isinstance(zones, Mapping) or set(zones) != set(expected_zones):
+        raise AuthoringError(
+            "author model changed compact low-rail landing/finish topology"
+        )
+
+    for name, expected in expected_objects.items():
+        actual = objects.get(name)
+        nominal = actual.get("nominal") if isinstance(actual, Mapping) else None
+        pose = nominal.get("pose") if isinstance(nominal, Mapping) else None
+        if (
+            not isinstance(actual, Mapping)
+            or actual.get("shape") != "box"
+            or actual.get("fixed") is not True
+            or not isinstance(nominal, Mapping)
+            or not _semantic_vector_matches(
+                nominal.get("size_m"), expected["nominal"]["size_m"]
+            )
+            or not isinstance(pose, Mapping)
+            or not _semantic_vector_matches(
+                pose.get("position_m"),
+                expected["nominal"]["pose"]["position_m"],
+            )
+        ):
+            raise AuthoringError(
+                f"author model changed compact low-rail geometry for {name!r}"
+            )
+
+    for name, expected in expected_zones.items():
+        actual = zones.get(name)
+        if (
+            not isinstance(actual, Mapping)
+            or actual.get("kind") != "disk"
+            or not _semantic_vector_matches(
+                actual.get("center_m"), expected["center_m"]
+            )
+            or not _semantic_float_matches(
+                actual.get("radius_m"), expected["radius_m"]
+            )
+        ):
+            raise AuthoringError(
+                f"author model changed compact low-rail zone {name!r}"
+            )
+
+    world_train = world.get("train")
+    variations = (
+        world_train.get("variations")
+        if isinstance(world_train, Mapping)
+        else None
+    )
+    if variations != []:
+        raise AuthoringError(
+            "author model made the deterministic compact low-rail geometry vary"
+        )
+
+    task_shared = task.get("shared")
+    if not isinstance(task_shared, Mapping):
+        raise AuthoringError("author model dropped compact low-rail task semantics")
+    goal = task_shared.get("goal")
+    success = goal.get("success") if isinstance(goal, Mapping) else None
+    if (
+        not isinstance(goal, Mapping)
+        or goal.get("type") != "waypoint_sequence"
+        or goal.get("waypoints") != waypoints
+        or not isinstance(success, Mapping)
+        or success.get("predicate") != "sequence_complete"
+        or success.get("ordered") is not True
+        or not _semantic_float_matches(
+            success.get("tolerance_m"), _COMPACT_RAIL_LANDING_RADIUS_M
+        )
+        or not _semantic_float_matches(
+            success.get("hold_s"), _COMPACT_RAIL_HOLD_S
+        )
+    ):
+        raise AuthoringError(
+            "author model changed compact low-rail ordered route authority"
+        )
+
+    contacts = task_shared.get("contacts")
+    expected_forbidden = [
+        ["robot:any", f"object:rail_{index + 1:02d}"]
+        for index in range(requested)
+    ]
+    if (
+        not isinstance(contacts, Mapping)
+        or contacts.get("forbidden") != expected_forbidden
+        or contacts.get("desired") != []
+        or contacts.get("terminate_on") != []
+    ):
+        raise AuthoringError(
+            "author model changed compact low-rail contact authority"
+        )
+
+    termination = task_shared.get("termination")
+    if (
+        not isinstance(termination, Mapping)
+        or termination.get("success_ends_episode") is not False
+        or not _semantic_float_matches(
+            termination.get("episode_length_s"), _COMPACT_RAIL_EPISODE_S
+        )
+    ):
+        raise AuthoringError(
+            "author model changed compact low-rail episode/dwell horizon"
+        )
+
+    observations = task_shared.get("observations")
+    if (
+        not isinstance(observations, Mapping)
+        or observations.get("proprioception") is not True
+        or observations.get("height_scan") is not True
+        or observations.get("object_relative") != []
+        or observations.get("region_relative") != waypoints
+        or observations.get("end_effector_relative", []) != []
+        or "event_sequence" in task_shared
+    ):
+        raise AuthoringError(
+            "author model changed compact low-rail policy observation interface"
+        )
+
+
 def _raise_prompt_semantic_drift(
     prompt: str, world: Mapping[str, Any], task: Mapping[str, Any],
 ) -> None:
@@ -1563,10 +1933,20 @@ def _raise_prompt_semantic_drift(
         # Novel model-only intents have no offline semantic oracle yet.  Their
         # schema/capability/build gates remain authoritative.
         return
-    if intent not in {"parkour", "slalom"}:
+    if intent not in {"parkour", "slalom", "compact_low_rails"}:
         return
-    requested = _parse_count(prompt, default=0)
+    requested = _parse_count(
+        prompt,
+        default=4 if intent == "compact_low_rails" else 0,
+    )
     if requested <= 0:
+        return
+    if intent == "compact_low_rails":
+        _raise_compact_low_rail_drift(
+            world,
+            task,
+            requested=requested,
+        )
         return
     shared = world.get("shared")
     if intent == "slalom":

@@ -25,6 +25,16 @@ from sculptor.world.task_spec import validate_task_spec
 from sculptor.world.world_spec import validate_world_spec
 
 
+_COMPACT_LOW_RAIL_PROMPT = (
+    "Build a compact low-rail course with four low fixed rails centered at "
+    "x=0.35, 0.85, 1.35, and 1.85 m at y=0. Each rail is 0.10 by 0.60 by "
+    "0.06 m. Put ordered landing disks at x=0.65, 1.15, 1.65, and 2.15 m "
+    "with radius 0.30 m, then a finish at (2.55, 0) with radius 0.45 m. "
+    "Perform four distinct support-cycle hops without touching the rails, "
+    "then hold in finish for 2 seconds in an 8 second episode."
+)
+
+
 @pytest.mark.parametrize(
     ("prompt", "robot", "goal_type"),
     [
@@ -435,6 +445,7 @@ def test_parse_count_reads_requested_number():
         "four progressively taller, high-friction boxes in a straight line",
         default=3,
     ) == 4
+    assert _parse_count("four low fixed rails", default=3) == 4
     # unquantified → nominal default
     assert _parse_count("build a parkour course", default=3) == 3
     # articles are not counts ("a course with 8 steps" is 8, not 1)
@@ -494,6 +505,91 @@ def test_intent_routing_object_vs_parkour_precedence():
     assert _intent("climb onto the platform") == "parkour"
     # specific parkour cues still win
     assert _intent("parkour course of boxes") == "parkour"
+
+
+def test_compact_low_rail_profile_is_exact_and_policy_compatible() -> None:
+    """The named UI profile must preserve exact physical and observation truth."""
+    from sculptor.world.author import _intent
+
+    assert _intent(_COMPACT_LOW_RAIL_PROMPT) == "compact_low_rails"
+    assert _intent("Build four low rails for hopping") == "compact_low_rails"
+    draft = author_environment(
+        _COMPACT_LOW_RAIL_PROMPT,
+        robot_capability_id="unitree_g1:base",
+    )
+    world = draft.world_spec
+    task = draft.task_spec
+
+    assert validate_world_spec(world) == []
+    assert validate_task_spec(task, world=world) == []
+    assert draft.clarification_plan.questions == ()
+    assert world["shared"]["robot"]["required_capabilities"] == [
+        "jump", "locomotion",
+    ]
+    assert list(world["shared"]["objects"]) == [
+        "rail_01", "rail_02", "rail_03", "rail_04",
+    ]
+    assert [
+        item["nominal"]["pose"]["position_m"]
+        for item in world["shared"]["objects"].values()
+    ] == [
+        [0.35, 0.0, 0.03],
+        [0.85, 0.0, 0.03],
+        [1.35, 0.0, 0.03],
+        [1.85, 0.0, 0.03],
+    ]
+    assert all(
+        item["shape"] == "box"
+        and item["fixed"] is True
+        and item["nominal"]["size_m"] == [0.10, 0.60, 0.06]
+        for item in world["shared"]["objects"].values()
+    )
+    assert world["shared"]["zones"] == {
+        "waypoint_01": {
+            "kind": "disk", "center_m": [0.65, 0.0], "radius_m": 0.30,
+        },
+        "waypoint_02": {
+            "kind": "disk", "center_m": [1.15, 0.0], "radius_m": 0.30,
+        },
+        "waypoint_03": {
+            "kind": "disk", "center_m": [1.65, 0.0], "radius_m": 0.30,
+        },
+        "waypoint_04": {
+            "kind": "disk", "center_m": [2.15, 0.0], "radius_m": 0.30,
+        },
+        "finish": {
+            "kind": "disk", "center_m": [2.55, 0.0], "radius_m": 0.45,
+        },
+    }
+    assert world["train"]["variations"] == []
+
+    waypoints = [
+        "waypoint_01", "waypoint_02", "waypoint_03", "waypoint_04", "finish",
+    ]
+    assert task["shared"]["goal"] == {
+        "id": "complete_compact_rail_course",
+        "type": "waypoint_sequence",
+        "waypoints": waypoints,
+        "success": {
+            "predicate": "sequence_complete",
+            "hold_s": 2.0,
+            "tolerance_m": 0.30,
+            "ordered": True,
+        },
+    }
+    assert task["shared"]["contacts"]["forbidden"] == [
+        ["robot:any", f"object:rail_{index:02d}"]
+        for index in range(1, 5)
+    ]
+    assert task["shared"]["termination"]["episode_length_s"] == 8.0
+    assert task["shared"]["termination"]["success_ends_episode"] is False
+    assert task["shared"]["observations"] == {
+        "proprioception": True,
+        "height_scan": True,
+        "object_relative": [],
+        "region_relative": waypoints,
+    }
+    assert "event_sequence" not in task["shared"]
 
 
 def test_slalom_preserves_obstacles_waypoints_and_terminal_dwell():

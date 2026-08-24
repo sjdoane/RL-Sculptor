@@ -1334,6 +1334,71 @@ def test_admission_green_path_stamps_manifest() -> None:
     assert rebuilt.manifest_hash == compiled.resolved_eval.manifest_hash
 
 
+def test_compact_low_rail_profile_compiles_and_passes_admission() -> None:
+    """Thin separated rails must not be rejected by spherical overlap bounds."""
+    from sculptor.world.author import author_environment
+
+    draft = author_environment(
+        "Build a compact low-rail course with four low rails. Perform four "
+        "distinct support-cycle hops without touching them, then hold in the "
+        "finish for 2 seconds.",
+        robot_capability_id="unitree_g1:base",
+    )
+
+    report, compiled = run_admission_gates(
+        draft.world_spec,
+        draft.task_spec,
+        settle_steps=5,
+    )
+
+    assert report.ok, [
+        violation.to_dict() for violation in report.violations
+    ]
+    assert compiled is not None
+    assert list(compiled.resolved_eval.objects) == [
+        "rail_01", "rail_02", "rail_03", "rail_04",
+    ]
+    assert compiled.resolved_eval.task_shared["termination"] == {
+        "fall": "capability_default",
+        "out_of_bounds_m": 12.0,
+        "success_ends_episode": False,
+        "episode_length_s": 8.0,
+    }
+    assert compiled.resolved_eval.task_shared["observations"] == {
+        "proprioception": True,
+        "height_scan": True,
+        "object_relative": [],
+        "region_relative": [
+            "waypoint_01", "waypoint_02", "waypoint_03", "waypoint_04",
+            "finish",
+        ],
+    }
+
+
+def test_axis_aligned_box_gate_still_rejects_real_rail_overlap() -> None:
+    from sculptor.world.author import author_environment
+    from sculptor.world.gates import _placement_gate
+
+    draft = author_environment(
+        "Build a compact low-rail course with four low rails.",
+        robot_capability_id="unitree_g1:base",
+    )
+    world = copy.deepcopy(draft.world_spec)
+    world["shared"]["objects"]["rail_02"]["nominal"]["pose"][
+        "position_m"
+    ][0] = 0.39
+
+    result = _placement_gate(world, draft.task_spec, None)
+
+    assert not result.ok
+    overlap = [
+        violation for violation in result.violations
+        if violation.code == "object_overlap"
+    ]
+    assert len(overlap) == 1
+    assert "rail_01|rail_02" in overlap[0].path
+
+
 def test_admission_returns_independent_budget_placement_and_reach_violations() -> None:
     world = _world()
     world["shared"]["obstacles"]["course"] = [

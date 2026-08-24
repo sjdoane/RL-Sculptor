@@ -44,6 +44,14 @@ class _FakeClient:
 
 
 _PARKOUR = "Learn parkour over a course of boxes."
+_COMPACT_LOW_RAIL = (
+    "Build a compact low-rail course with four low fixed rails centered at "
+    "x=0.35, 0.85, 1.35, and 1.85 m at y=0. Each rail is 0.10 by 0.60 by "
+    "0.06 m. Put ordered landing disks at x=0.65, 1.15, 1.65, and 2.15 m "
+    "with radius 0.30 m, then a finish at (2.55, 0) with radius 0.45 m. "
+    "Perform four distinct support-cycle hops without touching the rails, "
+    "then hold in finish for 2 seconds in an 8 second episode."
+)
 
 
 def _valid_spec_json(robot="unitree_g1:base"):
@@ -198,6 +206,83 @@ def test_hybrid_rejects_slalom_that_drops_post_route_jump_program() -> None:
     assert draft.task_spec["shared"]["event_sequence"]["id"] \
         == "route_jump_hold"
     assert draft.task_spec["shared"]["goal"]["success"]["hold_s"] == 0.0
+
+
+def test_hybrid_accepts_exact_compact_low_rail_profile() -> None:
+    """Presentation-only changes survive when physical/profile truth is exact."""
+    seed = author_environment(
+        _COMPACT_LOW_RAIL,
+        robot_capability_id="unitree_g1:base",
+    )
+    world = copy.deepcopy(seed.world_spec)
+    world["shared"]["objects"]["rail_01"]["nominal"]["rgba"] = [
+        0.2, 0.8, 1.0, 1.0,
+    ]
+    client = _FakeClient(json.dumps({
+        "world_spec": world,
+        "task_spec": seed.task_spec,
+        "parameter_provenance": world["meta"]["parameter_provenance"],
+    }))
+
+    draft = hybrid_author_environment(
+        _COMPACT_LOW_RAIL,
+        client=client,
+        robot_capability_id="unitree_g1:base",
+    )
+
+    assert client.calls == 1
+    assert draft.world_spec["shared"]["objects"]["rail_01"][
+        "nominal"
+    ]["rgba"] == [0.2, 0.8, 1.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["cardinality", "geometry", "observations", "episode_horizon"],
+)
+def test_hybrid_rejects_compact_low_rail_semantic_drift(drift: str) -> None:
+    """Schema-valid model output cannot weaken the named execution profile."""
+    seed = author_environment(
+        _COMPACT_LOW_RAIL,
+        robot_capability_id="unitree_g1:base",
+    )
+    world = copy.deepcopy(seed.world_spec)
+    task = copy.deepcopy(seed.task_spec)
+    if drift == "cardinality":
+        world["shared"]["objects"].pop("rail_04")
+        world["shared"]["zones"].pop("waypoint_04")
+        task["shared"]["goal"]["waypoints"].remove("waypoint_04")
+        task["shared"]["observations"]["region_relative"].remove(
+            "waypoint_04"
+        )
+        task["shared"]["contacts"]["forbidden"].pop()
+    elif drift == "geometry":
+        world["shared"]["objects"]["rail_02"]["nominal"]["size_m"][0] = 0.12
+    elif drift == "observations":
+        task["shared"]["observations"]["object_relative"] = ["rail_01"]
+    else:
+        task["shared"]["termination"]["episode_length_s"] = 9.0
+    client = _FakeClient(json.dumps({
+        "world_spec": world,
+        "task_spec": task,
+        "parameter_provenance": world["meta"]["parameter_provenance"],
+    }))
+
+    draft = hybrid_author_environment(
+        _COMPACT_LOW_RAIL,
+        client=client,
+        robot_capability_id="unitree_g1:base",
+    )
+
+    assert client.calls == 1
+    assert list(draft.world_spec["shared"]["objects"]) == [
+        "rail_01", "rail_02", "rail_03", "rail_04",
+    ]
+    assert draft.world_spec["shared"]["objects"]["rail_02"]["nominal"][
+        "size_m"
+    ] == [0.10, 0.60, 0.06]
+    assert draft.task_spec["shared"]["observations"]["object_relative"] == []
+    assert draft.task_spec["shared"]["termination"]["episode_length_s"] == 8.0
 
 
 def test_hybrid_falls_back_when_client_errors():

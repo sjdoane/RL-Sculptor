@@ -63,6 +63,21 @@ def test_explicit_repeated_hops_preserve_takeoff_landing_cardinality():
     ]
 
 
+def test_support_cycle_hops_preserve_takeoff_landing_cardinality():
+    goal = (
+        "Move forward and perform four distinct support-cycle hops over four "
+        "low rails, landing after each, then recover upright and hold still."
+    )
+    assert _abstract_objective_program(goal) == [
+        "move_forward",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "recover", "dwell",
+    ]
+
+
 def test_geometry_count_does_not_invent_repeated_jumps():
     assert _abstract_objective_program(
         "Jump over four obstacles, land, recover upright, and hold still"
