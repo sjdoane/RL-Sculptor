@@ -27,6 +27,12 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
+
+# One shared temporal authority for the synthetic landing support schedule and
+# the catalog route advances derived from it.  A landing remains airborne
+# before this normalized phase and is grounded at/after it.
+_ABSTRACT_LAND_AIR_UNTIL = 0.85
+
 from sculptor.eval.generated_metric import (
     ALLOWED_ARRAYS,
     GENERATED_FN_NAME,
@@ -837,6 +843,113 @@ def _interrupted_hold_probe(
     return probe
 
 
+def _route_first_stationary_hops_probe(
+    arrays: Mapping[str, Any], *, route_start_step: int,
+    hop_start_step: int, route_end_step: int,
+) -> tuple[dict[str, Any], int]:
+    """Move the complete route before otherwise-correct stationary hops.
+
+    The competent exemplar interleaves route travel with its hop/landing
+    cycles.  This controlled counterexample preserves its total horizontal
+    displacement, four support cycles, and terminal hold, but allocates a
+    same-duration grounded traversal before the first hop.  The later hop
+    cycles are shifted intact and frozen at the route endpoint.  A metric that
+    checks route completion and hop count independently must therefore reject
+    this probe unless it also proves that each touchdown advances the route.
+
+    The returned integer is the shifted first-hop phase boundary.  Callers use
+    it to place an ordered, distinct catalog route entirely before the hops.
+    """
+    root_source = arrays.get("root_link_pos_w")
+    if not (
+        isinstance(root_source, np.ndarray)
+        and root_source.ndim == 3
+        and root_source.shape[0] >= 3
+    ):
+        return ({
+            key: value.copy() if hasattr(value, "copy") else value
+            for key, value in arrays.items()
+        }, max(0, int(hop_start_step)))
+
+    source_steps = int(root_source.shape[0])
+    route_start = min(source_steps - 3, max(0, int(route_start_step)))
+    hop_start = min(source_steps - 2, max(route_start + 1, int(hop_start_step)))
+    route_end = min(source_steps - 1, max(hop_start + 1, int(route_end_step)))
+    inserted_steps = route_end - hop_start
+    shifted_hop_start = hop_start + inserted_steps
+
+    probe: dict[str, Any] = {}
+    for key, value in arrays.items():
+        if (
+            isinstance(value, np.ndarray)
+            and value.ndim >= 1
+            and value.shape[0] == source_steps
+        ):
+            inserted = np.repeat(
+                value[hop_start:hop_start + 1], inserted_steps, axis=0,
+            )
+            probe[key] = np.concatenate(
+                (value[:hop_start], inserted, value[hop_start:]), axis=0,
+            )
+        else:
+            probe[key] = value.copy() if hasattr(value, "copy") else value
+
+    root = probe["root_link_pos_w"]
+    route_samples = shifted_hop_start - route_start
+    route_alpha = np.linspace(0.0, 1.0, route_samples, dtype=np.float64)
+    start_xy = root_source[route_start, :, :2]
+    end_xy = root_source[route_end - 1, :, :2]
+    root[route_start:shifted_hop_start, :, :2] = (
+        (1.0 - route_alpha)[:, None, None] * start_xy[None, ...]
+        + route_alpha[:, None, None] * end_xy[None, ...]
+    )
+    root[route_start:shifted_hop_start, :, 2] = root_source[
+        route_start, :, 2
+    ]
+    root[shifted_hop_start:, :, :2] = end_xy[None, ...]
+
+    for contact_name in ("left_foot_contact", "right_foot_contact"):
+        contact = probe.get(contact_name)
+        if isinstance(contact, np.ndarray) and contact.shape[0] == root.shape[0]:
+            contact[route_start:shifted_hop_start] = 1.0
+
+    joint_pos = probe.get("joint_pos")
+    source_joint_pos = arrays.get("joint_pos")
+    if (
+        isinstance(joint_pos, np.ndarray)
+        and isinstance(source_joint_pos, np.ndarray)
+        and source_joint_pos.shape[0] == source_steps
+    ):
+        gait = source_joint_pos[route_start:hop_start]
+        if gait.shape[0] > 0:
+            gait_indices = np.arange(route_samples) % gait.shape[0]
+            joint_pos[route_start:shifted_hop_start] = gait[gait_indices]
+        joint_vel = probe.get("joint_vel")
+        if isinstance(joint_vel, np.ndarray) and joint_vel.shape == joint_pos.shape:
+            joint_vel[...] = np.gradient(joint_pos, axis=0) / 0.02
+        default_pose = probe.get("default_pose_rms")
+        if (
+            isinstance(default_pose, np.ndarray)
+            and default_pose.shape == joint_pos.shape[:-1]
+        ):
+            default_pose[...] = np.sqrt(np.mean(joint_pos ** 2, axis=-1))
+
+    for world_name, body_name in (
+        ("left_foot_pos_w", "left_foot_pos_b"),
+        ("right_foot_pos_w", "right_foot_pos_b"),
+    ):
+        world = probe.get(world_name)
+        body = probe.get(body_name)
+        if (
+            isinstance(world, np.ndarray)
+            and isinstance(body, np.ndarray)
+            and world.shape == root.shape
+            and body.shape == root.shape
+        ):
+            world[...] = root + body
+    return probe, shifted_hop_start
+
+
 def _invalid_temporal_support_probe(
     arrays: Mapping[str, Any], *, tail_steps: int = 12,
 ) -> dict[str, Any]:
@@ -1245,14 +1358,16 @@ def _abstract_phase_bounds(
 def _abstract_route_window(
     phases: Sequence[str], *, probe_steps: int, final_hold_steps: int = 0,
 ) -> tuple[int, int] | None:
-    """Locate the physical route block before a post-route extension skill.
+    """Locate the physical route block in the abstract phase schedule.
 
     Authored route channels describe traversal progress, while the abstract
     program may continue with a jump, landing, recovery, or dwell.  A route
     phase after an explicit jump boundary is ambiguous in today's flat phase
     schema, so this helper abstains instead of inventing ownership.  Future
     objective contracts can replace this conservative rule with explicit
-    ``route``/``extension`` phase roles.
+    ``route``/``extension`` phase roles.  The one proven compound form is a
+    planar prefix followed by repeated travelling jump/landing pairs: those
+    pairs extend the route through the final landing.
     """
     clean, bounds = _abstract_phase_bounds(
         phases,
@@ -1275,6 +1390,25 @@ def _abstract_route_window(
         extension_start = extension_indices[0]
         if any(index > extension_start for index in all_route_indices):
             return None
+        traveling_jump_schedule = _abstract_traveling_jump_route_schedule(
+            clean,
+            probe_steps=probe_steps,
+            final_hold_steps=final_hold_steps,
+        )
+        if traveling_jump_schedule is not None:
+            # A repeated travelling hop course is one interleaved route, not a
+            # planar prelude followed by a stationary extension.  Preserve the
+            # compact <=12-phase objective program and let each jump/landing
+            # cycle carry one ordered-region transition.  The finish becomes
+            # authoritative only after the final landing completes.
+            final_land_index = max(
+                index for index, phase in enumerate(clean)
+                if phase == "land" and index > extension_start
+            )
+            return (
+                int(bounds[all_route_indices[0]]),
+                int(bounds[final_land_index + 1]),
+            )
         route_indices = [
             index for index in all_route_indices if index < extension_start
         ]
@@ -1286,6 +1420,82 @@ def _abstract_route_window(
         int(bounds[route_indices[0]]),
         int(bounds[route_indices[-1] + 1]),
     )
+
+
+def _abstract_traveling_jump_route_schedule(
+    phases: Sequence[str], *, probe_steps: int, final_hold_steps: int = 0,
+) -> tuple[int, ...] | None:
+    """Return one ordered-region touchdown per travelling jump cycle.
+
+    The flat abstract program has no nested ``route`` node.  A program such as
+    ``move_forward, jump_off, land, jump_off, land, ...`` nevertheless states
+    that the jumps perform the route: treating the initial move phase as the
+    entire route creates a false-positive exemplar that finishes every region
+    and then hops in place.  This conservative recognizer activates only for a
+    planar route prefix followed by two or more contiguous ``jump_off``/``land``
+    pairs.  A single post-route leap, a slalom without jumps, and repeated
+    stationary ``jump`` phases therefore retain their historical semantics.
+
+    Each returned step is the first grounded sample of its landing window,
+    derived from the same support schedule as the abstract probe.  Catalog
+    region distance and waypoint state therefore advance when the landing is
+    physically observable, rather than while both feet are still airborne.
+    """
+    clean, bounds = _abstract_phase_bounds(
+        phases,
+        probe_steps=probe_steps,
+        final_hold_steps=final_hold_steps,
+    )
+    planar_phases = {
+        "move_forward", "move_backward", "move_left", "move_right",
+    }
+    route_indices = [
+        index for index, phase in enumerate(clean) if phase in planar_phases
+    ]
+    jump_indices = [
+        index for index, phase in enumerate(clean) if phase == "jump_off"
+    ]
+    if not route_indices or len(jump_indices) < 2:
+        return None
+    first_jump = jump_indices[0]
+    if any(index >= first_jump for index in route_indices):
+        return None
+    if any(
+        phase not in planar_phases
+        for phase in clean[route_indices[0]:first_jump]
+    ):
+        return None
+
+    landing_indices: list[int] = []
+    cursor = first_jump
+    while cursor + 1 < len(clean):
+        if clean[cursor] != "jump_off" or clean[cursor + 1] != "land":
+            break
+        landing_indices.append(cursor + 1)
+        cursor += 2
+    if len(landing_indices) < 2:
+        return None
+    # Do not silently reinterpret another motion inserted between hop cycles
+    # as part of the route.  Only terminal recovery/hold phases may follow.
+    if any(
+        phase not in {"recover", "dwell"}
+        for phase in clean[cursor:]
+    ):
+        return None
+    if len(landing_indices) != len(jump_indices):
+        return None
+
+    touchdown_steps: list[int] = []
+    for index in landing_indices:
+        start = int(bounds[index])
+        end = int(bounds[index + 1])
+        sample_count = max(1, end - start)
+        phase = np.linspace(0.0, 1.0, sample_count)
+        grounded = np.flatnonzero(phase >= _ABSTRACT_LAND_AIR_UNTIL)
+        touchdown_steps.append(
+            start + int(grounded[0] if grounded.size else sample_count - 1)
+        )
+    return tuple(touchdown_steps)
 
 
 def _abstract_objective_probe(
@@ -1466,7 +1676,7 @@ def _abstract_objective_probe(
                 else (u > 0.12) & (u < 0.92)
             )
         elif phase == "land":
-            air = u < 0.85
+            air = u < _ABSTRACT_LAND_AIR_UNTIL
         else:
             air = None
         if air is not None:
@@ -2885,13 +3095,44 @@ def validate_generated_metric(
         )
     )
     abstract_catalog_route_window: tuple[int, int] | None = None
+    abstract_catalog_route_advances: tuple[int, ...] | None = None
+    abstract_first_traveling_jump_step: int | None = None
     if abstract_is_prompt_native and has_route_catalog:
         probe_steps = int(next(iter(abstract_probe.values())).shape[0])
+        final_hold_steps = _requested_terminal_hold_steps(behavior_goal)
         abstract_catalog_route_window = _abstract_route_window(
             abstract_program,
             probe_steps=probe_steps,
-            final_hold_steps=_requested_terminal_hold_steps(behavior_goal),
+            final_hold_steps=final_hold_steps,
         )
+        traveling_schedule = _abstract_traveling_jump_route_schedule(
+            abstract_program,
+            probe_steps=probe_steps,
+            final_hold_steps=final_hold_steps,
+        )
+        ordered_region_count = len([
+            channel for channel in catalog.channels
+            if channel.producer == "region_relative"
+            and isinstance(channel.source.get("sequence_index"), int)
+            and not isinstance(channel.source.get("sequence_index"), bool)
+        ])
+        # A route catalog contains one terminal region in addition to its
+        # maneuver regions.  Use explicit cycle advances only when the
+        # cardinality is exact; mismatched contracts retain the legacy fixture
+        # rather than fabricating a one-to-many association.
+        if (
+            traveling_schedule is not None
+            and len(traveling_schedule) == max(0, ordered_region_count - 1)
+        ):
+            abstract_catalog_route_advances = traveling_schedule
+            clean, bounds = _abstract_phase_bounds(
+                abstract_program,
+                probe_steps=probe_steps,
+                final_hold_steps=final_hold_steps,
+            )
+            abstract_first_traveling_jump_step = int(
+                bounds[clean.index("jump_off")]
+            )
     if abstract_is_prompt_native:
         arche["prompt_competent"] = abstract_probe
     catalog_cases: dict[str, str] = {}
@@ -2930,6 +3171,11 @@ def validate_generated_metric(
                     abstract_catalog_route_window[1]
                     if name == "prompt_competent"
                     and abstract_catalog_route_window is not None
+                    else None
+                ),
+                competent_route_advance_steps=(
+                    abstract_catalog_route_advances
+                    if name == "prompt_competent"
                     else None
                 ),
             ))
@@ -2973,8 +3219,36 @@ def validate_generated_metric(
                     and abstract_catalog_route_window is not None
                     else None
                 ),
+                competent_route_advance_steps=(
+                    abstract_catalog_route_advances
+                    if name in {
+                        "catalog_competent", "catalog_event_violation",
+                    }
+                    else None
+                ),
             ))
             arche[name] = fixture_base
+        if (
+            abstract_catalog_route_advances is not None
+            and abstract_catalog_route_window is not None
+            and abstract_first_traveling_jump_step is not None
+        ):
+            route_first, shifted_hop_start = _route_first_stationary_hops_probe(
+                arche["prompt_competent"],
+                route_start_step=abstract_catalog_route_window[0],
+                hop_start_step=abstract_first_traveling_jump_step,
+                route_end_step=abstract_catalog_route_window[1],
+            )
+            route_first.update(catalog_fixture_arrays(
+                catalog,
+                time_steps=int(next(iter(route_first.values())).shape[0]),
+                num_envs=E,
+                case="competent",
+                competent_route_start_step=abstract_catalog_route_window[0],
+                competent_route_completion_step=shifted_hop_start - 1,
+                competent_route_advance_steps=abstract_catalog_route_advances,
+            ))
+            arche["catalog_route_first_stationary_hops"] = route_first
         if _requires_uninterrupted_hold(behavior_goal):
             arche["catalog_interrupted_hold"] = _interrupted_hold_probe(
                 arche["catalog_competent"])
@@ -3022,6 +3296,30 @@ def validate_generated_metric(
     semantic_competent = arche.get(semantic_competent_key)
     semantic_baseline = scores.get(semantic_competent_key, float("nan"))
     semantic_ceiling = min(float(distractor_ceiling), 0.05)
+
+    if "catalog_route_first_stationary_hops" in arche:
+        route_first_score = scores.get(
+            "catalog_route_first_stationary_hops", float("nan")
+        )
+        route_hop_alignment_ok = (
+            np.isfinite(route_first_score)
+            and (
+                not np.isfinite(semantic_baseline)
+                or semantic_baseline <= semantic_ceiling
+                or route_first_score <= semantic_ceiling
+            )
+        )
+        gates["traveling_hop_route_alignment"] = route_hop_alignment_ok
+        if not route_hop_alignment_ok:
+            hop_count = len(abstract_catalog_route_advances or ())
+            reasons.append(
+                "[route-hop-alignment] the authored route completed before "
+                f"{hop_count} otherwise-valid stationary hop cycles, yet the "
+                f"metric scored it {route_first_score:.3f}; repeated travelling "
+                "jump/landing cycles must each carry their corresponding "
+                "ordered-region advance "
+                f"(required <= {semantic_ceiling:.3f})"
+            )
 
     if temporal_validity_required and semantic_competent is not None:
         temporal_probe = _invalid_temporal_support_probe(semantic_competent)

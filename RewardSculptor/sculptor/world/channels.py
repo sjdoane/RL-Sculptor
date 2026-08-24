@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from sculptor.world.artifacts import canonical_json_bytes, sha256_bytes
 
@@ -592,6 +592,7 @@ def catalog_fixture_arrays(
     ],
     competent_route_start_step: int | None = None,
     competent_route_completion_step: int | None = None,
+    competent_route_advance_steps: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Deterministic semantic fixtures for catalog-aware metric gates.
 
@@ -600,6 +601,9 @@ def catalog_fixture_arrays(
     distance-only edge camping, transient predicate/contact flicker, forbidden
     contact, and a held successful completion.  They are also used to populate
     task-derived calibration ladders with the exact declared array surface.
+    ``competent_route_advance_steps`` is an optional exact alignment contract:
+    one physical advance for every ordered nonterminal region.  When absent or
+    structurally incompatible, the legacy route interpolation is unchanged.
     """
     import numpy as np
 
@@ -663,8 +667,31 @@ def catalog_fixture_arrays(
         max(0, int(competent_route_start_step or 0)),
     )
     nonterminal_count = max(0, len(route_regions) - 1)
+    explicit_route_advances: list[int] | None = None
+    if competent_route_advance_steps is not None:
+        candidate_advances = [
+            int(step) for step in competent_route_advance_steps
+            if isinstance(step, int) and not isinstance(step, bool)
+        ]
+        # Exact cardinality is the scientific contract: one authored
+        # nonterminal region per independently scheduled maneuver.  If a
+        # caller cannot prove that correspondence, preserve the historical
+        # interpolation instead of truncating, duplicating, or inventing an
+        # alignment.
+        if (
+            len(candidate_advances) == nonterminal_count
+            and len(candidate_advances) == len(competent_route_advance_steps)
+            and candidate_advances == sorted(set(candidate_advances))
+            and all(
+                route_start <= step < terminal_start
+                for step in candidate_advances
+            )
+        ):
+            explicit_route_advances = candidate_advances
     if nonterminal_count:
-        if competent_route_start_step is None:
+        if explicit_route_advances is not None:
+            route_centers = explicit_route_advances
+        elif competent_route_start_step is None:
             first_center = min(
                 terminal_start,
                 max(0, int(round(0.08 * time_steps))),
@@ -686,12 +713,13 @@ def catalog_fixture_arrays(
             )
             first_center = min(terminal_start, route_start + center_margin)
             last_center = max(first_center, terminal_start - center_margin)
-        route_centers = np.linspace(
-            first_center,
-            last_center,
-            nonterminal_count,
-            dtype=int,
-        ).tolist()
+        if explicit_route_advances is None:
+            route_centers = np.linspace(
+                first_center,
+                last_center,
+                nonterminal_count,
+                dtype=int,
+            ).tolist()
     else:
         route_centers = []
     if route_regions:
@@ -699,7 +727,7 @@ def catalog_fixture_arrays(
 
     def _waypoint_progression(
         spec: ChannelSpec,
-    ) -> tuple[int, int, np.ndarray]:
+    ) -> tuple[int, int, int, np.ndarray]:
         raw_count = spec.source.get("waypoint_count", 4)
         waypoint_count = (
             int(raw_count)
@@ -716,13 +744,25 @@ def catalog_fixture_arrays(
             route_start,
             max(0, progression_end - waypoint_count),
         )
-        bounds = np.linspace(
+        if (
+            explicit_route_advances is not None
+            and waypoint_count == len(route_centers)
+        ):
+            advance_steps = np.asarray(route_centers, dtype=int)
+        else:
+            bounds = np.linspace(
+                progression_start,
+                progression_end,
+                waypoint_count + 1,
+                dtype=int,
+            )
+            advance_steps = bounds[1:]
+        return (
+            waypoint_count,
             progression_start,
             progression_end,
-            waypoint_count + 1,
-            dtype=int,
+            advance_steps,
         )
-        return waypoint_count, progression_end, bounds
 
     for spec in catalog.channels:
         shape = tuple(shape_values.get(dim, dim) for dim in spec.shape)
@@ -765,14 +805,18 @@ def catalog_fixture_arrays(
             # Distance to the active waypoint falls to zero, then resets when
             # the ordered state advances.  This matches the waypoint-index
             # trace instead of claiming zero distance before route motion.
-            _, progression_end, bounds = _waypoint_progression(spec)
-            arr[:bounds[0], ...] = 1.0
-            for start, end in zip(bounds[:-1], bounds[1:]):
+            (
+                _, progression_start, progression_end, advance_steps,
+            ) = _waypoint_progression(spec)
+            arr[:progression_start, ...] = 1.0
+            start = progression_start
+            for end in advance_steps:
                 length = end - start
                 if length > 0:
                     trace = np.linspace(1.0, 0.0, length, endpoint=True)
                     arr[start:end, ...] = trace.reshape(
                         (length,) + (1,) * (arr.ndim - 1))
+                start = int(end)
             arr[progression_end:, ...] = 0.0
         elif producer in {"region_relative", "object_region_distance",
                           "robot_region_distance", "waypoint_distance",
@@ -813,15 +857,20 @@ def catalog_fixture_arrays(
             # Metrics are expected to reject teleportation/skipped waypoints and
             # commonly inspect ordered plateaus.  The old ``int.max`` at every
             # frame made all such honest metrics see zero transitions.
-            waypoint_count, progression_end, bounds = _waypoint_progression(spec)
+            (
+                waypoint_count, progression_start, progression_end,
+                advance_steps,
+            ) = _waypoint_progression(spec)
             # Reach the terminal index on the same frame as the competent
             # finish-region trace.  Previously this progression was stretched
             # across the entire rollout even though the terminal region began
             # much earlier, producing an internally contradictory fixture.
             # Keep every ordered plateau observable when a caller requests a
             # very early completion step.
-            for index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+            start = progression_start
+            for index, end in enumerate(advance_steps):
                 arr[start:end, ...] = index
+                start = int(end)
             arr[progression_end:, ...] = waypoint_count
         elif producer == "event_phase_state" and competent_like:
             jump_start = terminal_start
