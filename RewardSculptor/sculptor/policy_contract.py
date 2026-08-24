@@ -598,6 +598,185 @@ def policy_contract_migration(
     }
 
 
+def _completed_iteration_same_tuple_authority(
+    iter_dir: Path,
+    *,
+    iteration: int,
+    target_selection_path: Path,
+    target_selection_version: int,
+    target_tuple_hash: str,
+    source_tuple_hash: str,
+    target_contract: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Verify a completed checkpoint evaluated under the exact target tuple.
+
+    Schema-1 markers and absent markers deliberately do not qualify. A
+    schema-2 marker is security-sensitive evidence: once present, malformed
+    metadata or checkpoint bytes fail closed instead of falling back to a
+    weaker interpretation.
+    """
+    from sculptor.world.artifacts import canonical_json_bytes
+
+    iter_dir = Path(iter_dir).expanduser().resolve()
+    marker_path = iter_dir / "iteration_complete.json"
+    if marker_path.is_symlink():
+        raise ValueError("iteration completion marker must not be a symlink")
+    if not marker_path.exists():
+        return None
+    if not marker_path.is_file():
+        raise ValueError("iteration completion marker must be a regular file")
+    try:
+        marker_bytes = marker_path.read_bytes()
+        marker_payload = json.loads(marker_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("iteration completion marker is unreadable") from exc
+    if not isinstance(marker_payload, dict):
+        raise ValueError("iteration completion marker must be a JSON object")
+    marker_schema = marker_payload.get("schema")
+    if marker_schema == 1:
+        return None
+    if marker_schema != 2:
+        raise ValueError("iteration completion marker schema is unsupported")
+    if (
+        marker_payload.get("state") != "completed"
+        or type(marker_payload.get("iter")) is not int
+        or marker_payload.get("iter") != iteration
+    ):
+        raise ValueError(
+            "iteration completion marker does not attest this completed "
+            "iteration"
+        )
+
+    disclosed_checkpoint = marker_payload.get("checkpoint")
+    expected_sha256 = marker_payload.get("checkpoint_sha256")
+    expected_bytes = marker_payload.get("checkpoint_bytes")
+    evaluated_tuple_hash = marker_payload.get("world_selection_hash")
+    if (
+        not isinstance(disclosed_checkpoint, str)
+        or not disclosed_checkpoint.strip()
+    ):
+        raise ValueError("iteration completion marker has no checkpoint path")
+    if (
+        not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+    ):
+        raise ValueError(
+            "iteration completion marker has no valid checkpoint SHA-256"
+        )
+    if type(expected_bytes) is not int or expected_bytes <= 0:
+        raise ValueError(
+            "iteration completion marker has no valid checkpoint size"
+        )
+    if (
+        not isinstance(evaluated_tuple_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", evaluated_tuple_hash) is None
+    ):
+        raise ValueError(
+            "iteration completion marker has no valid world selection hash"
+        )
+
+    checkpoint_path = Path(disclosed_checkpoint).expanduser()
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = iter_dir / checkpoint_path
+    if checkpoint_path.is_symlink():
+        raise ValueError(
+            "iteration completion checkpoint must not be a symlink"
+        )
+    try:
+        resolved_checkpoint = checkpoint_path.resolve(strict=True)
+        resolved_iter_dir = iter_dir.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("iteration completion checkpoint is absent") from exc
+    if (
+        resolved_checkpoint.parent != resolved_iter_dir
+        or resolved_checkpoint.name not in {"checkpoint.pt", "checkpoint.zip"}
+        or not resolved_checkpoint.is_file()
+    ):
+        raise ValueError(
+            "iteration completion checkpoint is not the canonical iteration "
+            "checkpoint"
+        )
+
+    digest = hashlib.sha256()
+    actual_bytes = 0
+    try:
+        with resolved_checkpoint.open("rb") as checkpoint_handle:
+            for chunk in iter(
+                lambda: checkpoint_handle.read(1024 * 1024), b""
+            ):
+                digest.update(chunk)
+                actual_bytes += len(chunk)
+    except OSError as exc:
+        raise ValueError(
+            "iteration completion checkpoint is unreadable"
+        ) from exc
+    actual_sha256 = digest.hexdigest()
+    if actual_bytes <= 0:
+        raise ValueError("iteration completion checkpoint is empty")
+    if actual_sha256 != expected_sha256 or actual_bytes != expected_bytes:
+        raise ValueError(
+            "iteration completion checkpoint bytes disagree with the marker"
+        )
+
+    if evaluated_tuple_hash != target_tuple_hash:
+        if evaluated_tuple_hash == source_tuple_hash:
+            return None
+        raise ValueError(
+            "iteration completion marker world selection matches neither "
+            "the immutable source nor target tuple"
+        )
+
+    authority: dict[str, Any] = {
+        "kind": "completed_evaluation_same_tuple",
+        "completion_marker_path": str(marker_path),
+        "completion_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+        "checkpoint_path": str(resolved_checkpoint),
+        "checkpoint_sha256": actual_sha256,
+        "checkpoint_bytes": actual_bytes,
+        "evaluated_tuple_hash": evaluated_tuple_hash,
+        "target_selection_path": str(target_selection_path),
+        "target_selection_version": int(target_selection_version),
+        "target_tuple_hash": target_tuple_hash,
+    }
+
+    sidecar_path = iter_dir / "warm_start_effective_policy_contract.json"
+    if sidecar_path.is_symlink():
+        raise ValueError(
+            "origin-persisted warm-start policy contract must not be a symlink"
+        )
+    if not sidecar_path.exists():
+        raise ValueError(
+            "origin-persisted warm-start policy contract is absent"
+        )
+    if not sidecar_path.is_file():
+        raise ValueError(
+            "origin-persisted warm-start policy contract must be a regular file"
+        )
+    try:
+        sidecar_bytes = sidecar_path.read_bytes()
+        sidecar_payload = json.loads(sidecar_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "origin-persisted warm-start policy contract is unreadable"
+        ) from exc
+    if (
+        not isinstance(sidecar_payload, dict)
+        or sidecar_payload.get("schema")
+        not in (CONTRACT_SCHEMA, EVENT_CONTRACT_SCHEMA)
+        or canonical_json_bytes(sidecar_payload)
+        != canonical_json_bytes(target_contract)
+    ):
+        raise ValueError(
+            "origin-persisted warm-start policy contract does not "
+            "corroborate the completed evaluation target"
+        )
+    authority["corroborating_contract_path"] = str(sidecar_path)
+    authority["corroborating_contract_sha256"] = hashlib.sha256(
+        sidecar_bytes
+    ).hexdigest()
+    return authority
+
+
 def build_iteration_warm_start_contract_receipt(
     project_dir: Path,
     iteration: int,
@@ -606,12 +785,15 @@ def build_iteration_warm_start_contract_receipt(
 ) -> dict[str, Any]:
     """Attest an iteration's source tuple against one immutable target.
 
-    The iteration-owned ``artifact_tuple.json`` is the authority for what the
-    source checkpoint executed in.  It must be byte-equivalent as canonical
-    JSON to the immutable ``selection_vN`` it names, whose every component is
-    then hash-verified by ``WorldArtifactStore``.  Compatibility is admitted
-    only for an exact contract or the single explicit schema-2 -> schema-3
-    event-observation migration above.
+    The iteration-owned ``artifact_tuple.json`` remains immutable attempt
+    lineage and must be byte-equivalent as canonical JSON to the selection it
+    names. A modern schema-2 completion marker may supersede that attempt as
+    policy-interface authority only when it verifies the canonical checkpoint
+    byte-for-byte and names the exact immutable target tuple under which the
+    checkpoint completed evaluation. Otherwise the historical source world is
+    reconstructed as before. Compatibility is admitted only for an exact
+    contract or the single explicit schema-2 -> schema-3 event-observation
+    migration above.
     """
     from sculptor.world.artifacts import (
         WorldArtifactStore,
@@ -672,14 +854,37 @@ def build_iteration_warm_start_contract_receipt(
         raise FileNotFoundError(
             f"immutable target selection is absent: {target_selection_path}"
         )
-    source_contract = build_project_policy_contract(
-        project_dir,
-        world_selection_path=source_selection_path,
-    )
     target_contract = build_project_policy_contract(
         project_dir,
         world_selection_path=target_selection_path,
     )
+    completed_authority = _completed_iteration_same_tuple_authority(
+        tuple_path.parent,
+        iteration=iteration,
+        target_selection_path=target_selection_path,
+        target_selection_version=target_selection.selection_version,
+        target_tuple_hash=target_selection.tuple_hash,
+        source_tuple_hash=source_selection.tuple_hash,
+        target_contract=target_contract,
+    )
+    source_checkpoint: dict[str, Any] = {}
+    if completed_authority is not None:
+        source_contract = copy.deepcopy(target_contract)
+        source_contract_authority = completed_authority
+        source_checkpoint = {
+            "checkpoint_path": completed_authority["checkpoint_path"],
+            "checkpoint_sha256": completed_authority["checkpoint_sha256"],
+            "checkpoint_bytes": completed_authority["checkpoint_bytes"],
+        }
+    else:
+        source_contract = build_project_policy_contract(
+            project_dir,
+            world_selection_path=source_selection_path,
+        )
+        source_contract_authority = {
+            "kind": "reconstructed_from_source_selection",
+            "selection_path": str(source_selection_path),
+        }
     migration = policy_contract_migration(source_contract, target_contract)
     if source_contract == target_contract:
         compatibility = {
@@ -709,6 +914,8 @@ def build_iteration_warm_start_contract_receipt(
             "tuple_hash": source_selection.tuple_hash,
             "contract": source_contract,
             "contract_sha256": contract_fingerprint(source_contract),
+            "contract_authority": source_contract_authority,
+            **source_checkpoint,
         },
         "target": {
             "selection_path": str(target_selection_path),

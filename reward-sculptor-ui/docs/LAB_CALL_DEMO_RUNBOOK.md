@@ -1697,3 +1697,18 @@ false; no sustained fall; exactly one bilateral air event of at least three
 frames with apex gain at least `0.18 m`; bilateral landing inside finish; and
 100 uninterrupted in-finish horizontal, angular, joint, uprightness, and
 default-pose quiet frames.
+
+If launch reports `robot capability descriptor differs from admission` while
+the World header still says selection v8/tuple verified, do not re-admit or
+bypass the world. Confirm the current descriptor hash and selection-v8 hash
+are both `f7448145…ba8f`. Iter 2 retains historical source selection v4 as
+attempt lineage. Transfer authority comes from its schema-2 completion marker:
+canonical checkpoint SHA `fb235700…10d0`, exact non-empty bytes, completed
+iteration 2, evaluated tuple `f06d4e…6074`, and target selection v8 with the
+same tuple. The required corroborating sidecar (file SHA `a5257cd4…e7c0`,
+contract fingerprint `83b59f11…d7c0`) must equal the independently rebuilt
+target contract. Missing/legacy evidence or a marker tied to the disclosed
+source tuple uses strict historical reconstruction. Same-target evidence
+without the sidecar, an unrelated third tuple, or malformed modern evidence
+fails closed. A stale backend must be restarted before retrying; no worker
+exists after this 412.

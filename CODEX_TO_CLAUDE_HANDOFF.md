@@ -3874,3 +3874,33 @@ and exact promoted recovery off. Require exact actor+critic load of the SHA
 above, a 24-second runtime-horizon receipt, the JUMP arbitration receipt, and
 PPO iteration 0 before treating training as live. Do not edit reload-watched
 core or run a GPU audit after launch.
+
+The first launch click on clean commit `42a51d4` correctly failed before job
+allocation. Its iter-2 `artifact_tuple.json` names historical source selection
+v4, whose robot descriptor predates the composed-actuator capability, so the
+policy-contract preflight tried to recompile old physics against the current
+registry and reported `robot capability descriptor differs from admission`.
+This did not indicate a target-world mismatch: current selection v8 and the
+runtime descriptor both hash to
+`f74481454e8fdff1f0e646708bacf213669b8957be91c2f6df0a36e0ad57ba8f`.
+
+Iteration policy transfer now separates those authorities without trusting a
+mutable sidecar. The exact historical artifact tuple remains disclosed
+training-attempt lineage. A shortcut is admitted only when the schema-2
+completion marker re-verifies the canonical checkpoint path, exact bytes/SHA,
+iteration/state, and an evaluated tuple identical to the immutable target.
+For iter 2 the marker binds checkpoint SHA
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`
+and tuple `f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`;
+target selection v8 is that exact tuple. The effective-contract sidecar is
+required corroborating evidence, not root authority. Its file hashes to
+`a5257cd4b3240a5fd0be704c0c9ab42c90020a48d5749cbb55cdc06f7f9ce7c0`
+and its canonical contract fingerprint is
+`83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`.
+It must equal the independently rebuilt target contract. Missing or legacy
+completion evidence and markers tied to the disclosed source tuple retain
+strict historical source reconstruction; same-target evidence without the
+sidecar, an unrelated third tuple, and malformed modern evidence fail closed.
+The actual project receipt now produces exact schema-3 actor+critic admission
+with the two contract fingerprints equal. The focused policy-contract suite is
+23 passed.

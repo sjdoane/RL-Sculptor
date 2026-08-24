@@ -1676,3 +1676,18 @@ v8/reward v2/env v1 and starts actor+critic from iter 2 SHA
 `fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`.
 Do not use the automatically proposed multi-factor reward v3/env v2 for this
 causal test.
+
+The first iter-2 launch click exposed a transfer-boundary bug before worker
+creation: preflight recompiled historical checkpoint selection v4 against the
+current robot registry, although current selection v8 itself matched exactly.
+Project-policy transfer now retains the historical tuple as disclosed
+training-attempt lineage but does not trust its sidecar as the sole interface
+authority. Exact
+schema-2 completion evidence re-verifies the canonical checkpoint SHA/bytes
+and proves its evaluated tuple is identical to the immutable target before the
+target contract can serve as source interface authority. Iter 2 binds
+checkpoint SHA `fb235700…10d0` to tuple `f06d4e…6074`; target selection v8 is
+that tuple. Its required sidecar corroborates the independently rebuilt contract;
+the sidecar and current target both fingerprint to
+`83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`;
+current target physics remains strictly recompiled and verified.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -17,7 +18,7 @@ from sculptor.policy_contract import (
     policy_contract_migration,
     recovery_snapshot_receipt_fingerprint,
 )
-from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore, file_sha256
 
 
 def _legacy_contract() -> dict:
@@ -243,6 +244,32 @@ def _selection_pair(project_dir: Path) -> tuple[Path, Path]:
     return source_path, target_path
 
 
+def _write_completion_marker(
+    iter_dir: Path,
+    *,
+    iteration: int,
+    world_selection_hash: str,
+    checkpoint_bytes: bytes = b"completed-policy-checkpoint",
+) -> tuple[Path, Path, dict]:
+    checkpoint_path = iter_dir / "checkpoint.pt"
+    checkpoint_path.write_bytes(checkpoint_bytes)
+    marker_payload = {
+        "schema": 2,
+        "state": "completed",
+        "iter": iteration,
+        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+        "checkpoint_bytes": len(checkpoint_bytes),
+        "world_selection_hash": world_selection_hash,
+    }
+    marker_path = iter_dir / "iteration_complete.json"
+    marker_path.write_text(
+        json.dumps(marker_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return checkpoint_path, marker_path, marker_payload
+
+
 def _recovery_snapshot_receipt(source_contract: dict) -> dict:
     receipt = {
         "schema": 1,
@@ -324,6 +351,326 @@ def test_iteration_warm_start_receipt_binds_exact_source_and_target(
         build_iteration_warm_start_contract_receipt(
             tmp_path, 38, target_selection_path=target_path,
         )
+
+
+def test_iteration_warm_start_uses_completed_same_tuple_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    target_selection = WorldArtifactStore(tmp_path).read_selection(target_path)
+    assert target_selection is not None
+    target_contract = _event_contract(_legacy_contract())
+    checkpoint_path, marker_path, marker = _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=target_selection.tuple_hash,
+    )
+    contract_path = iter_dir / "warm_start_effective_policy_contract.json"
+    contract_path.write_text(
+        json.dumps(target_contract, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    def target_only(_project_dir, *, world_selection_path):
+        assert Path(world_selection_path) == target_path
+        return copy.deepcopy(target_contract)
+
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract", target_only,
+    )
+    receipt = build_iteration_warm_start_contract_receipt(
+        tmp_path, 38, target_selection_path=target_path,
+    )
+
+    authority = receipt["source"]["contract_authority"]
+    assert receipt["source"]["selection_version"] == 1
+    assert receipt["source"]["contract"] == target_contract
+    assert receipt["source"]["checkpoint_path"] == str(checkpoint_path)
+    assert receipt["source"]["checkpoint_sha256"] == marker["checkpoint_sha256"]
+    assert receipt["source"]["checkpoint_bytes"] == marker["checkpoint_bytes"]
+    assert authority["kind"] == "completed_evaluation_same_tuple"
+    assert authority["completion_marker_path"] == str(marker_path)
+    assert authority["completion_marker_sha256"] == file_sha256(marker_path)
+    assert authority["evaluated_tuple_hash"] == target_selection.tuple_hash
+    assert authority["target_selection_path"] == str(target_path)
+    assert authority["target_selection_version"] == 2
+    assert authority["corroborating_contract_path"] == str(contract_path)
+    assert authority["corroborating_contract_sha256"] == file_sha256(
+        contract_path
+    )
+    assert receipt["compatibility"]["type"] == "exact_policy_contract"
+    assert build_iteration_warm_start_contract_receipt(
+        tmp_path, 38, target_selection_path=target_path,
+    ) == receipt
+
+
+def test_iteration_warm_start_rejects_same_tuple_without_effective_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    target_selection = WorldArtifactStore(tmp_path).read_selection(target_path)
+    assert target_selection is not None
+    _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=target_selection.tuple_hash,
+    )
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: _event_contract(_legacy_contract()),
+    )
+
+    with pytest.raises(ValueError, match="policy contract is absent"):
+        build_iteration_warm_start_contract_receipt(
+            tmp_path, 38, target_selection_path=target_path,
+        )
+
+
+def test_iteration_warm_start_does_not_trust_sidecar_without_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    source_contract = _legacy_contract()
+    target_contract = _event_contract(source_contract)
+    (iter_dir / "warm_start_effective_policy_contract.json").write_text(
+        json.dumps(target_contract, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_build(_project_dir, *, world_selection_path):
+        return (
+            copy.deepcopy(source_contract)
+            if Path(world_selection_path) == source_path
+            else copy.deepcopy(target_contract)
+        )
+
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract", fake_build,
+    )
+    receipt = build_iteration_warm_start_contract_receipt(
+        tmp_path, 38, target_selection_path=target_path,
+    )
+
+    assert receipt["source"]["contract"] == source_contract
+    assert receipt["source"]["contract_authority"] == {
+        "kind": "reconstructed_from_source_selection",
+        "selection_path": str(source_path),
+    }
+    assert receipt["compatibility"]["type"] == (
+        "zero_initialized_event_phase_observation"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema", 3),
+        ("state", "errored"),
+        ("iter", 39),
+        ("checkpoint_sha256", "0" * 64),
+        ("checkpoint_bytes", 1),
+        ("world_selection_hash", "not-a-sha"),
+    ],
+)
+def test_iteration_warm_start_rejects_invalid_completion_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    target_selection = WorldArtifactStore(tmp_path).read_selection(target_path)
+    assert target_selection is not None
+    _checkpoint, marker_path, marker = _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=target_selection.tuple_hash,
+    )
+    marker[field] = value
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: _event_contract(_legacy_contract()),
+    )
+
+    with pytest.raises(ValueError, match="iteration completion"):
+        build_iteration_warm_start_contract_receipt(
+            tmp_path, 38, target_selection_path=target_path,
+        )
+
+
+def test_iteration_warm_start_rejects_noncanonical_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    target_selection = WorldArtifactStore(tmp_path).read_selection(target_path)
+    assert target_selection is not None
+    _checkpoint, marker_path, marker = _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=target_selection.tuple_hash,
+    )
+    escaped = tmp_path / "checkpoint.pt"
+    escaped.write_bytes(b"completed-policy-checkpoint")
+    marker["checkpoint"] = str(escaped)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: _event_contract(_legacy_contract()),
+    )
+
+    with pytest.raises(ValueError, match="canonical iteration checkpoint"):
+        build_iteration_warm_start_contract_receipt(
+            tmp_path, 38, target_selection_path=target_path,
+        )
+
+
+def test_iteration_warm_start_rejects_mismatched_contract_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    target_selection = WorldArtifactStore(tmp_path).read_selection(target_path)
+    assert target_selection is not None
+    _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=target_selection.tuple_hash,
+    )
+    (iter_dir / "warm_start_effective_policy_contract.json").write_text(
+        json.dumps(_legacy_contract()), encoding="utf-8",
+    )
+    target_contract = _event_contract(_legacy_contract())
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: copy.deepcopy(target_contract),
+    )
+
+    with pytest.raises(ValueError, match="does not corroborate"):
+        build_iteration_warm_start_contract_receipt(
+            tmp_path, 38, target_selection_path=target_path,
+        )
+
+
+def test_iteration_warm_start_different_evaluated_tuple_uses_source_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    source_selection = WorldArtifactStore(tmp_path).read_selection(source_path)
+    assert source_selection is not None
+    _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=source_selection.tuple_hash,
+    )
+    source_contract = _legacy_contract()
+    target_contract = _event_contract(source_contract)
+
+    def fake_build(_project_dir, *, world_selection_path):
+        return (
+            copy.deepcopy(source_contract)
+            if Path(world_selection_path) == source_path
+            else copy.deepcopy(target_contract)
+        )
+
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract", fake_build,
+    )
+    receipt = build_iteration_warm_start_contract_receipt(
+        tmp_path, 38, target_selection_path=target_path,
+    )
+
+    assert receipt["source"]["contract"] == source_contract
+    assert receipt["source"]["contract_authority"]["kind"] == (
+        "reconstructed_from_source_selection"
+    )
+
+
+def test_iteration_warm_start_rejects_unrelated_evaluated_tuple(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    source_selection = WorldArtifactStore(tmp_path).read_selection(source_path)
+    target_selection = WorldArtifactStore(tmp_path).read_selection(target_path)
+    assert source_selection is not None
+    assert target_selection is not None
+    unrelated_tuple_hash = "f" * 64
+    assert unrelated_tuple_hash not in {
+        source_selection.tuple_hash,
+        target_selection.tuple_hash,
+    }
+    _write_completion_marker(
+        iter_dir,
+        iteration=38,
+        world_selection_hash=unrelated_tuple_hash,
+    )
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract",
+        lambda *_args, **_kwargs: _event_contract(_legacy_contract()),
+    )
+
+    with pytest.raises(ValueError, match="matches neither"):
+        build_iteration_warm_start_contract_receipt(
+            tmp_path, 38, target_selection_path=target_path,
+        )
+
+
+def test_iteration_warm_start_legacy_completion_does_not_qualify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, target_path = _selection_pair(tmp_path)
+    iter_dir = tmp_path / "runs" / "iter_38"
+    iter_dir.mkdir(parents=True)
+    shutil.copyfile(source_path, iter_dir / "artifact_tuple.json")
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps({"schema": 1, "state": "completed", "iter": 38}),
+        encoding="utf-8",
+    )
+    source_contract = _legacy_contract()
+    target_contract = _event_contract(source_contract)
+
+    def fake_build(_project_dir, *, world_selection_path):
+        return (
+            copy.deepcopy(source_contract)
+            if Path(world_selection_path) == source_path
+            else copy.deepcopy(target_contract)
+        )
+
+    monkeypatch.setattr(
+        "sculptor.policy_contract.build_project_policy_contract", fake_build,
+    )
+    receipt = build_iteration_warm_start_contract_receipt(
+        tmp_path, 38, target_selection_path=target_path,
+    )
+
+    assert receipt["source"]["contract"] == source_contract
+    assert receipt["source"]["contract_authority"]["kind"] == (
+        "reconstructed_from_source_selection"
+    )
 
 
 def test_recovery_snapshot_receipt_binds_exact_runtime_contract_and_sha(
