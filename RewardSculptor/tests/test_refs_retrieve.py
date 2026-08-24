@@ -190,7 +190,7 @@ def test_search_filters_by_robot_symmetrically(tmp_path: Path) -> None:
             source={"kind": "hf_dataset", "repo": "r",
                     "path": "p", "url": "u"},
             license="cc-by-4.0", attribution="a",
-            content_sha256_=f"{robot}".ljust(64, "0"),
+                content_sha256_=("1" if robot == "g1" else "2") * 64,
             labels=["fall", "and", "get", "up", "1", "subject", "1"],
             text="fall and get up 1 subject 1",
             qc={"duration_s": 5.0, "n_frames": 150, "root_z_range": [0.1, 0.8]})
