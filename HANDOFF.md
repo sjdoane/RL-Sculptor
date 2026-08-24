@@ -1761,3 +1761,89 @@ window is not proof of terminal retention.
 The active reference-guided demonstration remains unlaunched. No G1 library
 motion currently has an admissible Tier-D certificate; do not describe a
 Tier-K preview or the policy-only slalom experiment as reference following.
+
+## 2026-08-24: Tier-D tracker continuation is explicit and hash-verified
+
+The first complete physics-tracking attempt for
+`g1/four-rail-hop-modes-v2--g1` remains diagnostic Tier K. It completed all
+three 2,000-update stages and a pinned lane-0 rollout, but its static-baseline
+ratio was `0.862787` against the unchanged `<=0.80` gate (joint MAE
+`0.114937 rad`, root-Z RMSE `0.060565 m`, duration coverage `0.996491`). The
+policy reproduced the large right-leg motion but held much of the left support
+leg near a safer static pose. Do not relax the certificate threshold.
+
+The generated Tier-D reward now exposes immutable term scales and gives the
+gated joint trajectory the dominant mass (`joint=4.0`, `root=1.0`, measured-only
+orientation=`0.25`), normalized back to the historical perfect-return scale.
+Certification thresholds are unchanged. `refs track`
+also accepts an explicit `--resume-checkpoint` for a prior trusted local
+tracker attempt. Before GPU allocation it re-verifies the checkpoint SHA,
+adjacent runner metrics, exact policy-contract sidecar, and training
+environment artifacts, copies those bytes into the fresh run, and requires the
+first runtime load receipt to match the retained SHA. The prior reward SHA and
+the new requested reward SHA remain separate disclosed facts. This is tracker
+initialization, not a portable or exact optimizer-resume claim.
+
+The preserved diagnostic checkpoint SHA is
+`e43e296b9580c33d6aafb871a184935231ef64f33d8d2f4e3c2a2d474995043a`;
+its policy contract is
+`caeacce9cdf8364205e80c8c22ecf0c1c512e248580dd4d17fbaf4afb326a19d`.
+A real CPU-only continuation preflight passed and retained all three source
+artifacts. No fresh certification rollout has passed yet, so the reference-led
+task run remains blocked.
+
+Certified tracker policies now have a separate portable export boundary. A
+trusted local Tier-D tracker project may be converted to schema-3 `.rskill`
+only after its current certificate, final checkpoint, policy-contract sidecar,
+runner receipt, config, reward, and reference admission chain all re-verify.
+The archive contains canonical actor safetensors, the origin policy contract,
+and bounded JSON source-training evidence. It deliberately excludes critic,
+optimizer, raw `.pt`, reference motion, reward, world, controller, and mode
+executor bytes. Import preserves and re-verifies that evidence as inert
+provenance and admits only `actor_only` initialization; it never selects the
+source reference or claims exact resume. The current Tier-K attempt correctly
+cannot cross this exporter, so no portable tracker skill exists yet.
+
+## 2026-08-24: per-mode authoring binds intent without circular staleness
+
+Phase-reward authoring now records `phase-window-context-v2`. Its context
+digest covers the exact reference bytes and the immutable non-reward world
+tuple, but excludes both the reward member and mutable selection wrapper.
+Replacing only the reward during atomic promotion therefore no longer makes
+the newly promoted reward stale relative to itself; changes to task, world,
+catalog, clarifications, evaluation, env spec, or reference bytes still fail
+closed through the context and binding checks.
+
+The authoring brief now exposes WorldSpec-v2 objects and zones, along with
+relevant goal, region, entity, object, and contact channels under their real
+shaping-versus-metric-only access boundary. The UI chooses authoring intent in
+researcher order: behavior draft, then project description, then generated
+reward description.
+
+Every scaffold/list response also includes `mode-duration-qa-v1`. It states
+that per-step reward is accumulated raw, reports each mode's duration/share,
+and raises an advisory when one imbalanced window dominates the schedule. The
+same warning reaches the authoring prompt and UI. It does not block launch and
+does not normalize or otherwise alter reward semantics. No empirical
+per-mode reward-mass metric is claimed by this slice; rollout evidence remains
+the authority for deciding whether the advisory is materially harmful.
+
+Composition admission is now bounded and fail-closed. A composite accepts at
+most 16 segments, 240 fps, 10 seconds of crossfade, and 50,000 projected output
+frames; the segment limit is enforced before source arrays are loaded. Every
+parent must carry one supported, immutable root-frame convention, and the
+ordered inheritance receipts are re-read immediately before registration.
+Only a structured kinematic-gate refusal may be retried with strict checking
+disabled, and that retry is bound to the exact unchanged request. Missing root
+evidence, malformed bounds, ordinary composition errors, and edited retries
+cannot cross that authority.
+
+Reference-aware starting-policy migration now has an exact actor/critic role
+contract. It may zero-initialize only declared inserted observation terms,
+including the frozen authored-event interface and immutable reference clock,
+while moving every preserved input column and normalizer statistic to its
+target offset. Unsupported/recurrent architectures and undeclared schema
+changes fail closed. Actor-only imports prove only actor migration;
+actor-plus-critic loads require both mappings at route admission and again at
+the worker load receipt. This remains parameter initialization, never an
+optimizer-resume claim.

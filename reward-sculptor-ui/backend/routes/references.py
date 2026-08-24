@@ -34,18 +34,20 @@ import ast
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.models.kg import JobSummary
 from backend.models.project import ProblemDetail
 from backend.services import mission_store
 from backend.services.job_manager import JobManager
 from backend.services.project_store import ProjectStore
+from sculptor.refs.compose import MAX_COMPOSE_SEGMENTS
 
 
 router = APIRouter(tags=["references"])
@@ -339,8 +341,12 @@ class ComposeSegment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     clip_id: str
-    t_start_s: Optional[float] = None
-    t_end_s: Optional[float] = None
+    t_start_s: Optional[float] = Field(
+        default=None, ge=0.0, allow_inf_nan=False,
+    )
+    t_end_s: Optional[float] = Field(
+        default=None, ge=0.0, allow_inf_nan=False,
+    )
     label: Optional[str] = None
 
 
@@ -349,11 +355,15 @@ class ComposeRequest(BaseModel):
 
     clip_id: str
     robot: str
-    segments: list[ComposeSegment]
+    segments: list[ComposeSegment] = Field(max_length=MAX_COMPOSE_SEGMENTS)
     text: str = ""
     labels: list[str] = []
-    blend_s: float = 0.20
-    target_fps: Optional[float] = None
+    # Mirrors the pure composer bounds. Route validation rejects pathological
+    # requests before any library clip is loaded or resampling array exists.
+    blend_s: float = Field(default=0.20, ge=0.0, le=10.0, allow_inf_nan=False)
+    target_fps: Optional[float] = Field(
+        default=None, ge=1.0, le=240.0, allow_inf_nan=False,
+    )
     # `strict=False` still MEASURES every seam — it only declines to refuse.
     # Exposed because a marginal composite is sometimes worth eyeballing in
     # the preview before deciding, and the seam report says how bad it is.
@@ -374,7 +384,11 @@ def compose_reference_clip(body: ComposeRequest) -> Any:
     judge before spending a tracking run.
     """
     from sculptor.refs import library
-    from sculptor.refs.compose import ComposeError, compose_and_register
+    from sculptor.refs.compose import (
+        ComposeError,
+        ComposeGateError,
+        compose_and_register,
+    )
 
     if not _valid_clip_id(body.clip_id):
         return _problem(
@@ -404,6 +418,16 @@ def compose_reference_clip(body: ComposeRequest) -> Any:
             blend_s=body.blend_s,
             target_fps=body.target_fps,
             strict=body.strict,
+        )
+    except ComposeGateError as exc:
+        # This is the sole failure class an explicit `strict=false` retry may
+        # bypass. A stable problem type lets the UI bind that authority to the
+        # exact refused request instead of regexing human prose.
+        return _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "kinematic composition gate refused these segments",
+            detail=str(exc),
+            type_="/problems/reference-compose-gate",
         )
     except ComposeError as exc:
         # Every ComposeError is a caller-fixable statement about the spans
@@ -987,7 +1011,90 @@ class ModeRewardRequest(BaseModel):
     overwrite: bool = False
 
 
-def _selection_specs(project_dir: Path) -> tuple[dict, dict, dict]:
+@dataclass(frozen=True)
+class _ModeSelectionState:
+    """One verified view of the authoritative world/task selection.
+
+    A missing pointer is an explicit pure-imitation project. A pointer that
+    exists but cannot be verified is *not* equivalent: callers must surface
+    ``blocker`` and fail closed. Keeping the exact context bytes here also
+    prevents mode context, binding, and authoring from independently parsing
+    different views of the same selection during one request.
+    """
+
+    present: bool
+    selection: Any | None
+    context_bytes: dict[str, bytes]
+    context_json: dict[str, dict[str, Any]]
+    blocker: str | None = None
+
+
+def _verified_mode_selection(project_dir: Path) -> _ModeSelectionState:
+    """Read and cryptographically verify the sole selection authority."""
+    from sculptor.mode_rewards import MODE_BINDING_CONTEXT_REFS
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    store = WorldArtifactStore(project_dir)
+    if not store.selection_path.is_file():
+        return _ModeSelectionState(False, None, {}, {})
+    try:
+        selection = store.read_selection(store.selection_path)
+        if selection is None:
+            raise ValueError("selection pointer disappeared while reading")
+        context_bytes: dict[str, bytes] = {}
+        context_json: dict[str, dict[str, Any]] = {}
+        for kind in MODE_BINDING_CONTEXT_REFS:
+            ref = selection.refs[kind]
+            raw = store.resolve_ref(ref).read_bytes()
+            # Recheck the retained bytes, closing the small resolve/read race
+            # without inventing a second authority.
+            actual = hashlib.sha256(raw).hexdigest()
+            if actual != ref.sha256:
+                raise ValueError(
+                    f"selected {kind} hash mismatch while snapshotting: "
+                    f"expected {ref.sha256}, got {actual}"
+                )
+            context_bytes[kind] = raw
+            if kind in {"task", "world", "channel_catalog"}:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"selected {kind} artifact must contain a JSON object"
+                    )
+                context_json[kind] = parsed
+        return _ModeSelectionState(
+            True, selection, context_bytes, context_json
+        )
+    except Exception as exc:  # noqa: BLE001 - disk corruption becomes 4xx
+        return _ModeSelectionState(
+            True,
+            None,
+            {},
+            {},
+            blocker=(
+                "The project's authoritative selection exists but cannot be "
+                f"verified ({type(exc).__name__}: {exc}). Re-promote a "
+                "complete world/task tuple before using mode rewards."
+            ),
+        )
+
+
+def _selection_blocker_response(
+    state: _ModeSelectionState, *, action: str,
+) -> JSONResponse:
+    """Researcher-facing 409 for a present but unverifiable selection."""
+    return _problem(
+        status.HTTP_409_CONFLICT,
+        "authoritative selection is invalid",
+        detail=f"{state.blocker} Cannot {action} until it is repaired.",
+        type_="/problems/stale-artifact",
+    )
+
+
+def _selection_specs(
+    project_dir: Path,
+    selection_state: _ModeSelectionState | None = None,
+) -> tuple[dict, dict, dict]:
     """`(task, world, channel_catalog)` from the promoted selection.
 
     `({}, {}, {})` when there is no selection or a file is unreadable. One
@@ -997,21 +1104,14 @@ def _selection_specs(project_dir: Path) -> tuple[dict, dict, dict]:
     them separately meant three helpers that could each independently decide
     the project had no world.
     """
-    sel = project_dir / "env" / "selection_current.json"
-    try:
-        refs = (json.loads(sel.read_text(encoding="utf-8")) or {}).get("refs")
-    except (OSError, ValueError, TypeError, AttributeError):
+    state = selection_state or _verified_mode_selection(project_dir)
+    if state.selection is None:
         return {}, {}, {}
-    out = []
-    for kind in ("task", "world", "channel_catalog"):
-        rel = (((refs or {}).get(kind) or {}).get("path"))
-        try:
-            loaded = json.loads(
-                (project_dir / rel).read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, AttributeError):
-            loaded = None
-        out.append(loaded if isinstance(loaded, dict) else {})
-    return out[0], out[1], out[2]
+    return (
+        state.context_json.get("task", {}),
+        state.context_json.get("world", {}),
+        state.context_json.get("channel_catalog", {}),
+    )
 
 
 #: How much a task-grounded project's imitation backbone is worth. The backbone
@@ -1024,10 +1124,14 @@ def _selection_specs(project_dir: Path) -> tuple[dict, dict, dict]:
 WORLD_TRACKING_WEIGHT = 1.0 / 3.0
 
 
-def _tracking_weight(project_dir: Path) -> float:
+def _tracking_weight(
+    project_dir: Path,
+    selection_state: _ModeSelectionState | None = None,
+) -> float:
     """`WORLD_TRACKING_WEIGHT` when a mission exists, else 1.0."""
     return (WORLD_TRACKING_WEIGHT
-            if _mission_brief(*_selection_specs(project_dir)) else 1.0)
+            if _mission_brief(*_selection_specs(
+                project_dir, selection_state)) else 1.0)
 
 
 def _mission_brief(task: dict, world: dict, catalog: dict) -> str:
@@ -1037,7 +1141,10 @@ def _mission_brief(task: dict, world: dict, catalog: dict) -> str:
     return task_brief(task, world, (catalog or {}).get("channels"))
 
 
-def _episode_horizon_s(project_dir: Path) -> Optional[float]:
+def _episode_horizon_s(
+    project_dir: Path,
+    selection_state: _ModeSelectionState | None = None,
+) -> Optional[float]:
     """The execution budget for an explicit terminal hold, if knowable.
 
     A Tier-D certificate covers the reference at its exact cadence, so this
@@ -1055,7 +1162,7 @@ def _episode_horizon_s(project_dir: Path) -> Optional[float]:
     selection, malformed json — so projects without a world keep clip time and
     byte-identical output.
     """
-    task, _world, _catalog = _selection_specs(project_dir)
+    task, _world, _catalog = _selection_specs(project_dir, selection_state)
     try:
         horizon = float((((task.get("shared") or {}).get("termination") or {})
                          .get("episode_length_s")))
@@ -1070,55 +1177,48 @@ def _mode_context(
     clip_id: str,
     robot: str,
     tracking_weight: float,
+    selection_state: _ModeSelectionState | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Content identity of everything that fixes phase-window semantics.
 
     A clip id alone is not a reuse key. The same reference paired with a new
     task/world selection can have a different terminal hold, tracking
-    balance, and therefore a different execution manifest. Hash the reference bytes plus
-    the promoted selection and every immutable object it names. This gives
-    authoring, promotion, and launch one generic answer to "is this still the
-    artifact I reviewed?" without teaching the key about a particular robot or
-    task.
+    balance, and therefore a different execution manifest. Hash the reference
+    bytes plus the exact non-reward artifacts that authoring consumes. The
+    reward ref and mutable selection wrapper are deliberately excluded: a
+    successful promotion changes both while leaving the authored context
+    unchanged, so including them would make promotion invalidate itself.
     """
+    from sculptor.mode_rewards import MODE_BINDING_CONTEXT_REFS
+
     reference_path = _clip_dir_for(clip_id, robot) / "clip.npz"
     reference_sha = (
         hashlib.sha256(reference_path.read_bytes()).hexdigest()
         if reference_path.is_file() else ""
     )
 
-    selection_path = project_dir / "env" / "selection_current.json"
+    state = selection_state or _verified_mode_selection(project_dir)
     selection_hasher = hashlib.sha256()
-    selection_valid = False
-    try:
-        raw = selection_path.read_bytes()
-        selection_hasher.update(b"selection_current.json\0" + raw)
-        selection = json.loads(raw)
-        refs = selection.get("refs") if isinstance(selection, dict) else None
-        root = project_dir.resolve()
-        for kind in sorted((refs or {}).keys()):
-            rel = (((refs or {}).get(kind) or {}).get("path"))
-            if not isinstance(rel, str) or not rel:
-                continue
-            target = (project_dir / rel).resolve()
-            if not target.is_relative_to(root) or not target.is_file():
-                raise ValueError(f"unsafe or missing selection ref {rel!r}")
+    if state.selection is not None:
+        for kind in MODE_BINDING_CONTEXT_REFS:
             selection_hasher.update(kind.encode("utf-8") + b"\0")
-            selection_hasher.update(target.read_bytes())
-        selection_valid = True
-    except (OSError, ValueError, TypeError, AttributeError):
-        # No authored selection is a legitimate pure-imitation context. It is
-        # represented explicitly, not confused with an unreadable reference.
+            selection_hasher.update(state.context_bytes[kind])
+    elif state.present:
+        # Invalid is intentionally distinct from explicit pure imitation. HTTP
+        # callers gate the blocker, and the digest cannot accidentally match a
+        # scaffold produced before the tuple became unverifiable.
+        selection_hasher.update(b"invalid-promoted-selection")
+    else:
         selection_hasher.update(b"no-promoted-selection")
 
     payload = {
-        "schema": "phase-window-context-v1",
+        "schema": "phase-window-context-v2",
         "clip_id": clip_id,
         "robot": robot,
         "reference_sha256": reference_sha,
-        "selection_content_sha256": selection_hasher.hexdigest(),
-        "selection_present": selection_valid,
-        "episode_horizon_s": _episode_horizon_s(project_dir),
+        "non_reward_selection_content_sha256": selection_hasher.hexdigest(),
+        "selection_present": state.present,
+        "episode_horizon_s": _episode_horizon_s(project_dir, state),
         "tracking_weight": round(float(tracking_weight), 12),
     }
     digest = hashlib.sha256(
@@ -1128,24 +1228,20 @@ def _mode_context(
     return digest, payload
 
 
-def _mode_binding_context_refs(project_dir: Path) -> dict[str, str]:
+def _mode_binding_context_refs(
+    project_dir: Path,
+    selection_state: _ModeSelectionState | None = None,
+) -> dict[str, str]:
     """Current non-reward artifact digests, normalized by the core contract."""
     from sculptor.mode_rewards import MODE_BINDING_CONTEXT_REFS
 
-    context_refs: dict[str, str] = {}
-    try:
-        selection = json.loads(
-            (project_dir / "env" / "selection_current.json")
-            .read_text(encoding="utf-8")
-        )
-        refs = selection.get("refs") if isinstance(selection, dict) else {}
-        for kind in MODE_BINDING_CONTEXT_REFS:
-            value = ((refs or {}).get(kind) or {}).get("sha256")
-            if isinstance(value, str) and value:
-                context_refs[kind] = value
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    return context_refs
+    state = selection_state or _verified_mode_selection(project_dir)
+    if state.selection is None:
+        return {}
+    return {
+        kind: state.selection.refs[kind].sha256
+        for kind in MODE_BINDING_CONTEXT_REFS
+    }
 
 
 def _mode_binding(
@@ -1155,6 +1251,7 @@ def _mode_binding(
     robot: str,
     graph: Any,
     execution_manifest: dict[str, Any],
+    selection_state: _ModeSelectionState | None = None,
 ) -> dict[str, Any]:
     """Structured non-circular reuse key persisted in ``REWARD_SPEC``.
 
@@ -1177,7 +1274,7 @@ def _mode_binding(
         robot=robot,
         clip_sha256=clip_sha,
         graph_sha256=graph_digest,
-        context_refs=_mode_binding_context_refs(project_dir),
+        context_refs=_mode_binding_context_refs(project_dir, selection_state),
         execution_manifest=execution_manifest,
     )
 
@@ -1195,13 +1292,34 @@ def _manifest_digest(spec: dict[str, Any]) -> str:
         return ""
 
 
+def _authoring_intent_fields(
+    spec: dict[str, Any],
+) -> tuple[str, str, bool]:
+    """Pinned behavior goal, digest, and whether the pin verifies."""
+    from sculptor.mode_rewards import (
+        mode_authoring_intent_sha256,
+        normalized_behavior_goal,
+    )
+
+    intent = spec.get("authoring_intent")
+    if not isinstance(intent, dict):
+        return "", "", False
+    goal = normalized_behavior_goal(str(intent.get("behavior_goal") or ""))
+    digest = str(intent.get("sha256") or "")
+    return goal, digest, digest == mode_authoring_intent_sha256(goal)
+
+
 def _mode_binding_is_current(
     project_dir: Path,
     *,
     clip_id: str,
     robot: str,
     spec: dict[str, Any],
+    selection_state: _ModeSelectionState | None = None,
 ) -> bool:
+    state = selection_state or _verified_mode_selection(project_dir)
+    if state.blocker:
+        return False
     stored = spec.get("mode_binding")
     if not isinstance(stored, dict):
         return False
@@ -1218,6 +1336,7 @@ def _mode_binding_is_current(
         robot=robot,
         graph=graph,
         execution_manifest=manifest,
+        selection_state=state,
     )
 
 
@@ -1342,16 +1461,21 @@ def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
 
 
 def _selection_reward_agreement(
-    project_dir: Path, reward_path: Path,
+    project_dir: Path,
+    reward_path: Path,
+    selection_state: _ModeSelectionState | None = None,
 ) -> tuple[bool, str]:
     """Whether the immutable world tuple pins the same reward bytes."""
-    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+    from sculptor.world.artifacts import file_sha256
 
-    selection = WorldArtifactStore(project_dir).read_selection(
-        project_dir / "env" / "selection_current.json"
-    )
+    state = selection_state or _verified_mode_selection(project_dir)
+    if state.blocker:
+        return False, state.blocker
+    selection = state.selection
     if selection is None:
-        return False, "the project has no authoritative selection"
+        # Explicit pure imitation has no tuple to update. current.py remains
+        # the complete reward authority for that project.
+        return True, ""
     ref = selection.refs.get("reward")
     if ref is None:
         return False, "the authoritative selection has no reward ref"
@@ -1368,6 +1492,16 @@ def _selection_reward_agreement(
     if str(ref.sha256 or "") != file_sha256(target):
         return False, "the selection reward digest does not match current.py"
     return True, ""
+
+
+def _restore_file_snapshot(path: Path, payload: bytes | None) -> None:
+    """Restore a small commit-point file by atomic replace under route lock."""
+    if payload is None:
+        path.unlink(missing_ok=True)
+        return
+    rollback = path.with_name(f".{path.name}.mode-reward-rollback")
+    rollback.write_bytes(payload)
+    rollback.replace(path)
 
 
 def _chain_name(stem: str, mode_name: str) -> str:
@@ -1399,7 +1533,7 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
     was "Scaffold reward", which overwrote the very bodies the reload had
     hidden. This is the read side that makes the panel resumable.
     """
-    from sculptor.mode_rewards import authored_modes
+    from sculptor.mode_rewards import authored_modes, mode_duration_qa
 
     store: ProjectStore = request.app.state.project_store
     project_dir = _project_dir(store, slug)
@@ -1409,6 +1543,7 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
             detail=f"no project with slug {slug!r}",
             type_="/problems/not-found")
 
+    selection_state = _verified_mode_selection(project_dir)
     rewards_dir = project_dir / "rewards"
     out: list[dict[str, Any]] = []
     for path in sorted(rewards_dir.glob("mode_reward_v*.py")):
@@ -1422,6 +1557,9 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
         windows = _mode_windows_from_source(source)
         from sculptor.mode_rewards import reward_spec_from_source
         spec = reward_spec_from_source(source)
+        authoring_goal, authoring_intent_sha, authoring_intent_valid = (
+            _authoring_intent_fields(spec)
+        )
         clip_id = _spec_str_from_source(source, "reference_clip_id")
         reference_robot = _spec_str_from_source(source, "reference_robot")
         stored_context = _spec_str_from_source(
@@ -1436,12 +1574,14 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
                 clip_id=clip_id,
                 robot=reference_robot,
                 tracking_weight=tracking_weight,
+                selection_state=selection_state,
             )
             binding_current = _mode_binding_is_current(
                 project_dir,
                 clip_id=clip_id,
                 robot=reference_robot,
                 spec=spec,
+                selection_state=selection_state,
             )
         else:
             # A legacy phase reward without source-robot identity cannot be
@@ -1450,22 +1590,33 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
             # same-robot claim.
             current_context = ""
             binding_current = False
+        context_blocker = (
+            "source robot identity is missing; regenerate this mode reward"
+            if not reference_robot
+            else selection_state.blocker
+            if selection_state.blocker
+            else "authoring intent is missing or invalid; regenerate this mode reward"
+            if not authoring_intent_valid
+            else None
+        )
         out.append({
             "filename": path.name,
             "path": str(path),
             "clip_id": clip_id,
             "reference_robot": reference_robot,
             "execution_context_digest": stored_context,
-            "context_blocker": (
-                None if reference_robot
-                else "source robot identity is missing; regenerate this mode reward"
-            ),
+            "authoring_goal": authoring_goal,
+            "authoring_intent_sha256": authoring_intent_sha,
+            "authoring_intent_valid": authoring_intent_valid,
+            "context_blocker": context_blocker,
             # Missing is stale, never "probably current". Older files can be
             # inspected, but must be explicitly regenerated before promotion.
             "context_current": bool(
                 stored_context
                 and stored_context == current_context
                 and binding_current
+                and not selection_state.blocker
+                and authoring_intent_valid
             ),
             "tracking_enabled": bool(
                 spec.get("tracking_enabled", "def _tracking(" in source)
@@ -1484,6 +1635,7 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
                 for name, done in authored.items()
             ],
             "unauthored": [n for n, done in authored.items() if not done],
+            "duration_qa": mode_duration_qa(windows),
         })
     out.sort(key=lambda r: r["mtime"], reverse=True)
 
@@ -1509,6 +1661,9 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
             windows = _mode_windows_from_source(source)
             from sculptor.mode_rewards import reward_spec_from_source
             spec = reward_spec_from_source(source)
+            authoring_goal, authoring_intent_sha, authoring_intent_valid = (
+                _authoring_intent_fields(spec)
+            )
             promoted_clip = _spec_str_from_source(
                 source, "reference_clip_id")
             promoted_robot = _spec_str_from_source(source, "reference_robot")
@@ -1524,18 +1679,31 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
                     clip_id=promoted_clip,
                     robot=promoted_robot,
                     tracking_weight=tracking_weight,
+                    selection_state=selection_state,
                 )
                 binding_current = _mode_binding_is_current(
                     project_dir,
                     clip_id=promoted_clip,
                     robot=promoted_robot,
                     spec=spec,
+                    selection_state=selection_state,
                 )
             else:
                 current_context = ""
                 binding_current = False
+            context_blocker = (
+                "source robot identity is missing; regenerate this mode reward"
+                if not promoted_robot
+                else selection_state.blocker
+                if selection_state.blocker
+                else "authoring intent is missing or invalid; regenerate this mode reward"
+                if not authoring_intent_valid
+                else None
+            )
             selection_current, selection_blocker = (
-                _selection_reward_agreement(project_dir, current_path)
+                _selection_reward_agreement(
+                    project_dir, current_path, selection_state
+                )
             )
             promoted = {
                 "version": current_n,
@@ -1543,15 +1711,17 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
                 "clip_id": promoted_clip,
                 "reference_robot": promoted_robot,
                 "execution_context_digest": stored_context,
-                "context_blocker": (
-                    None if promoted_robot
-                    else "source robot identity is missing; regenerate this mode reward"
-                ),
+                "authoring_goal": authoring_goal,
+                "authoring_intent_sha256": authoring_intent_sha,
+                "authoring_intent_valid": authoring_intent_valid,
+                "context_blocker": context_blocker,
                 "context_current": bool(
                     stored_context
                     and stored_context == current_context
                     and binding_current
                     and selection_current
+                    and not selection_state.blocker
+                    and authoring_intent_valid
                 ),
                 "selection_current": selection_current,
                 "promotion_blocker": selection_blocker or None,
@@ -1573,6 +1743,7 @@ def list_mode_rewards(slug: str, request: Request) -> Any:
                     for name, done in authored.items()
                 ],
                 "unauthored": [n for n, done in authored.items() if not done],
+                "duration_qa": mode_duration_qa(windows),
             }
 
     return {"mode_rewards": out, "promoted": promoted}
@@ -1632,6 +1803,7 @@ def scaffold_mode_reward(
     """
     from sculptor.mode_rewards import (authored_modes,
                                        generate_mode_reward_scaffold,
+                                       mode_duration_qa,
                                        mode_windows_s,
                                        validate_mode_reward_source)
     from sculptor.modes import ModeError
@@ -1649,6 +1821,12 @@ def scaffold_mode_reward(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "clip_id mismatch",
             detail=f"path says {clip_id!r}, body says {body.clip_id!r}",
             type_="/problems/validation-error")
+
+    selection_state = _verified_mode_selection(project_dir)
+    if selection_state.blocker:
+        return _selection_blocker_response(
+            selection_state, action="scaffold a mode reward"
+        )
 
     loaded, err = _load_mode_graph(clip_id, body.robot)
     if err is not None:
@@ -1668,19 +1846,20 @@ def scaffold_mode_reward(
                    "authored mode bodies. Pass overwrite=true to replace it.",
             type_="/problems/conflict")
 
-    tracking_weight = _tracking_weight(project_dir)
+    tracking_weight = _tracking_weight(project_dir, selection_state)
     context_digest, context = _mode_context(
         project_dir,
         clip_id=clip_id,
         robot=body.robot,
         tracking_weight=tracking_weight,
+        selection_state=selection_state,
     )
     try:
         source = generate_mode_reward_scaffold(
             graph, behavior_goal=body.goal, clip_id=clip_id,
             robot=body.robot,
             clip=clip if body.tracking else None,
-            horizon_s=_episode_horizon_s(project_dir),
+            horizon_s=_episode_horizon_s(project_dir, selection_state),
             tracking_weight=tracking_weight)
         # Binding is immutable provenance, not a comment. Promotion and launch
         # can now distinguish "same clip id" from "same reviewed execution
@@ -1707,6 +1886,7 @@ def scaffold_mode_reward(
                 robot=body.robot,
                 graph=graph,
                 execution_manifest=execution_manifest,
+                selection_state=selection_state,
             ),
         })
     except ModeError as e:
@@ -1725,6 +1905,9 @@ def scaffold_mode_reward(
     dest.write_text(source, encoding="utf-8")
 
     authored = authored_modes(source)
+    authoring_goal, authoring_intent_sha, authoring_intent_valid = (
+        _authoring_intent_fields(generated_spec)
+    )
     # The MODULE's execution windows, not only the graph's certified windows.
     # They differ solely when an explicit terminal hold extends the final
     # mode; no certified clip phase is fitted or retimed.
@@ -1733,7 +1916,11 @@ def scaffold_mode_reward(
         "path": str(dest),
         "filename": dest.name,
         "clip_id": clip_id,
+        "reference_robot": body.robot,
         "execution_context_digest": context_digest,
+        "authoring_goal": authoring_goal,
+        "authoring_intent_sha256": authoring_intent_sha,
+        "authoring_intent_valid": authoring_intent_valid,
         "tracking": bool(body.tracking),
         "modes": [
             {"name": name,
@@ -1743,6 +1930,7 @@ def scaffold_mode_reward(
             for name, done in authored.items()
         ],
         "unauthored": [n for n, done in authored.items() if not done],
+        "duration_qa": mode_duration_qa(windows),
     }
 
 
@@ -1800,13 +1988,11 @@ def author_mode_reward(
             detail=f"path says {clip_id!r}, body says {body.clip_id!r}",
             type_="/problems/validation-error")
 
-    if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
-        return _problem(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "ANTHROPIC_API_KEY required for mode authoring",
-            detail="Set ANTHROPIC_API_KEY in the shell launching the backend "
-                   "OR in ../RewardSculptor/.env, then restart.",
-            type_="/problems/anthropic-key-missing")
+    selection_state = _verified_mode_selection(project_dir)
+    if selection_state.blocker:
+        return _selection_blocker_response(
+            selection_state, action="author from this mode scaffold"
+        )
 
     loaded, err = _load_mode_graph(clip_id, body.robot)
     if err is not None:
@@ -1833,6 +2019,87 @@ def author_mode_reward(
             detail=f"{src.name} does not exist — scaffold the mode reward "
                    "first (POST .../mode-reward).",
             type_="/problems/not-found")
+
+    from sculptor.mode_rewards import reward_spec_from_source
+
+    source = src.read_text(encoding="utf-8")
+    spec = reward_spec_from_source(source)
+    pinned_goal, pinned_intent_sha, intent_valid = _authoring_intent_fields(spec)
+    from sculptor.mode_rewards import mode_authoring_intent_sha256
+
+    requested_intent_sha = mode_authoring_intent_sha256(body.goal)
+    if not intent_valid or requested_intent_sha != pinned_intent_sha:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode authoring goal does not match the scaffold",
+            detail=(
+                f"{src.name} pins behavior goal {pinned_goal!r}. Authoring "
+                "must use that exact normalized goal; regenerate the scaffold "
+                "to intentionally change research intent."
+            ),
+            type_="/problems/stale-artifact",
+        )
+    source_clip = spec.get("reference_clip_id")
+    source_robot = spec.get("reference_robot")
+    if source_clip != clip_id or source_robot != body.robot:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode scaffold belongs to a different reference",
+            detail=(
+                f"{src.name} binds {source_robot!r}/{source_clip!r}, while "
+                f"this request targets {body.robot!r}/{clip_id!r}. Select the "
+                "matching scaffold or regenerate it before authoring."
+            ),
+            type_="/problems/stale-artifact",
+        )
+    try:
+        tracking_weight = float(spec.get("tracking_weight", 1.0))
+    except (TypeError, ValueError):
+        tracking_weight = 1.0
+    stored_context = spec.get("execution_context_digest")
+    current_context, _current_fields = _mode_context(
+        project_dir,
+        clip_id=clip_id,
+        robot=body.robot,
+        tracking_weight=tracking_weight,
+        selection_state=selection_state,
+    )
+    if not isinstance(stored_context, str) or stored_context != current_context:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode scaffold belongs to an older execution context",
+            detail=(
+                "The reference bytes, task/world selection, episode horizon, "
+                "or tracking balance changed after this scaffold was made. "
+                "Regenerate it before spending a model call on authoring."
+            ),
+            type_="/problems/stale-artifact",
+        )
+    if not _mode_binding_is_current(
+        project_dir,
+        clip_id=clip_id,
+        robot=body.robot,
+        spec=spec,
+        selection_state=selection_state,
+    ):
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode scaffold binding is stale or incomplete",
+            detail=(
+                "The scaffold no longer binds the exact reference bytes, "
+                "robot, mode graph, execution schedule, and non-reward world "
+                "artifacts. Regenerate it before authoring."
+            ),
+            type_="/problems/stale-artifact",
+        )
+
+    if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+        return _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ANTHROPIC_API_KEY required for mode authoring",
+            detail="Set ANTHROPIC_API_KEY in the shell launching the backend "
+                   "OR in ../RewardSculptor/.env, then restart.",
+            type_="/problems/anthropic-key-missing")
 
     out_name = body.out_filename or _chain_name(src.stem, body.mode)
     dest = _reward_dest(project_dir, out_name)
@@ -1868,14 +2135,55 @@ def author_mode_reward(
 
     from backend.services.mode_jobs import run_mode_author_job
 
+    author_runner = run_mode_author_job(
+        project_dir=project_dir,
+        reward_path=src,
+        out_path=dest,
+        clip_id=clip_id,
+        robot=body.robot,
+        mode=body.mode,
+        behavior_goal=body.goal,
+        mode_goal=body.mode_goal,
+        mission=_mission_brief(*_selection_specs(
+            project_dir, selection_state)),
+    )
+
+    async def _run_if_still_current(job, cancel):
+        """Close the queue-time race before the underlying model call."""
+        fresh_state = _verified_mode_selection(project_dir)
+        fresh_source = (
+            src.read_text(encoding="utf-8") if src.is_file() else ""
+        )
+        fresh_context, _ = _mode_context(
+            project_dir,
+            clip_id=clip_id,
+            robot=body.robot,
+            tracking_weight=tracking_weight,
+            selection_state=fresh_state,
+        )
+        if (
+            fresh_state.blocker
+            or fresh_source != source
+            or fresh_context != stored_context
+            or not _mode_binding_is_current(
+                project_dir,
+                clip_id=clip_id,
+                robot=body.robot,
+                spec=spec,
+                selection_state=fresh_state,
+            )
+        ):
+            raise RuntimeError(
+                "Mode authoring stopped before the model call because the "
+                "scaffold or authoritative selection changed after queuing. "
+                "Regenerate/review the scaffold and try again."
+            )
+        return await author_runner(job, cancel)
+
     job = jobs.submit(
         kind="mode_author",  # type: ignore[arg-type]
         project_slug=slug,
-        fn=run_mode_author_job(
-            project_dir=project_dir, reward_path=src, out_path=dest,
-            clip_id=clip_id, robot=body.robot, mode=body.mode,
-            behavior_goal=body.goal, mode_goal=body.mode_goal,
-            mission=_mission_brief(*_selection_specs(project_dir))),
+        fn=_run_if_still_current,
         params={"clip_id": clip_id, "mode": body.mode,
                 "filename": src.name, "out_filename": dest.name},
     )
@@ -1945,6 +2253,19 @@ def promote_mode_reward_route(
     from sculptor.mode_rewards import reward_spec_from_source
     spec = reward_spec_from_source(source)
     stored_context = spec.get("execution_context_digest")
+    _pinned_goal, _pinned_sha, authoring_intent_valid = (
+        _authoring_intent_fields(spec)
+    )
+    if not authoring_intent_valid:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mode reward authoring intent is missing or invalid",
+            detail=(
+                "Regenerate this phase reward so its normalized behavior goal "
+                "and digest are pinned before promotion."
+            ),
+            type_="/problems/stale-artifact",
+        )
     reference_robot = spec.get("reference_robot")
     if not isinstance(reference_robot, str) or not reference_robot.strip():
         return _problem(
@@ -1959,6 +2280,11 @@ def promote_mode_reward_route(
             type_="/problems/stale-artifact",
         )
     reference_robot = reference_robot.strip()
+    selection_state = _verified_mode_selection(project_dir)
+    if selection_state.blocker:
+        return _selection_blocker_response(
+            selection_state, action="promote this mode reward"
+        )
     try:
         tracking_weight = float(spec.get("tracking_weight", 1.0))
     except (TypeError, ValueError):
@@ -1968,6 +2294,7 @@ def promote_mode_reward_route(
         clip_id=clip_id,
         robot=str(reference_robot),
         tracking_weight=tracking_weight,
+        selection_state=selection_state,
     )
     if not isinstance(stored_context, str) or stored_context != current_context:
         return _problem(
@@ -1987,6 +2314,7 @@ def promote_mode_reward_route(
         clip_id=clip_id,
         robot=str(reference_robot),
         spec=spec,
+        selection_state=selection_state,
     ):
         return _problem(
             status.HTTP_409_CONFLICT,
@@ -2003,8 +2331,6 @@ def promote_mode_reward_route(
     from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
 
     world_store = WorldArtifactStore(project_dir)
-    selection_path = project_dir / "env" / "selection_current.json"
-    selection = world_store.read_selection(selection_path)
 
     contract = None
     try:
@@ -2014,43 +2340,129 @@ def promote_mode_reward_route(
         contract = None
 
     current_path = project_dir / "rewards" / "current.py"
-    previous_current = (
-        current_path.read_bytes() if current_path.is_file() else None
-    )
-    try:
-        out = promote_mode_reward(
-            src, contract=contract, allow_unauthored=body.allow_unauthored)
-    except ModeAuthorError as e:
-        return _problem(
-            status.HTTP_409_CONFLICT, "reward not promotable", detail=str(e),
-            type_="/problems/state-conflict")
-
-    promoted_path = Path(out["path"]).resolve()
+    selection_path = world_store.selection_path
     promoted_selection = None
-    if selection is not None:
-        try:
-            refs = dict(selection.refs)
-            refs["reward"] = ArtifactRef.from_path(
-                "reward", promoted_path.stem, promoted_path, base=project_dir
-            )
-            promoted_selection = world_store.promote(
-                refs, evaluation_lineage=selection.evaluation_lineage
-            )
-        except Exception as exc:  # noqa: BLE001 - restore prior commit point
-            if previous_current is None:
-                current_path.unlink(missing_ok=True)
-            else:
-                current_path.write_bytes(previous_current)
-            promoted_path.unlink(missing_ok=True)
+    # The artifact-store lock is project-scoped and process-safe. Holding it
+    # across reward version allocation, current.py, and tuple promotion makes
+    # the two visible commit points one route transaction. Re-verify inside
+    # the lock so a selection change between admission and commit cannot race.
+    with world_store.locked():
+        if src.read_text(encoding="utf-8") != source:
             return _problem(
                 status.HTTP_409_CONFLICT,
-                "reward tuple promotion failed",
+                "mode reward changed during promotion",
                 detail=(
-                    "The reward file passed validation, but its immutable "
-                    f"world/task tuple could not be committed: {exc}"
+                    f"{src.name} changed after validation. Review the new "
+                    "bytes and promote again."
                 ),
+                type_="/problems/stale-artifact",
+            )
+        locked_state = _verified_mode_selection(project_dir)
+        if locked_state.blocker:
+            return _selection_blocker_response(
+                locked_state, action="promote this mode reward"
+            )
+        locked_context, _locked_fields = _mode_context(
+            project_dir,
+            clip_id=clip_id,
+            robot=reference_robot,
+            tracking_weight=tracking_weight,
+            selection_state=locked_state,
+        )
+        if stored_context != locked_context or not _mode_binding_is_current(
+            project_dir,
+            clip_id=clip_id,
+            robot=reference_robot,
+            spec=spec,
+            selection_state=locked_state,
+        ):
+            return _problem(
+                status.HTTP_409_CONFLICT,
+                "mode reward context changed during promotion",
+                detail=(
+                    "The selected world/task tuple or reference binding "
+                    "changed after validation. Regenerate or review the mode "
+                    "reward against the current selection, then promote again."
+                ),
+                type_="/problems/stale-artifact",
+            )
+
+        selection = locked_state.selection
+        previous_current = (
+            current_path.read_bytes() if current_path.is_file() else None
+        )
+        previous_selection = (
+            selection_path.read_bytes() if selection_path.is_file() else None
+        )
+        reward_versions_before = set(
+            (project_dir / "rewards").glob("v[0-9]*.py")
+        )
+        selection_versions_before = set(
+            world_store.env_dir.glob("selection_v[0-9]*.json")
+        )
+        try:
+            out = promote_mode_reward(
+                src,
+                contract=contract,
+                allow_unauthored=body.allow_unauthored,
+            )
+        except ModeAuthorError as e:
+            return _problem(
+                status.HTTP_409_CONFLICT,
+                "reward not promotable",
+                detail=str(e),
                 type_="/problems/state-conflict",
             )
+        except Exception as exc:  # noqa: BLE001 - roll back partial reward IO
+            _restore_file_snapshot(current_path, previous_current)
+            for created in (
+                set((project_dir / "rewards").glob("v[0-9]*.py"))
+                - reward_versions_before
+            ):
+                created.unlink(missing_ok=True)
+            return _problem(
+                status.HTTP_409_CONFLICT,
+                "reward promotion failed",
+                detail=f"No reward change was committed: {exc}",
+                type_="/problems/state-conflict",
+            )
+
+        promoted_path = Path(out["path"]).resolve()
+        if selection is not None:
+            try:
+                refs = dict(selection.refs)
+                refs["reward"] = ArtifactRef.from_path(
+                    "reward",
+                    promoted_path.stem,
+                    promoted_path,
+                    base=project_dir,
+                )
+                promoted_selection = world_store.promote(
+                    refs, evaluation_lineage=selection.evaluation_lineage
+                )
+            except Exception as exc:  # noqa: BLE001 - restore both commit points
+                _restore_file_snapshot(current_path, previous_current)
+                _restore_file_snapshot(selection_path, previous_selection)
+                for created in (
+                    set((project_dir / "rewards").glob("v[0-9]*.py"))
+                    - reward_versions_before
+                ):
+                    created.unlink(missing_ok=True)
+                for created in (
+                    set(world_store.env_dir.glob("selection_v[0-9]*.json"))
+                    - selection_versions_before
+                ):
+                    created.unlink(missing_ok=True)
+                return _problem(
+                    status.HTTP_409_CONFLICT,
+                    "reward tuple promotion failed",
+                    detail=(
+                        "The reward file passed validation, but its immutable "
+                        "world/task tuple could not be committed. Both reward "
+                        f"and selection were restored: {exc}"
+                    ),
+                    type_="/problems/state-conflict",
+                )
 
     return {"version": out["version"], "filename": out["filename"],
             "path": out["path"], "clip_id": clip_id,

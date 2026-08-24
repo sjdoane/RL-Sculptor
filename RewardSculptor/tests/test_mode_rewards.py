@@ -28,6 +28,7 @@ from sculptor.mode_rewards import (
     generate_mode_reward_scaffold,
     graft_mode_bodies,
     mode_authoring_prompt,
+    mode_duration_qa,
     mode_ident,
     mode_windows_s,
     task_brief,
@@ -247,6 +248,40 @@ def test_a_valid_scaffold_validates_clean():
     assert validate_mode_reward_source(generate_mode_reward_scaffold(g), g) == []
 
 
+def test_scaffold_pins_one_normalized_authoring_intent():
+    from sculptor.mode_rewards import (
+        mode_authoring_intent_sha256,
+        reward_spec_from_source,
+    )
+
+    source = generate_mode_reward_scaffold(
+        _graph(), behavior_goal="  sprint   then land  ",
+    )
+    intent = reward_spec_from_source(source)["authoring_intent"]
+
+    assert intent["behavior_goal"] == "sprint then land"
+    assert intent["sha256"] == mode_authoring_intent_sha256(
+        "sprint then land",
+    )
+
+
+def test_authoring_refuses_a_goal_changed_after_scaffolding():
+    from sculptor.mode_rewards import ModeAuthorError, author_mode
+
+    source = generate_mode_reward_scaffold(
+        _graph(), behavior_goal="sprint then land",
+    )
+
+    with pytest.raises(ModeAuthorError, match="goal changed"):
+        author_mode(
+            source=source,
+            graph=_graph(),
+            mode="approach",
+            contract=None,
+            behavior_goal="stand still instead",
+        )
+
+
 def test_a_certified_clip_cannot_be_silently_retimed():
     """Tier-D cadence is part of the certified artifact identity.
 
@@ -375,6 +410,52 @@ def test_a_single_mode_graph_reads_as_the_only_mode():
 def test_asking_for_an_unknown_mode_is_a_caller_bug():
     with pytest.raises(KeyError):
         mode_authoring_prompt(_graph(), "nope")
+
+
+def test_duration_qa_exposes_a_long_raw_accumulation_window():
+    windows = {
+        "approach": (0.0, 1.0),
+        "launch": (1.0, 2.0),
+        "land": (2.0, 12.0),
+    }
+
+    qa = mode_duration_qa(windows)
+
+    assert qa["accumulation"] == "raw_per_step_not_duration_normalized"
+    assert qa["episode_duration_s"] == 12.0
+    assert qa["warnings"] == [{
+        "code": "long_window_raw_per_step_accumulation",
+        "mode": "land",
+        "duration_s": 10.0,
+        "episode_share": pytest.approx(10.0 / 12.0),
+        "ratio_to_median": 10.0,
+    }]
+
+    prompt = mode_authoring_prompt(_graph(), "land", windows=windows)
+    assert "10s of the 12s execution schedule (83.3%)" in prompt
+    assert "NOT duration-normalized" in prompt
+    assert "LONG-WINDOW ADVISORY" in prompt
+
+
+def test_duration_qa_does_not_warn_on_balanced_windows():
+    qa = mode_duration_qa(mode_windows_s(_graph()))
+    assert qa["warnings"] == []
+
+
+def test_duration_qa_catches_extreme_two_mode_imbalance():
+    """The candidate must not dilute its own comparison baseline."""
+    qa = mode_duration_qa({
+        "transition": (0.0, 1.0),
+        "terminal_hold": (1.0, 100.0),
+    })
+
+    assert qa["warnings"] == [{
+        "code": "long_window_raw_per_step_accumulation",
+        "mode": "terminal_hold",
+        "duration_s": 99.0,
+        "episode_share": 0.99,
+        "ratio_to_median": 99.0,
+    }]
 
 
 # ── the spec the metric layer reads ─────────────────────────────────────
@@ -1472,6 +1553,94 @@ _CHANNELS = [
      "source": {"goal": "complete_course"}},
 ]
 
+_TASK_V2 = {"shared": {
+    "goal": {
+        "id": "complete_compact_rail_course",
+        "type": "waypoint_sequence",
+        "waypoints": ["waypoint_01", "finish"],
+        "success": {"predicate": "sequence_complete", "hold_s": 2.0},
+    },
+    "contacts": {
+        "forbidden": [["robot:any", "object:rail_01"]],
+    },
+}}
+_WORLD_V2 = {"shared": {
+    "obstacles": {"course": []},
+    "objects": {
+        "rail_01": {
+            "shape": "box",
+            "fixed": True,
+            "route_semantics": "traverse_over",
+            "nominal": {
+                "size_m": [0.1, 0.6, 0.06],
+                "pose": {"position_m": [0.35, 0.0, 0.03]},
+            },
+        },
+    },
+    "zones": {
+        "waypoint_01": {
+            "kind": "disk", "center_m": [0.65, 0.0], "radius_m": 0.3,
+        },
+        "finish": {
+            "kind": "disk", "center_m": [1.05, 0.0], "radius_m": 0.45,
+        },
+    },
+}}
+_CHANNELS_V2 = [
+    # Put a region progress channel first: REQUIRED must still select the
+    # goal-level distance as its single, stable progress authority.
+    {"name": "region__waypoint_01__relative",
+     "access": "shared_shaping", "metric_role": "progress",
+     "source": {"region": "waypoint_01"}},
+    {"name": "goal__complete_compact_rail_course__waypoint_distance",
+     "access": "shared_shaping", "metric_role": "progress",
+     "source": {"goal": "complete_compact_rail_course"}},
+    {"name": "object__rail_01__pos_w",
+     "access": "shared_shaping", "metric_role": "state",
+     "source": {"entity": "rail_01"}},
+    {"name": "contact__forbidden__0",
+     "access": "metric_only", "metric_role": "contact",
+     "source": {"group": "forbidden", "index": 0,
+                "selectors": ["robot:any", "object:rail_01"]}},
+    {"name": "region__unrelated__relative",
+     "access": "shared_shaping", "metric_role": "progress",
+     "source": {"region": "unrelated"}},
+]
+
+_TASK_EVENT = {"shared": {
+    **_TASK_V2["shared"],
+    "event_sequence": {
+        "id": "route_jump_hold",
+        "phases": [
+            {"id": "route", "until": {"event": "goal_complete"}},
+            {"id": "jump", "until": {
+                "event": "bilateral_support_cycle",
+                "min_height_delta_m": 0.18,
+                "min_air_time_s": 0.12,
+                "support_contacts": [
+                    ["robot:left_foot", "world:terrain"],
+                    ["robot:right_foot", "world:terrain"],
+                ],
+            }},
+            {"id": "hold", "terminal": True, "minimum_hold_s": 2.0},
+        ],
+    },
+}}
+_EVENT_CHANNELS = [
+    {"name": "event__route_jump_hold__phase",
+     "access": "shared_shaping", "metric_role": "state",
+     "source": {"event_sequence": "route_jump_hold"}},
+    {"name": "event__route_jump_hold__phase_height_delta",
+     "access": "shared_shaping", "metric_role": "progress",
+     "source": {"event_sequence": "route_jump_hold"}},
+    {"name": "event__route_jump_hold__base_vertical_velocity",
+     "access": "shared_shaping", "metric_role": "state",
+     "source": {"event_sequence": "route_jump_hold"}},
+    {"name": "event__route_jump_hold__violation",
+     "access": "metric_only", "metric_role": "safety",
+     "source": {"event_sequence": "route_jump_hold"}},
+]
+
 
 def test_a_project_with_no_goal_gets_no_mission_brief():
     """Pure imitation must not be told to chase a course that does not exist."""
@@ -1485,6 +1654,73 @@ def test_the_brief_names_the_course_the_robot_is_actually_in():
     brief = task_brief(_TASK, _WORLD, _CHANNELS)
     assert "platform box_01" in brief and "height 0.231 m" in brief
     assert "starts 0.81 m before it" in brief
+
+
+def test_world_v2_objects_and_zones_reach_the_authoring_brief():
+    """World-v2 courses use fixed objects and route zones, not the legacy
+    `obstacles.course` list; hiding them makes a course reward world-blind."""
+    brief = task_brief(_TASK_V2, _WORLD_V2, _CHANNELS_V2)
+    assert "box rail_01" in brief
+    assert "center (0.35, 0, 0.03) m" in brief
+    assert "size (0.1, 0.6, 0.06) m" in brief
+    assert "route traverse_over" in brief
+    assert "disk waypoint_01" in brief
+    assert "center (0.65, 0) m" in brief
+
+
+def test_world_v2_zone_placement_and_rotation_reach_the_brief():
+    world = {"shared": {
+        **_WORLD_V2["shared"],
+        "objects": {
+            "rail_01": {
+                "shape": "box", "fixed": True,
+                "nominal": {
+                    "size_m": [0.1, 0.6, 0.06],
+                    "pose": {
+                        "placement": "zone:waypoint_01",
+                        "z_m": 0.03,
+                        "quaternion_wxyz": [0.7071, 0.0, 0.0, 0.7071],
+                    },
+                },
+            },
+        },
+    }}
+
+    brief = task_brief(_TASK_V2, world, _CHANNELS_V2)
+
+    assert "placement zone:waypoint_01" in brief
+    assert "env-local center (0.65, 0, 0.03) m" in brief
+    assert "quaternion wxyz (0.7071, 0, 0, 0.7071)" in brief
+    assert "env-local center (0.65, 0) m" in brief
+
+
+def test_event_program_and_access_boundaries_reach_the_brief():
+    brief = task_brief(
+        _TASK_EVENT, _WORLD_V2, [*_CHANNELS_V2, *_EVENT_CHANNELS],
+    )
+    may, must_not = brief.split("METRICS ONLY", 1)
+
+    assert "Event program 'route_jump_hold', in order: route -> jump -> hold" \
+        in brief
+    assert "min height delta m=0.18" in brief
+    assert "hold requires 2s hold" in brief
+    assert "event__route_jump_hold__phase" in may
+    assert "event__route_jump_hold__phase_height_delta" in may
+    assert "event__route_jump_hold__base_vertical_velocity" in may
+    assert "event__route_jump_hold__violation" not in may
+    assert "event__route_jump_hold__violation" in must_not
+
+
+def test_world_v2_relevant_channels_are_visible_with_their_access_boundary():
+    brief = task_brief(_TASK_V2, _WORLD_V2, _CHANNELS_V2)
+    may, must_not = brief.split("METRICS ONLY", 1)
+    assert "region__waypoint_01__relative" in may
+    assert "object__rail_01__pos_w" in may
+    assert "contact__forbidden__0" not in may
+    assert "contact__forbidden__0" in must_not
+    assert "region__unrelated__relative" not in brief
+    required = brief.split("REQUIRED:", 1)[1].splitlines()[0]
+    assert "goal__complete_compact_rail_course__waypoint_distance" in required
 
 
 def test_only_shaping_channels_are_offered_to_read():

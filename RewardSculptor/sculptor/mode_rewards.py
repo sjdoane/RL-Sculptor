@@ -77,6 +77,18 @@ MODE_FN_PREFIX = "_mode_"
 #: off this, so it is part of the contract rather than a formatting detail.
 MODE_COMPONENT_PREFIX = "mode_"
 
+
+def normalized_behavior_goal(value: str) -> str:
+    """Canonical researcher intent pinned by a mode-reward scaffold."""
+    return " ".join(str(value or "").split())
+
+
+def mode_authoring_intent_sha256(value: str) -> str:
+    """Content identity for the goal an authoring chain is allowed to use."""
+    return hashlib.sha256(
+        normalized_behavior_goal(value).encode("utf-8")
+    ).hexdigest()
+
 #: Hard ceiling on an authoring prompt. This is a SYSTEM-composed prompt, not
 #: the Rewards-tab text box, so it budgets against `SYSTEM_PROMPT_MAX_CHARS`
 #: rather than the human bound — a mission brief naming the course and the
@@ -132,6 +144,94 @@ def mode_windows_s(graph: ModeGraph) -> dict[str, tuple[float, float]]:
     from sculptor.modes import mode_phase_windows
 
     return mode_phase_windows(graph)
+
+
+def mode_duration_qa(
+    windows: Mapping[str, tuple[float, float]],
+) -> dict[str, Any]:
+    """Describe raw per-step reward exposure across execution windows.
+
+    Mode rewards are summed once per control step; they are intentionally not
+    divided by window duration.  A terminal hold can therefore give a weak,
+    state-only term much more return mass than a short transition term.  This
+    helper makes that fact inspectable without silently rewriting scientific
+    semantics.  Warnings are advisory: empirical rollout evidence decides
+    whether the imbalance is actually harmful.
+    """
+    rows: list[dict[str, Any]] = []
+    bounds: list[tuple[float, float]] = []
+    for name, raw_window in windows.items():
+        try:
+            lo, hi = float(raw_window[0]), float(raw_window[1])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ModeError(f"mode {name!r} has an invalid time window") from exc
+        if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
+            raise ModeError(
+                f"mode {name!r} has invalid time window {(lo, hi)!r}; "
+                "bounds must be finite and increasing")
+        bounds.append((lo, hi))
+        rows.append({"name": str(name), "duration_s": hi - lo})
+
+    if not rows:
+        return {
+            "schema": "mode-duration-qa-v1",
+            "accumulation": "raw_per_step_not_duration_normalized",
+            "episode_duration_s": 0.0,
+            "modes": [],
+            "warnings": [],
+        }
+
+    schedule_start = min(lo for lo, _ in bounds)
+    schedule_end = max(hi for _, hi in bounds)
+    episode_duration = schedule_end - schedule_start
+    def _median(values: Sequence[float]) -> float:
+        ordered = sorted(float(value) for value in values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+    warnings: list[dict[str, Any]] = []
+    for row in rows:
+        duration = float(row["duration_s"])
+        share = duration / episode_duration
+        # Compare a mode with its peers, not with a median that includes the
+        # candidate itself.  Including it hid the most extreme two-mode case:
+        # [1s, 99s] has a global median of 50s and therefore used to report a
+        # harmless-looking 1.98x ratio.  The peer median preserves the useful
+        # interpretation: how much raw return exposure this mode has relative
+        # to a typical *other* mode.
+        peer_durations = [
+            float(other["duration_s"])
+            for other in rows
+            if other is not row
+        ]
+        peer_median = _median(peer_durations) if peer_durations else duration
+        ratio = duration / peer_median
+        row.update({
+            "duration_s": round(duration, 12),
+            "episode_share": round(share, 12),
+            "ratio_to_median": round(ratio, 12),
+        })
+        # Require both absolute dominance and relative imbalance.  This avoids
+        # flagging a one-mode schedule or two equal halves while catching a
+        # long terminal hold that can dominate raw accumulated return.
+        if len(rows) > 1 and share >= 0.5 and ratio >= 2.0:
+            warnings.append({
+                "code": "long_window_raw_per_step_accumulation",
+                "mode": row["name"],
+                "duration_s": row["duration_s"],
+                "episode_share": row["episode_share"],
+                "ratio_to_median": row["ratio_to_median"],
+            })
+
+    return {
+        "schema": "mode-duration-qa-v1",
+        "accumulation": "raw_per_step_not_duration_normalized",
+        "episode_duration_s": round(episode_duration, 12),
+        "modes": rows,
+        "warnings": warnings,
+    }
 
 
 def scale_windows(
@@ -705,7 +805,7 @@ one and a `{BATCHED_FN_SUFFIX}` twin, because mjlab only ever calls the batched
 path — and leave the dispatch alone; regenerate from the graph rather than
 hand-editing windows.
 
-Behavior goal: {behavior_goal.strip() or "(unspecified)"}
+Behavior goal: {normalized_behavior_goal(behavior_goal) or "(unspecified)"}
 """
 from __future__ import annotations
 
@@ -742,6 +842,14 @@ REWARD_SPEC: dict = {{
     # Explicit capability bit for API/UI consumers. Inferring this by grepping
     # generated source made task-only scaffolds look like imitation rewards.
     "tracking_enabled": {has_track!r},
+    # Authoring is a chain over one researcher intent. A later UI draft may
+    # change independently; author_mode verifies this identity before making
+    # an LLM call rather than quietly mixing terms from two objectives.
+    "authoring_intent": {{
+        "schema": 1,
+        "behavior_goal": {normalized_behavior_goal(behavior_goal)!r},
+        "sha256": {mode_authoring_intent_sha256(behavior_goal)!r},
+    }},
 {reference_clock_spec}    "reference_robot": {reference_robot!r},
     "hyperparameters": {{}},
     "references": [],
@@ -1593,6 +1701,13 @@ def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
     mode = graph.mode(mode_name)
     windows = dict(windows) if windows else mode_windows_s(graph)
     lo, hi = windows[mode_name]
+    duration_qa = mode_duration_qa(windows)
+    duration_row = next(
+        row for row in duration_qa["modes"] if row["name"] == mode_name)
+    duration_warning = any(
+        warning["mode"] == mode_name
+        for warning in duration_qa["warnings"]
+    )
     order = [m.name for m in graph.modes]
     i = order.index(mode_name)
 
@@ -1604,6 +1719,12 @@ def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
         neighbours.append(
             f"before {order[i + 1]!r} (starts {windows[order[i + 1]][0]:g}s)")
     neighbour_line = "; ".join(neighbours) if neighbours else "the only mode"
+    duration_advisory = (
+        "LONG-WINDOW ADVISORY: this mode dominates the execution schedule. "
+        "Gate stationary bonuses on task progress and verify per-mode reward "
+        "mass in rollout evidence.\n"
+        if duration_warning else ""
+    )
 
     ident = mode_ident(mode_name)
     return (
@@ -1617,7 +1738,13 @@ def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
         f"This mode's job: {mode_text}\n"
         f"Window: {lo:g}s-{hi:g}s (reference frames "
         f"[{mode.frame_range[0]}, {mode.frame_range[1]}) at {graph.fps:g} fps); "
-        f"{neighbour_line}.\n\n"
+        f"{neighbour_line}.\n"
+        f"Reward exposure: {duration_row['duration_s']:g}s of the "
+        f"{duration_qa['episode_duration_s']:g}s execution schedule "
+        f"({duration_row['episode_share']:.1%}). Per-step reward is summed "
+        "raw and is NOT duration-normalized, so a constant or state-only "
+        "term accumulates for this whole window.\n"
+        f"{duration_advisory}\n"
         f"{task_brief}"
         "Scope:\n"
         "- Called ONLY inside that window. Do not re-detect the phase — the "
@@ -1663,6 +1790,86 @@ def _element_line(element: Mapping[str, Any]) -> str:
     return f"  {kind} {ident}: {dims}" if dims else f"  {kind} {ident}"
 
 
+def _number_vector(value: Any) -> Optional[str]:
+    """Compact vector formatting for author-facing world geometry."""
+    if (not isinstance(value, Sequence)
+            or isinstance(value, (str, bytes))
+            or not value
+            or not all(isinstance(item, (int, float)) for item in value)):
+        return None
+    return "(" + ", ".join(f"{float(item):g}" for item in value) + ")"
+
+
+def _world_object_line(
+    name: str,
+    item: Mapping[str, Any],
+    zones: Mapping[str, Any],
+) -> str:
+    """One WorldSpec-v2 object with its admitted env-local geometry."""
+    shape = str(item.get("shape") or "object")
+    nominal = item.get("nominal")
+    nominal = nominal if isinstance(nominal, Mapping) else {}
+    pose = nominal.get("pose")
+    pose = pose if isinstance(pose, Mapping) else {}
+    details: list[str] = []
+    position = _number_vector(pose.get("position_m"))
+    if position:
+        details.append(f"env-local center {position} m")
+    placement = str(pose.get("placement") or "").strip()
+    if placement:
+        details.append(f"placement {placement}")
+        if placement.startswith("zone:"):
+            zone_id = placement.removeprefix("zone:")
+            zone = zones.get(zone_id)
+            zone = zone if isinstance(zone, Mapping) else {}
+            center = zone.get("center_m")
+            if (isinstance(center, Sequence)
+                    and not isinstance(center, (str, bytes))
+                    and len(center) == 2
+                    and all(isinstance(v, (int, float)) for v in center)
+                    and isinstance(pose.get("z_m"), (int, float))):
+                resolved = _number_vector([
+                    float(center[0]), float(center[1]), float(pose["z_m"]),
+                ])
+                details.append(f"env-local center {resolved} m")
+    orientation = _number_vector(pose.get("quaternion_wxyz"))
+    if orientation:
+        details.append(f"quaternion wxyz {orientation}")
+    size = _number_vector(nominal.get("size_m"))
+    if size:
+        details.append(f"size {size} m")
+    for key, value in sorted(nominal.items()):
+        if key in {"pose", "rgba", "size_m"} or not isinstance(
+                value, (int, float)):
+            continue
+        label = str(key).removesuffix("_m").replace("_", " ")
+        unit = " m" if str(key).endswith("_m") else ""
+        details.append(f"{label} {float(value):g}{unit}")
+    details.append("fixed" if item.get("fixed") is True else "movable")
+    route = str(item.get("route_semantics") or "").strip()
+    if route:
+        details.append(f"route {route}")
+    suffix = ", ".join(details)
+    return f"  {shape} {name}: {suffix}" if suffix else f"  {shape} {name}"
+
+
+def _zone_line(name: str, item: Mapping[str, Any]) -> str:
+    """One WorldSpec-v2 goal/spawn zone in the declared env-local frame."""
+    kind = str(item.get("kind") or "zone")
+    details: list[str] = []
+    center = _number_vector(item.get("center_m"))
+    if center:
+        details.append(f"env-local center {center} m")
+    for key, value in sorted(item.items()):
+        if key in {"kind", "center_m"} or not isinstance(value, (int, float)):
+            continue
+        label = str(key).removesuffix("_m").replace("_", " ")
+        unit = " m" if str(key).endswith("_m") else ""
+        details.append(f"{label} {float(value):g}{unit}")
+    suffix = ", ".join(details)
+    return f"  {kind} {name}: {suffix}" if suffix else f"  {kind} {name}"
+
+
 #: Catalog `access` value that means "a reward term may read this". Everything
 #: else is published for metrics only and is NOT in the contract's
 #: `expected_info_keys`, so `sculptor.edit`'s grounding check rejects any term
@@ -1678,9 +1885,10 @@ def task_brief(task: Optional[Mapping[str, Any]],
     """The mission section of an authoring prompt, or "" when there is none.
 
     Renders three things the author cannot otherwise know: the course geometry,
-    the goal channels the runner publishes into `info` (by their exact keys and
-    split by whether a reward may read them), and the magnitude discipline that
-    keeps a stand-still policy from out-earning a working one.
+    the relevant goal/region/object/contact channels the runner publishes into
+    `info` (by exact key and split by whether a reward may read them), and the
+    magnitude discipline that keeps a stand-still policy from out-earning a
+    working one.
 
     `channels` is the project's channel catalog (`channel_catalog["channels"]`).
     Without it the brief still describes the course and the goal, but names no
@@ -1699,18 +1907,49 @@ def task_brief(task: Optional[Mapping[str, Any]],
     lines = ["MISSION — what this reward is FOR. The reference clip is a style",
              "prior; the world below is the objective."]
 
-    obstacles = dict(
-        ((world or {}).get("shared") or world or {}).get("obstacles") or {})
-    course = list(obstacles.get("course") or [])
-    if course:
+    shared_world = dict((world or {}).get("shared") or world or {})
+    obstacles = dict(shared_world.get("obstacles") or {})
+    course = [item for item in (obstacles.get("course") or [])
+              if isinstance(item, Mapping)]
+    objects_raw = shared_world.get("objects") or {}
+    objects = (dict(objects_raw)
+               if isinstance(objects_raw, Mapping) else {})
+    zones_raw = shared_world.get("zones") or {}
+    zones = dict(zones_raw) if isinstance(zones_raw, Mapping) else {}
+    rendered_elements = 0
+    if course and rendered_elements < MAX_BRIEF_ELEMENTS:
         start = obstacles.get("start_offset_m")
         head = f"Course ({obstacles.get('layout') or 'linear'})"
         if isinstance(start, (int, float)):
             head += f", robot starts {float(start):g} m before it"
         lines.append(head + ", in order:")
-        lines.extend(_element_line(e) for e in course[:MAX_BRIEF_ELEMENTS])
-        if len(course) > MAX_BRIEF_ELEMENTS:
-            lines.append(f"  … and {len(course) - MAX_BRIEF_ELEMENTS} more")
+        selected = course[:MAX_BRIEF_ELEMENTS]
+        lines.extend(_element_line(item) for item in selected)
+        rendered_elements += len(selected)
+
+    if objects and rendered_elements < MAX_BRIEF_ELEMENTS:
+        selected_names = sorted(objects)[:MAX_BRIEF_ELEMENTS - rendered_elements]
+        lines.append("World objects:")
+        lines.extend(
+            _world_object_line(name, objects[name], zones)
+            for name in selected_names
+            if isinstance(objects[name], Mapping)
+        )
+        rendered_elements += len(selected_names)
+
+    if zones and rendered_elements < MAX_BRIEF_ELEMENTS:
+        selected_names = sorted(zones)[:MAX_BRIEF_ELEMENTS - rendered_elements]
+        lines.append("Goal and route zones:")
+        lines.extend(
+            _zone_line(name, zones[name])
+            for name in selected_names
+            if isinstance(zones[name], Mapping)
+        )
+        rendered_elements += len(selected_names)
+
+    total_elements = len(course) + len(objects) + len(zones)
+    if total_elements > rendered_elements:
+        lines.append(f"  … and {total_elements - rendered_elements} more")
 
     success = dict(goal.get("success") or {})
     goal_line = f"Goal: {goal_type} {goal_id!r}"
@@ -1720,8 +1959,72 @@ def task_brief(task: Optional[Mapping[str, Any]],
         goal_line += f", held {float(success['hold_s']):g}s"
     lines.append(goal_line + ".")
 
+    event_sequence = shared.get("event_sequence")
+    event_sequence = (
+        event_sequence if isinstance(event_sequence, Mapping) else {}
+    )
+    event_id = str(event_sequence.get("id") or "").strip()
+    event_phases = [
+        phase for phase in (event_sequence.get("phases") or [])
+        if isinstance(phase, Mapping)
+    ]
+    if event_id and event_phases:
+        phase_ids = [
+            str(phase.get("id") or "unnamed") for phase in event_phases
+        ]
+        lines.append(
+            f"Event program {event_id!r}, in order: "
+            + " -> ".join(phase_ids)
+            + "."
+        )
+        for index, phase in enumerate(event_phases):
+            phase_id = phase_ids[index]
+            until = phase.get("until")
+            if isinstance(until, Mapping):
+                fields = ", ".join(
+                    f"{str(key).replace('_', ' ')}={value}"
+                    for key, value in until.items()
+                    if key != "support_contacts"
+                )
+                if fields:
+                    lines.append(f"  {phase_id} advances when {fields}")
+            hold = phase.get("minimum_hold_s")
+            if isinstance(hold, (int, float)):
+                lines.append(f"  {phase_id} requires {float(hold):g}s hold")
+
+    raw_waypoints = goal.get("waypoints") or []
+    relevant_regions = {
+        str(name) for name in raw_waypoints
+        if isinstance(name, str) and name
+    } if (isinstance(raw_waypoints, Sequence)
+          and not isinstance(raw_waypoints, (str, bytes))) else set()
+    if isinstance(goal.get("region"), str) and goal.get("region"):
+        relevant_regions.add(str(goal["region"]))
+    relevant_entities = set(objects)
+    if isinstance(goal.get("subject"), str) and goal.get("subject"):
+        relevant_entities.add(str(goal["subject"]))
+    contacts = shared.get("contacts") or {}
+    relevant_contact_groups = {
+        group for group in ("desired", "forbidden", "terminate_on")
+        if isinstance(contacts, Mapping) and contacts.get(group)
+    }
+
+    def _is_relevant(channel: Mapping[str, Any]) -> bool:
+        source = channel.get("source") or {}
+        if not isinstance(source, Mapping):
+            return False
+        return any((
+            str(source.get("goal") or "") == goal_id,
+            str(source.get("region") or "") in relevant_regions,
+            str(source.get("entity") or "") in relevant_entities,
+            str(source.get("object") or "") in relevant_entities,
+            str(source.get("group") or "") in relevant_contact_groups,
+            str(source.get("event_sequence") or "") == event_id
+            and bool(event_id),
+        ))
+
     mine = [c for c in (channels or [])
-            if str((c.get("source") or {}).get("goal") or "") == goal_id]
+            if isinstance(c, Mapping) and _is_relevant(c)]
     readable = [c for c in mine if c.get("access") == SHAPING_ACCESS]
     metric_only = [c for c in mine if c.get("access") != SHAPING_ACCESS]
 
@@ -1742,7 +2045,12 @@ def task_brief(task: Optional[Mapping[str, Any]],
         lines += [f"  {c.get('name')}" for c in metric_only]
 
     progress = next((c.get("name") for c in readable
-                     if c.get("metric_role") == "progress"), None)
+                     if (c.get("metric_role") == "progress"
+                         and str((c.get("source") or {}).get("goal") or "")
+                         == goal_id)), None)
+    if not progress:
+        progress = next((c.get("name") for c in readable
+                         if c.get("metric_role") == "progress"), None)
     if progress:
         lines += [
             "",
@@ -1823,6 +2131,7 @@ __all__ = [
     "AUTHOR_MAX_TOKENS",
     "BATCHED_FN_SUFFIX",
     "MAX_PROMPT_CHARS",
+    "MODE_BINDING_CONTEXT_REFS",
     "MODE_COMPONENT_PREFIX",
     "MODE_FN_PREFIX",
     "ModeAuthorError",
@@ -1832,6 +2141,7 @@ __all__ = [
     "generate_mode_reward_scaffold",
     "graft_mode_bodies",
     "mode_authoring_prompt",
+    "mode_duration_qa",
     "mode_ident",
     "mode_windows_s",
     "probe_info_keys",
@@ -2020,6 +2330,23 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
         raise ModeAuthorError(
             "scaffold no longer matches the automaton: " + "; ".join(stale))
 
+    source_spec = reward_spec_from_source(source)
+    intent = source_spec.get("authoring_intent")
+    if not isinstance(intent, Mapping):
+        raise ModeAuthorError(
+            "scaffold predates pinned authoring intent; re-scaffold before "
+            "authoring so one reward chain cannot mix behavior goals"
+        )
+    pinned_goal = str(intent.get("behavior_goal") or "")
+    pinned_sha = str(intent.get("sha256") or "")
+    expected_sha = mode_authoring_intent_sha256(pinned_goal)
+    requested_sha = mode_authoring_intent_sha256(behavior_goal)
+    if pinned_sha != expected_sha or requested_sha != pinned_sha:
+        raise ModeAuthorError(
+            "behavior goal changed since this scaffold was created; "
+            "re-scaffold to start a new authoring chain"
+        )
+
     # State the module's OWN windows, not the graph's. They differ whenever the
     # scaffold was fitted to an episode horizon, and the prompt's whole job is
     # to tell the model which slice of the episode its terms are paid over.
@@ -2027,7 +2354,6 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
         graph, mode, behavior_goal=behavior_goal, mode_goal=mode_goal,
         windows=windows_in_source(source) or None, task_brief=mission)
 
-    source_spec = reward_spec_from_source(source)
     twin_source = authoring_twin_source(
         graph, clip=clip, behavior_goal=behavior_goal, clip_id=clip_id,
         robot=str(source_spec.get("reference_robot") or ""),

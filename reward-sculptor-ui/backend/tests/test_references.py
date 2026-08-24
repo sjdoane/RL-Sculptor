@@ -480,6 +480,38 @@ def test_search_respects_k(client: TestClient, refs_root: Path) -> None:
     assert len(r.json()) == 1
 
 
+def test_search_robot_scoped_exact_id_outranks_identical_descriptions(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """The UI exposes copyable ``robot/clip_id`` identities.  Pasting one
+    must resolve that exact artifact before semantic ties, even when a derived
+    clip deliberately retains its parent's human-readable description.
+    """
+    from sculptor.refs import library
+
+    _seed_library(refs_root)
+    rows = library.read_index(root=refs_root)
+    parent = next(row for row in rows if row["clip_id"] == "walk1_subject2")
+    derived = dict(parent)
+    derived["clip_id"] = "walk1_subject2--origin-relative"
+    derived["robot"] = "g1"
+    library.write_index([*rows, derived], root=refs_root)
+
+    response = client.get(
+        "/references",
+        params={
+            "robot": "g1",
+            "q": "g1/walk1_subject2--origin-relative",
+            "llm": 0,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    matches = response.json()
+    assert matches[0]["clip_id"] == "walk1_subject2--origin-relative"
+    assert matches[1]["clip_id"] == "walk1_subject2"
+
+
 def test_search_never_calls_llm_by_default(
     client: TestClient, refs_root: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1533,6 +1565,7 @@ def _seed_composable(root: Path) -> None:
             "root_pos_xy": np.stack([0.5 * t, np.zeros(n)], axis=1),
             "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
             "joint_pos": jp,
+            "root_frame": "absolute",
         }
         d = library.clip_dir("g1", clip_id, root=root)
         save_clip(d / "clip.npz", clip)
@@ -1628,6 +1661,32 @@ def test_compose_missing_source_is_a_400_not_a_500(
     assert "not in the g1 library" in r.json()["detail"]
 
 
+def test_compose_invalid_crop_is_a_contextual_400_not_a_500(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """A phase range outside its exact parent clip is caller-correctable.
+    Preserve the crop measurement, but add enough segment identity for the UI
+    to point the researcher to the correct row.
+    """
+    _seed_composable(refs_root)
+    response = client.post("/references/compose", json={
+        "clip_id": "novel--g1",
+        "robot": "g1",
+        "segments": [
+            {"clip_id": "src_alpha", "t_start_s": 0.0, "t_end_s": 4.0},
+            {"clip_id": "src_beta"},
+        ],
+    })
+
+    assert response.status_code == 400, response.text
+    assert response.json()["title"] == "cannot compose these segments"
+    detail = response.json()["detail"]
+    assert "segment 0 ('src_alpha')" in detail
+    assert "requested span [0, 4] s" in detail
+    assert "source duration 2 s" in detail
+    assert "outside the clip's own [0.0, 2.000] s bounds" in detail
+
+
 def test_compose_surfaces_the_seam_measurement_on_refusal(
     client: TestClient, refs_root: Path,
 ) -> None:
@@ -1648,6 +1707,7 @@ def test_compose_surfaces_the_seam_measurement_on_refusal(
         "root_pos_xy": np.stack([0.5 * t, np.zeros(n)], axis=1),
         "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
         "joint_pos": np.full((n, 4), 5.0),   # radians away from src_alpha
+        "root_frame": "absolute",
     }
     d = library.clip_dir("g1", "src_far", root=refs_root)
     save_clip(d / "clip.npz", far)
@@ -1661,6 +1721,108 @@ def test_compose_surfaces_the_seam_measurement_on_refusal(
     })
     assert r.status_code == 400
     assert "seam discontinuity" in r.json()["detail"]
+    assert r.json()["type"] == "/problems/reference-compose-gate"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target_fps", 241.0),
+        ("target_fps", "Infinity"),
+        ("blend_s", 10.1),
+        ("blend_s", "NaN"),
+    ],
+)
+def test_compose_numeric_bounds_fail_before_loading_sources(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    from sculptor.refs import compose
+
+    called = False
+
+    def should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("composer must not run")
+
+    monkeypatch.setattr(compose, "compose_and_register", should_not_run)
+    response = client.post("/references/compose", json={
+        "clip_id": "bounded--g1",
+        "robot": "g1",
+        field: value,
+        "segments": [{"clip_id": "a"}, {"clip_id": "b"}],
+    })
+
+    assert response.status_code == 422
+    assert called is False
+
+
+def test_compose_segment_cap_fails_before_loading_sources(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor.refs import compose
+    from sculptor.refs.compose import MAX_COMPOSE_SEGMENTS
+
+    called = False
+
+    def should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("composer must not run")
+
+    monkeypatch.setattr(compose, "compose_and_register", should_not_run)
+    response = client.post("/references/compose", json={
+        "clip_id": "bounded--g1",
+        "robot": "g1",
+        "segments": [
+            {"clip_id": f"source_{index}"}
+            for index in range(MAX_COMPOSE_SEGMENTS + 1)
+        ],
+    })
+
+    assert response.status_code == 422
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("t_start_s", -0.01),
+        ("t_start_s", "NaN"),
+        ("t_end_s", "Infinity"),
+    ],
+)
+def test_compose_trim_bounds_are_finite_before_loading_sources(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    from sculptor.refs import compose
+
+    called = False
+
+    def should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("composer must not run")
+
+    monkeypatch.setattr(compose, "compose_and_register", should_not_run)
+    response = client.post("/references/compose", json={
+        "clip_id": "bounded--g1",
+        "robot": "g1",
+        "segments": [
+            {"clip_id": "a", field: value},
+            {"clip_id": "b"},
+        ],
+    })
+
+    assert response.status_code == 422
+    assert called is False
 
 
 # ── the OGMP-inspired phase scaffold + its reward module ───────────────
@@ -1768,8 +1930,14 @@ def test_scaffolding_a_mode_reward_writes_it_into_the_project(
     # mode is authored, and nothing tells the policy to follow the reference.
     assert "TARGET_JOINT_POS" in src
     assert body["tracking"] is True
+    assert body["clip_id"] == "novel-jump-kick--g1"
+    assert body["reference_robot"] == "g1"
+    assert body["authoring_goal"] == "run in and strike at the apex"
+    assert len(body["authoring_intent_sha256"]) == 64
+    assert body["authoring_intent_valid"] is True
     listing = client.get(f"/projects/{slug}/mode-rewards").json()
     assert listing["mode_rewards"][0]["tracking_enabled"] is True
+    assert listing["mode_rewards"][0]["authoring_goal"] == body["authoring_goal"]
 
 
 def test_scaffolding_without_tracking_omits_the_backbone(
@@ -1912,6 +2080,39 @@ def test_authoring_an_unknown_mode_is_422_before_any_model_call(
                     json=_author_body(mode="nosuchmode"))
     assert r.status_code == 422, r.text
     assert "approach, launch, strike" in r.json()["detail"]
+
+
+def test_authoring_goal_must_match_the_scaffold_before_model_job_creation(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    response = client.post(
+        f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
+        json={
+            "clip_id": "novel-jump-kick--g1",
+            "robot": "g1",
+            "goal": "land the jump upright",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    def _must_not_create_model_job(**_kwargs):
+        raise AssertionError("mismatched intent reached model-job creation")
+
+    monkeypatch.setattr(
+        "backend.services.mode_jobs.run_mode_author_job",
+        _must_not_create_model_job,
+    )
+    refused = client.post(
+        AUTHOR_URL.format(slug=slug),
+        json=_author_body(goal="land somewhere else"),
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["title"] == (
+        "mode authoring goal does not match the scaffold"
+    )
 
 
 def test_authoring_without_a_scaffold_is_404(
@@ -2134,6 +2335,9 @@ def test_a_bare_scaffold_can_be_promoted_deliberately(
     assert r.status_code == 200, r.text
     assert sorted(r.json()["unauthored"]) == ["approach", "launch", "strike"]
     assert [v["version"] for v in client.get(f"/projects/{slug}/rewards").json()] == [1, 0]
+    promoted = client.get(f"/projects/{slug}/mode-rewards").json()["promoted"]
+    assert promoted["selection_current"] is True
+    assert promoted["context_current"] is True
 
 
 def test_same_clip_id_with_changed_bytes_is_stale_not_promotable(
@@ -2212,6 +2416,45 @@ def test_legacy_mode_reward_without_source_robot_fails_closed(
     )
     assert refused.status_code == 409, refused.text
     assert refused.json()["title"] == "mode reward source robot is unknown"
+
+
+def test_mode_reward_with_invalid_authoring_intent_is_stale_not_promotable(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    from sculptor.mode_rewards import _rewrite_reward_spec
+
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    body = _scaffold(client, slug)
+    reward_path = tmp_projects_root / slug / "rewards" / body["filename"]
+    reward_path.write_text(
+        _rewrite_reward_spec(
+            reward_path.read_text(encoding="utf-8"),
+            {"authoring_intent": {
+                "behavior_goal": "",
+                "sha256": "0" * 64,
+            }},
+        ),
+        encoding="utf-8",
+    )
+
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(
+        item for item in listing["mode_rewards"]
+        if item["filename"] == body["filename"]
+    )
+    assert mine["authoring_intent_valid"] is False
+    assert mine["context_current"] is False
+    assert "authoring intent" in mine["context_blocker"]
+
+    refused = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": body["filename"], "allow_unauthored": True},
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["title"] == (
+        "mode reward authoring intent is missing or invalid"
+    )
 
 
 def test_promoting_a_filename_that_escapes_the_project_is_refused(
@@ -2335,29 +2578,272 @@ def test_mode_rewards_promoted_clears_when_a_flat_reward_supersedes_it(
 # ── the mission a per-mode reward is authored against ───────────────────
 def _write_selection(project_dir: Path, *, episode_s: float = 20.0,
                      with_goal: bool = True) -> None:
-    """The three files `_selection_specs` reads, as a promoted selection."""
-    env = project_dir / "env"
-    env.mkdir(parents=True, exist_ok=True)
+    """A complete immutable tuple with task/world/catalog test payloads."""
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    rewards = project_dir / "rewards"
+    rewards.mkdir(parents=True, exist_ok=True)
+    reward_path = rewards / "v0.py"
+    if not reward_path.is_file():
+        reward_path.write_text("REWARD_SPEC = {'version': 'v0'}\n", encoding="utf-8")
+    config = project_dir / "config.toml"
+    if not config.is_file():
+        config.write_text("adapter = 'test'\n", encoding="utf-8")
+
     goal = {"id": "complete_course", "type": "waypoint_sequence",
             "success": {"predicate": "sequence_complete", "hold_s": 0.15}}
-    (env / "task.json").write_text(json.dumps({"shared": {
+    task = {"shared": {
         "goal": goal if with_goal else {},
-        "termination": {"episode_length_s": episode_s}}}), encoding="utf-8")
-    (env / "world.json").write_text(json.dumps({"shared": {"obstacles": {
+        "termination": {"episode_length_s": episode_s}}}
+    world = {"shared": {"obstacles": {
         "layout": "linear", "start_offset_m": 0.81,
         "course": [{"element": "platform", "id": "box_01",
-                    "nominal": {"height_m": 0.231}}]}}}), encoding="utf-8")
-    (env / "catalog.json").write_text(json.dumps({"channels": [
+                    "nominal": {"height_m": 0.231}}]},
+        "objects": {}, "zones": {}}}
+    catalog = {"channels": [
         {"name": "goal__complete_course__waypoint_distance",
          "access": "shared_shaping", "metric_role": "progress",
          "source": {"goal": "complete_course"}},
         {"name": "goal__complete_course__waypoint_index",
          "access": "metric_only", "metric_role": "progress",
-         "source": {"goal": "complete_course"}}]}), encoding="utf-8")
-    (env / "selection_current.json").write_text(json.dumps({"refs": {
-        "task": {"path": "env/task.json"},
-        "world": {"path": "env/world.json"},
-        "channel_catalog": {"path": "env/catalog.json"}}}), encoding="utf-8")
+         "source": {"goal": "complete_course"}}]}
+    store = WorldArtifactStore(project_dir)
+    refs = {
+        "reward": ArtifactRef.from_path(
+            "reward", "v0", reward_path, base=project_dir),
+        "env_spec": ArtifactRef.from_path(
+            "env_spec", "config", config, base=project_dir),
+        "world": store.write_json("world", world),
+        "task": store.write_json("task", task),
+        "resolved_eval": store.write_json(
+            "resolved_eval", {"schema": "test-eval-v1"}),
+        "channel_catalog": store.write_json("channel_catalog", catalog),
+        "clarifications": store.write_json("clarifications", {}),
+    }
+    store.promote(refs, evaluation_lineage="test-eval-v1")
+
+
+def _write_atomic_selection(project_dir: Path, *, episode_s: float = 8.0):
+    """A complete immutable tuple whose reward ref promotion may replace."""
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    reward_path = project_dir / "rewards" / "v0.py"
+    store = WorldArtifactStore(project_dir)
+    refs = {
+        "reward": ArtifactRef.from_path(
+            "reward", "v0", reward_path, base=project_dir,
+        ),
+        "env_spec": ArtifactRef.from_path(
+            "env_spec", "config", project_dir / "config.toml",
+            base=project_dir,
+        ),
+        "world": store.write_json("world", {"shared": {
+            "obstacles": {"layout": "linear", "course": []},
+            "objects": {},
+            "zones": {},
+        }}),
+        "task": store.write_json("task", {"shared": {
+            "goal": {
+                "id": "complete_course",
+                "type": "waypoint_sequence",
+                "waypoints": [],
+                "success": {"predicate": "sequence_complete"},
+            },
+            "termination": {"episode_length_s": episode_s},
+        }}),
+        "resolved_eval": store.write_json(
+            "resolved_eval", {"schema": "test-eval-v1"},
+        ),
+        "channel_catalog": store.write_json(
+            "channel_catalog", {"channels": []},
+        ),
+        "clarifications": store.write_json("clarifications", {}),
+    }
+    return store.promote(refs, evaluation_lineage="test-eval-v1")
+
+
+def test_atomic_reward_promotion_preserves_authored_phase_context(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    """Changing only the reward member and selection wrapper must not make a
+    just-promoted phase reward stale relative to its own authored context."""
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    selection = _write_atomic_selection(tmp_projects_root / slug)
+    scaffold = _scaffold(client, slug)
+
+    promoted_response = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": scaffold["filename"], "allow_unauthored": True},
+    )
+
+    assert promoted_response.status_code == 200, promoted_response.text
+    assert promoted_response.json()["selection_version"] == (
+        selection.selection_version + 1
+    )
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    authored = next(
+        item for item in listing["mode_rewards"]
+        if item["filename"] == scaffold["filename"]
+    )
+    promoted = listing["promoted"]
+    assert authored["context_current"] is True
+    assert promoted["context_current"] is True
+    assert promoted["selection_current"] is True
+
+
+@pytest.mark.parametrize(
+    ("damage", "detail_fragment"),
+    [
+        ("malformed", "JSONDecodeError"),
+        ("missing-member", "is absent"),
+        ("hash-mismatch", "hash mismatch"),
+        ("tuple-mismatch", "tuple hash mismatch"),
+    ],
+)
+def test_unverifiable_selection_is_a_visible_blocker_not_pure_imitation(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    damage: str,
+    detail_fragment: str,
+) -> None:
+    """A present broken authority must never collapse to the no-world path."""
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_atomic_selection(project_dir)
+    scaffold = _scaffold(client, slug)
+
+    store = WorldArtifactStore(project_dir)
+    selection = store.read_selection()
+    assert selection is not None
+    if damage == "malformed":
+        store.selection_path.write_text("{not-json", encoding="utf-8")
+    elif damage == "missing-member":
+        store.resolve_ref(selection.refs["task"]).unlink()
+    elif damage == "hash-mismatch":
+        store.resolve_ref(selection.refs["task"]).write_bytes(b"{}\n")
+    else:
+        payload = json.loads(store.selection_path.read_text(encoding="utf-8"))
+        payload["tuple_hash"] = "0" * 64
+        store.selection_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    listing = client.get(f"/projects/{slug}/mode-rewards")
+    assert listing.status_code == 200, listing.text
+    mine = next(
+        item for item in listing.json()["mode_rewards"]
+        if item["filename"] == scaffold["filename"]
+    )
+    assert mine["context_current"] is False
+    assert detail_fragment in mine["context_blocker"]
+
+    refused_scaffold = client.post(
+        f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
+        json={
+            "clip_id": "novel-jump-kick--g1",
+            "robot": "g1",
+            "filename": "mode_reward_v9.py",
+        },
+    )
+    assert refused_scaffold.status_code == 409, refused_scaffold.text
+    assert refused_scaffold.json()["title"] == (
+        "authoritative selection is invalid"
+    )
+
+    refused_promotion = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": scaffold["filename"], "allow_unauthored": True},
+    )
+    assert refused_promotion.status_code == 409, refused_promotion.text
+    assert detail_fragment in refused_promotion.json()["detail"]
+
+
+def test_authoring_rejects_a_stale_scaffold_before_model_job_creation(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid newer tuple is still stale relative to the old scaffold."""
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_atomic_selection(project_dir, episode_s=8.0)
+    _scaffold(client, slug)
+
+    store = WorldArtifactStore(project_dir)
+    selection = store.read_selection()
+    assert selection is not None
+    task = store.load_json_ref(selection.refs["task"])
+    task["shared"]["termination"]["episode_length_s"] = 9.0
+    refs = dict(selection.refs)
+    refs["task"] = store.write_json("task", task)
+    store.promote(refs, evaluation_lineage=selection.evaluation_lineage)
+
+    def _must_not_create_model_job(**_kwargs):
+        raise AssertionError("stale scaffold reached model-job creation")
+
+    monkeypatch.setattr(
+        "backend.services.mode_jobs.run_mode_author_job",
+        _must_not_create_model_job,
+    )
+    response = client.post(
+        AUTHOR_URL.format(slug=slug), json=_author_body()
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["title"] == (
+        "mode scaffold belongs to an older execution context"
+    )
+
+
+def test_tuple_failure_after_commit_rolls_back_reward_and_selection(
+    client: TestClient,
+    refs_root: Path,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a post-commit exception leaves both authorities byte-identical."""
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_atomic_selection(project_dir)
+    scaffold = _scaffold(client, slug)
+
+    store = WorldArtifactStore(project_dir)
+    current_path = project_dir / "rewards" / "current.py"
+    before_current = current_path.read_bytes()
+    before_selection = store.selection_path.read_bytes()
+    before_rewards = {p.name for p in (project_dir / "rewards").glob("v*.py")}
+    before_selections = {p.name for p in store.env_dir.glob("selection_v*.json")}
+
+    original_promote = WorldArtifactStore.promote
+
+    def _fail_after_commit(self, *args, **kwargs):
+        original_promote(self, *args, **kwargs)
+        raise RuntimeError("injected failure after selection commit")
+
+    monkeypatch.setattr(WorldArtifactStore, "promote", _fail_after_commit)
+    response = client.post(
+        PROMOTE_URL.format(slug=slug),
+        json={"filename": scaffold["filename"], "allow_unauthored": True},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["title"] == "reward tuple promotion failed"
+    assert current_path.read_bytes() == before_current
+    assert store.selection_path.read_bytes() == before_selection
+    assert {p.name for p in (project_dir / "rewards").glob("v*.py")} == before_rewards
+    assert {p.name for p in store.env_dir.glob("selection_v*.json")} == before_selections
+    assert store.read_selection() is not None
 
 
 def test_a_project_with_no_selection_stays_on_clip_time_and_full_tracking(
@@ -2389,19 +2875,23 @@ def test_a_world_project_declares_horizon_and_demotes_the_clip(
 def test_changed_task_content_invalidates_same_clip_mode_reward(
     client: TestClient, refs_root: Path, tmp_projects_root: Path,
 ) -> None:
-    """A selection file can keep the same ref paths while the immutable
-    objects behind them change. The binding hashes the referenced content, not
-    merely the path or clip id."""
+    """A newly promoted task tuple invalidates the prior mode context."""
+    from sculptor.world.artifacts import WorldArtifactStore
+
     _write_composite(refs_root)
     slug = _make_project(client)
     project_dir = tmp_projects_root / slug
     _write_selection(project_dir, episode_s=20.0)
     body = _scaffold(client, slug)
 
-    task_path = project_dir / "env" / "task.json"
-    task = json.loads(task_path.read_text(encoding="utf-8"))
+    store = WorldArtifactStore(project_dir)
+    selection = store.read_selection()
+    assert selection is not None
+    task = store.load_json_ref(selection.refs["task"])
     task["shared"]["termination"]["episode_length_s"] = 12.0
-    task_path.write_text(json.dumps(task), encoding="utf-8")
+    refs = dict(selection.refs)
+    refs["task"] = store.write_json("task", task)
+    store.promote(refs, evaluation_lineage=selection.evaluation_lineage)
 
     listing = client.get(f"/projects/{slug}/mode-rewards").json()
     mine = next(
@@ -2477,6 +2967,18 @@ def test_a_scaffold_on_a_world_project_carries_both_fixes(
     assert len(spec["mode_binding"]["graph_sha256"]) == 64
     assert len(spec["mode_binding"]["execution_manifest_digest"]) == 64
     assert "REFERENCE_DURATION_S = 1.9916666666666667" in src
+    qa = body["duration_qa"]
+    assert qa["accumulation"] == "raw_per_step_not_duration_normalized"
+    assert qa["episode_duration_s"] == 20.0
+    assert qa["warnings"][0]["mode"] == "strike"
+    assert qa["warnings"][0]["episode_share"] > 0.9
+
+    listing = client.get(f"/projects/{slug}/mode-rewards").json()
+    mine = next(
+        item for item in listing["mode_rewards"]
+        if item["filename"] == body["filename"]
+    )
+    assert mine["duration_qa"] == qa
 
 
 def test_promotion_records_which_file_it_came_from(

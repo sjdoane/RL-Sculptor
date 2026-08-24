@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { Icon } from "@/components/rs/icon";
 import { ModeRewardPanel } from "@/components/ModeRewardPanel";
 import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
+import { resolveModeAuthoringGoal } from "@/lib/behaviorFlow";
 import { referenceRobotForProject } from "@/lib/referenceRobot";
 import { AuthorBadge, Btn, Delta, Modal } from "@/components/rs/primitives";
 import { MonacoDiffLazy, MonacoLazy } from "@/components/MonacoLazy";
@@ -679,7 +680,11 @@ function ReadOnlyPane({
         // Was hardcoded "g1": on a Go1 project this offered G1 motion, the
         // attach succeeded, and training failed with a seed error.
         robot={referenceRobotForProject(project)}
-        goal={detail.spec.description || draft.data?.behavior_goal || ""}
+        goal={resolveModeAuthoringGoal({
+          draftGoal: draft.data?.behavior_goal,
+          projectDescription: project.description,
+          rewardDescription: detail.spec.description,
+        })}
       />
       </div>
     </>

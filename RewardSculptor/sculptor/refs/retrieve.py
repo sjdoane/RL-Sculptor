@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
 from sculptor.refs import library
@@ -201,6 +201,25 @@ def _row_to_match(row: dict[str, Any], score: float) -> RefMatch:
     )
 
 
+def _is_exact_clip_query(query: str, row: Mapping[str, Any]) -> bool:
+    """Whether ``query`` names this exact robot-scoped library artifact.
+
+    The HTTP surface scopes search with a separate ``robot`` parameter, while
+    the UI renders the copyable identity as ``robot/clip_id``.  Accept both
+    forms so pasting the identity shown on screen has the same authority as
+    typing the bare id.  This is an identity comparison, not fuzzy retrieval;
+    no token expansion or filename-prefix inference participates.
+    """
+    clip_id = str(row.get("clip_id") or "").casefold()
+    if not clip_id:
+        return False
+    normalized = str(query).strip().casefold()
+    if normalized == clip_id:
+        return True
+    robot = str(row.get("robot") or "").casefold()
+    return bool(robot) and normalized == f"{robot}/{clip_id}"
+
+
 #: Synonym-bridged matches count HALF a literal match (within the
 #: concept component — see `_CONCEPT_BOOST` below). Rationale
 #: (2026-07-09, found against the real 301-row library): expanding BOTH
@@ -259,9 +278,11 @@ def deterministic_rank(
       "forward"/"high"/"down"/"subject" style tokens that still add
       useful discriminating signal between same-concept clips.
 
-    Zero-scoring rows are excluded. Deterministic, offline, never
-    raises on well-formed input — this is the §decision-7 "always on,
-    zero API" floor."""
+    Zero-scoring rows are excluded unless the query is the row's exact bare
+    or robot-scoped clip identity.  Exact identity always ranks before fuzzy
+    relevance; every non-exact result retains the prior score/density/id
+    ordering. Deterministic, offline, never raises on well-formed input —
+    this is the §decision-7 "always on, zero API" floor."""
     q_lit = set(tokenize_query(query))
     if not q_lit or not rows:
         return []
@@ -270,7 +291,7 @@ def deterministic_rank(
     grouped_tokens: set[str] = set()
     for group in SYNONYM_GROUPS:
         grouped_tokens |= frozenset(group)
-    scored: list[tuple[float, dict[str, Any]]] = []
+    scored: list[tuple[bool, float, int, dict[str, Any]]] = []
     for row in rows:
         r_lit = set(_row_tokens(row))
         r_all = expand_synonyms(sorted(r_lit))
@@ -292,9 +313,10 @@ def deterministic_rank(
             weights.get(tok, 0.0) for tok in literal if tok not in grouped_tokens
         )
         score = _CONCEPT_BOOST * concept + modifier
-        if score <= 0.0:
+        exact_id = _is_exact_clip_query(query, row)
+        if score <= 0.0 and not exact_id:
             continue
-        scored.append((score, len(r_lit), row))
+        scored.append((exact_id, score, len(r_lit), row))
     # Tie-break (2026-07-11, found against the real index after the
     # stageii ingest recovered MOYO yoga clips): rows that EXACTLY tie on
     # score are ordered by match DENSITY — fewer distinct row tokens
@@ -309,8 +331,11 @@ def deterministic_rank(
     # change. clip_id stays as the last key so ties remain deterministic
     # across runs/platforms (dict/set iteration order is not a ranking
     # input).
-    scored.sort(key=lambda sr: (-sr[0], sr[1], sr[2]["clip_id"]))
-    return [_row_to_match(row, score) for score, _n_tokens, row in scored[:k]]
+    scored.sort(key=lambda sr: (not sr[0], -sr[1], sr[2], sr[3]["clip_id"]))
+    return [
+        _row_to_match(row, score)
+        for _exact, score, _n_tokens, row in scored[:k]
+    ]
 
 
 # ── LLM rerank (§decision 7, optional) ──────────────────────────────────
@@ -421,7 +446,11 @@ def search_rows(
     I/O) — what `search()` calls after filtering by robot, and what
     tests use directly against an in-memory fixture index."""
     deterministic = deterministic_rank(query, rows, k=max(k, _RERANK_TOP_N))
-    if not use_llm or not deterministic:
+    # A pasted artifact identity is already a complete selection instruction,
+    # not a semantic prompt.  Letting an optional LLM reshuffle it would turn
+    # exact lookup back into an ambiguous recommendation list.
+    exact_id_query = any(_is_exact_clip_query(query, row) for row in rows)
+    if not use_llm or not deterministic or exact_id_query:
         return deterministic[:k]
     try:
         reranked = _rerank_with_llm(query, deterministic[:_RERANK_TOP_N], client=client)

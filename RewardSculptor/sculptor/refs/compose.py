@@ -52,6 +52,7 @@ Continuity handling, in order:
 from __future__ import annotations
 
 import re
+from itertools import islice
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -66,10 +67,18 @@ _CONTACT_KEYS = ("contact_left_foot", "contact_right_foot")
 DEFAULT_MAX_SEAM_JOINT_JUMP_RAD = 0.35
 DEFAULT_MAX_JOINT_VEL_RAD_S = 30.0
 DEFAULT_BLEND_S = 0.20
+MAX_COMPOSE_FPS = 240.0
+MAX_COMPOSE_BLEND_S = 10.0
+MAX_COMPOSE_OUTPUT_FRAMES = 50_000
+MAX_COMPOSE_SEGMENTS = 16
 
 
 class ComposeError(ValueError):
     """Raised when segments cannot be composed into a valid clip."""
+
+
+class ComposeGateError(ComposeError):
+    """A measured kinematic gate refusal that may be explicitly bypassed."""
 
 
 # ── quaternion helpers (wxyz, the clip schema's convention) ─────────────
@@ -430,36 +439,76 @@ def compose_reference(
     from sculptor.reference import validate_clip
     from sculptor.refs.spans import crop_span
 
-    raw = list(segments)
+    # Bounded materialization is part of the hostile-input contract. A direct
+    # caller may supply a generator; consuming the whole iterable before
+    # enforcing the cap would merely move the allocation hazard one line up.
+    raw = list(islice(segments, MAX_COMPOSE_SEGMENTS + 1))
     if len(raw) < 2:
         raise ComposeError(
             f"compose_reference needs >= 2 segments, got {len(raw)}; a single "
             "span is already handled by refs.spans.crop_span")
+    if len(raw) > MAX_COMPOSE_SEGMENTS:
+        raise ComposeError(
+            "compose_reference accepts at most "
+            f"{MAX_COMPOSE_SEGMENTS} segments"
+        )
+    try:
+        blend_value = float(blend_s)
+    except (TypeError, ValueError) as exc:
+        raise ComposeError("blend_s must be a finite number") from exc
+    if (
+        not np.isfinite(blend_value)
+        or blend_value < 0.0
+        or blend_value > MAX_COMPOSE_BLEND_S
+    ):
+        raise ComposeError(
+            f"blend_s must be in [0, {MAX_COMPOSE_BLEND_S:g}] seconds"
+        )
+    if target_fps is not None:
+        try:
+            requested_fps = float(target_fps)
+        except (TypeError, ValueError) as exc:
+            raise ComposeError("target_fps must be a finite number") from exc
+        if (
+            not np.isfinite(requested_fps)
+            or requested_fps < 1.0
+            or requested_fps > MAX_COMPOSE_FPS
+        ):
+            raise ComposeError(
+                f"target_fps must be in [1, {MAX_COMPOSE_FPS:g}]"
+            )
+    else:
+        requested_fps = None
 
     # Root height has two materially different meanings in the library. A
     # composer must not silently erase that contract (forcing a researcher to
     # re-assert it later) or combine clips whose heights live in different
-    # frames. Legacy clips with no declaration remain composable as Tier-K
-    # candidates, but a partially declared or contradictory composition fails
-    # closed.
-    root_frames = [spec.get("clip", {}).get("root_frame")
-                   if isinstance(spec.get("clip"), Mapping) else None
-                   for spec in raw]
-    declared_root_frames = {str(value) for value in root_frames
-                            if value is not None}
-    if declared_root_frames and (
+    # frames. Every source must carry one exact supported convention; missing,
+    # partially declared, and contradictory sets all fail closed. The library
+    # registration adapter additionally proves each declaration from immutable
+    # parent bytes/evidence before this low-level transform can be retained.
+    raw_root_frames = [spec.get("clip", {}).get("root_frame")
+                       if isinstance(spec.get("clip"), Mapping) else None
+                       for spec in raw]
+    root_frames = [
+        str(value)
+        if isinstance(value, (str, np.str_))
+        and str(value) in {"absolute", "origin_relative"}
+        else None
+        for value in raw_root_frames
+    ]
+    declared_root_frames = {value for value in root_frames if value is not None}
+    if (
         len(declared_root_frames) != 1
         or any(value is None for value in root_frames)
     ):
         rendered = [str(value) if value is not None else "<missing>"
-                    for value in root_frames]
+                    for value in raw_root_frames]
         raise ComposeError(
             "source clips have incompatible root_frame contracts: "
-            f"{rendered}; declare one exact convention on every source before "
-            "composition")
-    inherited_root_frame = (
-        next(iter(declared_root_frames)) if declared_root_frames else None
-    )
+            f"{rendered}; every source must declare the same exact supported "
+            "convention before composition")
+    inherited_root_frame = next(iter(declared_root_frames))
 
     # 1. crop
     cropped: list[dict] = []
@@ -476,25 +525,71 @@ def compose_reference(
                 + "\n  - ".join(errors))
         n = int(np.asarray(clip["root_pos_z"]).shape[0])
         fps = float(clip["fps"])
-        t0 = float(spec.get("t_start_s", 0.0) or 0.0)
-        t1 = float(spec.get("t_end_s") if spec.get("t_end_s") is not None
-                   else n / fps)
-        piece = crop_span(clip, t0, t1) if (t0 > 0.0 or t1 < n / fps) else clip
+        source_id = str(
+            spec.get("source_id")
+            or (clip.get("meta") or {}).get("clip_id")
+            or "unknown"
+        )
+        try:
+            t0 = float(spec.get("t_start_s", 0.0) or 0.0)
+            t1 = float(
+                spec.get("t_end_s")
+                if spec.get("t_end_s") is not None
+                else n / fps
+            )
+        except (TypeError, ValueError) as exc:
+            raise ComposeError(
+                f"segment {i} ({source_id!r}) trim bounds must be finite "
+                "numbers"
+            ) from exc
+        if not np.isfinite(t0) or not np.isfinite(t1):
+            raise ComposeError(
+                f"segment {i} ({source_id!r}) trim bounds must be finite "
+                "numbers"
+            )
+        try:
+            # Any non-default bound must pass through crop_span's validation.
+            # The former directional check silently accepted a negative start
+            # or an end beyond the clip because neither requested a smaller
+            # slice.
+            piece = (
+                crop_span(clip, t0, t1)
+                if (t0 != 0.0 or t1 != n / fps)
+                else clip
+            )
+        except ValueError as exc:
+            raise ComposeError(
+                f"segment {i} ({source_id!r}) cannot crop requested span "
+                f"[{t0:.6g}, {t1:.6g}] s from source duration "
+                f"{n / fps:.6g} s: {exc}"
+            ) from exc
         cropped.append(dict(piece))
         provenance.append({
             "index": i,
             "label": str(spec.get("label") or f"segment_{i}"),
-            "source_id": str(spec.get("source_id")
-                             or (clip.get("meta") or {}).get("clip_id")
-                             or "unknown"),
+            "source_id": source_id,
             "source_fps": fps,
             "source_frames": [int(round(t0 * fps)), int(round(t1 * fps))],
             "source_span_s": [round(t0, 4), round(t1, 4)],
         })
 
     # 2. one fps for everything
-    fps_out = float(target_fps if target_fps
+    fps_out = float(requested_fps if requested_fps is not None
                     else max(float(c["fps"]) for c in cropped))
+    projected_frames = sum(
+        max(2, int(round(
+            int(np.asarray(piece["root_pos_z"]).shape[0])
+            / float(piece["fps"])
+            * fps_out
+        )))
+        for piece in cropped
+    )
+    if projected_frames > MAX_COMPOSE_OUTPUT_FRAMES:
+        raise ComposeError(
+            "composition would materialize "
+            f"{projected_frames} frames, exceeding the bounded "
+            f"{MAX_COMPOSE_OUTPUT_FRAMES}-frame limit"
+        )
     resampled = [_resample(c, fps_out) for c in cropped]
 
     # 3. one joint ordering
@@ -503,7 +598,7 @@ def compose_reference(
         _align_joints(resampled, base_names)
 
     # 4. SE(2)-align + blend, tracking where each seam lands
-    n_blend = int(round(max(0.0, blend_s) * fps_out))
+    n_blend = int(round(blend_value * fps_out))
     acc = resampled[0]
     provenance[0]["se2"] = {"d_yaw_rad": 0.0, "anchor_xy": [0.0, 0.0]}
     seam_frames: list[int] = []
@@ -545,8 +640,7 @@ def compose_reference(
                 "sculptor.refs.track before authoring a reward against it."),
         },
     }
-    if inherited_root_frame is not None:
-        acc["root_frame"] = inherited_root_frame
+    acc["root_frame"] = inherited_root_frame
 
     errors = validate_clip(acc)
     if errors:
@@ -557,14 +651,14 @@ def compose_reference(
         worst = max((s.get("max_joint_jump_rad", 0.0) for s in report["seams"]),
                     default=0.0)
         if worst > max_seam_joint_jump_rad:
-            raise ComposeError(
+            raise ComposeGateError(
                 f"seam discontinuity {worst:.3f} rad exceeds "
                 f"{max_seam_joint_jump_rad:.3f} rad. The spans do not meet "
                 "kinematically — widen blend_s, pick spans whose boundary "
                 "poses agree, or reorder them.")
         peak = report.get("peak_joint_vel_rad_s")
         if peak is not None and peak > max_joint_vel_rad_s:
-            raise ComposeError(
+            raise ComposeGateError(
                 f"composite peak joint velocity {peak:.2f} rad/s exceeds "
                 f"{max_joint_vel_rad_s:.2f} rad/s; the blend is too short for "
                 "how far the poses are apart.")
@@ -636,6 +730,11 @@ def compose_and_register(
     from sculptor.refs import library
 
     library.validate_clip_id(clip_id)
+    if len(segments) > MAX_COMPOSE_SEGMENTS:
+        raise ComposeError(
+            "compose_and_register accepts at most "
+            f"{MAX_COMPOSE_SEGMENTS} segments, got {len(segments)}"
+        )
     resolved: list[dict[str, Any]] = []
     parents: list[dict[str, Any]] = []
     for i, spec in enumerate(segments):
@@ -686,41 +785,63 @@ def compose_and_register(
             "clip_id": resolved_segment["source_id"],
             "content_sha256": parent_sha,
         })
-    root_frame_inheritance: Optional[dict[str, Any]] = None
     inherited_root_frame = composite.get("root_frame")
-    if inherited_root_frame in {"absolute", "origin_relative"}:
-        parent_frame_receipts: list[dict[str, Any]] = []
-        for i, resolved_segment in enumerate(resolved):
-            parent_receipt, receipt_issues = library.root_frame_parent_receipt(
-                robot,
-                resolved_segment["source_id"],
-                root=root,
-            )
-            if receipt_issues or parent_receipt is None:
-                raise ComposeError(
-                    f"segment {i}: cannot inherit authoritative root_frame "
-                    f"from {resolved_segment['source_id']!r}: "
-                    + "; ".join(receipt_issues or ["evidence is missing"])
-                )
-            parent_frame_receipts.append(parent_receipt)
-        root_frame_inheritance = {
-            "schema": library.ROOT_FRAME_INHERITANCE_SCHEMA,
-            "method": library.ROOT_FRAME_INHERITANCE_METHOD,
-            "asserted_root_frame": inherited_root_frame,
-            "parents": parent_frame_receipts,
-        }
-        receipt_issues = library.validate_root_frame_inheritance_receipt(
-            root_frame_inheritance,
-            expected_root_frame=inherited_root_frame,
-            expected_parent_artifacts=parent_artifacts,
+    if inherited_root_frame not in {"absolute", "origin_relative"}:
+        raise ComposeError(
+            "composed clip has no exact supported root_frame convention"
         )
-        if receipt_issues:  # pragma: no cover - constructed from validated data
+    parent_frame_receipts: list[dict[str, Any]] = []
+    for i, resolved_segment in enumerate(resolved):
+        parent_receipt, receipt_issues = library.root_frame_parent_receipt(
+            robot,
+            resolved_segment["source_id"],
+            root=root,
+        )
+        if receipt_issues or parent_receipt is None:
             raise ComposeError(
-                "cannot build canonical root-frame inheritance receipt: "
-                + "; ".join(receipt_issues)
+                f"segment {i}: cannot inherit authoritative root_frame "
+                f"from {resolved_segment['source_id']!r}: "
+                + "; ".join(receipt_issues or ["evidence is missing"])
             )
+        parent_frame_receipts.append(parent_receipt)
+    root_frame_inheritance: dict[str, Any] = {
+        "schema": library.ROOT_FRAME_INHERITANCE_SCHEMA,
+        "method": library.ROOT_FRAME_INHERITANCE_METHOD,
+        "asserted_root_frame": inherited_root_frame,
+        "parents": parent_frame_receipts,
+    }
+    receipt_issues = library.validate_root_frame_inheritance_receipt(
+        root_frame_inheritance,
+        expected_root_frame=inherited_root_frame,
+        expected_parent_artifacts=parent_artifacts,
+    )
+    if receipt_issues:  # pragma: no cover - constructed from validated data
+        raise ComposeError(
+            "cannot build canonical root-frame inheritance receipt: "
+            + "; ".join(receipt_issues)
+        )
     comp_meta = composite["meta"]["composition"]
     n_frames = int(np.asarray(composite["root_pos_z"]).shape[0])
+    # Composition and seam analysis may take long enough for a parent artifact
+    # to change underneath the request. Re-open every exact parent immediately
+    # before registration and require the ordered authority receipt to be byte-
+    # for-byte identical to the one that authorized composition.
+    for i, (resolved_segment, expected_receipt) in enumerate(zip(
+        resolved, parent_frame_receipts,
+    )):
+        observed_receipt, receipt_issues = library.root_frame_parent_receipt(
+            robot,
+            resolved_segment["source_id"],
+            root=root,
+        )
+        if receipt_issues or observed_receipt != expected_receipt:
+            detail = "; ".join(receipt_issues) if receipt_issues else (
+                "ordered inheritance receipt changed"
+            )
+            raise ComposeError(
+                f"segment {i}: root-frame authority changed before "
+                f"registration for {resolved_segment['source_id']!r}: {detail}"
+            )
     d = library.clip_dir(robot, clip_id, root=root)
     clip_path = save_clip(d / library.CLIP_FILENAME, composite)
     artifact_sha = library.content_sha256(clip_path.read_bytes())
@@ -732,8 +853,7 @@ def compose_and_register(
         "parent_artifacts": parent_artifacts,
         "segments": comp_meta["segments"],
     }
-    if root_frame_inheritance is not None:
-        source_provenance["root_frame_inheritance"] = root_frame_inheritance
+    source_provenance["root_frame_inheritance"] = root_frame_inheritance
 
     prov = library.make_provenance(
         clip_id=clip_id,

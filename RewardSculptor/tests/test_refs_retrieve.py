@@ -232,6 +232,59 @@ def test_deterministic_rank_no_overlap_returns_empty() -> None:
     assert deterministic_rank("xyzzy plugh", FIXTURE_ROWS) == []
 
 
+def test_exact_robot_scoped_id_wins_an_identical_semantic_tie() -> None:
+    """A derived clip can intentionally retain its parent's human-readable
+    description.  Pasting the identity shown by the UI must select the exact
+    derived artifact rather than let the lexical tie-break prefer its parent.
+    """
+    labels = ["50009", "one", "leg", "jump", "poses", "60", "jpos"]
+    rows = [
+        _row("50009_one_leg_jump_poses_60_jpos", labels),
+        _row("50009_one_leg_jump_poses_60_jpos--origin-relative", labels),
+    ]
+
+    results = deterministic_rank(
+        "g1/50009_one_leg_jump_poses_60_jpos--origin-relative", rows, k=2,
+    )
+
+    assert [match.clip_id for match in results] == [
+        "50009_one_leg_jump_poses_60_jpos--origin-relative",
+        "50009_one_leg_jump_poses_60_jpos",
+    ]
+    # Exact identity is an ordering authority, not a fabricated relevance
+    # score.  The underlying semantic tie remains honestly visible.
+    assert results[0].score == pytest.approx(results[1].score)
+
+
+def test_exact_id_is_included_without_semantic_overlap_and_respects_robot() -> None:
+    g1 = _row("opaque-derived-id", ["unrelated", "motion"])
+    t1 = _row("opaque-derived-id", ["unrelated", "motion"], robot="t1")
+
+    results = deterministic_rank("g1/opaque-derived-id", [t1, g1], k=10)
+
+    assert [match.clip_id for match in results] == ["opaque-derived-id"]
+    assert results[0].score == 0.0
+
+
+def test_exact_id_query_bypasses_optional_llm_reranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact artifact identity is a selection, not a rerank prompt."""
+    import sculptor.refs.retrieve as retrieve_mod
+
+    def _unexpected_rerank(*args, **kwargs):
+        raise AssertionError("exact ID lookup must not invoke the LLM")
+
+    monkeypatch.setattr(retrieve_mod, "_rerank_with_llm", _unexpected_rerank)
+    rows = [_row("opaque-derived-id", ["unrelated", "motion"])]
+
+    results = search_rows(
+        "g1/opaque-derived-id", rows, k=10, use_llm=True, client=object(),
+    )
+
+    assert [match.clip_id for match in results] == ["opaque-derived-id"]
+
+
 def test_deterministic_rank_score_tie_prefers_denser_match() -> None:
     """§2026-07-11 regression (found against the real index after the
     stageii ingest recovered the MOYO yoga clips): a verbose yoga-pose

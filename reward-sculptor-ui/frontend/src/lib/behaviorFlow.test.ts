@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveModeRewardReadiness } from "@/lib/behaviorFlow";
+import {
+  deriveModeRewardReadiness,
+  resolveModeAuthoringGoal,
+} from "@/lib/behaviorFlow";
 import type { ModeRewardFile, PromotedModeReward } from "@/lib/api";
 
 const file = (overrides: Partial<ModeRewardFile> = {}): ModeRewardFile => ({
@@ -80,5 +83,28 @@ describe("deriveModeRewardReadiness", () => {
     expect(readiness(
       [file()], promoted({ source_sha256: "c".repeat(64) }),
     ).promotionBlocker).toMatch(/source bytes/i);
+  });
+});
+
+describe("resolveModeAuthoringGoal", () => {
+  it("keeps the explicit behavior draft ahead of generated descriptions", () => {
+    expect(resolveModeAuthoringGoal({
+      draftGoal: "  traverse four low rails with controlled hops  ",
+      projectDescription: "Generic locomotion project",
+      rewardDescription: "Track the reference pose",
+    })).toBe("traverse four low rails with controlled hops");
+  });
+
+  it("falls back from project intent to reward description", () => {
+    expect(resolveModeAuthoringGoal({
+      draftGoal: " ",
+      projectDescription: "Cross the obstacle course",
+      rewardDescription: "Track motion",
+    })).toBe("Cross the obstacle course");
+    expect(resolveModeAuthoringGoal({
+      draftGoal: null,
+      projectDescription: "",
+      rewardDescription: "Track motion",
+    })).toBe("Track motion");
   });
 });

@@ -14,6 +14,9 @@ import pytest
 from sculptor.reference import validate_clip
 from sculptor.refs.compose import (
     ComposeError,
+    ComposeGateError,
+    MAX_COMPOSE_OUTPUT_FRAMES,
+    MAX_COMPOSE_SEGMENTS,
     _quat_yaw,
     compose_reference,
     seam_report,
@@ -56,6 +59,7 @@ def _clip(
         "joint_vel": np.gradient(jp, 1.0 / fps, axis=0),
         "contact_left_foot": (np.sin(2 * np.pi * t) > 0).astype(np.float64),
         "contact_right_foot": (np.sin(2 * np.pi * t) <= 0).astype(np.float64),
+        "root_frame": "absolute",
         "meta": {"clip_id": "synthetic"},
     }
 
@@ -75,6 +79,49 @@ def test_composes_two_clips_into_a_valid_clip():
     assert out["root_pos_z"].shape[0] == 240 - comp["blend_frames"]
     # A composite is a candidate, never a certified motion.
     assert comp["certified"] is False
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"target_fps": 241.0}, "target_fps"),
+        ({"target_fps": float("inf")}, "target_fps"),
+        ({"blend_s": 10.1}, "blend_s"),
+        ({"blend_s": float("nan")}, "blend_s"),
+    ],
+)
+def test_composition_rejects_unbounded_numeric_controls(kwargs, message):
+    with pytest.raises(ComposeError, match=message):
+        compose_reference(
+            [{"clip": _clip()}, {"clip": _clip()}],
+            **kwargs,
+        )
+
+
+def test_composition_caps_materialized_output_before_resampling():
+    n = MAX_COMPOSE_OUTPUT_FRAMES // 2 + 1
+    with pytest.raises(ComposeError, match="bounded.*frame limit"):
+        compose_reference([
+            {"clip": _clip(n=n, fps=240.0)},
+            {"clip": _clip(n=n, fps=240.0)},
+        ], target_fps=240.0)
+
+
+@pytest.mark.parametrize("bound", [float("nan"), float("inf"), "not-a-number"])
+def test_composition_rejects_nonfinite_trim_bounds_contextually(bound):
+    with pytest.raises(
+        ComposeError,
+        match=r"segment 0 \('clip_a'\) trim bounds must be finite numbers",
+    ):
+        compose_reference([
+            {
+                "clip": _clip(),
+                "source_id": "clip_a",
+                "t_start_s": bound,
+                "t_end_s": 1.0,
+            },
+            {"clip": _clip(), "source_id": "clip_b"},
+        ])
 
 
 def test_composition_preserves_a_shared_root_frame_contract():
@@ -105,6 +152,18 @@ def test_composition_refuses_mixed_root_frame_contracts(left, right):
     first["root_frame"] = left
     if right is not None:
         second["root_frame"] = right
+    else:
+        second.pop("root_frame")
+
+    with pytest.raises(ComposeError, match="incompatible root_frame"):
+        compose_reference([{"clip": first}, {"clip": second}])
+
+
+def test_composition_refuses_when_every_root_frame_contract_is_missing():
+    first = _clip()
+    second = _clip(joint_offset=0.05)
+    first.pop("root_frame")
+    second.pop("root_frame")
 
     with pytest.raises(ComposeError, match="incompatible root_frame"):
         compose_reference([{"clip": first}, {"clip": second}])
@@ -115,11 +174,54 @@ def test_requires_at_least_two_segments():
         compose_reference([{"clip": _clip()}])
 
 
+def test_segment_cap_fails_before_any_source_array_is_loaded():
+    unreadable = object()
+    consumed = 0
+
+    def unbounded_segments():
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield {"clip": unreadable}
+
+    with pytest.raises(ComposeError, match=f"at most {MAX_COMPOSE_SEGMENTS}"):
+        compose_reference(unbounded_segments())
+    assert consumed == MAX_COMPOSE_SEGMENTS + 1
+
+
 def test_rejects_invalid_source_clip():
     bad = _clip()
     bad["root_pos_z"] = bad["root_pos_z"] * -1.0  # violates strictly-positive
     with pytest.raises(ComposeError, match="source clip is invalid"):
         compose_reference([{"clip": bad}, {"clip": _clip()}])
+
+
+def test_invalid_crop_is_a_contextual_compose_error():
+    """A bad user-authored span is a composition error, not a raw helper
+    exception.  The message must identify the phase, parent, requested range,
+    and valid duration so the researcher can correct the right row.
+
+    An end beyond the clip also locks the negative path that the former
+    directional `needs crop` check silently treated as the whole clip.
+    """
+    with pytest.raises(
+        ComposeError,
+        match=(
+            r"segment 0 \('clip_a'\) cannot crop requested span "
+            r"\[0, 2\.5\] s from source duration 2 s: span"
+        ),
+    ) as caught:
+        compose_reference([
+            {
+                "clip": _clip(),
+                "source_id": "clip_a",
+                "t_start_s": 0.0,
+                "t_end_s": 2.5,
+            },
+            {"clip": _clip(), "source_id": "clip_b"},
+        ])
+
+    assert type(caught.value.__cause__) is ValueError
 
 
 # ── continuity: the guarantees that make a composite trackable ──────────
@@ -215,7 +317,7 @@ def test_explicit_target_fps_is_honored():
 def test_rejects_a_seam_that_does_not_meet():
     """Spans whose boundary poses are far apart cannot be blended into a
     plausible motion; failing here is far cheaper than failing in physics."""
-    with pytest.raises(ComposeError, match="seam discontinuity"):
+    with pytest.raises(ComposeGateError, match="seam discontinuity"):
         compose_reference([
             {"clip": _clip(joint_offset=0.0)},
             {"clip": _clip(joint_offset=5.0)},
@@ -234,7 +336,7 @@ def test_strict_false_returns_the_composite_with_its_measurements():
 
 
 def test_rejects_excessive_joint_velocity():
-    with pytest.raises(ComposeError, match="peak joint velocity"):
+    with pytest.raises(ComposeGateError, match="peak joint velocity"):
         compose_reference([
             {"clip": _clip()}, {"clip": _clip(joint_offset=1.0)},
         ], blend_s=0.05, max_seam_joint_jump_rad=99.0,
@@ -280,6 +382,50 @@ def _register_source(root, robot, clip_id, clip, *, license_="cc-by-4.0",
         source={"kind": "test"}, license=license_, attribution=attribution,
         content_sha256_=library.content_sha256(clip_path.read_bytes()))
     library.write_provenance(robot, clip_id, prov, root=root)
+
+
+def test_registration_segment_cap_precedes_library_array_loading(
+    tmp_path, monkeypatch,
+):
+    import sculptor.reference as reference
+
+    from sculptor.refs.compose import compose_and_register
+
+    loaded = False
+
+    def should_not_load(*args, **kwargs):
+        nonlocal loaded
+        loaded = True
+        raise AssertionError("source arrays must not load")
+
+    monkeypatch.setattr(reference, "load_clip", should_not_load)
+    with pytest.raises(ComposeError, match=f"at most {MAX_COMPOSE_SEGMENTS}"):
+        compose_and_register(
+            "g1",
+            [{"clip_id": "source"} for _ in range(MAX_COMPOSE_SEGMENTS + 1)],
+            clip_id="too-many--g1",
+            root=tmp_path,
+        )
+    assert loaded is False
+
+
+def test_registration_refuses_all_missing_root_frame_authority(tmp_path):
+    from sculptor.refs.compose import compose_and_register
+
+    first = _clip()
+    second = _clip(joint_offset=0.05)
+    first.pop("root_frame")
+    second.pop("root_frame")
+    _register_source(tmp_path, "g1", "missing_a", first)
+    _register_source(tmp_path, "g1", "missing_b", second)
+
+    with pytest.raises(ComposeError, match="incompatible root_frame"):
+        compose_and_register(
+            "g1",
+            [{"clip_id": "missing_a"}, {"clip_id": "missing_b"}],
+            clip_id="missing-root--g1",
+            root=tmp_path,
+        )
 
 
 def test_compose_and_register_records_every_parent(tmp_path):
@@ -375,6 +521,49 @@ def test_registered_composite_binds_ordered_root_frame_authority(tmp_path):
     )
     assert observed is None
     assert any("content hash differs" in issue for issue in issues)
+
+
+def test_registration_reverifies_ordered_root_authority_before_save(
+    tmp_path, monkeypatch,
+):
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+    from sculptor.refs.compose import compose_and_register
+
+    _register_source(tmp_path, "g1", "src_a", _clip())
+    _register_source(tmp_path, "g1", "src_b", _clip(joint_offset=0.05))
+    original = library.root_frame_parent_receipt
+    calls = 0
+
+    def mutate_between_checks(robot, clip_id, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            changed_path = (
+                library.clip_dir("g1", "src_b", root=tmp_path)
+                / library.CLIP_FILENAME
+            )
+            save_clip(changed_path, _clip(joint_offset=0.25))
+        return original(robot, clip_id, **kwargs)
+
+    monkeypatch.setattr(
+        library, "root_frame_parent_receipt", mutate_between_checks,
+    )
+    with pytest.raises(
+        ComposeError,
+        match="root-frame authority changed before registration",
+    ):
+        compose_and_register(
+            "g1",
+            [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
+            clip_id="stale-before-save--g1",
+            root=tmp_path,
+        )
+    assert calls == 4
+    assert not (
+        library.clip_dir("g1", "stale-before-save--g1", root=tmp_path)
+        / library.CLIP_FILENAME
+    ).exists()
 
 
 def test_root_frame_inheritance_rejects_missing_and_weak_evidence(tmp_path):

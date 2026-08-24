@@ -39,6 +39,7 @@ def _clip(n: int = 120, *, joint_offset: float = 0.0) -> dict:
         "root_pos_xy": np.stack([0.5 * t, np.zeros(n)], axis=1),
         "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
         "joint_pos": jp,
+        "root_frame": "absolute",
         "meta": {"clip_id": "synthetic"},
     }
 

@@ -13,6 +13,27 @@ export type ModeRewardReadiness = {
   promotionBlocker: string | null;
 };
 
+/** Pick the researcher-authored behavior intent for per-mode authoring.
+ *
+ * A generated reward description is useful fallback context, but it must not
+ * overwrite the behavior draft the researcher explicitly reviewed. Project
+ * description sits between them because it is durable human-facing intent,
+ * while reward description describes one implementation of that intent.
+ */
+export function resolveModeAuthoringGoal({
+  draftGoal,
+  projectDescription,
+  rewardDescription,
+}: {
+  draftGoal?: string | null;
+  projectDescription?: string | null;
+  rewardDescription?: string | null;
+}): string {
+  return [draftGoal, projectDescription, rewardDescription]
+    .map((value) => value?.trim() ?? "")
+    .find(Boolean) ?? "";
+}
+
 /** One authority calculation shared by overview readiness and run admission.
  *
  * A file being fully authored is not enough: it was grounded against one

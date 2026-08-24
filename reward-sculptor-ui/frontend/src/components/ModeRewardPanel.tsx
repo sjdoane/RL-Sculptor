@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/rs/icon";
 import { Btn } from "@/components/rs/primitives";
@@ -15,13 +15,128 @@ import {
   promoteModeReward,
   recordModeEvidenceReceipt,
   scaffoldModeReward,
+  searchReferences,
   type ModeRewardFile,
   type ModeRewardResult,
   type ModeEvidenceStatus,
   type PromotedModeReward,
   type ReferenceModeGraph,
 } from "@/lib/api";
-import type { RefIndexRow } from "@/lib/types";
+
+type ReferencePickerHit = { clip_id: string; text?: string };
+
+const SHA256_RE = /^[a-f0-9]{64}$/;
+
+/** Match the backend's whitespace-only behavior-goal canonicalization. */
+export function normalizeModeAuthoringGoal(value?: string | null): string {
+  return String(value ?? "").trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+export type ModeRewardReadiness = {
+  ready: boolean;
+  blocker: string | null;
+};
+
+/** One authority for the banner and both mutating actions. Missing evidence is
+ * stale evidence: legacy/malformed responses must never become authorable by
+ * virtue of JavaScript truthiness. */
+export function modeRewardReadiness(
+  reward: ModeRewardResult | null,
+  requestedGoal: string,
+  expected: { robot: string; clipId: string },
+): ModeRewardReadiness {
+  if (!reward) return { ready: false, blocker: "Scaffold a mode reward first." };
+  if (
+    reward.clip_id !== expected.clipId
+    || reward.reference_robot !== expected.robot
+  ) {
+    return {
+      ready: false,
+      blocker:
+        `The scaffold identity does not match selected reference ${expected.robot}/${expected.clipId}.`,
+    };
+  }
+  if (reward.context_blocker) {
+    return { ready: false, blocker: reward.context_blocker };
+  }
+  if (
+    reward.context_current !== true
+    || !SHA256_RE.test(reward.execution_context_digest ?? "")
+  ) {
+    return {
+      ready: false,
+      blocker: "The scaffold does not prove the current execution context.",
+    };
+  }
+  if (
+    reward.authoring_intent_valid !== true
+    || !SHA256_RE.test(reward.authoring_intent_sha256 ?? "")
+    || typeof reward.authoring_goal !== "string"
+  ) {
+    return {
+      ready: false,
+      blocker: "The scaffold does not contain a verifiable authoring intent.",
+    };
+  }
+  if (
+    normalizeModeAuthoringGoal(requestedGoal)
+    !== normalizeModeAuthoringGoal(reward.authoring_goal)
+  ) {
+    return {
+      ready: false,
+      blocker:
+        "The behavior goal changed after this scaffold was created. Re-scaffold to pin the new research intent.",
+    };
+  }
+  return { ready: true, blocker: null };
+}
+
+/** Select only the exact robot-scoped reference. A verified current file wins
+ * over a newer stale derivative; ties prefer valid/matching intent, then mtime. */
+export function selectModeRewardFile(
+  files: ModeRewardFile[],
+  clipId: string,
+  robot: string,
+  requestedGoal: string,
+): ModeRewardFile | undefined {
+  const requested = normalizeModeAuthoringGoal(requestedGoal);
+  return files
+    .filter((file) => file.clip_id === clipId && file.reference_robot === robot)
+    .sort((left, right) => {
+      const rank = (file: ModeRewardFile) => [
+        file.context_current === true ? 1 : 0,
+        file.context_blocker == null ? 1 : 0,
+        file.authoring_intent_valid === true ? 1 : 0,
+        normalizeModeAuthoringGoal(file.authoring_goal) === requested ? 1 : 0,
+        Number.isFinite(file.mtime) ? file.mtime : 0,
+      ];
+      const a = rank(left);
+      const b = rank(right);
+      for (let index = 0; index < a.length; index += 1) {
+        if (a[index] !== b[index]) return b[index] - a[index];
+      }
+      return 0;
+    })[0];
+}
+
+function rewardResultFromFile(file: ModeRewardFile): ModeRewardResult {
+  return {
+    path: file.path,
+    filename: file.filename,
+    clip_id: file.clip_id,
+    reference_robot: file.reference_robot,
+    execution_context_digest: file.execution_context_digest,
+    authoring_goal: file.authoring_goal,
+    authoring_intent_sha256: file.authoring_intent_sha256,
+    authoring_intent_valid: file.authoring_intent_valid,
+    context_blocker: file.context_blocker,
+    context_current: file.context_current,
+    tracking: file.tracking_enabled,
+    modes: file.modes,
+    unauthored: file.unauthored,
+    duration_qa: file.duration_qa,
+  };
+}
 
 /**
  * Per-mode reward authoring for a composed reference.
@@ -55,8 +170,9 @@ export function ModeRewardPanel({
 }) {
   const [clipId, setClipId] = useState<string>(initialClipId ?? "");
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<RefIndexRow[] | null>(null);
+  const [hits, setHits] = useState<ReferencePickerHit[] | null>(null);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [graph, setGraph] = useState<ReferenceModeGraph | null>(null);
   const [graphError, setGraphError] = useState<string | null>(null);
   const [reward, setReward] = useState<ModeRewardResult | null>(null);
@@ -85,6 +201,20 @@ export function ModeRewardPanel({
   const [evidenceBusy, setEvidenceBusy] = useState(false);
   const qc = useQueryClient();
   const saveDraft = useSaveBehaviorDraft(slug);
+  const selectionKey = JSON.stringify([
+    robot,
+    clipId,
+    normalizeModeAuthoringGoal(goal),
+  ]);
+  const selectionGuard = useRef({ key: selectionKey, generation: 0 });
+  // Update synchronously with render. An older promise can otherwise resolve
+  // between a selection-changing render and that render's effect cleanup.
+  if (selectionGuard.current.key !== selectionKey) {
+    selectionGuard.current = {
+      key: selectionKey,
+      generation: selectionGuard.current.generation + 1,
+    };
+  }
 
   // `useState` reads its argument once, at mount — and at mount the behavior
   // draft that names the clip is still in flight, so the panel opened on the
@@ -108,27 +238,33 @@ export function ModeRewardPanel({
    *  where the panel has no `reward` yet.
    */
   const refresh = useCallback(
-    async ({ adopt = false }: { adopt?: boolean } = {}) => {
+    async ({
+      adopt = false,
+      expectedGeneration = selectionGuard.current.generation,
+      isLive,
+    }: {
+      adopt?: boolean;
+      expectedGeneration?: number;
+      isLive?: () => boolean;
+    } = {}) => {
       const { mode_rewards: files, promoted: p } = await listModeRewards(slug);
+      if (
+        selectionGuard.current.generation !== expectedGeneration
+        || (isLive && !isLive())
+      ) {
+        return false;
+      }
       setPromoted(p);
-      const mine = files.find(
-        (f) => f.clip_id === clipId && f.reference_robot === robot,
-      );
+      const mine = selectModeRewardFile(files, clipId, robot, goal);
       setDigest(mine?.digest ?? "");
       if (adopt && mine) {
-        setReward({
-          path: mine.path,
-          filename: mine.filename,
-          clip_id: mine.clip_id,
-          tracking: mine.tracking_enabled,
-          modes: mine.modes,
-          unauthored: mine.unauthored,
-        });
+        setReward(rewardResultFromFile(mine));
         setTracking(mine.tracking_enabled);
         setResumed(true);
       }
+      return true;
     },
-    [clipId, robot, slug],
+    [clipId, goal, robot, slug],
   );
 
   useEffect(() => {
@@ -145,6 +281,7 @@ export function ModeRewardPanel({
     setResumed(false);
     setConfirmRescaffold(false);
     setConfirmPartial(false);
+    const generation = selectionGuard.current.generation;
     getReferenceModes(clipId, robot)
       .then((g) => live && setGraph(g))
       .catch((e) =>
@@ -157,7 +294,11 @@ export function ModeRewardPanel({
     // used to live only in this component's state, so a reload showed a panel
     // whose only button was "Scaffold reward" — which overwrote the very
     // bodies the reload had hidden.
-    refresh({ adopt: true }).catch(() => {
+    refresh({
+      adopt: true,
+      expectedGeneration: generation,
+      isLive: () => live,
+    }).catch(() => {
       /* no scaffold yet is the normal first-visit case */
     });
     return () => {
@@ -193,14 +334,28 @@ export function ModeRewardPanel({
 
   async function runSearch() {
     setSearching(true);
+    setSearchError(null);
     try {
-      // Browse, not semantic search: a composite you just made is found by
-      // its own name, and `listReferences` capped that at the ten
-      // alphabetically-first clips of ~6000.
-      const r = await browseReferences({ robot, q: query, limit: 8 });
-      setHits(r.rows as RefIndexRow[]);
-    } catch {
-      setHits([]);
+      const trimmed = query.trim();
+      // The exact-aware retrieval endpoint accepts both a semantic
+      // description and a pasted `robot/clip_id`. The faceted browse endpoint
+      // is retained only for the useful empty-query "recent composites"
+      // state; its substring filter cannot round-trip a scoped identity.
+      if (trimmed) {
+        setHits(await searchReferences(trimmed, {
+          robot, k: 8, useLlm: false,
+        }));
+      } else {
+        const r = await browseReferences({ robot, composed: true, limit: 8 });
+        setHits(r.rows);
+      }
+    } catch (e) {
+      setHits(null);
+      setSearchError(
+        e instanceof ApiError
+          ? e.message
+          : "Reference search is unavailable. Try again when the library service is reachable.",
+      );
     } finally {
       setSearching(false);
     }
@@ -212,8 +367,17 @@ export function ModeRewardPanel({
     if (clipId || hits !== null) return;
     let live = true;
     browseReferences({ robot, composed: true, limit: 8 })
-      .then((r) => live && setHits(r.rows as RefIndexRow[]))
-      .catch(() => {});
+      .then((r) => {
+        if (!live) return;
+        setHits(r.rows);
+        setSearchError(null);
+      })
+      .catch(() => {
+        if (!live) return;
+        setSearchError(
+          "Reference search is unavailable. Try again when the library service is reachable.",
+        );
+      });
     return () => {
       live = false;
     };
@@ -225,7 +389,8 @@ export function ModeRewardPanel({
         <input
           className="rs-input rs-grow"
           style={{ fontSize: 12 }}
-          placeholder="find a composed reference, e.g. 'running jump kick'"
+          aria-label="Search composed references by description or exact robot/clip ID"
+          placeholder={`Describe a motion or paste ${robot}/clip_id`}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && runSearch()}
@@ -235,6 +400,16 @@ export function ModeRewardPanel({
           {searching ? "Searching…" : "Search"}
         </Btn>
       </div>
+      {searchError && (
+        <div
+          className="rs-banner err"
+          role="alert"
+          style={{ fontSize: 11, marginTop: 8 }}
+        >
+          <Icon name="alert-triangle" size={14} />
+          <span className="rs-grow">{searchError}</span>
+        </div>
+      )}
       {hits && hits.length === 0 && (
         <div className="rs-sub" style={{ fontSize: 11, marginTop: 8 }}>
           No clips matched. Compose one from the reference picker first — a
@@ -247,6 +422,7 @@ export function ModeRewardPanel({
             <button
               key={h.clip_id}
               className="rs-btn rs-btn-quiet rs-btn-sm"
+              aria-label={`Select exact reference ${robot}/${h.clip_id}`}
               style={{ justifyContent: "flex-start", fontSize: 12,
                        border: "1px solid var(--hairline)" }}
               onClick={() => {
@@ -255,7 +431,7 @@ export function ModeRewardPanel({
                                    reference_robot: robot });
               }}
             >
-              <span className="mono">{h.clip_id}</span>
+              <span className="mono">{robot}/{h.clip_id}</span>
               {h.text && (
                 <span className="rs-sub" style={{ marginLeft: 8 }}>
                   {h.text}
@@ -278,7 +454,7 @@ export function ModeRewardPanel({
         <div className="rs-sub" style={{ fontSize: 11 }}>
           {graphError ? (
             <>
-              No mode automaton for <code>{clipId}</code> — {graphError}. A
+              No mode automaton for <code>{robot}/{clipId}</code> — {graphError}. A
               per-mode reward needs a composed reference; a single clip is one
               mode with nothing to transition to.
             </>
@@ -307,6 +483,7 @@ export function ModeRewardPanel({
     (reward?.modes ?? []).filter((m) => m.authored).map((m) => m.name),
   );
   const doneCount = authored.size;
+  const readiness = modeRewardReadiness(reward, goal, { robot, clipId });
   // Is the version `current.py` points at the file in front of me, byte for
   // byte? An empty digest on either side means "cannot tell", which resolves
   // to false — the safe direction, since the cost of a needless second
@@ -316,8 +493,18 @@ export function ModeRewardPanel({
     promoted !== null
     && promoted.clip_id === clipId
     && promoted.reference_robot === robot
-    && promoted.context_current !== false && digest !== "" &&
-    promoted.source_sha256 === digest;
+    && promoted.context_current === true
+    && promoted.selection_current === true
+    && promoted.context_blocker == null
+    && promoted.promotion_blocker == null
+    && promoted.authoring_intent_valid === true
+    && SHA256_RE.test(promoted.authoring_intent_sha256 ?? "")
+    && normalizeModeAuthoringGoal(promoted.authoring_goal)
+      === normalizeModeAuthoringGoal(goal)
+    && digest !== ""
+    && promoted.source_sha256 === digest;
+  const durationQa = reward?.duration_qa;
+  const durationWarning = durationQa?.warnings[0];
   async function onScaffold(overwrite = false) {
     setBusy("scaffold");
     setError(null);
@@ -334,7 +521,11 @@ export function ModeRewardPanel({
       setReward(r);
       setResumed(false);
       setConfirmRescaffold(false);
-      await refresh();
+      // The scaffold response proves what was written, while the list
+      // endpoint is the sole authority for whether those exact bytes are
+      // current in the project's selected execution context.
+      await refresh({ adopt: true });
+      setResumed(false);
       // Record what is being built so the run dialog and the flow card can
       // find it without the user re-searching the library for the clip.
       saveDraft.mutate({
@@ -350,15 +541,9 @@ export function ModeRewardPanel({
         const files = await listModeRewards(slug)
           .then((r) => r.mode_rewards)
           .catch(() => [] as ModeRewardFile[]);
-        const mine = files.find(
-          (f) => f.clip_id === clipId && f.reference_robot === robot,
-        );
+        const mine = selectModeRewardFile(files, clipId, robot, goal);
         if (mine) {
-          setReward({
-            path: mine.path, filename: mine.filename, clip_id: mine.clip_id,
-            tracking: mine.tracking_enabled,
-            modes: mine.modes, unauthored: mine.unauthored,
-          });
+          setReward(rewardResultFromFile(mine));
           setTracking(mine.tracking_enabled);
           setResumed(true);
           setLog((l) => [...l, `found existing ${mine.filename} — resumed`]);
@@ -372,7 +557,7 @@ export function ModeRewardPanel({
   }
 
   async function onAuthor(mode: string) {
-    if (!reward) return;
+    if (!reward || !readiness.ready) return;
     setBusy(mode);
     setError(null);
     try {
@@ -411,7 +596,8 @@ export function ModeRewardPanel({
                 }
               : prev,
           );
-          await refresh();
+          await refresh({ adopt: true });
+          setResumed(false);
           setLog((l) => [...l, `${mode}: authored → ${out.filename}`]);
           break;
         }
@@ -432,7 +618,7 @@ export function ModeRewardPanel({
   }
 
   async function onPromote(allowUnauthored: boolean) {
-    if (!reward) return;
+    if (!reward || !readiness.ready) return;
     setBusy("promote");
     setError(null);
     try {
@@ -479,7 +665,13 @@ export function ModeRewardPanel({
       <div className="rs-flex rs-gap-8" style={{ marginBottom: 4 }}>
         <Icon name="layers" size={16} />
         <strong style={{ fontSize: 13 }}>Per-mode reward</strong>
-        <span className="mono rs-sub" style={{ fontSize: 11 }}>{clipId}</span>
+        <span
+          className="mono rs-sub"
+          style={{ fontSize: 11 }}
+          aria-label={`Selected exact reference ${robot}/${clipId}`}
+        >
+          {robot}/{clipId}
+        </span>
         <span className="rs-grow" />
         {reward && (
           <span className="rs-sub" style={{ fontSize: 11 }}>
@@ -585,6 +777,30 @@ export function ModeRewardPanel({
             final reference frame; it never stretches a certified motion.
           </div>
         )}
+        {durationQa && durationWarning && (
+          <div
+            className="rs-banner"
+            role="note"
+            style={{
+              fontSize: 11,
+              lineHeight: 1.5,
+              marginTop: 8,
+              borderLeft: "3px solid var(--st-amber, #d97706)",
+            }}
+          >
+            <Icon name="info" size={14} color="var(--st-amber, #d97706)" />
+            <span className="rs-grow">
+              <b>Duration advisory.</b> <code>{durationWarning.mode}</code> owns{" "}
+              {durationWarning.duration_s.toFixed(2)} of{" "}
+              {durationQa.episode_duration_s.toFixed(2)} seconds ({
+                (durationWarning.episode_share * 100).toFixed(1)
+              }%). Reward is summed raw per step, not normalized by duration.
+              Gate stationary bonuses on task progress and compare per-mode
+              reward mass after rollout. This is advisory and does not block
+              authoring or launch.
+            </span>
+          </div>
+        )}
       </div>
 
       {resumed && (
@@ -594,6 +810,30 @@ export function ModeRewardPanel({
             Resumed <code>{reward?.filename}</code> from disk — {doneCount} of{" "}
             {reward?.modes.length} modes already authored.
           </span>
+        </div>
+      )}
+
+      {reward && !readiness.ready && (
+        <div
+          className="rs-banner err"
+          role="alert"
+          style={{ fontSize: 11.5, marginBottom: 10, alignItems: "flex-start" }}
+        >
+          <Icon name="alert-triangle" size={15} />
+          <span className="rs-grow" style={{ lineHeight: 1.5 }}>
+            <b>Mode reward is not ready.</b> {readiness.blocker} Authoring and
+            promotion are blocked so the warning and the actions use the same
+            exact authority.
+          </span>
+          <Btn
+            kind="quiet"
+            size="sm"
+            icon="refresh-cw"
+            disabled={busy !== null}
+            onClick={() => setConfirmRescaffold(true)}
+          >
+            Re-scaffold
+          </Btn>
         </div>
       )}
 
@@ -663,7 +903,8 @@ export function ModeRewardPanel({
                   kind={isDone ? "quiet" : "primary"}
                   size="sm"
                   icon={isDone ? "check" : "sparkles"}
-                  disabled={isDone || busy !== null}
+                  disabled={isDone || busy !== null || !readiness.ready}
+                  title={!readiness.ready ? readiness.blocker ?? undefined : undefined}
                   onClick={() => onAuthor(m.name)}
                 >
                   {busy === m.name ? "Authoring…" : isDone ? "Authored" : "Author"}
@@ -681,7 +922,12 @@ export function ModeRewardPanel({
                    borderTop: "1px solid var(--hairline)" }}
         >
           <div className="rs-grow rs-sub" style={{ fontSize: 11 }}>
-            {promotedIsCurrent ? (
+            {!readiness.ready ? (
+              <>
+                This file cannot be authored or selected for training until
+                its context and pinned research intent are current.
+              </>
+            ) : promotedIsCurrent ? (
               <>
                 Promoted as <b>v{promoted!.version}.py</b> — <code>current.py</code>{" "}
                 points at it, so this is what a run trains.
@@ -735,7 +981,8 @@ export function ModeRewardPanel({
             // disabled the control forever: re-scaffold with a corrected clock,
             // re-author all four modes, and there was no click anywhere that
             // could make the new reward the one a run trains.
-            disabled={busy !== null || promotedIsCurrent}
+            disabled={busy !== null || promotedIsCurrent || !readiness.ready}
+            title={!readiness.ready ? readiness.blocker ?? undefined : undefined}
             onClick={() => {
               // `allow_unauthored` used to be passed automatically whenever a
               // mode was unauthored, which turned the backend's explicit
@@ -750,7 +997,9 @@ export function ModeRewardPanel({
           >
             {busy === "promote"
               ? "Promoting…"
-              : promotedIsCurrent
+              : !readiness.ready
+                ? "Re-scaffold required"
+                : promotedIsCurrent
                 ? `Training v${promoted!.version}`
                 : confirmPartial
                   ? "Promote incomplete"
@@ -768,7 +1017,7 @@ export function ModeRewardPanel({
           windows were found to be on the clip's clock instead of the episode's,
           a project that had already trained could not be re-scaffolded from the
           UI, at any point, by any sequence of clicks. */}
-      {reward && (
+      {reward && (readiness.ready || confirmRescaffold) && (
         <div className="rs-flex rs-gap-8" style={{ marginTop: 8 }}>
           <span className="rs-grow" />
           {confirmRescaffold ? (

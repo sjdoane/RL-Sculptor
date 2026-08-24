@@ -33,12 +33,78 @@ function toClipId(name: string, robot: string): string {
   return base ? `${base}--${robot}` : "";
 }
 
-const numOrNull = (v: string): number | null => {
-  const t = v.trim();
-  if (!t) return null;
-  const n = Number(t);
-  return Number.isFinite(n) ? n : null;
-};
+type ParsedNumber = { value: number | null; error: string | null };
+
+export const MAX_COMPOSE_FPS = 240;
+export const MAX_COMPOSE_BLEND_S = 10;
+export const MAX_COMPOSE_SEGMENTS = 16;
+const DECIMAL_NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+/** Parse a researcher-entered numeric field without turning malformed input
+ * into an omitted/default value. `Number("1,5")` and `Number("abc")` are both
+ * invalid, not aliases for a blank field. */
+export function parseNumericInput(
+  raw: string,
+  label: string,
+  opts: {
+    optional?: boolean;
+    minimum?: number;
+    exclusiveMinimum?: boolean;
+    maximum?: number;
+  } = {},
+): ParsedNumber {
+  const text = raw.trim();
+  if (!text) {
+    return opts.optional === false
+      ? { value: null, error: `${label} is required.` }
+      : { value: null, error: null };
+  }
+  const value = Number(text);
+  if (!DECIMAL_NUMBER.test(text) || !Number.isFinite(value)) {
+    return {
+      value: null,
+      error: `${label} must be a number using a decimal point (for example 0.2).`,
+    };
+  }
+  if (opts.minimum != null) {
+    const invalid = opts.exclusiveMinimum
+      ? value <= opts.minimum
+      : value < opts.minimum;
+    if (invalid) {
+      return {
+        value: null,
+        error: opts.exclusiveMinimum
+          ? `${label} must be greater than ${opts.minimum}.`
+          : `${label} must be at least ${opts.minimum}.`,
+      };
+    }
+  }
+  if (opts.maximum != null && value > opts.maximum) {
+    return {
+      value: null,
+      error: `${label} must be at most ${opts.maximum}.`,
+    };
+  }
+  return { value, error: null };
+}
+
+function parseTrim(draft: Draft): {
+  start: number | null;
+  end: number | null;
+  error: string | null;
+} {
+  const start = parseNumericInput(draft.startS, "Trim start", { minimum: 0 });
+  const end = parseNumericInput(draft.endS, "Trim end", { minimum: 0 });
+  const orderError = start.value != null && end.value != null
+    && end.value <= start.value
+    ? "Trim end must be greater than trim start."
+    : null;
+  return {
+    start: start.value,
+    end: end.value,
+    error: start.error ?? end.error ?? orderError,
+  };
+}
 
 /** Recover cadence from a sampled trajectory's exact `(N - 1) / fps`
  * duration contract. This must match the runtime reference clock. */
@@ -48,14 +114,26 @@ export function sampledTrajectoryFps(nFrames: number, durationS: number): number
   return Math.max(1, nFrames - 1) / durationS;
 }
 
+/** Exact library identity accepted by deterministic retrieval. The search
+ * endpoint is already robot-filtered, while the copyable UI receipt includes
+ * that namespace; accepting both forms makes paste-back lossless. */
+export function isExactReferenceQuery(
+  query: string, robot: string, clipId: string,
+): boolean {
+  const normalized = query.trim().toLowerCase();
+  const id = clipId.toLowerCase();
+  return normalized === id || normalized === `${robot.toLowerCase()}/${id}`;
+}
+
 /** One phase row: search the library, pick a clip, optionally trim it. */
 function SegmentRow({
-  draft, index, robot, canRemove, onChange, onRemove, onMove,
+  draft, index, robot, canRemove, trimError, onChange, onRemove, onMove,
 }: {
   draft: Draft;
   index: number;
   robot: string;
   canRemove: boolean;
+  trimError: string | null;
   onChange: (patch: Partial<Draft>) => void;
   onRemove: () => void;
   onMove: (delta: number) => void;
@@ -63,6 +141,7 @@ function SegmentRow({
   const [query, setQuery] = useState("");
   const trimmed = query.trim();
   const search = useReferenceSearch(trimmed, { robot, enabled: trimmed.length > 1 });
+  const trimErrorId = `compose-phase-${draft.key}-trim-error`;
 
   return (
     <div
@@ -106,7 +185,12 @@ function SegmentRow({
             <div style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {draft.clipText || draft.clipId}
             </div>
-            <div className="rs-sub" style={{ fontSize: 10 }}>{draft.clipId}</div>
+            <div
+              className="mono"
+              style={{ fontSize: 10, color: "var(--rs-muted)", overflowWrap: "anywhere" }}
+            >
+              {robot}/{draft.clipId}
+            </div>
           </div>
           <Btn kind="quiet" onClick={() => onChange({ clipId: null, clipText: "" })}>
             Change
@@ -125,7 +209,7 @@ function SegmentRow({
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="find a clip for this phase…"
+              placeholder={`Describe a motion or paste ${robot}/clip_id…`}
               aria-label={`Search a clip for phase ${index + 1}`}
               style={{
                 border: 0, background: "none", outline: "none", fontSize: 12,
@@ -134,29 +218,62 @@ function SegmentRow({
             />
           </div>
           {search.isLoading && <p className="rs-sub" style={{ marginTop: 6 }}>Searching…</p>}
-          {trimmed.length > 1 && !search.isLoading && (search.data ?? []).length === 0 && (
+          {trimmed.length > 1 && !search.isLoading && search.isError && (
+            <p role="alert" className="rs-sub" style={{ marginTop: 6, fontSize: 11 }}>
+              Reference search is unavailable. Retry; this is not evidence that the clip is absent.
+            </p>
+          )}
+          {trimmed.length > 1 && !search.isLoading && !search.isError
+            && (search.data ?? []).length === 0 && (
             <p className="rs-sub" style={{ marginTop: 6, fontSize: 11 }}>No matches.</p>
           )}
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6, maxHeight: 132, overflowY: "auto" }}>
-            {(search.data ?? []).slice(0, 6).map((m) => (
-              <button
-                key={m.clip_id}
-                type="button"
-                onClick={() => onChange({ clipId: m.clip_id, clipText: m.text })}
-                style={{
-                  textAlign: "left", padding: "5px 8px", cursor: "pointer",
-                  border: "1px solid var(--hairline)", borderRadius: "var(--radius-sm)",
-                  background: "var(--canvas-soft)", font: "inherit", color: "inherit",
-                }}
-              >
-                <div style={{ fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {m.text}
-                </div>
-                <div className="rs-sub" style={{ fontSize: 9.5 }}>
-                  declared tier {m.tier} · {m.duration_s.toFixed(1)}s · score {m.score.toFixed(1)}
-                </div>
-              </button>
-            ))}
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6, maxHeight: 168, overflowY: "auto" }}>
+            {!search.isError && (search.data ?? []).slice(0, 6).map((m) => {
+              const exactId = isExactReferenceQuery(trimmed, robot, m.clip_id);
+              return (
+                <button
+                  key={m.clip_id}
+                  type="button"
+                  onClick={() => onChange({ clipId: m.clip_id, clipText: m.text })}
+                  style={{
+                    textAlign: "left", padding: "5px 8px", cursor: "pointer",
+                    border: "1px solid var(--hairline)", borderRadius: "var(--radius-sm)",
+                    background: "var(--canvas-soft)", font: "inherit", color: "inherit",
+                  }}
+                >
+                  <div style={{ fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {m.text}
+                  </div>
+                  <div
+                    className="mono"
+                    title={`${robot}/${m.clip_id}`}
+                    style={{
+                      marginTop: 2, fontSize: 9.5, color: "var(--rs-muted)",
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {robot}/{m.clip_id}
+                  </div>
+                  <div
+                    className="rs-sub"
+                    style={{
+                      marginTop: 2, fontSize: 9.5, display: "flex",
+                      flexWrap: "wrap", alignItems: "center", gap: 5,
+                    }}
+                  >
+                    <span>declared tier {m.tier}</span>
+                    <span>· {m.duration_s.toFixed(1)}s</span>
+                    {exactId ? (
+                      <span className="rs-badge slate" style={{ fontSize: 8.5 }}>
+                        exact ID match
+                      </span>
+                    ) : (
+                      <span>· score {m.score.toFixed(1)}</span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </>
       )}
@@ -169,6 +286,8 @@ function SegmentRow({
           placeholder="start"
           inputMode="decimal"
           aria-label={`Phase ${index + 1} start seconds`}
+          aria-invalid={trimError ? "true" : undefined}
+          aria-describedby={trimError ? trimErrorId : undefined}
           style={{
             width: 64, fontSize: 11.5, height: 24, padding: "0 6px",
             border: "1px solid var(--hairline)", borderRadius: "var(--radius-sm)",
@@ -182,6 +301,8 @@ function SegmentRow({
           placeholder="end"
           inputMode="decimal"
           aria-label={`Phase ${index + 1} end seconds`}
+          aria-invalid={trimError ? "true" : undefined}
+          aria-describedby={trimError ? trimErrorId : undefined}
           style={{
             width: 64, fontSize: 11.5, height: 24, padding: "0 6px",
             border: "1px solid var(--hairline)", borderRadius: "var(--radius-sm)",
@@ -192,6 +313,11 @@ function SegmentRow({
           blank = whole clip
         </span>
       </div>
+      {trimError && (
+        <div id={trimErrorId} role="alert" style={{ marginTop: 5, fontSize: 10, color: "var(--st-red)" }}>
+          {trimError}
+        </div>
+      )}
     </div>
   );
 }
@@ -303,13 +429,57 @@ export function ComposeMotionDialog({
   //: Set only by "Compose anyway" after the gate has already refused once, so
   //  turning the gate off is a reply to a specific measurement rather than a
   //  checkbox someone leaves unticked.
-  const [seamRefusal, setSeamRefusal] = useState<string | null>(null);
+  const [seamRefusal, setSeamRefusal] = useState<{
+    detail: string;
+    requestFingerprint: string;
+  } | null>(null);
   const compose = useComposeReference();
 
   const clipId = toClipId(name, robot);
+  const parsedTrims = drafts.map(parseTrim);
+  const parsedBlend = parseNumericInput(blendS, "Crossfade", {
+    optional: false,
+    minimum: 0,
+    maximum: MAX_COMPOSE_BLEND_S,
+  });
+  const parsedFps = parseNumericInput(targetFps, "Target fps", {
+    minimum: 1,
+    maximum: MAX_COMPOSE_FPS,
+  });
+  const numericError = parsedTrims.some((trim) => trim.error)
+    || parsedBlend.error !== null
+    || parsedFps.error !== null;
   const ready = drafts.length >= 2
     && drafts.every((d) => d.clipId)
-    && clipId.length > 0;
+    && clipId.length > 0
+    && !numericError;
+
+  const buildRequest = (strict: boolean) => {
+    const fps = parsedFps.value;
+    return {
+      clip_id: clipId,
+      robot,
+      text: name.trim(),
+      labels: ["novel"],
+      segments: drafts.map((d, i) => ({
+        clip_id: d.clipId as string,
+        label: d.label.trim() || `phase_${i + 1}`,
+        t_start_s: parsedTrims[i].start,
+        t_end_s: parsedTrims[i].end,
+      })),
+      blend_s: parsedBlend.value as number,
+      ...(fps === null ? {} : { target_fps: fps }),
+      strict,
+    };
+  };
+  const requestFingerprint = ready
+    ? JSON.stringify({ ...buildRequest(true), strict: undefined })
+    : null;
+  const activeSeamRefusal = seamRefusal
+    && seamRefusal.requestFingerprint === requestFingerprint
+    ? seamRefusal
+    : null;
+  const atSegmentLimit = drafts.length >= MAX_COMPOSE_SEGMENTS;
 
   const patch = (key: number, p: Partial<Draft>) =>
     setDrafts((ds) => ds.map((d) => (d.key === key ? { ...d, ...p } : d)));
@@ -326,23 +496,14 @@ export function ComposeMotionDialog({
   const submit = (opts: { strict?: boolean } = {}) => {
     if (!ready) return;
     const strict = opts.strict !== false;
-    const fps = numOrNull(targetFps);
+    if (!strict && !activeSeamRefusal) return;
+    const request = buildRequest(strict);
+    const submittedFingerprint = JSON.stringify({
+      ...request,
+      strict: undefined,
+    });
     compose.mutate(
-      {
-        clip_id: clipId,
-        robot,
-        text: name.trim(),
-        labels: ["novel"],
-        segments: drafts.map((d, i) => ({
-          clip_id: d.clipId as string,
-          label: d.label.trim() || `phase_${i + 1}`,
-          t_start_s: numOrNull(d.startS),
-          t_end_s: numOrNull(d.endS),
-        })),
-        blend_s: numOrNull(blendS) ?? 0.2,
-        ...(fps === null ? {} : { target_fps: fps }),
-        strict,
-      },
+      request,
       {
         onSuccess: (res) => {
           setResult(res);
@@ -365,9 +526,14 @@ export function ComposeMotionDialog({
           // `strict=false` would fix, and offering it there would just teach
           // people to turn the gate off on every error.
           setSeamRefusal(
-            strict && /seam|blend|discontinu|jump/i.test(String(detail))
-              ? String(detail)
-              : null);
+            strict && err instanceof ApiError
+              && err.type === "/problems/reference-compose-gate"
+              ? {
+                  detail: String(detail),
+                  requestFingerprint: submittedFingerprint,
+                }
+              : null,
+          );
         },
       },
     );
@@ -384,7 +550,7 @@ export function ComposeMotionDialog({
           <Btn kind="quiet" onClick={onClose} disabled={compose.isPending}>
             {result ? "Done" : "Cancel"}
           </Btn>
-          {seamRefusal && !result && (
+          {activeSeamRefusal && !result && (
             <Btn
               kind="danger"
               icon="alert-triangle"
@@ -442,6 +608,7 @@ export function ComposeMotionDialog({
             index={i}
             robot={robot}
             canRemove={drafts.length > 2}
+            trimError={parsedTrims[i].error}
             onChange={(p) => patch(d.key, p)}
             onRemove={() => setDrafts((ds) => ds.filter((x) => x.key !== d.key))}
             onMove={(delta) => move(i, delta)}
@@ -449,9 +616,25 @@ export function ComposeMotionDialog({
         ))}
       </div>
 
-      <Btn kind="quiet" icon="plus" onClick={() => setDrafts((ds) => [...ds, emptyDraft()])}>
+      <Btn
+        kind="quiet"
+        icon="plus"
+        onClick={() => setDrafts((ds) => (
+          ds.length >= MAX_COMPOSE_SEGMENTS ? ds : [...ds, emptyDraft()]
+        ))}
+        disabled={atSegmentLimit}
+        aria-describedby="compose-phase-count"
+      >
         Add phase
       </Btn>
+      <span
+        id="compose-phase-count"
+        className="rs-sub"
+        style={{ marginLeft: 8, fontSize: 10.5 }}
+      >
+        {drafts.length} of {MAX_COMPOSE_SEGMENTS} phases
+        {atSegmentLimit ? " · maximum reached" : ""}
+      </span>
 
       {!result && (
         <div
@@ -473,6 +656,8 @@ export function ComposeMotionDialog({
                 onChange={(e) => setBlendS(e.target.value)}
                 inputMode="decimal"
                 aria-label="Crossfade seconds"
+                aria-invalid={parsedBlend.error ? "true" : undefined}
+                aria-describedby={parsedBlend.error ? "compose-seam-numeric-error" : undefined}
                 style={{
                   width: "100%", fontSize: 12.5, height: 28, padding: "0 8px",
                   marginTop: 3,
@@ -493,6 +678,8 @@ export function ComposeMotionDialog({
                 inputMode="decimal"
                 placeholder="source fps"
                 aria-label="Target fps"
+                aria-invalid={parsedFps.error ? "true" : undefined}
+                aria-describedby={parsedFps.error ? "compose-seam-numeric-error" : undefined}
                 style={{
                   width: "100%", fontSize: 12.5, height: 28, padding: "0 8px",
                   marginTop: 3,
@@ -504,20 +691,27 @@ export function ComposeMotionDialog({
               />
             </label>
           </div>
+          {(parsedBlend.error || parsedFps.error) && (
+            <div id="compose-seam-numeric-error" role="alert" style={{ fontSize: 10, marginTop: 5, color: "var(--st-red)" }}>
+              {parsedBlend.error ?? parsedFps.error}
+            </div>
+          )}
           <div className="rs-sub" style={{ fontSize: 10, marginTop: 5, lineHeight: 1.45 }}>
             A longer crossfade is what closes a seam the gate refuses; phases
             of different fps are resampled to the first one unless you set a
             target.
           </div>
-          {seamRefusal && (
+          {activeSeamRefusal && (
             <div
+              role="alert"
               style={{
                 marginTop: 8, fontSize: 10.8, lineHeight: 1.45,
                 color: "var(--st-amber)",
               }}
             >
-              The kinematic gate refused this composition — either a seam jump
-              or a peak joint velocity the blend is too short to cover. Widen
+              <strong>Kinematic gate measurement:</strong>{" "}
+              {activeSeamRefusal.detail}{" "}
+              Widen
               the crossfade or move a phase boundary and compose again, or use{" "}
               <b>Compose anyway</b> to register it as measured. The result is
               declared tier K and lacks verified Tier-D exact-schedule tracking

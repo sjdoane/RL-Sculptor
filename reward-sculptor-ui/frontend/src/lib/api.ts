@@ -1406,12 +1406,39 @@ export async function patchBehaviorDraft(
   );
 }
 
+export type ModeDurationQa = {
+  schema: "mode-duration-qa-v1";
+  accumulation: "raw_per_step_not_duration_normalized";
+  episode_duration_s: number;
+  modes: {
+    name: string;
+    duration_s: number;
+    episode_share: number;
+    ratio_to_median: number;
+  }[];
+  warnings: {
+    code: "long_window_raw_per_step_accumulation";
+    mode: string;
+    duration_s: number;
+    episode_share: number;
+    ratio_to_median: number;
+  }[];
+};
+
 export type ModeRewardFile = {
   filename: string;
   path: string;
   clip_id: string;
   reference_robot: string;
   execution_context_digest: string;
+  /** Normalized behavior goal immutably pinned when this scaffold was made. */
+  authoring_goal?: string;
+  /** Digest of the pinned authoring goal. Empty on legacy/unverifiable files. */
+  authoring_intent_sha256?: string;
+  /** Exact digest verification result. Missing/false must fail closed in UI. */
+  authoring_intent_valid?: boolean;
+  /** Human-readable reason this file cannot be authored or promoted. */
+  context_blocker?: string | null;
   context_current: boolean;
   tracking_enabled: boolean;
   mtime: number;
@@ -1421,6 +1448,8 @@ export type ModeRewardFile = {
   digest: string;
   modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
   unauthored: string[];
+  /** Derived from immutable execution windows. Optional for older servers. */
+  duration_qa?: ModeDurationQa;
 };
 
 /** The per-mode reward selected by current.py, if that exact version is one.
@@ -1435,6 +1464,10 @@ export type PromotedModeReward = {
   clip_id: string;
   reference_robot: string;
   execution_context_digest: string;
+  authoring_goal?: string;
+  authoring_intent_sha256?: string;
+  authoring_intent_valid?: boolean;
+  context_blocker?: string | null;
   context_current: boolean;
   /** True only when selection_current pins the same reward path and digest. */
   selection_current: boolean;
@@ -1448,6 +1481,7 @@ export type PromotedModeReward = {
   source_filename: string;
   modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
   unauthored: string[];
+  duration_qa?: ModeDurationQa;
 };
 
 export type ModeRewardsResult = {
@@ -1770,9 +1804,20 @@ export type ModeRewardResult = {
   path: string;
   filename: string;
   clip_id: string;
+  /** Exact robot namespace paired with clip_id; missing legacy values block. */
+  reference_robot?: string;
+  execution_context_digest: string;
+  authoring_goal?: string;
+  authoring_intent_sha256?: string;
+  authoring_intent_valid?: boolean;
+  /** Supplied by the authoritative list response after scaffold/author. */
+  context_blocker?: string | null;
+  /** Supplied by the authoritative list response after scaffold/author. */
+  context_current?: boolean;
   tracking: boolean;
   modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
   unauthored: string[];
+  duration_qa?: ModeDurationQa;
 };
 
 /** GET /references/{clip_id}/modes — the hybrid automaton a composed clip's
