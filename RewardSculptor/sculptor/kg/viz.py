@@ -23,7 +23,9 @@ from typing import Any
 from sculptor.kg.schema import (
     Environment,
     FailureMode,
+    ImplementationStatus,
     Paper,
+    ResearchCapability,
     RewardComponent,
     Result,
     RunCase,
@@ -44,6 +46,10 @@ _NODE_COLORS = {
     # §2026-07-03: the run-experience silo is a first-class visual citizen
     # (it was falling through to gray with a raw `case:...` id as label).
     "RunCase":         {"background": "#4dd0e1", "border": "#00acc1"},
+    "ResearchCapability": {
+        "background": "#64b5f6", "border": "#1565c0"},
+    "ImplementationStatus": {
+        "background": "#fff176", "border": "#f9a825"},
 }
 _ACTIVE_COLOR = {"background": "#ffd54f", "border": "#ffa000"}  # gold halo
 _FALLBACK_COLOR = {"background": "#bdbdbd", "border": "#757575"}
@@ -60,6 +66,8 @@ _EDGE_COLORS = {
     "CITES":         "#78909c",
     "REPORTS":       "#9ccc65",
     "IMPROVES_OVER": "#42a5f5",
+    "GROUNDS_CAPABILITY": "#5c6bc0",
+    "HAS_IMPLEMENTATION_STATUS": "#fdd835",
 }
 _DEFAULT_EDGE_COLOR = "#b0bec5"
 
@@ -90,6 +98,10 @@ def _label_for(node: Any) -> str:
         parts = node.id.split(":")
         it = parts[-2] if len(parts) >= 3 else "?"
         return f"iter {it} {glyph}"
+    if isinstance(node, ResearchCapability):
+        return node.name[:40]
+    if isinstance(node, ImplementationStatus):
+        return node.status.replace("_", " ")[:40]
     return str(getattr(node, "id", node))[:40]
 
 
@@ -166,6 +178,16 @@ def _tooltip_for(node: Any, active_reason: str | None = None) -> str:
         if node.behavior:
             _row("behavior", ", ".join(
                 f"{k}={v:g}" for k, v in node.behavior.items())[:300])
+    elif isinstance(node, ResearchCapability):
+        _row("name", node.name)
+        _row("scope", node.scope)
+        if node.description:
+            _row("description", node.description[:400])
+        if node.code_evidence:
+            _row("code evidence", "; ".join(node.code_evidence)[:400])
+    elif isinstance(node, ImplementationStatus):
+        _row("status", node.status.replace("_", " "))
+        _row("definition", node.definition[:400])
 
     if active_reason:
         rows.append(
@@ -198,11 +220,11 @@ def _active_reason_for(
     node: Any, *, active_terms: set[str], active_arxiv_ids: set[str],
 ) -> str | None:
     if isinstance(node, Paper) and node.arxiv_id in active_arxiv_ids:
-        return f"cited by active edits in provenance.json"
+        return "cited by active edits in provenance.json"
     if isinstance(node, (Technique, FailureMode, RewardComponent, Environment)):
         name = getattr(node, "name", "")
         if name in active_terms:
-            return f"target_term appears in provenance.json with still_active=True"
+            return "target_term appears in provenance.json with still_active=True"
     return None
 
 
@@ -437,6 +459,8 @@ _KIND_LEGEND_ORDER = (
     ("Environment", "#ffb74d", "dot"),
     ("Result", "#90a4ae", "dot"),
     ("RunCase", "#4dd0e1", "diamond"),
+    ("ResearchCapability", "#64b5f6", "dot"),
+    ("ImplementationStatus", "#fff176", "dot"),
 )
 
 _LEGEND_HTML = """

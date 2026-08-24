@@ -123,6 +123,8 @@ class Relation(str, enum.Enum):
     ATTESTS        = "ATTESTS"        # ArtifactAttestation → immutable artifact
     PRODUCED       = "PRODUCED"       # TrainingRun → output PolicyArtifact
     USES_MODE_EXECUTION = "USES_MODE_EXECUTION"  # TrainingRun → ModeExecutionArtifact
+    GROUNDS_CAPABILITY = "GROUNDS_CAPABILITY"  # Paper → ResearchCapability
+    HAS_IMPLEMENTATION_STATUS = "HAS_IMPLEMENTATION_STATUS"  # ResearchCapability → ImplementationStatus
 
 
 # ── Node dataclasses ────────────────────────────────────────────────────────
@@ -231,6 +233,43 @@ class Result:
     value: float | None = None
     environment_id: str | None = None
     notes: str = ""
+
+
+@dataclass
+class ResearchCapability:
+    """One paper concept or deliberately narrower system capability.
+
+    This node describes *what* a mechanism means. Whether RewardSculptor
+    executes it is represented by a separate :class:`ImplementationStatus`
+    edge, so paper extraction can never accidentally turn a literature claim
+    into a product claim. ``code_evidence`` names reviewed executable symbols
+    for implemented or metadata-only capabilities and is empty for unsupported
+    concepts by construction.
+    """
+
+    kind: ClassVar[str] = "ResearchCapability"
+    id: str
+    name: str
+    description: str = ""
+    scope: str = "paper_mechanism"
+    code_evidence: list[str] = field(default_factory=list)
+    provenance: str = PROVENANCE_SEED
+
+
+@dataclass
+class ImplementationStatus:
+    """Definition node for a capability's current implementation status.
+
+    The values are not interchangeable: ``implemented`` affects runtime
+    behavior, ``metadata_only`` is retained or inspected but is not an
+    execution authority, and ``unsupported`` is absent from the runtime.
+    """
+
+    kind: ClassVar[str] = "ImplementationStatus"
+    id: str
+    status: str
+    definition: str
+    provenance: str = PROVENANCE_SEED
 
 
 @dataclass
@@ -484,6 +523,14 @@ def make_environment_id(name: str) -> str:
     return f"environment:{_slugify(name)}"
 
 
+def make_research_capability_id(name: str) -> str:
+    return f"capability:{_slugify(name)}"
+
+
+def make_implementation_status_id(status: str) -> str:
+    return f"implementation-status:{_slugify(status)}"
+
+
 def make_result_id(paper_id: str, metric_name: str, environment_id: str | None) -> str:
     """Content-addressed: same (paper, metric, env) always produces the same id."""
     env_slug = _slugify(environment_id or "none")
@@ -543,6 +590,7 @@ NODE_TYPES: dict[str, type] = {
     cls.kind: cls  # type: ignore[attr-defined]
     for cls in (
         Paper, Technique, FailureMode, RewardComponent, Environment, Result,
+        ResearchCapability, ImplementationStatus,
         RunCase, PolicyArtifact, ReferenceMotion, WorldArtifact,
         ModeExecutionArtifact,
         ArtifactAttestation,

@@ -167,6 +167,35 @@ uv run sculpt kg extract \
 list when multiple papers corroborate the same technique/failure claim, and
 retrieval renders evidence beside a citation from that same source.
 
+## Reviewed implementation-capability subgraph
+
+Literature claims and product claims now have separate graph identities.
+`sculptor.kg.capabilities` defines a small reviewed map for OGMP
+(`2403.04205`) and Preferenced OGMP (`2410.01030`): each paper
+`GROUNDS_CAPABILITY`, and every `ResearchCapability` has exactly one
+`HAS_IMPLEMENTATION_STATUS` edge to one of these definition nodes:
+
+- `implemented` — an evidence-named executable path affects training or
+  rollout behavior;
+- `metadata_only` — the concept is stored, validated, or reported, but cannot
+  control runtime handover, policy input, reward dispatch, or selection;
+- `unsupported` — the paper mechanism is not executed by this runtime.
+
+The current implemented subset is the deliberately narrower fixed linear
+phase-window scaffold: per-mode reward authoring/dispatch plus immutable
+execution admission and diagnostic evidence. Guard and mode-predicate fields
+are metadata-only. The online receding-horizon oracle, rho-bounded permissible
+exploration, learned mode/task-feedback conditioning, runtime predicate or
+branch transitions, and preference conditioning remain unsupported.
+
+Call `materialize_ogmp_capability_map(store)` only after both canonical Paper
+nodes exist. It refuses to invent or overwrite missing literature rows, is
+idempotent, and removes contradictory prior status edges. The modes API and
+persisted mode diagnostics derive their disclosure fields from the same
+catalog. `tests/test_kg_capabilities.py` pins the reviewed statuses and resolves
+every executable evidence symbol, so a renamed path or expanded capability
+requires an explicit claim review rather than silent copy drift.
+
 ## Prompt-time research — implemented
 
 Implemented as `sculptor/kg/research.py` (`research_topic`) + the UI

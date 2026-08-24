@@ -41,6 +41,14 @@ oracles, rho-bounded exploration, learned mode latents, predicate branching,
 or preference conditioning. Training and evaluation must consume the same
 certified cadence; retiming creates a new artifact and requires recertification.
 
+That boundary is now executable KG data rather than duplicated prose:
+`sculptor.kg.capabilities` materializes OGMP/Preferenced-OGMP concept nodes
+with exactly one `implemented`, `metadata_only`, or `unsupported` status edge.
+The modes API and persisted diagnostics derive their disclosures from this
+catalog, and CI resolves every evidence symbol behind an implemented or
+metadata-only claim. Materialization requires the real paper nodes and never
+overwrites their literature metadata.
+
 The implementation is now end-to-end rather than a UI-only selector:
 
 - New Run offers an explicit **From scratch / Project checkpoint / Imported

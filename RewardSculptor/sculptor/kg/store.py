@@ -465,6 +465,22 @@ class SculptorKG:
         with self._tx() as cx:
             cx.execute(sql, (src, dst, rel, json.dumps(extra, default=str)))
 
+    def delete_edge(
+        self,
+        src: str,
+        dst: str,
+        relation: Relation | str,
+    ) -> bool:
+        """Delete one exact typed edge and report whether it existed."""
+
+        rel = relation.value if isinstance(relation, Relation) else relation
+        with self._tx() as cx:
+            cur = cx.execute(
+                "DELETE FROM edges WHERE src = ? AND dst = ? AND relation = ?",
+                (src, dst, rel),
+            )
+        return bool(cur.rowcount)
+
     def neighbors(
         self,
         node_id: str,

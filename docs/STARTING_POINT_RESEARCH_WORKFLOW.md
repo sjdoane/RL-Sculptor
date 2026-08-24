@@ -222,6 +222,15 @@ Co-location in a bundle never creates `TRACKS`, `EXECUTES_IN`, or
 `INITIALIZED_FROM`. Replaying the same evidence is idempotent; contradictory
 facts under the same content identity are rejected.
 
+Paper mechanisms also remain separate from implementation claims. The reviewed
+OGMP capability subgraph links each concept to an explicit `implemented`,
+`metadata_only`, or `unsupported` status node. The modes API and rollout
+diagnostics read that same catalog, so a paper extraction cannot promote a
+mechanism and a UI copy edit cannot make it executable. Current guard and
+mode-predicate declarations are metadata-only; online oracle queries,
+rho-bounded exploration, learned mode/task-feedback conditioning, runtime
+predicate branching, and preference conditioning remain unsupported.
+
 ## Design references
 
 - [Oracle Guided Multi-mode Policies (OGMP)](https://arxiv.org/abs/2403.04205)

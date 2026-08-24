@@ -971,6 +971,8 @@ def build_mode_diagnostics(
         if rendered_env is not None:
             transition["rendered_env_fired"] = bool(per_env[rendered_env])
 
+    from sculptor.kg.capabilities import unsupported_mode_diagnostic_keys
+
     record: dict[str, Any] = {
         "schema_version": MODE_DIAGNOSTICS_SCHEMA_VERSION,
         "authority": {
@@ -978,10 +980,7 @@ def build_mode_diagnostics(
             "calibrated_success_authority": False,
             "fitness_or_selection_authority": False,
             "execution_model": "fixed_linear_phase_windows",
-            "not_implemented": [
-                "closed_loop_oracle", "rho_bounded_exploration",
-                "predicate_or_branch_executor", "mode_conditioned_policy",
-            ],
+            "not_implemented": unsupported_mode_diagnostic_keys(),
         },
         "provenance": normalized_provenance,
         "mode_binding": dict(mode_binding),
