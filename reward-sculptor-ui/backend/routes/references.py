@@ -57,6 +57,7 @@ router = APIRouter(tags=["references"])
 # route layer doesn't have to import sculptor at module scope just to
 # validate a path segment).
 _CLIP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,95}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 # Same plain-slug-component guard `routes/missions.py` applies to
 # mission_slug / stage before they hit the filesystem.
@@ -120,6 +121,29 @@ def _clip_dir_for(clip_id: str, robot: str) -> Path:
     return library.clip_dir(robot, clip_id)
 
 
+def _public_index_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Never advertise a claimed Tier D without current verifier evidence."""
+    public = dict(row)
+    claimed_tier = str(public.get("tier") or "K")
+    if claimed_tier != "D":
+        return public
+    try:
+        from sculptor.refs.track import verify_tierd_certificate
+
+        certificate, reason = verify_tierd_certificate(
+            str(public.get("robot") or ""),
+            str(public.get("clip_id") or ""),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        certificate = None
+        reason = f"verification failed: {type(exc).__name__}: {exc}"
+    if certificate is None:
+        public["tier"] = "K"
+        public["claimed_tier"] = "D"
+        public["tier_verification_reason"] = reason
+    return public
+
+
 # ── GET /references ──────────────────────────────────────────────────
 @router.get("/references")
 def list_or_search_references(
@@ -144,9 +168,11 @@ def list_or_search_references(
 
     if q is not None and q.strip():
         matches = retrieve.search(q, robot=robot, k=k, use_llm=bool(llm))
-        return [
-            {
+        rows = []
+        for m in matches:
+            row = _public_index_row({
                 "clip_id": m.clip_id,
+                "robot": robot,
                 "text": m.text,
                 "score": m.score,
                 "match_confidence": m.match_confidence,
@@ -157,11 +183,15 @@ def list_or_search_references(
                 "fps": m.fps,
                 "duration_s": m.duration_s,
                 "rerank": m.rerank,
-            }
-            for m in matches
-        ]
+            })
+            rows.append(row)
+        return rows
 
-    rows = [r for r in library.read_index() if r.get("robot") == robot]
+    rows = [
+        _public_index_row(r)
+        for r in library.read_index()
+        if r.get("robot") == robot
+    ]
     if offset:
         rows = rows[offset:]
     return rows[:k] if k else rows
@@ -196,7 +226,7 @@ def browse_references(
     #: timestamp — and it is exactly what "show me the clip I just composed"
     #: needs.
     all_rows = library.read_index()
-    rows = [dict(r, _seq=i) for i, r in enumerate(all_rows)
+    rows = [dict(_public_index_row(r), _seq=i) for i, r in enumerate(all_rows)
             if r.get("robot") == robot]
 
     def _is_composed(r: dict) -> bool:
@@ -421,6 +451,7 @@ def get_reference_detail(
             status.HTTP_404_NOT_FOUND, "reference clip not found",
             detail=f"no reference clip ({robot!r}, {clip_id!r})",
             type_="/problems/not-found")
+    public_row = _public_index_row(row)
 
     from sculptor.refs import library
 
@@ -430,6 +461,40 @@ def get_reference_detail(
     except (OSError, ValueError):
         provenance = None
 
+    clip_path = (
+        library.clip_dir(row["robot"], clip_id) / library.CLIP_FILENAME
+    )
+    provenance_clip_sha = (
+        provenance.get("content_sha256")
+        if isinstance(provenance, dict) else None
+    )
+    source_content_sha = (
+        provenance.get("source_content_sha256")
+        if isinstance(provenance, dict) else None
+    )
+    actual_clip_sha: Optional[str] = None
+    artifact_hash_reason: Optional[str] = None
+    try:
+        actual_clip_sha = library.content_sha256(clip_path.read_bytes())
+    except OSError as exc:
+        artifact_hash_reason = (
+            f"cannot read exact clip.npz artifact: {type(exc).__name__}: {exc}"
+        )
+    else:
+        if provenance_clip_sha != actual_clip_sha:
+            artifact_hash_reason = (
+                "provenance.content_sha256 does not match the exact "
+                "clip.npz bytes"
+            )
+    artifact_hash_verified = artifact_hash_reason is None
+    artifact_identity = {
+        "verified": artifact_hash_verified,
+        "clip_sha256": actual_clip_sha if artifact_hash_verified else None,
+        "provenance_clip_sha256": provenance_clip_sha,
+        "source_content_sha256": source_content_sha,
+        "reason": artifact_hash_reason,
+    }
+
     # A top-level ``tier: D`` string is not admission evidence.  Re-run the
     # certificate verifier against the current clip and rollout bytes whenever
     # the UI asks whether this motion is suitable for a real training plan.
@@ -438,36 +503,96 @@ def get_reference_detail(
     from sculptor.refs.track import verify_tierd_certificate
 
     certificate, denial_reason = verify_tierd_certificate(row["robot"], clip_id)
+    if certificate is not None and (
+        not artifact_hash_verified
+        or certificate.clip_content_sha256 != actual_clip_sha
+    ):
+        certificate = None
+        denial_reason = (
+            artifact_hash_reason
+            or "Tier-D certificate clip hash disagrees with exact clip.npz"
+        )
+    execution_receipt: Optional[dict[str, str]] = None
+    if certificate is not None:
+        try:
+            from sculptor.policy_contract import contract_fingerprint
+            from sculptor.reference_clock import validate_reference_clock
+
+            clock_contract = validate_reference_clock(
+                certificate.execution_contract["reference"]["clock_contract"]
+            )
+            candidate_receipt = {
+                "execution_contract_sha256": (
+                    certificate.execution_contract_sha256
+                ),
+                "execution_boundary_sha256": (
+                    certificate.execution_boundary_sha256
+                ),
+                "reference_clock_sha256": contract_fingerprint(
+                    clock_contract
+                ),
+            }
+            if not all(
+                isinstance(value, str) and _SHA256_RE.fullmatch(value)
+                for value in candidate_receipt.values()
+            ):
+                raise ValueError(
+                    "certificate execution identities are not lowercase "
+                    "SHA-256 values"
+                )
+            execution_receipt = candidate_receipt
+        except (KeyError, TypeError, ValueError) as exc:
+            certificate = None
+            denial_reason = (
+                "verified Tier-D certificate has no exact execution receipt: "
+                f"{exc}"
+            )
     if certificate is None:
         dynamics_admission = {
             "admitted": False,
-            "tier": str(row.get("tier") or "K"),
+            "tier": str(public_row.get("tier") or "K"),
             "certificate_digest": None,
-            "clip_sha256": (
-                provenance.get("content_sha256")
-                if isinstance(provenance, dict) else None
-            ),
+            "clip_sha256": artifact_identity["clip_sha256"],
+            "source_content_sha256": source_content_sha,
+            "artifact_hash_verified": artifact_hash_verified,
             "rollout_sha256": None,
-            "reason": denial_reason or "no verified dynamics certificate",
+            "execution_contract_sha256": None,
+            "execution_boundary_sha256": None,
+            "reference_clock_sha256": None,
+            "certification_scope": None,
+            "reason": (
+                artifact_hash_reason
+                or denial_reason
+                or "no verified Tier-D tracking certificate"
+            ),
         }
     else:
+        assert execution_receipt is not None
         dynamics_admission = {
             "admitted": True,
             "tier": "D",
             "certificate_digest": certificate.certificate_sha256,
             "clip_sha256": certificate.clip_content_sha256,
+            "source_content_sha256": source_content_sha,
+            "artifact_hash_verified": True,
             "rollout_sha256": certificate.rollout_sha256,
+            **execution_receipt,
+            "certification_scope": certificate.certification_scope,
             "reason": None,
             "tracking_errors": {
                 "mean_joint_err_rad": certificate.mean_joint_err_rad,
                 "max_joint_err_rad": certificate.max_joint_err_rad,
                 "root_z_rmse_m": certificate.root_z_rmse_m,
+                "common_joint_names": list(certificate.common_joint_names),
+                "static_baseline_err_rad": certificate.static_baseline_err_rad,
+                "static_baseline_ratio": certificate.static_baseline_ratio,
             },
         }
 
     return {
-        "index_row": row,
+        "index_row": public_row,
         "provenance": provenance,
+        "artifact_identity": artifact_identity,
         "dynamics_admission": dynamics_admission,
     }
 
@@ -1146,6 +1271,7 @@ def get_reference_modes(
     policy.  Consumers must not infer those capabilities from the word
     ``mode`` or from the presence of transition metadata.
     """
+    from sculptor.kg.capabilities import mode_api_capability_summary
     from sculptor.mode_rewards import mode_windows_s
 
     loaded, err = _load_mode_graph(clip_id, robot)
@@ -1156,21 +1282,7 @@ def get_reference_modes(
     return {
         "clip_id": clip_id,
         "fps": graph.fps,
-        "capability": {
-            "kind": "phase_window_reference_scaffold",
-            "paper_alignment": "ogmp_inspired",
-            "dispatch_authority": "episode_time_window",
-            "reference_generator": "fixed_composed_clip",
-            "runtime_transition_guards": False,
-            "policy_mode_conditioning": False,
-            "rho_bounded_exploration": False,
-            "closed_loop_receding_horizon_oracle": False,
-            "summary": (
-                "Fixed composite-reference windows gate phase-specific reward "
-                "terms. Transition guards are inspectable metadata; they do "
-                "not currently drive the policy or runtime handover."
-            ),
-        },
+        "capability": mode_api_capability_summary(),
         "modes": [
             {"name": m.name,
              "frame_range": list(m.frame_range),
@@ -1566,6 +1678,7 @@ def scaffold_mode_reward(
     try:
         source = generate_mode_reward_scaffold(
             graph, behavior_goal=body.goal, clip_id=clip_id,
+            robot=body.robot,
             clip=clip if body.tracking else None,
             horizon_s=_episode_horizon_s(project_dir),
             tracking_weight=tracking_weight)

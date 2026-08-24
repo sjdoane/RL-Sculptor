@@ -70,6 +70,42 @@ def _tracking_clip() -> dict:
     }
 
 
+def test_backend_current_writer_uses_canonical_reference_transparent_selector(
+    tmp_path: Path,
+) -> None:
+    """Every UI launch writer must preserve the same conditioned surface."""
+    import importlib.util
+
+    from backend.services.reward_store import _write_current_reexport
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    selected = rewards / "v2.py"
+    selected.write_text(
+        "REWARD_SPEC = {'reference_clock': {'schema': 1}}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n"
+        "def reference_clock_batched(step_count, device): return step_count\n"
+        "def reference_target_index_batched(step_count, device): "
+        "return step_count + 1\n",
+        encoding="utf-8",
+    )
+
+    _write_current_reexport(rewards, selected)
+    spec = importlib.util.spec_from_file_location(
+        "backend_current_writer_regression", str(rewards / "current.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.SCULPTOR_REWARD_SELECTOR["filename"] == "v2.py"
+    assert module.reference_clock_batched is module._mod.reference_clock_batched
+    assert (
+        module.reference_target_index_batched
+        is module._mod.reference_target_index_batched
+    )
+
+
 def test_manual_tracking_guard_allows_residual_hooks_only() -> None:
     parent_source = generate_tracking_residual_reward_source(
         clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",

@@ -388,6 +388,29 @@ class RunSummary(BaseModel):
     mode: Optional[str] = None
 
 
+class AuthoredWorldExecutionPin(BaseModel):
+    """One immutable authored-world identity at a launch boundary."""
+
+    selection_version: Annotated[int, Field(ge=1)]
+    selection_path: Annotated[str, Field(min_length=1)]
+    selection_sha256: Annotated[
+        str, Field(pattern=r"^[a-f0-9]{64}$")
+    ]
+    tuple_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+
+class AuthoredWorldExecutionReceipt(BaseModel):
+    """Requested world plus the worker-observed identity, when available.
+
+    This is deliberately a server-derived receipt rather than a launch
+    parameter: API clients may request a world, but only the worker can attest
+    which immutable tuple was actually consumed.
+    """
+
+    requested: AuthoredWorldExecutionPin
+    observed: Optional[AuthoredWorldExecutionPin] = None
+
+
 class RunDetail(RunSummary):
     params: RunParams
     # Server-resolved feasibility receipt. It is deliberately outside
@@ -400,6 +423,11 @@ class RunDetail(RunSummary):
     # Server-derived queue/launch attestation for an imported starting skill.
     # Kept outside RunParams so API clients cannot self-assert compatibility.
     starting_skill_target_receipt: Optional[dict] = None
+    # Server-derived requested/observed authored-world execution identity.
+    # Kept outside RunParams so clients cannot self-assert EXECUTES_IN.
+    authored_world_execution_receipt: Optional[
+        AuthoredWorldExecutionReceipt
+    ] = None
     iterations: list[IterEventSummary]
     stdout_tail: list[str]                # last 200 in-memory lines
     total_event_count: int                # events list size
@@ -413,6 +441,10 @@ class PolicyEvidenceValue(BaseModel):
     key: str
     value: float
     kind: Literal["fraction", "count", "frames", "score", "value"]
+    comparison: Optional[Literal["gte", "lte", "eq"]] = None
+    threshold: Optional[float] = None
+    passed: Optional[bool] = None
+    semantics_source: Optional[str] = None
 
 
 class PolicySummary(BaseModel):
@@ -423,6 +455,9 @@ class PolicySummary(BaseModel):
     iter_index: int
     checkpoint: str                       # "checkpoint.pt" | "checkpoint.zip"
     checkpoint_bytes: int
+    checkpoint_sha256: Annotated[
+        str, Field(pattern=r"^[a-f0-9]{64}$")
+    ]
     # Server-authoritative completion decision. Evidence coverage below is
     # descriptive and must never become a second, task-specific deploy gate.
     deployable: bool
@@ -445,6 +480,24 @@ class PolicySummary(BaseModel):
     route_evidence: Optional[PolicyEvidenceValue] = None
     contact_evidence: Optional[PolicyEvidenceValue] = None
     hold_evidence: Optional[PolicyEvidenceValue] = None
+    # Conjunctive, fail-closed interpretation of the exact evidence fields
+    # above. ``evidence_status=complete`` means only that three values exist;
+    # it never means those values met their declared comparisons.
+    objective_proof_status: Literal[
+        "passed", "failed", "incomplete"
+    ] = "incomplete"
+    objective_proof_blockers: list[str] = Field(default_factory=list)
+    # Worker-authored video-lane identity. ``verified`` requires all four
+    # behavior.json fields, an explicit precommitted selector, equal requested
+    # and resolved indices, and a finite [0, 1] batch percentile. Missing
+    # fields are never reconstructed from launch parameters.
+    lane_evidence_status: Literal[
+        "verified", "incomplete", "mismatch", "unavailable"
+    ] = "unavailable"
+    requested_evidence_env_index: Optional[int] = None
+    resolved_evidence_env_index: Optional[int] = None
+    resolved_episode_percentile: Optional[float] = None
+    evidence_lane_selection: Optional[str] = None
     rollout_available: bool = False
     # True only for a coherent on-disk selection receipt: top-level selected
     # index + source and the matching candidate's selected=true marker.

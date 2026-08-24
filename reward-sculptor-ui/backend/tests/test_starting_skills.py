@@ -834,7 +834,9 @@ def test_reference_only_bundle_imports_without_policy_contract(
 def test_imported_reference_only_tier_k_cannot_authorize_live_training(
     client: TestClient, tmp_path: Path, monkeypatch,
 ) -> None:
+    from backend.routes import runs as runs_routes
     from backend.services import world_store
+    from sculptor.reference_clock import build_reference_clock
 
     monkeypatch.setenv(ENV_LIBRARY_ROOT, str(tmp_path / "skills"))
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
@@ -849,7 +851,46 @@ def test_imported_reference_only_tier_k_cannot_authorize_live_training(
     selection = project_dir / "env" / "selection_current.json"
     selection.parent.mkdir(parents=True, exist_ok=True)
     selection.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(world_store, "validate", lambda _p: {"ok": True})
+    world_report = {
+        "ok": True,
+        "selection_version": 1,
+        "tuple_hash": "f" * 64,
+        "world_robot": "g1",
+        "project_robot": "g1",
+        "robot_matches_project": True,
+        "errors": [],
+    }
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _project: dict(world_report),
+    )
+    monkeypatch.setattr(
+        world_store,
+        "immutable_training_receipt",
+        lambda _project, _report=None: {
+            "selection_version": 1,
+            "selection_path": str(selection.resolve()),
+            "selection_sha256": hashlib.sha256(
+                selection.read_bytes()
+            ).hexdigest(),
+            "tuple_hash": "f" * 64,
+            "world_robot": "g1",
+            "project_robot": "g1",
+        },
+    )
+    monkeypatch.setattr(
+        runs_routes,
+        "resolve_reference_clock_for_run",
+        lambda *_args, **_kwargs: build_reference_clock(
+            clip_id="complex_seed",
+            robot="g1",
+            target_sha256="b" * 64,
+            phase_mode="hold",
+            phase_duration_s=1.0,
+            n_phase_targets=24,
+        ),
+    )
 
     launched = client.post(
         f"/projects/{slug}/runs",
@@ -1155,6 +1196,9 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
         "source_policy_contract_sha256": policy_receipt["source"][
             "contract_sha256"
         ],
+        "effective_policy_contract_sha256": policy_receipt["target"][
+            "contract_sha256"
+        ],
         "admitted_policy_contract_migration": policy_receipt[
             "compatibility"
         ],
@@ -1163,8 +1207,14 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
     class _Stdout:
         def __init__(self) -> None:
             self.lines = [
+                (
+                    run_manager.EVENT_TAG
+                    + " "
+                    + json.dumps({"type": "iter_started", "iter": 0})
+                    + "\n"
+                ).encode("utf-8"),
                 (run_manager.EVENT_TAG + " " + json.dumps(load_event) + "\n")
-                .encode("utf-8")
+                .encode("utf-8"),
             ]
 
         async def readline(self) -> bytes:
@@ -1260,9 +1310,15 @@ def test_imported_policy_reaches_exact_worker_load_and_verified_lineage(
     )
     assert any(event.get("type") == "starting_skill_resolved" for event in job.events)
     assert any(event.get("type") == "warm_start_loaded" for event in job.events)
+    event_types = [event.get("type") for event in job.events]
+    assert event_types.index("iter_started") < event_types.index(
+        "starting_policy_initialization_verified"
+    )
 
     with SculptorKG(tmp_path / "lineage.db") as kg:
-        assert kg.count_edges(Relation.INITIALIZED_FROM) == 1
+        # The verified load is attached both to the run and to its exact
+        # iter_started child; neither edge exists before the worker event.
+        assert kg.count_edges(Relation.INITIALIZED_FROM) == 2
 
 
 def test_selected_imported_policy_requires_runtime_load_receipt_even_on_rc_zero(
@@ -1417,6 +1473,172 @@ def test_runtime_load_receipt_rejects_wrong_digest_roles_or_source(
             expected_checkpoint=checkpoint,
             expected_sha256=digest,
             initialization_mode="actor_only",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "roles", "migration"),
+    [
+        (
+            "actor_only",
+            ["actor"],
+            {
+                "type": "zero_initialized_reference_clock_observation",
+                "from_schema": 2,
+                "to_schema": 4,
+                "observation_term": "reference_phase",
+                "extension_width": 1,
+                "reference_clock_sha256": "c" * 64,
+                "optimizer_resume": False,
+            },
+        ),
+        (
+            "actor_critic",
+            ["actor", "critic"],
+            {
+                "type": "zero_initialized_observation_extensions",
+                "from_schema": 2,
+                "to_schema": 4,
+                "extension_width": 4,
+                "extensions": [
+                    {
+                        "type": "zero_initialized_event_phase_observation",
+                        "from_schema": 2,
+                        "to_schema": 3,
+                        "observation_term": "authored_event_phase",
+                        "extension_width": 3,
+                        "ordered_phase_ids": ["route", "jump", "hold"],
+                        "optimizer_resume": False,
+                    },
+                    {
+                        "type": (
+                            "zero_initialized_reference_clock_observation"
+                        ),
+                        "from_schema": 3,
+                        "to_schema": 4,
+                        "observation_term": "reference_phase",
+                        "extension_width": 1,
+                        "reference_clock_sha256": "c" * 64,
+                        "optimizer_resume": False,
+                    },
+                ],
+                "optimizer_resume": False,
+            },
+        ),
+    ],
+    ids=["actor-reference-clock", "actor-critic-combined"],
+)
+def test_runtime_load_receipt_accepts_exact_schema4_migration(
+    tmp_path: Path,
+    mode: str,
+    roles: list[str],
+    migration: dict[str, object],
+) -> None:
+    from backend.services.run_manager import _verify_starting_skill_load_event
+
+    source = tmp_path / "source.pt"
+    source.write_bytes(b"source")
+    loaded = tmp_path / "adapted.pt"
+    loaded.write_bytes(b"adapted")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    loaded_sha = hashlib.sha256(loaded.read_bytes()).hexdigest()
+    expected_contract = {
+        "source": {"contract_sha256": "a" * 64},
+        "target": {"contract_sha256": "b" * 64},
+        "compatibility": migration,
+    }
+    receipt = _verify_starting_skill_load_event(
+        {
+            "type": "warm_start_loaded",
+            "source": str(source),
+            "source_sha256": source_sha,
+            "loaded_checkpoint": str(loaded),
+            "loaded_checkpoint_sha256": loaded_sha,
+            "adapted": True,
+            "derived_from": {
+                "source": str(source.resolve()),
+                "source_sha256": source_sha,
+            },
+            "policy_contract_migration": migration["type"],
+            "admitted_policy_contract_migration": migration,
+            "source_policy_contract_sha256": "a" * 64,
+            "effective_policy_contract_sha256": "b" * 64,
+            "load_cfg_keys": roles,
+        },
+        expected_checkpoint=source,
+        expected_sha256=source_sha,
+        initialization_mode=mode,
+        expected_policy_contract_receipt=expected_contract,
+    )
+    assert receipt is not None
+    assert receipt["policy_contract_migration"] == migration
+
+
+@pytest.mark.parametrize(
+    ("mode", "roles"),
+    [("actor_only", ["actor"]), ("actor_critic", ["actor", "critic"])],
+)
+def test_verified_initialization_event_keeps_three_nested_authorities(
+    mode: str, roles: list[str],
+) -> None:
+    from backend.services.run_manager import (
+        _build_starting_policy_initialization_event,
+    )
+
+    digest = "a" * 64
+    event = _build_starting_policy_initialization_event(
+        requested={
+            "kind": "starting_skill",
+            "id": "123456789abc",
+            "initialization_mode": mode,
+            "roles": roles,
+            "manifest_digest": "b" * 64,
+            "trust_status": "sanitized",
+        },
+        resolved={
+            "checkpoint": "/library/policy.pt",
+            "checkpoint_sha256": digest,
+            "initialization_mode": mode,
+            "roles": roles,
+        },
+        observed={
+            "source": "/library/policy.pt",
+            "source_sha256": digest,
+            "loaded_checkpoint": "/run/policy.pt",
+            "loaded_checkpoint_sha256": "c" * 64,
+            "adapted": True,
+            "load_cfg_keys": roles,
+            "initialization_mode": mode,
+        },
+    )
+    assert "source" not in event
+    assert event["receipt"]["requested"]["roles"] == roles
+    assert event["receipt"]["resolved"]["checkpoint_sha256"] == digest
+    assert event["receipt"]["observed"]["source_sha256"] == digest
+    assert event["receipt"]["observed"]["roles"] == roles
+
+
+def test_verified_initialization_event_rejects_role_mismatch() -> None:
+    from backend.services.run_manager import (
+        _build_starting_policy_initialization_event,
+    )
+
+    with pytest.raises(ValueError, match="initialization differ"):
+        _build_starting_policy_initialization_event(
+            requested={
+                "initialization_mode": "actor_critic",
+                "roles": ["actor", "critic"],
+            },
+            resolved={
+                "checkpoint_sha256": "a" * 64,
+                "initialization_mode": "actor_critic",
+                "roles": ["actor", "critic"],
+            },
+            observed={
+                "source_sha256": "a" * 64,
+                "initialization_mode": "actor_critic",
+                "load_cfg_keys": ["actor"],
+            },
         )
 
 

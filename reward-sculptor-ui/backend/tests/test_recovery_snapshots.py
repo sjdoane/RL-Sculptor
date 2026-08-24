@@ -759,6 +759,20 @@ def test_route_admits_attested_snapshot_as_actor_critic_only(
             "errors": [],
         },
     )
+    monkeypatch.setattr(
+        world_store,
+        "immutable_training_receipt",
+        lambda _project, _report=None: {
+            "selection_version": 6,
+            "selection_path": str(
+                (project_dir / "env" / "selection_current.json").resolve()
+            ),
+            "selection_sha256": "e" * 64,
+            "tuple_hash": "f" * 64,
+            "world_robot": None,
+            "project_robot": None,
+        },
+    )
     snapshot_id = "snap_" + "a" * 24
     snapshot_receipt = {
         "snapshot_id": snapshot_id,

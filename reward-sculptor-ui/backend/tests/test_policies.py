@@ -67,6 +67,7 @@ def _plant_iter(
     project_dir: Path, i: int, *, metric: float = 10.0,
     reward_version: str = "v0", fitness: float | None = None,
     fitness_doc: dict | None = None, rollout: bool = False,
+    behavior_doc: dict | None = None,
     completed: bool = True, legacy_complete: bool = False,
 ) -> None:
     it = project_dir / "runs" / f"iter_{i}"
@@ -88,6 +89,12 @@ def _plant_iter(
     if rollout:
         (it / "rollout").mkdir()
         (it / "rollout" / "rollout.mp4").write_bytes(b"immutable-rollout")
+    if behavior_doc is not None:
+        rollout_dir = it / "rollout"
+        rollout_dir.mkdir(exist_ok=True)
+        (rollout_dir / "behavior.json").write_text(
+            json.dumps(behavior_doc), encoding="utf-8",
+        )
     if legacy_complete:
         rollout_dir = it / "rollout"
         rollout_dir.mkdir(exist_ok=True)
@@ -147,7 +154,38 @@ def test_list_policies_returns_disk_iters(
     assert rows[1]["fitness"] == pytest.approx(0.37)
     assert rows[0]["checkpoint"] == "checkpoint.pt"
     assert rows[0]["checkpoint_bytes"] > 0
+    assert rows[0]["checkpoint_sha256"] == hashlib.sha256(
+        (pdir / "runs" / "iter_0" / "checkpoint.pt").read_bytes()
+    ).hexdigest()
     assert rows[0]["deployable"] is True
+
+
+def test_policy_listing_fails_closed_when_checkpoint_identity_escapes(
+    client: TestClient,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(project_dir, 0)
+
+    from sculptor import export as export_module
+
+    rows = export_module.list_exportable_iters(project_dir / "runs")
+    escaped = dict(rows[0])
+    escaped["checkpoint"] = "../checkpoint.pt"
+    monkeypatch.setattr(
+        export_module,
+        "list_exportable_iters",
+        lambda _runs_root: [escaped],
+    )
+
+    response = client.get(f"/projects/{slug}/policies")
+
+    assert response.status_code == 409
+    assert response.json()["type"] == (
+        "/problems/policy-checkpoint-identity-unavailable"
+    )
 
 
 def test_policy_listing_excludes_preserved_but_unevaluated_checkpoint(
@@ -281,6 +319,12 @@ def test_policy_listing_uses_evidenced_selection_not_newest(
             },
         },
         rollout=True,
+        behavior_doc={
+            "rendered_env_index_requested": 10,
+            "rendered_env_index": 10,
+            "rendered_env_selection": "precommitted",
+            "rendered_episode_percentile": 0.8125,
+        },
     )
     _plant_iter(
         pdir,
@@ -318,15 +362,134 @@ def test_policy_listing_uses_evidenced_selection_not_newest(
     assert rows[4]["evidence_status"] == "complete"
     assert rows[4]["route_evidence"] == {
         "key": "order_ok_frac", "value": 1.0, "kind": "fraction",
+        "comparison": "gte", "threshold": 1.0, "passed": True,
+        "semantics_source": (
+            "reward-sculptor-objective-evidence-semantics-v1"
+        ),
     }
     assert rows[4]["contact_evidence"]["key"] == "contact_frac"
+    assert rows[4]["contact_evidence"]["comparison"] == "lte"
+    assert rows[4]["contact_evidence"]["threshold"] == 0.0
+    assert rows[4]["contact_evidence"]["passed"] is True
     assert rows[4]["hold_evidence"]["key"] == "ch_hold"
+    assert rows[4]["hold_evidence"]["passed"] is True
+    assert rows[4]["objective_proof_status"] == "passed"
+    assert rows[4]["objective_proof_blockers"] == []
+    assert rows[4]["lane_evidence_status"] == "verified"
+    assert rows[4]["requested_evidence_env_index"] == 10
+    assert rows[4]["resolved_evidence_env_index"] == 10
+    assert rows[4]["resolved_episode_percentile"] == pytest.approx(0.8125)
+    assert rows[4]["evidence_lane_selection"] == "precommitted"
     assert rows[4]["rollout_available"] is True
 
     assert rows[5]["selected"] is False
     assert rows[5]["selection_source"] is None
     assert rows[5]["criterion_status"] == "failed"
+    assert rows[5]["objective_proof_status"] == "failed"
     assert rows[5]["rollout_available"] is False
+
+
+def test_policy_objective_proof_fails_on_present_but_failing_channels(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _plant_iter(
+        project_dir,
+        3,
+        fitness_doc={
+            "fitness": 0.99,
+            "metric": {
+                "id": "weave-stop",
+                "version": "v3",
+                "source": "generated",
+                "sha256": "d" * 64,
+            },
+            "components": {
+                "actual_route_complete_frac": 0.0,
+                "forbidden_contact_count": 2.0,
+                "hold_frames": 0.0,
+            },
+        },
+        rollout=True,
+        behavior_doc={
+            "rendered_env_index_requested": 10,
+            "rendered_env_index": 10,
+            "rendered_env_selection": "precommitted",
+            "rendered_episode_percentile": 0.5,
+            "terminal_proof_contract": {"minimum_hold_frames": 100},
+        },
+    )
+    (project_dir / "reports").mkdir(exist_ok=True)
+    (project_dir / "reports" / "selection.json").write_text(json.dumps({
+        "selected_iter_index": 3,
+        "selection_source": "objective_criterion",
+        "candidates": [
+            {"iter_index": 3, "selected": True, "criterion_pass": True},
+        ],
+    }))
+
+    response = client.get(f"/projects/{slug}/policies")
+
+    assert response.status_code == 200, response.text
+    row = response.json()[0]
+    assert row["evidence_status"] == "complete"
+    assert row["route_evidence"]["passed"] is False
+    assert row["contact_evidence"]["passed"] is False
+    assert row["hold_evidence"] == {
+        "key": "hold_frames", "value": 0.0, "kind": "frames",
+        "comparison": "gte", "threshold": 100.0, "passed": False,
+        "semantics_source": (
+            "behavior.terminal_proof_contract.minimum_hold_frames"
+        ),
+    }
+    assert row["criterion_status"] == "passed"
+    assert row["objective_proof_status"] == "failed"
+    assert row["objective_proof_blockers"] == [
+        "route evidence failed its declared comparison",
+        "forbidden contact evidence failed its declared comparison",
+        "terminal hold evidence failed its declared comparison",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("behavior_doc", "expected_status"),
+    [
+        ({}, "unavailable"),
+        ({
+            "rendered_env_index_requested": 10,
+            "rendered_env_index": 10,
+            "rendered_env_selection": "precommitted",
+        }, "incomplete"),
+        ({
+            "rendered_env_index_requested": 10,
+            "rendered_env_index": 9,
+            "rendered_env_selection": "precommitted",
+            "rendered_episode_percentile": 0.5,
+        }, "mismatch"),
+    ],
+)
+def test_policy_lane_receipt_fails_closed_without_exact_worker_fields(
+    client: TestClient,
+    tmp_projects_root: Path,
+    behavior_doc: dict,
+    expected_status: str,
+) -> None:
+    slug = _make_project(client)
+    _plant_iter(
+        tmp_projects_root / slug,
+        0,
+        rollout=True,
+        behavior_doc=behavior_doc,
+    )
+
+    response = client.get(f"/projects/{slug}/policies")
+
+    assert response.status_code == 200, response.text
+    row = response.json()[0]
+    assert row["lane_evidence_status"] == expected_status
+    if expected_status != "verified":
+        assert row["lane_evidence_status"] != "verified"
 
 
 def test_export_downloads_zip_bundle(

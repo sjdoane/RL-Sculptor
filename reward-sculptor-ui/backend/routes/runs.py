@@ -80,6 +80,10 @@ from sculptor.reference_authority import (
     ActiveReferenceAuthorityError,
     resolve_active_reference_authority,
 )
+from sculptor.reference_run import (
+    ReferenceRunError,
+    resolve_reference_clock_for_run,
+)
 
 # Snake-case-ish segment guard for mission_slug / stage_name before they are
 # used to build filesystem paths. Rejects traversal and path separators.
@@ -709,6 +713,7 @@ def launch_run(
     resolved_reference_clip_id = body.reference_clip_id
     resolved_reference_robot = body.reference_robot
     reference_feasibility: Optional[dict[str, Any]] = None
+    reference_clock: dict[str, Any] | None = None
     try:
         active_reference = resolve_active_reference_authority(
             project_dir / "rewards",
@@ -931,12 +936,154 @@ def launch_run(
                 active_reference=active_reference_receipt,
             )
         resolved_reference_clip_id, resolved_reference_robot = active_pair
+    selection_path = project_dir / "env" / "selection_current.json"
+    if resolved_reference_clip_id and resolved_reference_robot:
+        from sculptor.refs import library as reference_library
+
+        prequeue_ref_dir = reference_library.clip_dir(
+            resolved_reference_robot,
+            resolved_reference_clip_id,
+        )
+        if not (
+            (prequeue_ref_dir / reference_library.PROVENANCE_FILENAME).is_file()
+            and (prequeue_ref_dir / reference_library.CLIP_FILENAME).is_file()
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is unavailable",
+                detail=(
+                    "no complete reference clip "
+                    f"{resolved_reference_robot}/{resolved_reference_clip_id}"
+                ),
+                type_="/problems/reference-motion",
+            )
+        if not selection_path.is_file():
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "a reference motion needs an authored world",
+                detail=(
+                    "attaching a reference clip makes this a tracking-first "
+                    "run, and the generated tracking reward is bound to the "
+                    "authored world atomically â€” so the project needs a "
+                    "promoted world first. Author one from the World tab "
+                    "(the default flat scene still needs promoting), or "
+                    "launch without a motion prior."
+                ),
+                type_="/problems/reference-motion",
+            )
+        # Integrity precedes derived controller metadata. This keeps the
+        # authored tuple as the first scientific authority and avoids reporting
+        # a secondary clock error for a world that cannot launch at all.
+        try:
+            reference_world_report = world_store.training_preflight(project_dir)
+        except Exception as exc:  # noqa: BLE001 - fail closed before queueing
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world could not be verified",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/world-integrity",
+            )
+        if not isinstance(reference_world_report, dict) or not bool(
+            reference_world_report.get("ok")
+        ):
+            errors = (
+                reference_world_report.get("errors")
+                if isinstance(reference_world_report, dict)
+                else None
+            ) or ["unknown integrity error"]
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world integrity check failed",
+                detail="; ".join(str(error) for error in errors),
+                type_="/problems/world-integrity",
+            )
+        if reference_world_report.get("robot_matches_project") is False:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "training environment targets another robot",
+                detail=(
+                    f"the authored world targets "
+                    f"{reference_world_report.get('world_robot')!r}, but the "
+                    f"project targets "
+                    f"{reference_world_report.get('project_robot')!r}; "
+                    "re-author the world for the project robot before launching"
+                ),
+                type_="/problems/world-robot-mismatch",
+            )
+        try:
+            reference_clock = resolve_reference_clock_for_run(
+                project_dir,
+                clip_id=resolved_reference_clip_id,
+                robot=resolved_reference_robot,
+            )
+        except (OSError, TypeError, ValueError, ReferenceRunError) as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference clock is unavailable",
+                detail=str(exc),
+                type_="/problems/reference-clock",
+            )
+
+        # Starting-skill admission may have been evaluated before a bundled or
+        # active reward resolved the final reference pair. Rebuild the target
+        # contract with the exact clock now; this is the receipt the runner
+        # will attest and the only compatibility result allowed to launch.
+        if selected_skill is not None and selected_mode != "reference_only":
+            try:
+                target_payload, starting_skill_target_receipt = (
+                    resolve_starting_skill_target(
+                        project_dir,
+                        require_policy_contract=True,
+                        reference_clock=reference_clock,
+                    )
+                )
+                target = ImportTarget(
+                    adapter_class=target_payload["adapter_class"],
+                    task_id=target_payload["task_id"],
+                    robot_slug=target_payload["robot_slug"],
+                    compatibility_contract=target_payload[
+                        "compatibility_contract"
+                    ],
+                )
+                compatibility = compatibility_for(selected_skill, target)
+                if compatibility["reasons"]:
+                    raise ValueError("; ".join(compatibility["reasons"]))
+                if (
+                    selected_mode
+                    not in compatibility["allowed_initialization_modes"]
+                ):
+                    raise ValueError(
+                        f"{selected_mode!r} is unavailable for this skill"
+                    )
+                warm_start_policy_contract_receipt = (
+                    build_skill_warm_start_contract_receipt(
+                        skill_id=selected_skill.skill_id,
+                        manifest_digest=str(selected_skill.manifest_digest),
+                        checkpoint_sha256=selected_skill.checkpoint_sha256,
+                        tensor_signature_sha256=(
+                            selected_skill.tensor_signature_sha256
+                        ),
+                        source_contract=(
+                            selected_skill.compatibility_contract or {}
+                        ),
+                        target_contract=(
+                            target_payload["compatibility_contract"] or {}
+                        ),
+                        target_receipt=starting_skill_target_receipt,
+                    )
+                )
+            except (SkillLibraryError, TypeError, ValueError) as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill is incompatible with reference phase",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-project-contract",
+                )
     # A promoted authored world is part of the run's scientific input, not a
     # cosmetic preview. Verify the atomic tuple at the last responsible
     # moment so a stale browser or direct API client cannot start training on
     # tampered/drifted artifacts. Legacy projects without a selection keep
     # their existing default-scene behavior.
-    selection_path = project_dir / "env" / "selection_current.json"
     authored_world_receipt: dict[str, Any] | None = None
     if selection_path.is_file():
         try:
@@ -975,12 +1122,20 @@ def launch_run(
                 ),
                 type_="/problems/world-robot-mismatch",
             )
-        authored_world_receipt = {
-            "selection_version": world_report.get("selection_version"),
-            "tuple_hash": world_report.get("tuple_hash"),
-            "world_robot": world_report.get("world_robot"),
-            "project_robot": world_report.get("project_robot"),
-        }
+        try:
+            authored_world_receipt = (
+                world_store.immutable_training_receipt(
+                    project_dir,
+                    world_report,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - exact pin is mandatory
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world could not be pinned",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/world-integrity",
+            )
     if body.warm_start_iteration is not None:
         try:
             resolve_warm_start_checkpoint(
@@ -995,17 +1150,19 @@ def launch_run(
             )
         if authored_world_receipt is not None:
             try:
-                target_selection = (
-                    project_dir / "env" / (
-                        "selection_v"
-                        f"{int(authored_world_receipt['selection_version'])}.json"
-                    )
+                target_selection = Path(
+                    str(authored_world_receipt["selection_path"])
                 )
+                receipt_kwargs: dict[str, Any] = {
+                    "target_selection_path": target_selection,
+                }
+                if reference_clock is not None:
+                    receipt_kwargs["reference_clock"] = reference_clock
                 warm_start_policy_contract_receipt = (
                     build_iteration_warm_start_contract_receipt(
                         project_dir,
                         int(body.warm_start_iteration),
-                        target_selection_path=target_selection,
+                        **receipt_kwargs,
                     )
                 )
             except Exception as exc:
@@ -1075,19 +1232,19 @@ def launch_run(
                 type_="/problems/recovery-snapshot-policy-contract",
             )
         try:
-            target_selection = (
-                project_dir
-                / "env"
-                / (
-                    "selection_v"
-                    f"{int(authored_world_receipt['selection_version'])}.json"
-                )
+            target_selection = Path(
+                str(authored_world_receipt["selection_path"])
             )
+            recovery_contract_kwargs: dict[str, Any] = {
+                "recovery_receipt": selected_snapshot_receipt,
+                "target_selection_path": target_selection,
+            }
+            if reference_clock is not None:
+                recovery_contract_kwargs["reference_clock"] = reference_clock
             warm_start_policy_contract_receipt = (
                 build_recovery_snapshot_warm_start_contract_receipt(
                     project_dir,
-                    recovery_receipt=selected_snapshot_receipt,
-                    target_selection_path=target_selection,
+                    **recovery_contract_kwargs,
                 )
             )
         except Exception as exc:
@@ -1200,7 +1357,7 @@ def launch_run(
                 "reference motion is kinematic-only",
                 detail=(
                     "live reference-backed training requires a verified "
-                    "Tier-D physics-tracking certificate for the exact clip "
+                    "Tier-D exact reference-tracking certificate for the clip "
                     f"and rollout: {certificate_reason or 'not certified'}"
                 ),
                 type_="/problems/reference-feasibility",
@@ -1248,6 +1405,7 @@ def launch_run(
     run_params["reference_clip_id"] = resolved_reference_clip_id
     run_params["reference_robot"] = resolved_reference_robot
     run_params["reference_feasibility"] = reference_feasibility
+    run_params["reference_clock"] = reference_clock
     run_params["active_reference_authority"] = active_reference_receipt
     run_params["starting_skill_target_receipt"] = (
         starting_skill_target_receipt
@@ -1401,6 +1559,13 @@ def get_run(
             dict(job.params["starting_skill_target_receipt"])
             if isinstance(
                 job.params.get("starting_skill_target_receipt"), dict,
+            )
+            else None
+        ),
+        authored_world_execution_receipt=(
+            dict(job.params["authored_world_execution_receipt"])
+            if isinstance(
+                job.params.get("authored_world_execution_receipt"), dict,
             )
             else None
         ),

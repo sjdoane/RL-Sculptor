@@ -232,13 +232,294 @@ def _write_run_context(
     return context, event
 
 
-def _lineage_session(project: Path, run_id: str) -> RunLineageSession:
+def _lineage_session(
+    project: Path,
+    run_id: str,
+    *,
+    warm_start_policy_contract_receipt: dict | None = None,
+) -> RunLineageSession:
     return RunLineageSession(
         project_dir=project,
         project_slug="lineage-project",
         run_id=run_id,
         requested_initialization_mode="auto_resume",
+        warm_start_policy_contract_receipt=(
+            warm_start_policy_contract_receipt
+        ),
     )
+
+
+def _tierd_receipt(
+    robot: str, clip_id: str, clip_sha256: str,
+) -> dict[str, object]:
+    return {
+        "status": "tierd_verified",
+        "tier": "D",
+        "kinematic_only": False,
+        "training_authorized": True,
+        "reference_tracking_certificate_admitted": True,
+        "reference_robot": robot,
+        "target_robot": robot,
+        "reference_clip_id": clip_id,
+        "clip_sha256": clip_sha256,
+        "rollout_sha256": "7" * 64,
+        "certificate_sha256": "8" * 64,
+        "execution_contract_sha256": "9" * 64,
+        "execution_boundary_sha256": "a" * 64,
+        "certification_scope": {
+            "simulator": "mjlab",
+            "control_dt_s": 0.02,
+        },
+    }
+
+
+def _reference_schedule(robot: str, clip_id: str) -> dict[str, object]:
+    return {
+        "reference_robot": robot,
+        "reference_clip_id": clip_id,
+        "reference_target_sha256": "b" * 64,
+        "phase_mode": "hold",
+        "phase_duration_s": 1.0,
+        "n_phase_targets": 32,
+        "tracking_backbone_sha256": "c" * 64,
+    }
+
+
+def _reference_output_contract(
+    reference_schedule: dict[str, object],
+) -> dict[str, object]:
+    from sculptor.reference_clock import build_reference_clock
+
+    return {
+        "schema": 4,
+        "identity": {"task_id": "g1"},
+        "reference_clock": build_reference_clock(
+            clip_id=str(reference_schedule["reference_clip_id"]),
+            robot=str(reference_schedule["reference_robot"]),
+            target_sha256=str(
+                reference_schedule["reference_target_sha256"]
+            ),
+            phase_mode=str(reference_schedule["phase_mode"]),
+            phase_duration_s=float(reference_schedule["phase_duration_s"]),
+            n_phase_targets=int(reference_schedule["n_phase_targets"]),
+        ),
+        "joints": {"ordered_names": ["j0", "j1"]},
+        "observations": {"names": ["obs"], "shape": [1]},
+        "actions": {"names": ["act"], "shape": [1]},
+        "timing": {"control_dt_s": 0.02},
+    }
+
+
+def _strict_lineage_plan(
+    reference_schedule: dict[str, object],
+    *,
+    expected_iterations: int,
+    allowed_early_stop_sources: tuple[str, ...] = (),
+) -> dict[str, object]:
+    from sculptor.policy_contract import contract_fingerprint
+
+    contract = _reference_output_contract(reference_schedule)
+    return {
+        "expected_iterations": expected_iterations,
+        "allowed_early_stop_sources": allowed_early_stop_sources,
+        "expected_output_robot": str(reference_schedule["reference_robot"]),
+        "expected_output_policy_contract": contract,
+        "expected_output_policy_contract_sha256": contract_fingerprint(
+            contract
+        ),
+    }
+
+
+def _initialization_receipt(
+    source: Path,
+    *,
+    source_sha256: str,
+    loaded: Path | None = None,
+    loaded_sha256: str | None = None,
+    roles: list[str] | None = None,
+    migration: dict | None = None,
+    source_contract_sha256: str | None = None,
+    target_contract_sha256: str | None = None,
+) -> dict[str, object]:
+    loaded = source if loaded is None else loaded
+    loaded_sha256 = source_sha256 if loaded_sha256 is None else loaded_sha256
+    roles = ["actor"] if roles is None else sorted(roles)
+    mode = "actor_critic" if "critic" in roles else "actor_only"
+    return {
+        "schema": 1,
+        "requested": {
+            "roles": roles,
+            "initialization_mode": mode,
+        },
+        "resolved": {
+            "roles": roles,
+            "initialization_mode": mode,
+            "checkpoint_sha256": source_sha256,
+            "source_policy_contract_sha256": source_contract_sha256,
+            "target_policy_contract_sha256": target_contract_sha256,
+        },
+        "observed": {
+            "source": str(source.resolve()),
+            "source_sha256": source_sha256,
+            "loaded_checkpoint": str(loaded.resolve()),
+            "loaded_checkpoint_sha256": loaded_sha256,
+            "roles": roles,
+            "load_cfg_keys": roles,
+            "initialization_mode": mode,
+            "adapted": loaded.resolve() != source.resolve(),
+            "policy_contract_migration": migration,
+            "effective_policy_contract_sha256": target_contract_sha256,
+        },
+    }
+
+
+def _write_reference_output(
+    project: Path,
+    *,
+    iteration: int,
+    checkpoint_bytes: bytes,
+    selection_name: str,
+    input_checkpoint: Path | None,
+    reference_schedule: dict[str, object],
+    policy_contract: dict[str, object] | None = None,
+) -> Path:
+    from sculptor.policy_contract import contract_fingerprint
+    from sculptor.runtime_inputs import (
+        capture_environment_artifacts,
+        environment_artifacts_for_phase,
+    )
+
+    output_dir = project / "runs" / f"iter_{iteration}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = output_dir / "checkpoint.pt"
+    checkpoint.write_bytes(checkpoint_bytes)
+    checkpoint_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
+    contract = (
+        _reference_output_contract(reference_schedule)
+        if policy_contract is None else policy_contract
+    )
+    contract_sha = contract_fingerprint(contract)
+    sidecar = Path(str(checkpoint) + ".policy_contract.json")
+    sidecar.write_text(json.dumps({
+        "schema": 1,
+        "checkpoint_sha256": checkpoint_sha,
+        "policy_contract": contract,
+        "policy_contract_sha256": contract_sha,
+    }, sort_keys=True), encoding="utf-8")
+    sidecar_sha = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    selection_path = project / "env" / selection_name
+    environment = environment_artifacts_for_phase(
+        capture_environment_artifacts(world_selection_path=selection_path),
+        "train",
+    )
+    reward_sha = environment["world_selection"]["refs"]["reward"]["sha256"]
+    input_sha = (
+        hashlib.sha256(input_checkpoint.read_bytes()).hexdigest()
+        if input_checkpoint is not None else None
+    )
+    runtime = {
+        "schema": "reward-sculptor-runner-artifacts-v2",
+        "phase": "train",
+        "reward_module_sha256": reward_sha,
+        "environment_artifacts": environment,
+        "input_checkpoint_requested_sha256": input_sha,
+        "input_checkpoint_loaded_sha256": input_sha,
+        "input_checkpoint_load_completed": input_checkpoint is not None,
+        "output_checkpoint_sha256": checkpoint_sha,
+        "output_policy_contract_sha256": contract_sha,
+        "output_policy_contract_sidecar_sha256": sidecar_sha,
+    }
+    (output_dir / "metrics.json").write_text(json.dumps({
+        "checkpoint_path": str(checkpoint.resolve()),
+        "policy_contract_sidecar": str(sidecar.resolve()),
+        "runtime_artifacts": runtime,
+    }, sort_keys=True), encoding="utf-8")
+    return checkpoint
+
+
+def _ready_reference_session(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    expected_iterations: int,
+    completed_iterations: int,
+    allowed_early_stop_sources: tuple[str, ...] = (),
+    emit_iter_completed: bool = True,
+) -> tuple[
+    RunLineageSession,
+    Path,
+    str,
+    dict[str, object],
+]:
+    kg_path = tmp_path / "lineage.db"
+    reference_root = tmp_path / "references"
+    monkeypatch.setenv("RS_KG_PATH", str(kg_path))
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(reference_root))
+    project = tmp_path / "project"
+    tuple_hash, selection_name = _seed_world(project)
+    robot, clip_id, clip_sha = _seed_reference(reference_root)
+    schedule = _reference_schedule(robot, clip_id)
+    session = RunLineageSession(
+        project_dir=project,
+        project_slug="lineage-project",
+        run_id="job-proof-boundary",
+        requested_initialization_mode="reference_only",
+        reference_robot=robot,
+        reference_clip_id=clip_id,
+        reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(
+            schedule,
+            expected_iterations=expected_iterations,
+            allowed_early_stop_sources=allowed_early_stop_sources,
+        ),
+    )
+    session.record_started()
+    _context, context_event = _write_run_context(
+        project, commit="2" * 40, dirty=False,
+    )
+    session.observe_event(context_event)
+    session.observe_event({
+        "type": "reference_feasibility_admitted",
+        "source": "sculpt_run_worker",
+        **_tierd_receipt(robot, clip_id, clip_sha),
+    })
+    session.observe_event({
+        "type": "reference_runtime_schedule_admitted",
+        "source": "sculpt_run_boundary",
+        **schedule,
+    })
+    monkeypatch.setattr(
+        "backend.services.artifact_lineage._rederive_reference_schedule",
+        lambda *_args, **_kwargs: schedule,
+    )
+    session.observe_event({
+        "type": "run_started",
+        "reference_motion": {
+            "robot": robot,
+            "clip_id": clip_id,
+            "clip_sha256": clip_sha,
+            "reward_path": str(
+                (project / "rewards" / "v0.py").resolve()
+            ),
+        },
+    })
+    for iteration in range(completed_iterations):
+        session.observe_event({"type": "iter_started", "iter": iteration})
+        session.observe_event({
+            "type": "artifact_tuple_pinned",
+            "tuple_hash": tuple_hash,
+            "selection": selection_name,
+            "iter": iteration,
+        })
+        if emit_iter_completed:
+            session.observe_event({
+                "type": "iter_completed",
+                "iter": iteration,
+            })
+    return session, project, selection_name, schedule
 
 
 def test_run_lineage_uses_observed_load_and_new_checkpoint_only(
@@ -251,6 +532,7 @@ def test_run_lineage_uses_observed_load_and_new_checkpoint_only(
     project = tmp_path / "project"
     tuple_hash, selection_name = _seed_world(project)
     robot, clip_id, clip_sha = _seed_reference(reference_root)
+    schedule = _reference_schedule(robot, clip_id)
 
     old_checkpoint = project / "runs" / "iter_0" / "checkpoint.pt"
     old_checkpoint.parent.mkdir(parents=True)
@@ -265,31 +547,44 @@ def test_run_lineage_uses_observed_load_and_new_checkpoint_only(
         reference_robot=robot,
         reference_clip_id=clip_id,
         reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=1),
     )
     session.record_started()
+    _context, context_event = _write_run_context(
+        project, commit="d" * 40, dirty=False,
+    )
+    session.observe_event(context_event)
+    session.observe_event({"type": "iter_started", "iter": 1})
     session.observe_event({
         "type": "artifact_tuple_pinned",
         "tuple_hash": tuple_hash,
         "selection": selection_name,
+        "iter": 1,
     })
     session.observe_event({
         "type": "reference_feasibility_admitted",
         "source": "sculpt_run_worker",
-        "reference_robot": robot,
-        "reference_clip_id": clip_id,
-        "clip_sha256": clip_sha,
-        "rollout_sha256": "7" * 64,
-        "certificate_sha256": "8" * 64,
-        "execution_contract_sha256": "9" * 64,
-        "execution_boundary_sha256": "a" * 64,
-        "target_robot": robot,
+        **_tierd_receipt(robot, clip_id, clip_sha),
     })
+    session.observe_event({
+        "type": "reference_runtime_schedule_admitted",
+        "source": "sculpt_run_boundary",
+        **schedule,
+    })
+    monkeypatch.setattr(
+        "backend.services.artifact_lineage._rederive_reference_schedule",
+        lambda *_args, **_kwargs: schedule,
+    )
     session.observe_event({
         "type": "run_started",
         "reference_motion": {
             "robot": robot,
             "clip_id": clip_id,
             "clip_sha256": clip_sha,
+            "reward_path": str((project / "rewards" / "v0.py").resolve()),
         },
     })
 
@@ -300,20 +595,11 @@ def test_run_lineage_uses_observed_load_and_new_checkpoint_only(
         tracks_edge, _motion_id = kg.neighbors(
             runs[0].id, relation=Relation.TRACKS,
         )[0]
-        assert tracks_edge.data == {
-            "authority": "reference_feasibility_admitted+run_started",
-            "verified": True,
-            "tier": "D",
-            "robot": robot,
-            "clip_id": clip_id,
-            "clip_sha256": clip_sha,
-            "rollout_sha256": "7" * 64,
-            "certificate_sha256": "8" * 64,
-            "execution_contract_sha256": "9" * 64,
-            "execution_boundary_sha256": "a" * 64,
-            "target_robot": robot,
-        }
-        assert kg.count_edges(Relation.EXECUTES_IN) == 1
+        assert tracks_edge.data["tierd_receipt"] == _tierd_receipt(
+            robot, clip_id, clip_sha,
+        )
+        assert tracks_edge.data["runtime_schedule"] == schedule
+        assert kg.count_edges(Relation.EXECUTES_IN) == 3
         assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
         assert runs[0].selection_digest == tuple_hash
 
@@ -324,28 +610,567 @@ def test_run_lineage_uses_observed_load_and_new_checkpoint_only(
         "source_sha8": old_sha[:8],
         "load_cfg_keys": ["critic", "actor"],
     }
-    session.observe_event(load_event)
-    session.observe_event(load_event)  # replay is idempotent
+    session.observe_event(load_event)  # raw worker evidence alone is not authority
+    initialization_receipt = _initialization_receipt(
+        old_checkpoint,
+        source_sha256=old_sha,
+        roles=["critic", "actor"],
+    )
+    session.record_verified_initialization(initialization_receipt)
+    session.record_verified_initialization(initialization_receipt)
+    session.observe_event({"type": "iter_completed", "iter": 1})
 
-    new_checkpoint = project / "runs" / "iter_1" / "checkpoint.pt"
-    new_checkpoint.parent.mkdir(parents=True)
-    new_checkpoint.write_bytes(b"new-policy")
+    _write_reference_output(
+        project,
+        iteration=1,
+        checkpoint_bytes=b"new-policy",
+        selection_name=selection_name,
+        input_checkpoint=old_checkpoint,
+        reference_schedule=schedule,
+    )
     outputs = session.record_outputs()
     assert [item.sha256 for item in outputs] == [
         hashlib.sha256(b"new-policy").hexdigest()
     ]
     session.record_outputs()  # disk/event replay remains idempotent
+    proof = session.finalize_proof()
+    assert proof["strict_reference_lineage"] is True
+    assert proof["tierd_receipt"] == _tierd_receipt(robot, clip_id, clip_sha)
+    assert proof["reference_runtime_schedule"] == schedule
+    assert proof["iterations"][0]["world_tuple_sha256"] == tuple_hash
+    assert proof["iterations"][0]["input_policy_sha256"] == old_sha
+    assert proof["iterations"][0]["output_policy_sha256"] == outputs[0].sha256
 
     with SculptorKG(kg_path) as kg:
-        assert kg.count_edges(Relation.INITIALIZED_FROM) == 1
-        assert kg.count_edges(Relation.PRODUCED) == 1
+        assert kg.count_edges(Relation.INITIALIZED_FROM) == 2
+        assert kg.count_edges(Relation.PRODUCED) == 2
         assert kg.count_edges(Relation.DERIVED_FROM) == 1
         produced = kg.neighbors(runs[0].id, relation=Relation.PRODUCED)
         assert produced[0][1] == outputs[0].id
 
 
-def test_migrated_warm_start_initializes_from_loaded_bytes_and_records_source(
+def test_reference_lineage_reconstructs_multi_iteration_ancestry(
     tmp_path: Path, monkeypatch,
+) -> None:
+    kg_path = tmp_path / "lineage.db"
+    reference_root = tmp_path / "references"
+    monkeypatch.setenv("RS_KG_PATH", str(kg_path))
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(reference_root))
+    project = tmp_path / "project"
+    tuple_hash, selection_name = _seed_world(project)
+    robot, clip_id, clip_sha = _seed_reference(reference_root)
+    schedule = _reference_schedule(robot, clip_id)
+    session = RunLineageSession(
+        project_dir=project,
+        project_slug="lineage-project",
+        run_id="job-multi-iteration",
+        requested_initialization_mode="reference_only",
+        reference_robot=robot,
+        reference_clip_id=clip_id,
+        reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=2),
+    )
+    session.record_started()
+    _context, context_event = _write_run_context(
+        project, commit="e" * 40, dirty=False,
+    )
+    session.observe_event(context_event)
+    session.observe_event({
+        "type": "reference_feasibility_admitted",
+        "source": "sculpt_run_worker",
+        **_tierd_receipt(robot, clip_id, clip_sha),
+    })
+    session.observe_event({
+        "type": "reference_runtime_schedule_admitted",
+        "source": "sculpt_run_boundary",
+        **schedule,
+    })
+    monkeypatch.setattr(
+        "backend.services.artifact_lineage._rederive_reference_schedule",
+        lambda *_args, **_kwargs: schedule,
+    )
+    session.observe_event({
+        "type": "run_started",
+        "reference_motion": {
+            "robot": robot,
+            "clip_id": clip_id,
+            "clip_sha256": clip_sha,
+            "reward_path": str((project / "rewards" / "v0.py").resolve()),
+        },
+    })
+    for iteration in (0, 1):
+        session.observe_event({"type": "iter_started", "iter": iteration})
+        session.observe_event({
+            "type": "artifact_tuple_pinned",
+            "tuple_hash": tuple_hash,
+            "selection": selection_name,
+            "iter": iteration,
+        })
+        session.observe_event({
+            "type": "iter_completed",
+            "iter": iteration,
+        })
+    output_0 = _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"iteration-zero-policy",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    output_1 = _write_reference_output(
+        project,
+        iteration=1,
+        checkpoint_bytes=b"iteration-one-policy",
+        selection_name=selection_name,
+        input_checkpoint=output_0,
+        reference_schedule=schedule,
+    )
+    outputs = session.record_outputs()
+    proof = session.finalize_proof()
+
+    assert [item.sha256 for item in outputs] == [
+        hashlib.sha256(output_0.read_bytes()).hexdigest(),
+        hashlib.sha256(output_1.read_bytes()).hexdigest(),
+    ]
+    assert [item["iteration"] for item in proof["iterations"]] == [0, 1]
+    assert proof["iterations"][1]["input_policy_sha256"] == (
+        proof["iterations"][0]["output_policy_sha256"]
+    )
+    with SculptorKG(kg_path) as kg:
+        assert len(kg.find_nodes(kind="TrainingIteration")) == 2
+        assert kg.count_edges(Relation.HAS_ITERATION) == 2
+        assert kg.count_edges(Relation.EXECUTES_IN) == 4
+        assert kg.count_edges(Relation.PRODUCED) == 4
+        derived = kg.neighbors(outputs[1].id, relation=Relation.DERIVED_FROM)
+        assert any(destination == outputs[0].id for _edge, destination in derived)
+
+
+def test_rejected_strict_event_poisons_otherwise_complete_proof(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=1,
+        completed_iterations=1,
+    )
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"complete-before-conflict",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    session.record_outputs()
+
+    conflicting = {
+        **schedule,
+        "reference_target_sha256": "d" * 64,
+    }
+    with pytest.raises(
+        LineageObservationError,
+        match="conflicting reference runtime schedules",
+    ):
+        session.observe_event({
+            "type": "reference_runtime_schedule_admitted",
+            "source": "sculpt_run_boundary",
+            **conflicting,
+        })
+    with pytest.raises(
+        LineageObservationError,
+        match="rejected authoritative lineage evidence",
+    ):
+        session.finalize_proof()
+
+
+def test_fresh_one_cycle_reference_plan_is_proof_ready(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=1,
+        completed_iterations=1,
+    )
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"fresh-one-cycle-policy",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    session.record_outputs()
+
+    proof = session.finalize_proof()
+    assert proof["iteration_plan"] == {
+        "expected_count": 1,
+        "allowed_early_stop_sources": [],
+        "completed_count": 1,
+        "early_stop": None,
+    }
+    assert [item["iteration"] for item in proof["iterations"]] == [0]
+
+
+def test_reference_proof_rejects_truncated_iteration_plan(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=2,
+        completed_iterations=1,
+    )
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"one-of-two-iterations",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    session.record_outputs()
+
+    with pytest.raises(
+        LineageObservationError,
+        match="exact launch iteration plan",
+    ):
+        session.finalize_proof()
+
+
+def test_reference_proof_requires_iter_completed_for_each_output(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=1,
+        completed_iterations=1,
+        emit_iter_completed=False,
+    )
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"checkpoint-without-completion-event",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    session.record_outputs()
+
+    with pytest.raises(
+        LineageObservationError,
+        match="without exact iter_completed evidence",
+    ):
+        session.finalize_proof()
+
+
+def test_reference_proof_accepts_launch_authorized_fitness_early_stop(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=2,
+        completed_iterations=1,
+        allowed_early_stop_sources=("fitness", "goodhart_onset"),
+    )
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"fitness-stopped-policy",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    session.record_outputs()
+    session.observe_event({
+        "type": "early_stop",
+        "at_iter": 0,
+        "source": "fitness",
+        "reason": "fitness plateau: no new best in 2 iters",
+    })
+
+    proof = session.finalize_proof()
+    plan = proof["iteration_plan"]
+    assert plan["expected_count"] == 2
+    assert plan["completed_count"] == 1
+    assert plan["early_stop"]["at_iter"] == 0
+    assert plan["early_stop"]["source"] == "fitness"
+    assert plan["early_stop"]["reason"] == (
+        "fitness plateau: no new best in 2 iters"
+    )
+    assert len(plan["early_stop"]["event_sha256"]) == 64
+
+
+def test_reference_proof_rejects_unattested_manual_early_stop(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=2,
+        completed_iterations=1,
+        allowed_early_stop_sources=("fitness", "goodhart_onset"),
+    )
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"manually-stopped-policy",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    session.record_outputs()
+
+    with pytest.raises(
+        LineageObservationError,
+        match="not independently authorized at launch",
+    ):
+        session.observe_event({
+            "type": "early_stop",
+            "at_iter": 0,
+            "source": "user",
+            "reason": "stopped by user (interactive)",
+        })
+    with pytest.raises(
+        LineageObservationError,
+        match="rejected authoritative lineage evidence",
+    ):
+        session.finalize_proof()
+
+
+def test_reference_output_contract_must_match_launch_resolved_target(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    session, project, selection_name, schedule = _ready_reference_session(
+        tmp_path,
+        monkeypatch,
+        expected_iterations=1,
+        completed_iterations=1,
+    )
+    wrong_contract = _reference_output_contract(schedule)
+    wrong_contract["actions"] = {
+        "names": ["act"],
+        "shape": [2],
+    }
+    _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"self-consistent-wrong-interface",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+        policy_contract=wrong_contract,
+    )
+
+    with pytest.raises(
+        LineageObservationError,
+        match="independently launch-resolved target interface",
+    ):
+        session.record_outputs()
+    with SculptorKG(tmp_path / "lineage.db") as kg:
+        assert kg.count_edges(Relation.PRODUCED) == 0
+        assert kg.count_edges(Relation.COMPATIBLE_WITH) == 0
+
+
+def test_reference_output_sidecar_tamper_never_earns_production_lineage(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    kg_path = tmp_path / "lineage.db"
+    monkeypatch.setenv("RS_KG_PATH", str(kg_path))
+    project = tmp_path / "project"
+    tuple_hash, selection_name = _seed_world(project)
+    robot = "g1"
+    clip_id = "lineage-motion"
+    clip_sha = "f" * 64
+    schedule = _reference_schedule(robot, clip_id)
+    session = RunLineageSession(
+        project_dir=project,
+        project_slug="lineage-project",
+        run_id="job-sidecar-tamper",
+        requested_initialization_mode="reference_only",
+        reference_robot=robot,
+        reference_clip_id=clip_id,
+        reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=1),
+    )
+    session.record_started()
+    session.observe_event({
+        "type": "reference_runtime_schedule_admitted",
+        "source": "sculpt_run_boundary",
+        **schedule,
+    })
+    session.observe_event({"type": "iter_started", "iter": 0})
+    session.observe_event({
+        "type": "artifact_tuple_pinned",
+        "tuple_hash": tuple_hash,
+        "selection": selection_name,
+        "iter": 0,
+    })
+    checkpoint = _write_reference_output(
+        project,
+        iteration=0,
+        checkpoint_bytes=b"tamper-target",
+        selection_name=selection_name,
+        input_checkpoint=None,
+        reference_schedule=schedule,
+    )
+    sidecar = Path(str(checkpoint) + ".policy_contract.json")
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        LineageObservationError, match="sidecar bytes differ",
+    ):
+        session.record_outputs()
+    from sculptor.policy_contract import contract_fingerprint
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    payload["policy_contract"]["reference_clock"][
+        "reference_target_sha256"
+    ] = "d" * 64
+    payload["policy_contract_sha256"] = contract_fingerprint(
+        payload["policy_contract"]
+    )
+    sidecar.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    metrics_path = checkpoint.parent / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["runtime_artifacts"]["output_policy_contract_sha256"] = (
+        payload["policy_contract_sha256"]
+    )
+    metrics["runtime_artifacts"][
+        "output_policy_contract_sidecar_sha256"
+    ] = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    metrics_path.write_text(json.dumps(metrics, sort_keys=True), encoding="utf-8")
+    with pytest.raises(
+        LineageObservationError, match="clock differs from run admission",
+    ):
+        session.record_outputs()
+    with SculptorKG(kg_path) as kg:
+        assert kg.count_edges(Relation.PRODUCED) == 0
+        assert kg.count_edges(Relation.COMPATIBLE_WITH) == 0
+
+
+def test_reference_completion_rejects_missing_software_and_schedule(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    reference_root = tmp_path / "references"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(reference_root))
+    project = tmp_path / "project"
+    _seed_world(project)
+    robot, clip_id, clip_sha = _seed_reference(reference_root)
+    schedule = _reference_schedule(robot, clip_id)
+    session = RunLineageSession(
+        project_dir=project,
+        project_slug="lineage-project",
+        run_id="job-missing-proof",
+        requested_initialization_mode="reference_only",
+        reference_robot=robot,
+        reference_clip_id=clip_id,
+        reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=1),
+    )
+    session.record_started()
+    with pytest.raises(
+        LineageObservationError, match="software environment",
+    ):
+        session.finalize_proof()
+
+    _context, context_event = _write_run_context(
+        project, commit="f" * 40, dirty=False,
+    )
+    session.observe_event(context_event)
+    session.observe_event({
+        "type": "reference_feasibility_admitted",
+        "source": "sculpt_run_worker",
+        **_tierd_receipt(robot, clip_id, clip_sha),
+    })
+    with pytest.raises(
+        LineageObservationError, match="no admitted runtime schedule",
+    ):
+        session.observe_event({
+            "type": "run_started",
+            "reference_motion": {
+                "robot": robot,
+                "clip_id": clip_id,
+                "clip_sha256": clip_sha,
+                "reward_path": str(
+                    (project / "rewards" / "v0.py").resolve()
+                ),
+            },
+        })
+    with pytest.raises(
+        LineageObservationError, match="rejected authoritative lineage evidence",
+    ):
+        session.finalize_proof()
+
+
+@pytest.mark.parametrize(
+    "migration",
+    [
+        {
+            "type": "zero_initialized_event_phase_observation",
+            "from_schema": 2,
+            "to_schema": 3,
+            "observation_term": "authored_event_phase",
+            "extension_width": 3,
+            "ordered_phase_ids": ["route", "jump", "hold"],
+            "optimizer_resume": False,
+        },
+        {
+            "type": "zero_initialized_reference_clock_observation",
+            "from_schema": 2,
+            "to_schema": 4,
+            "observation_term": "reference_phase",
+            "extension_width": 1,
+            "reference_clock_sha256": "c" * 64,
+            "optimizer_resume": False,
+        },
+        {
+            "type": "zero_initialized_observation_extensions",
+            "from_schema": 2,
+            "to_schema": 4,
+            "extension_width": 4,
+            "extensions": [
+                {
+                    "type": "zero_initialized_event_phase_observation",
+                    "from_schema": 2,
+                    "to_schema": 3,
+                    "observation_term": "authored_event_phase",
+                    "extension_width": 3,
+                    "ordered_phase_ids": ["route", "jump", "hold"],
+                    "optimizer_resume": False,
+                },
+                {
+                    "type": "zero_initialized_reference_clock_observation",
+                    "from_schema": 3,
+                    "to_schema": 4,
+                    "observation_term": "reference_phase",
+                    "extension_width": 1,
+                    "reference_clock_sha256": "c" * 64,
+                    "optimizer_resume": False,
+                },
+            ],
+            "optimizer_resume": False,
+        },
+    ],
+    ids=["event-phase", "reference-clock", "combined"],
+)
+def test_migrated_warm_start_initializes_from_loaded_bytes_and_records_source(
+    tmp_path: Path, monkeypatch, migration: dict,
 ) -> None:
     kg_path = tmp_path / "lineage.db"
     monkeypatch.setenv("RS_KG_PATH", str(kg_path))
@@ -360,33 +1185,28 @@ def test_migrated_warm_start_initializes_from_loaded_bytes_and_records_source(
     loaded.write_bytes(b"schema-3-derived-policy")
     loaded_sha = hashlib.sha256(loaded.read_bytes()).hexdigest()
 
-    session = _lineage_session(project, "job-migrated-load")
-    session.record_started()
-    migration = {
-        "type": "zero_initialized_event_phase_observation",
-        "from_schema": 2,
-        "to_schema": 3,
-        "extension_width": 3,
+    contract_receipt = {
+        "source": {"contract_sha256": "a" * 64},
+        "target": {"contract_sha256": "b" * 64},
+        "compatibility": migration,
     }
-    session.observe_event({
-        "type": "warm_start_loaded",
-        "source": str(source),
-        "source_sha256": source_sha,
-        "loaded_checkpoint": str(loaded),
-        "loaded_checkpoint_sha256": loaded_sha,
-        "adapted": True,
-        "derived_from": {
-            "source": str(source),
-            "source_sha256": source_sha,
-        },
-        "policy_contract_migration": (
-            "zero_initialized_event_phase_observation"
-        ),
-        "admitted_policy_contract_migration": migration,
-        "source_policy_contract_sha256": "a" * 64,
-        "effective_policy_contract_sha256": "b" * 64,
-        "load_cfg_keys": ["actor", "critic"],
-    })
+    session = _lineage_session(
+        project,
+        "job-migrated-load",
+        warm_start_policy_contract_receipt=contract_receipt,
+    )
+    session.record_started()
+    session.observe_event({"type": "iter_started", "iter": 1})
+    session.record_verified_initialization(_initialization_receipt(
+        source,
+        source_sha256=source_sha,
+        loaded=loaded,
+        loaded_sha256=loaded_sha,
+        roles=["actor", "critic"],
+        migration=migration,
+        source_contract_sha256="a" * 64,
+        target_contract_sha256="b" * 64,
+    ))
 
     with SculptorKG(kg_path) as kg:
         run = kg.find_nodes(kind="TrainingRun")[0]
@@ -410,6 +1230,54 @@ def test_migrated_warm_start_initializes_from_loaded_bytes_and_records_source(
         assert edge.data["effective_policy_contract_sha256"] == "b" * 64
 
 
+def test_migrated_warm_start_rejects_forged_migration_receipt(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("RS_KG_PATH", str(tmp_path / "lineage.db"))
+    project = tmp_path / "project"
+    _seed_world(project)
+    source = project / "runs" / "iter_0" / "checkpoint.pt"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source-policy")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    loaded = project / "runs" / "iter_1" / "warm_start_observation.pt"
+    loaded.parent.mkdir(parents=True)
+    loaded.write_bytes(b"derived-policy")
+    loaded_sha = hashlib.sha256(loaded.read_bytes()).hexdigest()
+    admitted = {
+        "type": "zero_initialized_reference_clock_observation",
+        "from_schema": 2,
+        "to_schema": 4,
+        "observation_term": "reference_phase",
+        "extension_width": 1,
+        "reference_clock_sha256": "c" * 64,
+        "optimizer_resume": False,
+    }
+    session = _lineage_session(
+        project,
+        "job-forged-migration",
+        warm_start_policy_contract_receipt={
+            "source": {"contract_sha256": "a" * 64},
+            "target": {"contract_sha256": "b" * 64},
+            "compatibility": admitted,
+        },
+    )
+    session.record_started()
+    session.observe_event({"type": "iter_started", "iter": 1})
+    forged = {**admitted, "reference_clock_sha256": "d" * 64}
+    with pytest.raises(LineageObservationError, match="exact migration"):
+        session.record_verified_initialization(_initialization_receipt(
+            source,
+            source_sha256=source_sha,
+            loaded=loaded,
+            loaded_sha256=loaded_sha,
+            roles=["actor", "critic"],
+            migration=forged,
+            source_contract_sha256="a" * 64,
+            target_contract_sha256="b" * 64,
+        ))
+
+
 def test_reference_tracks_rejects_missing_or_untrusted_tierd_receipt(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -420,24 +1288,20 @@ def test_reference_tracks_rejects_missing_or_untrusted_tierd_receipt(
     project = tmp_path / "project"
     project.mkdir()
     robot, clip_id, clip_sha = _seed_reference(reference_root)
-    context = {
-        "robot": robot,
-        "clip_id": clip_id,
-        "clip_sha256": clip_sha,
-    }
+    schedule = _reference_schedule(robot, clip_id)
 
-    missing = RunLineageSession(
-        project_dir=project,
-        project_slug="lineage-project",
-        run_id="job-no-tierd",
-        requested_initialization_mode="reference_only",
-        reference_robot=robot,
-        reference_clip_id=clip_id,
-        reference_sha256=clip_sha,
-    )
-    missing.record_started()
-    with pytest.raises(LineageObservationError, match="no prior verified Tier-D"):
-        missing.observe_event({"type": "run_started", "reference_motion": context})
+    with pytest.raises(
+        LineageObservationError, match="launch-admitted Tier-D receipt",
+    ):
+        RunLineageSession(
+            project_dir=project,
+            project_slug="lineage-project",
+            run_id="job-no-tierd",
+            requested_initialization_mode="reference_only",
+            reference_robot=robot,
+            reference_clip_id=clip_id,
+            reference_sha256=clip_sha,
+        )
 
     spoofed = RunLineageSession(
         project_dir=project,
@@ -447,20 +1311,17 @@ def test_reference_tracks_rejects_missing_or_untrusted_tierd_receipt(
         reference_robot=robot,
         reference_clip_id=clip_id,
         reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=1),
     )
     spoofed.record_started()
     with pytest.raises(LineageObservationError, match="worker admission"):
         spoofed.observe_event({
             "type": "reference_feasibility_admitted",
             "source": "ui_launch",
-            "reference_robot": robot,
-            "reference_clip_id": clip_id,
-            "clip_sha256": clip_sha,
-            "rollout_sha256": "7" * 64,
-            "certificate_sha256": "8" * 64,
-            "execution_contract_sha256": "9" * 64,
-            "execution_boundary_sha256": "a" * 64,
-            "target_robot": robot,
+            **_tierd_receipt(robot, clip_id, clip_sha),
         })
 
     with SculptorKG(kg_path) as kg:
@@ -484,6 +1345,7 @@ def test_mode_execution_event_records_exact_reverified_authority(
         clip_id=clip_id,
         clip_sha256=clip_sha,
     )
+    schedule = _reference_schedule(robot, clip_id)
     session = RunLineageSession(
         project_dir=project,
         project_slug="lineage-project",
@@ -492,32 +1354,41 @@ def test_mode_execution_event_records_exact_reverified_authority(
         reference_robot=robot,
         reference_clip_id=clip_id,
         reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=1),
     )
     session.record_started()
+    session.observe_event({"type": "iter_started", "iter": 0})
     session.observe_event({
         "type": "reference_feasibility_admitted",
         "source": "sculpt_run_worker",
-        "reference_robot": robot,
-        "reference_clip_id": clip_id,
-        "clip_sha256": clip_sha,
-        "rollout_sha256": "7" * 64,
-        "certificate_sha256": "8" * 64,
-        "execution_contract_sha256": "9" * 64,
-        "execution_boundary_sha256": "a" * 64,
-        "target_robot": robot,
+        **_tierd_receipt(robot, clip_id, clip_sha),
     })
+    session.observe_event({
+        "type": "reference_runtime_schedule_admitted",
+        "source": "sculpt_run_boundary",
+        **schedule,
+    })
+    monkeypatch.setattr(
+        "backend.services.artifact_lineage._rederive_reference_schedule",
+        lambda *_args, **_kwargs: schedule,
+    )
     session.observe_event({
         "type": "run_started",
         "reference_motion": {
             "robot": robot,
             "clip_id": clip_id,
             "clip_sha256": clip_sha,
+            "reward_path": event["reward_path"],
         },
     })
     session.observe_event({
         "type": "artifact_tuple_pinned",
         "tuple_hash": tuple_hash,
         "selection": selection_name,
+        "iter": 0,
     })
     session.observe_event(event)
     session.observe_event(event)
@@ -533,7 +1404,7 @@ def test_mode_execution_event_records_exact_reverified_authority(
         ]
         assert artifact.selection_digest == tuple_hash
         assert artifact.context_refs == event["context_refs"]
-        assert kg.count_edges(Relation.USES_MODE_EXECUTION) == 1
+        assert kg.count_edges(Relation.USES_MODE_EXECUTION) == 2
 
     stale = {**event, "graph_sha256": "f" * 64}
     with pytest.raises(
@@ -550,7 +1421,78 @@ def test_mode_execution_event_records_exact_reverified_authority(
     ):
         session.observe_event(event)
     with SculptorKG(kg_path) as kg:
-        assert kg.count_edges(Relation.USES_MODE_EXECUTION) == 1
+        assert kg.count_edges(Relation.USES_MODE_EXECUTION) == 2
+
+
+def test_reference_completion_rejects_required_mode_without_admission(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    reference_root = tmp_path / "references"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(reference_root))
+    project = tmp_path / "project"
+    _seed_world(project)
+    robot, clip_id, clip_sha = _seed_reference(reference_root)
+    mode_event, selection_name, tuple_hash = _install_mode_reward(
+        project,
+        reference_root,
+        robot=robot,
+        clip_id=clip_id,
+        clip_sha256=clip_sha,
+    )
+    schedule = _reference_schedule(robot, clip_id)
+    session = RunLineageSession(
+        project_dir=project,
+        project_slug="lineage-project",
+        run_id="job-mode-missing",
+        requested_initialization_mode="reference_only",
+        reference_robot=robot,
+        reference_clip_id=clip_id,
+        reference_sha256=clip_sha,
+        reference_feasibility_receipt=_tierd_receipt(
+            robot, clip_id, clip_sha,
+        ),
+        **_strict_lineage_plan(schedule, expected_iterations=1),
+    )
+    session.record_started()
+    _context, context_event = _write_run_context(
+        project, commit="1" * 40, dirty=False,
+    )
+    session.observe_event(context_event)
+    session.observe_event({
+        "type": "reference_feasibility_admitted",
+        "source": "sculpt_run_worker",
+        **_tierd_receipt(robot, clip_id, clip_sha),
+    })
+    session.observe_event({
+        "type": "reference_runtime_schedule_admitted",
+        "source": "sculpt_run_boundary",
+        **schedule,
+    })
+    monkeypatch.setattr(
+        "backend.services.artifact_lineage._rederive_reference_schedule",
+        lambda *_args, **_kwargs: schedule,
+    )
+    session.observe_event({
+        "type": "run_started",
+        "reference_motion": {
+            "robot": robot,
+            "clip_id": clip_id,
+            "clip_sha256": clip_sha,
+            "reward_path": mode_event["reward_path"],
+        },
+    })
+    session.observe_event({"type": "iter_started", "iter": 0})
+    session.observe_event({
+        "type": "artifact_tuple_pinned",
+        "tuple_hash": tuple_hash,
+        "selection": selection_name,
+        "iter": 0,
+    })
+    session.observe_event({"type": "iter_completed", "iter": 0})
+    with pytest.raises(
+        LineageObservationError, match="lacks its required mode executor",
+    ):
+        session.finalize_proof()
 
 
 def test_run_context_lineage_distinguishes_clean_and_dirty_same_commit(
@@ -767,17 +1709,18 @@ def test_unverified_load_event_cannot_create_initialization_edge(
     )
     session.record_started()
 
-    try:
-        session.observe_event({
-            "type": "warm_start_loaded",
-            "source": str(outside),
-            "source_sha8": hashlib.sha256(outside.read_bytes()).hexdigest()[:8],
-            "load_cfg_keys": ["actor"],
-        })
-    except LineageObservationError as exc:
-        assert "outside project runs" in str(exc)
-    else:  # pragma: no cover - makes the negative authority explicit
-        raise AssertionError("outside checkpoint unexpectedly earned lineage")
+    outside_sha = hashlib.sha256(outside.read_bytes()).hexdigest()
+    session.observe_event({
+        "type": "warm_start_loaded",
+        "source": str(outside),
+        "source_sha8": outside_sha[:8],
+        "load_cfg_keys": ["actor"],
+    })
+    session.observe_event({"type": "iter_started", "iter": 0})
+    with pytest.raises(LineageObservationError, match="outside project runs"):
+        session.record_verified_initialization(_initialization_receipt(
+            outside, source_sha256=outside_sha,
+        ))
 
     with SculptorKG(kg_path) as kg:
         assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
@@ -802,36 +1745,38 @@ def test_project_actor_critic_lineage_is_earned_only_after_exact_load(
         requested_initialization_mode="actor_critic",
     )
     session.record_started()
+    session.observe_event({"type": "iter_started", "iter": 2})
 
     with pytest.raises(LineageObservationError, match="expected exactly"):
-        session.observe_event({
-            "type": "warm_start_loaded",
-            "source": str(checkpoint),
-            "source_sha256": checkpoint_sha,
-            "load_cfg_keys": ["actor"],
-        })
+        session.record_verified_initialization(_initialization_receipt(
+            checkpoint,
+            source_sha256=checkpoint_sha,
+            roles=["actor"],
+        ))
 
     with SculptorKG(kg_path) as kg:
         assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
 
     with pytest.raises(LineageObservationError, match="expected exactly"):
-        session.observe_event({
-            "type": "warm_start_loaded",
-            "source": str(checkpoint),
-            "source_sha256": checkpoint_sha,
-            "load_cfg_keys": ["actor", "critic", "critic"],
-        })
+        malformed = _initialization_receipt(
+            checkpoint,
+            source_sha256=checkpoint_sha,
+            roles=["actor", "critic"],
+        )
+        malformed["observed"]["load_cfg_keys"] = [
+            "actor", "critic", "critic",
+        ]
+        session.record_verified_initialization(malformed)
     with SculptorKG(kg_path) as kg:
         assert kg.count_edges(Relation.INITIALIZED_FROM) == 0
 
-    session.observe_event({
-        "type": "warm_start_loaded",
-        "source": str(checkpoint),
-        "source_sha256": checkpoint_sha,
-        "load_cfg_keys": ["critic", "actor"],
-    })
+    session.record_verified_initialization(_initialization_receipt(
+        checkpoint,
+        source_sha256=checkpoint_sha,
+        roles=["critic", "actor"],
+    ))
     with SculptorKG(kg_path) as kg:
-        assert kg.count_edges(Relation.INITIALIZED_FROM) == 1
+        assert kg.count_edges(Relation.INITIALIZED_FROM) == 2
 
 
 def test_no_kg_skips_every_lineage_side_effect(tmp_path: Path, monkeypatch) -> None:

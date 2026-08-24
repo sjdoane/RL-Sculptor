@@ -64,6 +64,35 @@ def _configure_g1_project(client: TestClient, slug: str) -> Path:
     return Path(detail.project_dir)
 
 
+def _stub_immutable_world_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    world_store,
+    selection_path: Path,
+    report: dict,
+) -> dict:
+    """Keep route-isolation tests explicit about their immutable pin seam."""
+    immutable = selection_path.with_name(
+        f"selection_v{int(report['selection_version'])}.json"
+    )
+    immutable.write_bytes(selection_path.read_bytes())
+    receipt = {
+        "selection_version": report["selection_version"],
+        "selection_path": str(immutable.resolve()),
+        "selection_sha256": hashlib.sha256(
+            immutable.read_bytes()
+        ).hexdigest(),
+        "tuple_hash": report["tuple_hash"],
+        "world_robot": report["world_robot"],
+        "project_robot": report["project_robot"],
+    }
+    monkeypatch.setattr(
+        world_store,
+        "immutable_training_receipt",
+        lambda _project, _report=None: dict(receipt),
+    )
+    return receipt
+
+
 def _register_feasibility_reference(
     tmp_path: Path,
     *,
@@ -88,8 +117,13 @@ def _register_feasibility_reference(
     source = save_clip(tmp_path / f"{clip_id}.npz", {
         "root_pos_z": np.full(n, 0.8),
         "root_pos_xy": np.stack([0.1 * t, np.zeros_like(t)], axis=1),
+        "root_frame": "absolute",
         "fps": fps,
-        "joint_pos": np.zeros((n, len(ordered_joints))),
+        "joint_pos": np.repeat(
+            (0.25 * np.sin(2.0 * np.pi * t / t[-1]))[:, None],
+            len(ordered_joints),
+            axis=1,
+        ),
         "joint_names": ordered_joints,
         "meta": {"source": "unit-test:reference-feasibility"},
     })
@@ -111,36 +145,209 @@ def _register_feasibility_reference(
     library.rebuild_index()
     rollout_sha = None
     if tier_d:
-        from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
+        from sculptor.refs.track import update_provenance_tier_d
 
-        rollout = clip_dir / "tierD_rollout.npz"
-        rollout.write_bytes(b"physics-tracked-rollout")
-        errors = TrackingErrors(
-            mean_joint_err_rad=0.05,
-            max_joint_err_rad=0.08,
-            root_z_rmse_m=0.02,
-            duration_coverage=1.0,
-            common_joint_names=ordered_joints,
-            n_common_joints=len(ordered_joints),
-        )
-        assert errors.feasible
         execution_contract = None
         if project_dir is not None and policy_contract is not None:
             from sculptor.reference import load_clip
-            from sculptor.refs.track import build_tierd_execution_contract
+            from sculptor.policy_contract import (
+                build_project_policy_contract,
+            )
+            from sculptor.refs.track import (
+                _score_tierd_rollout_artifact,
+                bind_tierd_runtime_artifacts,
+                build_tierd_execution_contract,
+                build_tierd_reference_clock,
+                downsample_phase_targets,
+            )
+            from sculptor.runtime_inputs import environment_artifacts_for_phase
 
+            certified_clip = load_clip(source)
+            reference_clock = build_tierd_reference_clock(
+                certified_clip, clip_id=clip_id, robot=robot,
+            )
+            policy_contract = build_project_policy_contract(
+                project_dir, reference_clock=reference_clock,
+            )
             execution_contract = build_tierd_execution_contract(
                 donor_project=project_dir,
                 certification_config_path=project_dir / "config.toml",
+                clip_id=clip_id,
                 robot=robot,
-                clip=load_clip(source),
+                clip=certified_clip,
                 policy_contract=policy_contract,
+                reference_clock=reference_clock,
             )
+            reward_sha = "a" * 64
+            checkpoint_sha = "b" * 64
+            policy_contract_sha = execution_contract["donor"][
+                "policy_contract_sha256"
+            ]
+            train_environment = environment_artifacts_for_phase(
+                execution_contract["environment_artifacts"], "train",
+            )
+            execution_contract = bind_tierd_runtime_artifacts(
+                execution_contract,
+                requested_reward_module_sha256=reward_sha,
+                train_receipts=[{
+                    "iteration": 1,
+                    "schema": "reward-sculptor-runner-artifacts-v2",
+                    "phase": "train",
+                    "reward_module_sha256": reward_sha,
+                    "requested_max_iterations": 2000,
+                    "requested_seed": 0,
+                    "requested_num_envs": 64,
+                    "seed_application": {
+                        "schema": "reward-sculptor-seed-application-v1",
+                        "applied_seed": 0,
+                        "python_random": True,
+                        "numpy_global": True,
+                        "torch_global": True,
+                        "env_cfg": True,
+                        "rl_cfg": True,
+                    },
+                    "environment_artifacts": train_environment,
+                    "env_spec_application": {
+                        "schema": "reward-sculptor-env-spec-application-v1",
+                        "phase": "train",
+                        "requested": [],
+                        "applied": [],
+                        "dead": [],
+                        "errors": [],
+                    },
+                    "input_checkpoint_requested_sha256": None,
+                    "input_checkpoint_loaded_sha256": None,
+                    "input_checkpoint_load_completed": False,
+                    "output_checkpoint_sha256": checkpoint_sha,
+                    "output_policy_contract_sha256": policy_contract_sha,
+                    "output_policy_contract_sidecar_sha256": "e" * 64,
+                }],
+                final_checkpoint_sha256=checkpoint_sha,
+                requested_steps_per_iteration=2000,
+                requested_seed=0,
+                requested_num_envs=64,
+            )
+            dt = float(execution_contract["execution_boundary"]["timing"][
+                "control_dt_s"
+            ])
+            duration_s = float(execution_contract["reference"][
+                "playback_duration_s"
+            ])
+            n_steps = int(np.ceil(duration_s / dt))
+            sample_times = (np.arange(n_steps, dtype=np.float64) + 1.0) * dt
+            phases = np.minimum(
+                sample_times / duration_s, np.nextafter(1.0, 0.0),
+            )
+            indices = np.floor(
+                phases * execution_contract["reference"]["phase_target_count"]
+            ).astype(int)
+            rollout_joint_pos = np.round(downsample_phase_targets(
+                np.asarray(certified_clip["joint_pos"], dtype=np.float64),
+                n=32,
+            ), 5)[indices]
+            rollout_root_pos = np.zeros((n_steps, 1, 3), dtype=np.float32)
+            rollout_root_pos[:, 0, 2] = np.round(downsample_phase_targets(
+                np.asarray(certified_clip["root_pos_z"], dtype=np.float64),
+                n=32,
+            ), 5)[indices]
+            rollout = clip_dir / "tierD_rollout_candidate.npz"
+            rollout_requirements = execution_contract["runtime_artifacts"][
+                "rollout_requirements"
+            ]
+            metadata = {
+                "schema": "reward-sculptor-trajectory-v1",
+                "layout": ["time", "environment", "feature"],
+                "ordered_joint_names": ordered_joints,
+                "control_dt_s": dt,
+                "root_link_pos_w_frame": "world",
+                "first_episode_lane": 0,
+                "valid_mask": {
+                    "key": "first_episode_valid_mask",
+                    "semantics": "true_prefix_before_first_done",
+                    "invalid_state": "frozen_last_valid_sample",
+                    "state_samples": "post_step_after_valid_transition",
+                },
+                "runtime_artifacts": {
+                    "schema": "reward-sculptor-runner-artifacts-v2",
+                    "phase": "rollout",
+                    "reward_module_sha256": reward_sha,
+                    "checkpoint_sha256": checkpoint_sha,
+                    "checkpoint_load_completed": True,
+                    "environment_artifacts": rollout_requirements[
+                        "environment_artifacts"
+                    ],
+                    "requested_seed": 0,
+                    "applied_seed": 0,
+                    "seed_application": {
+                        "schema": "reward-sculptor-seed-application-v1",
+                        "applied_seed": 0,
+                        "python_random": True,
+                        "numpy_global": True,
+                        "torch_global": True,
+                        "env_cfg": True,
+                        "rl_cfg": True,
+                    },
+                    "requested_n_episodes": 1,
+                    "configured_n_episodes": 1,
+                    "requested_max_episode_steps": rollout_requirements[
+                        "requested_max_episode_steps"
+                    ],
+                    "configured_max_episode_steps": rollout_requirements[
+                        "requested_max_episode_steps"
+                    ],
+                    "requested_task_id": rollout_requirements[
+                        "requested_task_id"
+                    ],
+                    "configured_task_id": rollout_requirements[
+                        "requested_task_id"
+                    ],
+                    "configured_num_envs": 1,
+                    "completed_first_episodes": 0,
+                    "env_spec_application": {
+                        "schema": "reward-sculptor-env-spec-application-v1",
+                        "phase": "rollout",
+                        "requested": [],
+                        "applied": [],
+                        "dead": [],
+                        "errors": [],
+                    },
+                    "eval_reset_application": {
+                        "schema": "reward-sculptor-eval-reset-application-v1",
+                        "requested": [],
+                        "applied": [],
+                        "dead": [],
+                        "errors": [],
+                    },
+                },
+            }
+            np.savez_compressed(
+                rollout,
+                joint_pos=rollout_joint_pos[:, None, :].astype(np.float32),
+                root_link_pos_w=rollout_root_pos,
+                first_episode_valid_mask=np.ones((n_steps, 1), dtype=bool),
+                trajectory_contract_json=np.asarray(json.dumps(
+                    metadata, sort_keys=True, separators=(",", ":"),
+                )),
+            )
+            rollout_sha256 = hashlib.sha256(rollout.read_bytes()).hexdigest()
+            retained_rollout = (
+                clip_dir / f"tierD_rollout_{rollout_sha256}.npz"
+            )
+            rollout.replace(retained_rollout)
+            rollout = retained_rollout
+            errors = _score_tierd_rollout_artifact(
+                rollout,
+                clip=certified_clip,
+                execution_contract=execution_contract,
+            )
+            assert errors.feasible
+        else:  # pragma: no cover - Tier-D callers always supply a project
+            raise AssertionError("Tier-D fixture requires a project contract")
         update_provenance_tier_d(
             robot=robot,
             clip_id=clip_id,
             errors=errors,
-            iterations=2,
+            iterations=1,
             rollout_path=rollout,
             execution_contract=execution_contract,
         )
@@ -420,18 +627,22 @@ def test_tier_k_reference_is_dry_run_only_and_receipt_says_kinematic(
     selection = project_dir / "env" / "selection_current.json"
     selection.parent.mkdir(parents=True, exist_ok=True)
     selection.write_text("{}", encoding="utf-8")
+    world_report = {
+        "ok": True,
+        "selection_version": 1,
+        "tuple_hash": "c" * 64,
+        "errors": [],
+        "robot_matches_project": True,
+        "world_robot": "unitree_g1:base",
+        "project_robot": "unitree_g1:base",
+    }
     monkeypatch.setattr(
         world_store,
         "training_preflight",
-        lambda _p: {
-            "ok": True,
-            "selection_version": 1,
-            "tuple_hash": "c" * 64,
-            "errors": [],
-            "robot_matches_project": True,
-            "world_robot": "unitree_g1:base",
-            "project_robot": "unitree_g1:base",
-        },
+        lambda _p: dict(world_report),
+    )
+    _stub_immutable_world_receipt(
+        monkeypatch, world_store, selection, world_report,
     )
 
     live = client.post(
@@ -510,24 +721,28 @@ def test_tier_d_reference_receipt_pins_exact_clip_and_rollout_digests(
         "build_project_policy_contract",
         lambda *_args, **_kwargs: certified_policy_contract,
     )
+    world_report = {
+        "ok": True,
+        "selection_version": 1,
+        "tuple_hash": "tier-d-route-fixture",
+        "errors": [],
+        "robot_matches_project": True,
+        "world_robot": "unitree_g1:base",
+        "project_robot": "unitree_g1:base",
+    }
     monkeypatch.setattr(
         world_store,
         "training_preflight",
-        lambda _p: {
-            "ok": True,
-            "selection_version": 1,
-            "tuple_hash": "tier-d-route-fixture",
-            "errors": [],
-            "robot_matches_project": True,
-            "world_robot": "unitree_g1:base",
-            "project_robot": "unitree_g1:base",
-        },
+        lambda _p: dict(world_report),
+    )
+    _stub_immutable_world_receipt(
+        monkeypatch, world_store, selection_path, world_report,
     )
 
     launched = client.post(
         f"/projects/{slug}/runs",
         json={
-            "behavior_goal": "evolve this dynamically feasible motion",
+            "behavior_goal": "evolve this exactly tracked motion",
             "iterations": 1,
             "dry_run": False,
             "acknowledge_blind_fitness": True,
@@ -578,26 +793,41 @@ def test_active_reference_reward_cannot_bypass_tierd_when_picker_is_empty(
         "build_project_policy_contract",
         lambda *_args, **_kwargs: certified_policy_contract,
     )
+    world_report = {
+        "ok": True,
+        "selection_version": 1,
+        "tuple_hash": "tier-d-route-fixture",
+        "errors": [],
+        "robot_matches_project": True,
+        "world_robot": "unitree_g1:base",
+        "project_robot": "unitree_g1:base",
+    }
     monkeypatch.setattr(
         world_store,
         "training_preflight",
-        lambda _p: {
-            "ok": True,
-            "selection_version": 1,
-            "tuple_hash": "tier-d-route-fixture",
-            "errors": [],
-            "robot_matches_project": True,
-            "world_robot": "unitree_g1:base",
-            "project_robot": "unitree_g1:base",
-        },
+        lambda _p: dict(world_report),
+    )
+    _stub_immutable_world_receipt(
+        monkeypatch, world_store, selection_path, world_report,
     )
 
     rewards = project_dir / "rewards"
     reward = rewards / "v41.py"
+    from sculptor.reference_clock import build_reference_clock
+
+    reference_clock = build_reference_clock(
+        clip_id="parkour_seed",
+        robot="g1",
+        target_sha256="a" * 64,
+        phase_mode="hold",
+        phase_duration_s=1.0,
+        n_phase_targets=128,
+    )
     reward.write_text(
         "REWARD_SPEC = {"
         "'reference_tracking': True,"
         "'reference_robot': 'g1',"
+        f"'reference_clock': {reference_clock!r},"
         "'composition': {"
         "'type': 'reference_tracking_residual',"
         "'reference_clip_id': 'parkour_seed',"
@@ -760,6 +990,43 @@ def test_get_run_preserves_advanced_launch_params(
 
     for field, expected in launch_params.items():
         assert detail["params"][field] == expected, field
+
+
+@pytest.mark.parametrize("worker_observed", [False, True])
+def test_get_run_exposes_server_owned_authored_world_execution_receipt(
+    client: TestClient,
+    worker_observed: bool,
+) -> None:
+    from backend.services.job_manager import Job
+
+    slug = _make_project_with_library(client, "WorldExecutionHistory")
+    requested = {
+        "selection_version": 7,
+        "selection_path": "/server/world/selection_v7.json",
+        "selection_sha256": "a" * 64,
+        "tuple_hash": "b" * 64,
+    }
+    receipt = {
+        "requested": requested,
+        "observed": dict(requested) if worker_observed else None,
+    }
+    run_id = "job_world_execution_receipt"
+    client.app.state.job_manager._jobs[run_id] = Job(
+        job_id=run_id,
+        kind="sculpt_run",
+        project_slug=slug,
+        status="queued",
+        params={
+            "behavior_goal": "audit the exact authored world",
+            "iterations": 1,
+            "authored_world_execution_receipt": receipt,
+        },
+    )
+
+    response = client.get(f"/projects/{slug}/runs/{run_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["authored_world_execution_receipt"] == receipt
 
 
 def test_cannot_launch_two_concurrent_runs(
@@ -1153,6 +1420,166 @@ def test_restore_promoted_training_inputs_rejects_hash_drift_before_repoint(
     assert env_current.read_bytes() == env_before
 
 
+def test_worker_passes_immutable_world_pin_across_spawn_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager, world_store
+    from backend.services.job_manager import Job
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    project_dir = tmp_path / "spawn-gap-world"
+    _promoted_recovery_project(project_dir)
+    selection = WorldArtifactStore(project_dir).read_selection()
+    assert selection is not None
+    report = {
+        "ok": True,
+        "selection_version": selection.selection_version,
+        "tuple_hash": selection.tuple_hash,
+        "errors": [],
+        "robot_matches_project": True,
+        "world_robot": "unitree_g1:base",
+        "project_robot": "unitree_g1:base",
+    }
+    receipt = world_store.immutable_training_receipt(project_dir, report)
+    assert receipt is not None
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _project: dict(report),
+    )
+    captured: dict[str, list[str]] = {}
+
+    class _SpawnGapReached(Exception):
+        pass
+
+    async def _fake_exec(*args, **_kwargs):
+        captured["cmd"] = [str(arg) for arg in args]
+        # Simulate an authoring promotion after the manager's final check but
+        # before the child begins. The child command must still name v1.
+        (project_dir / "env" / "selection_current.json").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
+        raise _SpawnGapReached()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "keep the admitted obstacle course",
+            "iterations": 1,
+            "dry_run": True,
+            "authored_world_receipt": receipt,
+        },
+    )
+    job = Job(
+        job_id="spawn_gap_world",
+        kind="sculpt_run",
+        project_slug="spawn-gap-world",
+        status="running",
+    )
+    job._cancel = asyncio.Event()
+
+    with pytest.raises(_SpawnGapReached):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--world-selection") + 1] == receipt["selection_path"]
+    assert cmd[cmd.index("--expected-world-selection-sha256") + 1] == (
+        receipt["selection_sha256"]
+    )
+    assert cmd[cmd.index("--expected-world-tuple-hash") + 1] == (
+        receipt["tuple_hash"]
+    )
+    assert receipt["selection_path"].endswith("selection_v1.json")
+
+
+def test_worker_rejects_missing_core_world_pin_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager, world_store
+    from backend.services.job_manager import Job
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    project_dir = tmp_path / "missing-core-world-receipt"
+    _promoted_recovery_project(project_dir)
+    selection = WorldArtifactStore(project_dir).read_selection()
+    assert selection is not None
+    report = {
+        "ok": True,
+        "selection_version": selection.selection_version,
+        "tuple_hash": selection.tuple_hash,
+        "errors": [],
+        "robot_matches_project": True,
+        "world_robot": "unitree_g1:base",
+        "project_robot": "unitree_g1:base",
+    }
+    receipt = world_store.immutable_training_receipt(project_dir, report)
+    assert receipt is not None
+    monkeypatch.setattr(
+        world_store,
+        "training_preflight",
+        lambda _project: dict(report),
+    )
+
+    class _SilentProcess:
+        pid = 41001
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_eof()
+
+        async def wait(self) -> int:
+            await asyncio.sleep(0.01)
+            self.returncode = 0
+            return 0
+
+        def send_signal(self, _signal) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def _fake_exec(*_args, **_kwargs):
+        return _SilentProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "prove the exact authored world pin",
+            "iterations": 1,
+            "dry_run": True,
+            "authored_world_receipt": receipt,
+        },
+    )
+    job = Job(
+        job_id="missing_core_world_receipt",
+        kind="sculpt_run",
+        project_slug="missing-core-world-receipt",
+        status="running",
+    )
+    job._cancel = asyncio.Event()
+
+    asyncio.run(runner(job, job._cancel))
+
+    assert job.status == "errored"
+    assert job.params["error_classification"]["kind"] == (
+        "authored_world_pin_unproven"
+    )
+    assert any(
+        event.get("type") == "run_errored"
+        and event.get("error_kind") == "authored_world_pin_unproven"
+        for event in job.events
+    )
+
+
 def test_run_sculpt_job_restores_promoted_tuple_before_subprocess(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1484,6 +1911,11 @@ def test_tier_k_inspection_never_spawns_training_or_publishes_policy(
     clip_sha, _ = _register_feasibility_reference(
         tmp_path, robot="g1", clip_id="walk_cycle", tier_d=False,
     )
+    from sculptor.reference_run import resolve_reference_clock_for_run
+
+    reference_clock = resolve_reference_clock_for_run(
+        project_dir, clip_id="walk_cycle", robot="g1",
+    )
 
     async def _fake_exec(*args, **kwargs):
         nonlocal subprocess_called
@@ -1499,6 +1931,7 @@ def test_tier_k_inspection_never_spawns_training_or_publishes_policy(
             "dry_run": True,
             "reference_clip_id": "walk_cycle",
             "reference_robot": "g1",
+            "reference_clock": reference_clock,
             "reference_feasibility": {
                 "status": "kinematic_reference_inspection_only",
                 "tier": "K",
@@ -1554,6 +1987,11 @@ def test_run_worker_rejects_reference_digest_drift_before_subprocess(
     clip_path.write_bytes(clip_path.read_bytes() + b"queue-time-drift")
     project_dir = tmp_path / "reference-drift"
     project_dir.mkdir()
+    from sculptor.reference_run import resolve_reference_clock_for_run
+
+    reference_clock = resolve_reference_clock_for_run(
+        project_dir, clip_id="drift_seed", robot="g1",
+    )
     runner = run_manager.run_sculpt_job(
         project_dir=project_dir,
         run_params={
@@ -1562,6 +2000,7 @@ def test_run_worker_rejects_reference_digest_drift_before_subprocess(
             "dry_run": True,
             "reference_clip_id": "drift_seed",
             "reference_robot": "g1",
+            "reference_clock": reference_clock,
             "reference_feasibility": {
                 "status": "kinematic_reference_inspection_only",
                 "tier": "K",

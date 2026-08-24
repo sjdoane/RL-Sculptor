@@ -702,6 +702,58 @@ def training_preflight(project_dir: Path) -> dict[str, Any] | None:
     return dict(validate(project_dir))
 
 
+def immutable_training_receipt(
+    project_dir: Path,
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Bind one verified training preflight to its immutable selection file.
+
+    ``selection_current.json`` is only an authoring pointer. A queued or
+    subprocess-backed run must carry the corresponding ``selection_vN.json``
+    path and its byte digest so a later promotion cannot change the experiment
+    between admission and core initialization.
+    """
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    report = training_preflight(project_dir) if report is None else report
+    if report is None:
+        return None
+    if not isinstance(report, dict) or not bool(report.get("ok")):
+        raise ValueError("authored world preflight is not verified")
+    version = report.get("selection_version")
+    tuple_hash = report.get("tuple_hash")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("authored world selection_version is invalid")
+    if (
+        not isinstance(tuple_hash, str)
+        or len(tuple_hash) != 64
+        or any(char not in "0123456789abcdef" for char in tuple_hash)
+    ):
+        raise ValueError("authored world tuple_hash is invalid")
+
+    store = WorldArtifactStore(project_dir)
+    selection_path = store.env_dir / f"selection_v{version}.json"
+    selection = store.read_selection(selection_path)
+    if selection is None:
+        raise ValueError("immutable authored world selection is missing")
+    if (
+        selection.selection_version != version
+        or selection.tuple_hash != tuple_hash
+    ):
+        raise ValueError(
+            "immutable authored world selection differs from preflight"
+        )
+    return {
+        "selection_version": version,
+        "selection_path": str(selection_path.resolve()),
+        "selection_sha256": file_sha256(selection_path),
+        "tuple_hash": tuple_hash,
+        "world_robot": report.get("world_robot"),
+        "project_robot": report.get("project_robot"),
+    }
+
+
 def curriculum(project_dir: Path) -> dict[str, Any]:
     """Terrain-curriculum progression of the most recent run — one entry
     per iteration that exported world_curriculum_stats.json (mean level

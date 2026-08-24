@@ -18,6 +18,7 @@ pending-stage-with-no-training-dir case (§commit 8b0bfa3 precedent).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
@@ -31,7 +32,11 @@ def _write_clip_npz(clip_dir: Path, *, n_frames: int = 50, fps: float = 30.0) ->
     from sculptor.reference import save_clip
 
     root_pos_z = np.linspace(0.3, 0.8, n_frames).astype(np.float32)
-    save_clip(clip_dir / "clip.npz", {"root_pos_z": root_pos_z, "fps": fps})
+    save_clip(clip_dir / "clip.npz", {
+        "root_pos_z": root_pos_z,
+        "fps": fps,
+        "root_frame": "absolute",
+    })
 
 
 def _write_provenance(
@@ -40,7 +45,7 @@ def _write_provenance(
     fps: float = 30.0, license_: str = "CC BY-NC-ND 4.0",
 ) -> dict:
     prov = {
-        "schema": 1,
+        "schema": 2,
         "clip_id": clip_id,
         "robot": robot,
         "source": {"kind": "hf_dataset", "repo": "test/repo", "path": "g1/x.csv",
@@ -53,10 +58,17 @@ def _write_provenance(
         "parent_clip_id": None,
         "frame_range": None,
         "joint_mapping": {"identity": True},
-        "content_sha256": "0" * 64,
+        "content_sha256": hashlib.sha256(
+            (clip_dir / "clip.npz").read_bytes()
+        ).hexdigest(),
+        "source_content_sha256": "0" * 64,
         "labels": labels,
         "text": text,
-        "qc": {"duration_s": n_frames / fps, "root_z_range": [0.3, 0.8], "checks": []},
+        "qc": {
+            "duration_s": (n_frames - 1) / fps,
+            "root_z_range": [0.3, 0.8],
+            "checks": [],
+        },
         "ingested_at": "2026-07-09T00:00:00Z",
     }
     (clip_dir / "provenance.json").write_text(json.dumps(prov, indent=2))
@@ -142,56 +154,216 @@ def _certify_clip(
     from sculptor.refs import library
     from sculptor.policy_contract import build_project_policy_contract
     from sculptor.reference import load_clip, save_clip
-    from sculptor.refs.track import build_tierd_execution_contract
+    from sculptor.refs.track import (
+        _score_tierd_rollout_artifact,
+        bind_tierd_runtime_artifacts,
+        build_tierd_execution_contract,
+        build_tierd_reference_clock,
+        downsample_phase_targets,
+        update_provenance_tier_d,
+    )
+    from sculptor.runtime_inputs import environment_artifacts_for_phase
 
     clip_dir = library.clip_dir(robot, clip_id, root=root)
-    policy_contract = build_project_policy_contract(project_dir)
     clip = load_clip(clip_dir / library.CLIP_FILENAME)
-    ordered_joints = list(policy_contract["joints"]["ordered_names"])
+    base_policy_contract = build_project_policy_contract(project_dir)
+    ordered_joints = list(base_policy_contract["joints"]["ordered_names"])
     frame_count = len(np.asarray(clip["root_pos_z"]))
     clip["joint_names"] = ordered_joints
-    clip["joint_pos"] = np.zeros(
-        (frame_count, len(ordered_joints)), dtype=np.float32,
+    phase = np.linspace(0.0, 2.0 * np.pi, frame_count, dtype=np.float32)
+    clip["joint_pos"] = np.repeat(
+        (0.25 * np.sin(phase))[:, None], len(ordered_joints), axis=1,
     )
+    clip["root_frame"] = "absolute"
     save_clip(clip_dir / library.CLIP_FILENAME, clip)
     clip_sha256 = library.content_sha256(
         (clip_dir / library.CLIP_FILENAME).read_bytes()
     )
-    rollout_path = clip_dir / "tierD_rollout.npz"
-    rollout_path.write_bytes(b"verified rollout fixture")
-    rollout_sha256 = library.content_sha256(rollout_path.read_bytes())
+    provenance = library.read_provenance(robot, clip_id, root=root)
+    provenance["content_sha256"] = clip_sha256
+    library.write_provenance(robot, clip_id, provenance, root=root)
+    certified_clip = load_clip(clip_dir / library.CLIP_FILENAME)
+    reference_clock = build_tierd_reference_clock(
+        certified_clip, clip_id=clip_id, robot=robot,
+    )
+    policy_contract = build_project_policy_contract(
+        project_dir, reference_clock=reference_clock,
+    )
     execution_contract = build_tierd_execution_contract(
         donor_project=project_dir,
         certification_config_path=project_dir / "config.toml",
+        clip_id=clip_id,
         robot=robot,
-        clip=load_clip(clip_dir / library.CLIP_FILENAME),
+        clip=certified_clip,
         policy_contract=policy_contract,
+        reference_clock=reference_clock,
     )
-    provenance = library.read_provenance(robot, clip_id, root=root)
-    provenance["tier"] = "D"
-    provenance["content_sha256"] = clip_sha256
-    provenance["tierD"] = {
-        "feasible": True,
-        "tracked_at": "2026-07-09T01:00:00Z",
-        "iterations": 5,
-        "errors": {
-            "mean_joint_err_rad": 0.01,
-            "max_joint_err_rad": 0.02,
-            "root_z_rmse_m": 0.01,
+    reward_sha = "a" * 64
+    checkpoint_sha = "b" * 64
+    policy_contract_sha = execution_contract["donor"][
+        "policy_contract_sha256"
+    ]
+    train_environment = environment_artifacts_for_phase(
+        execution_contract["environment_artifacts"], "train",
+    )
+    execution_contract = bind_tierd_runtime_artifacts(
+        execution_contract,
+        requested_reward_module_sha256=reward_sha,
+        train_receipts=[{
+            "iteration": 1,
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "train",
+            "reward_module_sha256": reward_sha,
+            "requested_max_iterations": 2000,
+            "requested_seed": 0,
+            "requested_num_envs": 64,
+            "seed_application": {
+                "schema": "reward-sculptor-seed-application-v1",
+                "applied_seed": 0,
+                "python_random": True,
+                "numpy_global": True,
+                "torch_global": True,
+                "env_cfg": True,
+                "rl_cfg": True,
+            },
+            "environment_artifacts": train_environment,
+            "env_spec_application": {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "train",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            },
+            "input_checkpoint_requested_sha256": None,
+            "input_checkpoint_loaded_sha256": None,
+            "input_checkpoint_load_completed": False,
+            "output_checkpoint_sha256": checkpoint_sha,
+            "output_policy_contract_sha256": policy_contract_sha,
+            "output_policy_contract_sidecar_sha256": "e" * 64,
+        }],
+        final_checkpoint_sha256=checkpoint_sha,
+        requested_steps_per_iteration=2000,
+        requested_seed=0,
+        requested_num_envs=64,
+    )
+    dt = float(execution_contract["execution_boundary"]["timing"][
+        "control_dt_s"
+    ])
+    duration_s = float(execution_contract["reference"][
+        "playback_duration_s"
+    ])
+    n_steps = int(np.floor(duration_s / dt + 1e-12))
+    sample_times = (np.arange(n_steps, dtype=np.float64) + 1.0) * dt
+    phases = np.minimum(
+        sample_times / duration_s, np.nextafter(1.0, 0.0),
+    )
+    indices = np.floor(
+        phases * execution_contract["reference"]["phase_target_count"]
+    ).astype(int)
+    joint_targets = np.round(downsample_phase_targets(
+        np.asarray(certified_clip["joint_pos"], dtype=np.float64), n=32,
+    ), 5)
+    root_targets = np.round(downsample_phase_targets(
+        np.asarray(certified_clip["root_pos_z"], dtype=np.float64), n=32,
+    ), 5)
+    rollout_joint_pos = joint_targets[indices]
+    rollout_root_pos = np.zeros((n_steps, 1, 3), dtype=np.float32)
+    rollout_root_pos[:, 0, 2] = root_targets[indices]
+    rollout_path = clip_dir / "tierD_rollout_candidate.npz"
+    rollout_requirements = execution_contract["runtime_artifacts"][
+        "rollout_requirements"
+    ]
+    metadata = {
+        "schema": "reward-sculptor-trajectory-v1",
+        "layout": ["time", "environment", "feature"],
+        "ordered_joint_names": ordered_joints,
+        "control_dt_s": dt,
+        "root_link_pos_w_frame": "world",
+        "first_episode_lane": 0,
+        "valid_mask": {
+            "key": "first_episode_valid_mask",
+            "semantics": "true_prefix_before_first_done",
+            "invalid_state": "frozen_last_valid_sample",
+            "state_samples": "post_step_after_valid_transition",
         },
-        "rollout_path": str(rollout_path.resolve()),
-        "rollout_sha256": rollout_sha256,
-        "clip_content_sha256": clip_sha256,
-        "execution_contract": execution_contract,
-        "execution_contract_sha256": execution_contract["contract_sha256"],
-        "execution_boundary_sha256": execution_contract[
-            "execution_boundary_sha256"
-        ],
+        "runtime_artifacts": {
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "rollout",
+            "reward_module_sha256": reward_sha,
+            "checkpoint_sha256": checkpoint_sha,
+            "checkpoint_load_completed": True,
+            "environment_artifacts": rollout_requirements[
+                "environment_artifacts"
+            ],
+            "requested_seed": 0,
+            "applied_seed": 0,
+            "seed_application": {
+                "schema": "reward-sculptor-seed-application-v1",
+                "applied_seed": 0,
+                "python_random": True,
+                "numpy_global": True,
+                "torch_global": True,
+                "env_cfg": True,
+                "rl_cfg": True,
+            },
+            "requested_n_episodes": 1,
+            "configured_n_episodes": 1,
+            "requested_max_episode_steps": rollout_requirements[
+                "requested_max_episode_steps"
+            ],
+            "configured_max_episode_steps": rollout_requirements[
+                "requested_max_episode_steps"
+            ],
+            "requested_task_id": rollout_requirements["requested_task_id"],
+            "configured_task_id": rollout_requirements["requested_task_id"],
+            "configured_num_envs": 1,
+            "completed_first_episodes": 0,
+            "env_spec_application": {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "rollout",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            },
+            "eval_reset_application": {
+                "schema": "reward-sculptor-eval-reset-application-v1",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            },
+        },
     }
-    library.write_provenance(
-        robot, clip_id, provenance, root=root,
+    np.savez_compressed(
+        rollout_path,
+        joint_pos=rollout_joint_pos[:, None, :].astype(np.float32),
+        root_link_pos_w=rollout_root_pos,
+        first_episode_valid_mask=np.ones((n_steps, 1), dtype=bool),
+        trajectory_contract_json=np.asarray(json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"),
+        )),
     )
-    library.rebuild_index(root=root)
+    rollout_sha256 = hashlib.sha256(rollout_path.read_bytes()).hexdigest()
+    retained_rollout_path = clip_dir / f"tierD_rollout_{rollout_sha256}.npz"
+    rollout_path.replace(retained_rollout_path)
+    rollout_path = retained_rollout_path
+    errors = _score_tierd_rollout_artifact(
+        rollout_path,
+        clip=certified_clip,
+        execution_contract=execution_contract,
+    )
+    assert errors.feasible
+    update_provenance_tier_d(
+        robot=robot,
+        clip_id=clip_id,
+        errors=errors,
+        iterations=1,
+        rollout_path=rollout_path,
+        execution_contract=execution_contract,
+        root=root,
+    )
 
 
 @pytest.fixture
@@ -366,6 +538,49 @@ def test_search_t1_clip_found_only_under_t1_robot(
     assert matches[0]["clip_id"] == "fallandgetup1_subject1_t1"
 
 
+def test_list_and_browse_downgrade_unverified_legacy_tier_d(
+    client: TestClient,
+    refs_root: Path,
+) -> None:
+    from sculptor.refs import library
+
+    _seed_library(refs_root)
+    clip_id = "fallandgetup1_subject1"
+    provenance_path = (
+        library.clip_dir("g1", clip_id, root=refs_root)
+        / library.PROVENANCE_FILENAME
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["schema"] = 1
+    provenance["tier"] = "D"
+    provenance_path.write_text(
+        json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8",
+    )
+    library.rebuild_index(root=refs_root)
+
+    listed = client.get("/references", params={"robot": "g1", "k": 100})
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if item["clip_id"] == clip_id)
+    assert row["tier"] == "K"
+    assert row["claimed_tier"] == "D"
+
+    browsed = client.get(
+        "/references/browse", params={"robot": "g1", "limit": 100},
+    )
+    assert browsed.status_code == 200, browsed.text
+    body = browsed.json()
+    row = next(item for item in body["rows"] if item["clip_id"] == clip_id)
+    assert row["tier"] == "K"
+    assert body["facets"]["tiers"].get("D", 0) == 0
+
+    filtered = client.get(
+        "/references/browse",
+        params={"robot": "g1", "tier": "D", "limit": 100},
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["total"] == 0
+
+
 # ── GET /references/{clip_id} ────────────────────────────────────────
 def test_get_reference_detail(client: TestClient, refs_root: Path) -> None:
     _seed_library(refs_root)
@@ -377,7 +592,38 @@ def test_get_reference_detail(client: TestClient, refs_root: Path) -> None:
     assert body["provenance"]["license"] == "CC BY-NC-ND 4.0"
     assert body["dynamics_admission"]["admitted"] is False
     assert body["dynamics_admission"]["certificate_digest"] is None
+    assert body["dynamics_admission"]["certification_scope"] is None
+    assert body["artifact_identity"]["verified"] is True
+    assert len(body["artifact_identity"]["clip_sha256"]) == 64
+    assert body["artifact_identity"]["source_content_sha256"] == "0" * 64
+    assert (
+        body["dynamics_admission"]["clip_sha256"]
+        == body["artifact_identity"]["clip_sha256"]
+    )
+    assert body["dynamics_admission"]["source_content_sha256"] == "0" * 64
     assert "tierD" in body["dynamics_admission"]["reason"]
+
+
+def test_get_reference_detail_fails_closed_on_tier_k_clip_hash_drift(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _seed_library(refs_root)
+    clip_path = (
+        refs_root / "g1" / "fallandgetup1_subject1" / "clip.npz"
+    )
+    clip_path.write_bytes(clip_path.read_bytes() + b"tampered")
+
+    response = client.get(
+        "/references/fallandgetup1_subject1", params={"robot": "g1"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["artifact_identity"]["verified"] is False
+    assert body["artifact_identity"]["clip_sha256"] is None
+    assert body["artifact_identity"]["source_content_sha256"] == "0" * 64
+    assert body["dynamics_admission"]["admitted"] is False
+    assert body["dynamics_admission"]["clip_sha256"] is None
+    assert "does not match" in body["dynamics_admission"]["reason"]
 
 
 def test_reference_artifact_routes_require_robot_identity(
@@ -390,13 +636,28 @@ def test_reference_artifact_routes_require_robot_identity(
         assert response.json()["detail"][0]["loc"] == ["query", "robot"]
 
 
-def test_get_reference_detail_exposes_reverified_dynamics_receipt(
-    client: TestClient, refs_root: Path, monkeypatch,
-) -> None:
-    from sculptor.refs.track import TierDCertificate
+def _detail_tierd_certificate(
+    refs_root: Path,
+    clip_sha256: str,
+    *,
+    execution_contract_sha256: str = "4" * 64,
+):
+    from sculptor.refs.track import (
+        TIER_D_CERTIFICATION_SCOPE,
+        TierDCertificate,
+    )
+    from sculptor.policy_contract import contract_fingerprint
+    from sculptor.reference_clock import build_reference_clock
 
-    _seed_library(refs_root)
-    certificate = TierDCertificate(
+    clock = build_reference_clock(
+        clip_id="fallandgetup1_subject1",
+        robot="g1",
+        target_sha256="6" * 64,
+        phase_mode="hold",
+        phase_duration_s=2.0,
+        n_phase_targets=8,
+    )
+    return TierDCertificate(
         robot="g1",
         clip_id="fallandgetup1_subject1",
         tracked_at="2026-08-17T00:00:00Z",
@@ -404,13 +665,38 @@ def test_get_reference_detail_exposes_reverified_dynamics_receipt(
         mean_joint_err_rad=0.1,
         max_joint_err_rad=0.3,
         root_z_rmse_m=0.02,
-        rollout_path=refs_root / "g1" / "fallandgetup1_subject1" / "tierD_rollout.npz",
+        common_joint_names=("hip",),
+        static_baseline_err_rad=0.2,
+        static_baseline_ratio=0.5,
+        rollout_path=(
+            refs_root / "g1" / "fallandgetup1_subject1" / "tierD_rollout.npz"
+        ),
         rollout_sha256="1" * 64,
-        clip_content_sha256="2" * 64,
-        execution_contract={"schema": "test-only"},
-        execution_contract_sha256="4" * 64,
+        clip_content_sha256=clip_sha256,
+        certification_scope=TIER_D_CERTIFICATION_SCOPE,
+        execution_contract={"reference": {"clock_contract": clock}},
+        execution_contract_sha256=execution_contract_sha256,
         execution_boundary_sha256="5" * 64,
         certificate_sha256="3" * 64,
+    ), contract_fingerprint(clock)
+
+
+def test_get_reference_detail_exposes_reverified_tracking_receipt_and_scope(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    from sculptor.refs.track import TIER_D_CERTIFICATION_SCOPE
+
+    _seed_library(refs_root)
+    clip_sha256 = hashlib.sha256(
+        (
+            refs_root
+            / "g1"
+            / "fallandgetup1_subject1"
+            / "clip.npz"
+        ).read_bytes()
+    ).hexdigest()
+    certificate, reference_clock_sha256 = _detail_tierd_certificate(
+        refs_root, clip_sha256,
     )
     monkeypatch.setattr(
         "sculptor.refs.track.verify_tierd_certificate",
@@ -424,9 +710,100 @@ def test_get_reference_detail_exposes_reverified_dynamics_receipt(
     admission = response.json()["dynamics_admission"]
     assert admission["admitted"] is True
     assert admission["tier"] == "D"
-    assert admission["clip_sha256"] == "2" * 64
+    assert admission["clip_sha256"] == clip_sha256
+    assert admission["source_content_sha256"] == "0" * 64
+    assert admission["artifact_hash_verified"] is True
     assert admission["rollout_sha256"] == "1" * 64
+    assert admission["execution_contract_sha256"] == "4" * 64
+    assert admission["execution_boundary_sha256"] == "5" * 64
+    assert admission["reference_clock_sha256"] == reference_clock_sha256
     assert len(admission["certificate_digest"]) == 64
+    assert admission["certification_scope"] == TIER_D_CERTIFICATION_SCOPE
+    assert "general_dynamics_feasibility" in (
+        admission["certification_scope"]["not_certified"]
+    )
+
+
+def test_reference_detail_rejects_malformed_execution_identity(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    _seed_library(refs_root)
+    clip_sha256 = hashlib.sha256(
+        (
+            refs_root
+            / "g1"
+            / "fallandgetup1_subject1"
+            / "clip.npz"
+        ).read_bytes()
+    ).hexdigest()
+    certificate, _clock_sha256 = _detail_tierd_certificate(
+        refs_root,
+        clip_sha256,
+        execution_contract_sha256="malformed",
+    )
+    monkeypatch.setattr(
+        "sculptor.refs.track.verify_tierd_certificate",
+        lambda robot, clip_id: (certificate, None),
+    )
+
+    response = client.get(
+        "/references/fallandgetup1_subject1", params={"robot": "g1"}
+    )
+
+    assert response.status_code == 200, response.text
+    admission = response.json()["dynamics_admission"]
+    assert admission["admitted"] is False
+    assert admission["execution_contract_sha256"] is None
+    assert admission["execution_boundary_sha256"] is None
+    assert admission["reference_clock_sha256"] is None
+    assert "exact execution receipt" in admission["reason"]
+
+
+def test_reference_detail_rejects_tier_d_receipt_after_clip_hash_drift(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    from sculptor.refs.track import (
+        TIER_D_CERTIFICATION_SCOPE,
+        TierDCertificate,
+    )
+
+    _seed_library(refs_root)
+    clip_path = (
+        refs_root / "g1" / "fallandgetup1_subject1" / "clip.npz"
+    )
+    certified_sha = hashlib.sha256(clip_path.read_bytes()).hexdigest()
+    certificate = TierDCertificate(
+        robot="g1",
+        clip_id="fallandgetup1_subject1",
+        tracked_at="2026-08-17T00:00:00Z",
+        iterations=500,
+        mean_joint_err_rad=0.1,
+        max_joint_err_rad=0.3,
+        root_z_rmse_m=0.02,
+        common_joint_names=("hip",),
+        static_baseline_err_rad=0.2,
+        static_baseline_ratio=0.5,
+        rollout_path=refs_root / "g1" / "fallandgetup1_subject1" / "tierD_rollout.npz",
+        rollout_sha256="1" * 64,
+        clip_content_sha256=certified_sha,
+        certification_scope=TIER_D_CERTIFICATION_SCOPE,
+        execution_contract={"schema": "test-only"},
+        certificate_sha256="3" * 64,
+    )
+    monkeypatch.setattr(
+        "sculptor.refs.track.verify_tierd_certificate",
+        lambda robot, clip_id: (certificate, None),
+    )
+    clip_path.write_bytes(clip_path.read_bytes() + b"tampered")
+
+    response = client.get(
+        "/references/fallandgetup1_subject1", params={"robot": "g1"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["artifact_identity"]["verified"] is False
+    assert body["dynamics_admission"]["admitted"] is False
+    assert body["dynamics_admission"]["certificate_digest"] is None
 
 
 def test_get_reference_detail_404_unknown_clip(
@@ -1334,21 +1711,9 @@ def test_reference_modes_are_derived_from_the_clips_own_provenance(
     # Capability disclosure is part of the API contract. A phase-window
     # scaffold must never be presented as the paper's closed-loop oracle or
     # latent-mode-conditioned policy merely because both use the word mode.
-    assert body["capability"] == {
-        "kind": "phase_window_reference_scaffold",
-        "paper_alignment": "ogmp_inspired",
-        "dispatch_authority": "episode_time_window",
-        "reference_generator": "fixed_composed_clip",
-        "runtime_transition_guards": False,
-        "policy_mode_conditioning": False,
-        "rho_bounded_exploration": False,
-        "closed_loop_receding_horizon_oracle": False,
-        "summary": (
-            "Fixed composite-reference windows gate phase-specific reward "
-            "terms. Transition guards are inspectable metadata; they do not "
-            "currently drive the policy or runtime handover."
-        ),
-    }
+    from sculptor.kg.capabilities import mode_api_capability_summary
+
+    assert body["capability"] == mode_api_capability_summary()
     assert [m["name"] for m in body["modes"]] == ["approach", "launch", "strike"]
     assert body["modes"][0]["reward_terms"] == []
     assert body["modes"][0]["success_predicate"] is None
@@ -2100,7 +2465,9 @@ def test_a_scaffold_on_a_world_project_carries_both_fixes(
     assert f"TRACKING_W = {WORLD_TRACKING_WEIGHT!r}" in src
     assert spec["episode_horizon_s"] == 20.0
     assert spec["clip_time_scale"] == 1.0
-    assert spec["terminal_hold_s"] == pytest.approx(18.0)
+    # A sampled clip's wall-clock span is (N - 1) / fps: 240 samples at
+    # 120 Hz span 1.991666… s, leaving the remainder as terminal hold.
+    assert spec["terminal_hold_s"] == pytest.approx(20.0 - (239.0 / 120.0))
     assert spec["schedule_policy"] == (
         "certified_clip_cadence_then_terminal_hold"
     )
@@ -2109,7 +2476,7 @@ def test_a_scaffold_on_a_world_project_carries_both_fixes(
     assert len(spec["mode_binding"]["clip_sha256"]) == 64
     assert len(spec["mode_binding"]["graph_sha256"]) == 64
     assert len(spec["mode_binding"]["execution_manifest_digest"]) == 64
-    assert "REFERENCE_DURATION_S = 2.0" in src
+    assert "REFERENCE_DURATION_S = 1.9916666666666667" in src
 
 
 def test_promotion_records_which_file_it_came_from(

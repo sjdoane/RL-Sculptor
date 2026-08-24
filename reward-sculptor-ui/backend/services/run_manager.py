@@ -87,6 +87,7 @@ def _verify_starting_skill_load_event(
     expected_sha256: str,
     initialization_mode: str,
     require_unadapted: bool = False,
+    expected_policy_contract_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return an exact runtime load receipt or reject contradictory evidence."""
     if event.get("type") != "warm_start_loaded":
@@ -147,15 +148,67 @@ def _verify_starting_skill_load_event(
             )
     else:
         derived_from = event.get("derived_from")
+        observed_migration = event.get("admitted_policy_contract_migration")
         if (
             not isinstance(derived_from, dict)
             or derived_from.get("source") != str(source)
             or derived_from.get("source_sha256") != expected_sha256
-            or event.get("policy_contract_migration")
-            != "zero_initialized_event_phase_observation"
         ):
             raise ValueError(
                 "adapted warm start lacks exact source and migration lineage"
+            )
+        if not isinstance(observed_migration, dict):
+            raise ValueError(
+                "adapted warm start has no structural migration receipt"
+            )
+        observed_migration_type = observed_migration.get("type")
+        if (
+            observed_migration_type
+            not in {
+                "zero_initialized_event_phase_observation",
+                "zero_initialized_reference_clock_observation",
+                "zero_initialized_observation_extensions",
+            }
+            or observed_migration.get("optimizer_resume") is not False
+            or event.get("policy_contract_migration")
+            != observed_migration_type
+        ):
+            raise ValueError(
+                "adapted warm start has an unsupported policy migration"
+            )
+        expected_migration = (
+            expected_policy_contract_receipt.get("compatibility")
+            if isinstance(expected_policy_contract_receipt, dict)
+            else None
+        )
+        if not isinstance(expected_migration, dict):
+            raise ValueError(
+                "adapted warm start has no prevalidated migration authority"
+            )
+        if observed_migration != expected_migration:
+            raise ValueError(
+                "loaded policy migration differs from the admitted contract"
+            )
+    if isinstance(expected_policy_contract_receipt, dict):
+        expected_source = expected_policy_contract_receipt.get("source")
+        expected_target = expected_policy_contract_receipt.get("target")
+        expected_compatibility = expected_policy_contract_receipt.get(
+            "compatibility"
+        )
+        if (
+            not isinstance(expected_source, dict)
+            or not isinstance(expected_target, dict)
+            or not isinstance(expected_compatibility, dict)
+            or event.get("source_policy_contract_sha256")
+            != expected_source.get("contract_sha256")
+            or event.get("effective_policy_contract_sha256")
+            != expected_target.get("contract_sha256")
+            or event.get("admitted_policy_contract_migration")
+            != expected_compatibility
+        ):
+            raise ValueError(
+                "warm_start_loaded policy contract differs from the "
+                "prevalidated admission receipt"
             )
     return {
         "source": str(source),
@@ -165,6 +218,56 @@ def _verify_starting_skill_load_event(
         "adapted": adapted,
         "load_cfg_keys": keys,
         "initialization_mode": initialization_mode,
+        "policy_contract_migration": (
+            dict(event["admitted_policy_contract_migration"])
+            if adapted
+            else None
+        ),
+        "effective_policy_contract_sha256": event.get(
+            "effective_policy_contract_sha256"
+        ),
+    }
+
+
+def _build_starting_policy_initialization_event(
+    *,
+    requested: dict[str, Any],
+    resolved: dict[str, Any],
+    observed: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the sole UI authority for an earned policy initialization.
+
+    Paths remain inside the nested receipt so an event transport's top-level
+    ``source``/``origin`` provenance fields cannot overwrite policy identity.
+    Requested intent, backend resolution, and observed runner roles must agree
+    before the UI may render ``Initialized from``.
+    """
+    requested_roles = requested.get("roles")
+    resolved_roles = resolved.get("roles")
+    observed_roles = observed.get("load_cfg_keys")
+    requested_mode = requested.get("initialization_mode")
+    if (
+        not isinstance(requested_roles, list)
+        or not all(isinstance(role, str) for role in requested_roles)
+        or requested_roles != resolved_roles
+        or requested_roles != observed_roles
+        or not isinstance(requested_mode, str)
+        or requested_mode != resolved.get("initialization_mode")
+        or requested_mode != observed.get("initialization_mode")
+        or resolved.get("checkpoint_sha256")
+        != observed.get("source_sha256")
+    ):
+        raise ValueError(
+            "requested, resolved, and observed policy initialization differ"
+        )
+    return {
+        "type": "starting_policy_initialization_verified",
+        "receipt": {
+            "schema": 1,
+            "requested": dict(requested),
+            "resolved": dict(resolved),
+            "observed": {**dict(observed), "roles": list(observed_roles)},
+        },
     }
 
 
@@ -272,6 +375,7 @@ def resolve_starting_skill_target(
     project_dir: Path,
     *,
     require_policy_contract: bool,
+    reference_clock: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Resolve the current project interface and its immutable receipt.
 
@@ -309,7 +413,13 @@ def resolve_starting_skill_target(
             contract_fingerprint,
         )
 
-        policy_contract = build_project_policy_contract(project_dir)
+        contract_kwargs: dict[str, Any] = {}
+        if reference_clock is not None:
+            contract_kwargs["reference_clock"] = reference_clock
+        policy_contract = build_project_policy_contract(
+            project_dir,
+            **contract_kwargs,
+        )
         policy_contract_sha256 = contract_fingerprint(policy_contract)
 
     target = {
@@ -845,6 +955,7 @@ def run_sculpt_job(
     reference_clip_id = run_params.get("reference_clip_id")
     reference_robot = run_params.get("reference_robot")
     reference_feasibility = run_params.get("reference_feasibility")
+    expected_reference_clock = run_params.get("reference_clock")
     expected_active_reference_authority = run_params.get(
         "active_reference_authority"
     )
@@ -900,6 +1011,56 @@ def run_sculpt_job(
             raise RuntimeError(
                 "live training has no objective fitness and no explicit "
                 "blind-ablation acknowledgement"
+            )
+        runtime_reference_clock: dict[str, Any] | None = None
+        if bool(reference_clip_id) != bool(reference_robot):
+            raise RuntimeError(
+                "reference clip and robot identity diverged after admission"
+            )
+        if reference_clip_id is not None and reference_robot is not None:
+            from sculptor.reference_authority import (
+                resolve_active_reference_authority,
+            )
+            from sculptor.reference_run import resolve_reference_clock_for_run
+
+            current_reference_authority = resolve_active_reference_authority(
+                project_dir / "rewards"
+            )
+            current_reference_receipt = (
+                current_reference_authority.to_dict()
+                if current_reference_authority is not None
+                else None
+            )
+            if current_reference_receipt != expected_active_reference_authority:
+                job.emit({
+                    "type": "active_reference_authority_failed",
+                    "source": "worker_launch",
+                    "expected": expected_active_reference_authority,
+                    "actual": current_reference_receipt,
+                })
+                raise RuntimeError(
+                    "active reference reward changed after route admission; "
+                    "the sculpt subprocess was not started"
+                )
+            runtime_reference_clock = await asyncio.to_thread(
+                resolve_reference_clock_for_run,
+                project_dir,
+                clip_id=str(reference_clip_id),
+                robot=str(reference_robot),
+            )
+            if runtime_reference_clock != expected_reference_clock:
+                raise RuntimeError(
+                    "reference clock changed after route admission; the "
+                    "sculpt subprocess was not started"
+                )
+            job.emit({
+                "type": "reference_clock_verified",
+                "source": "worker_launch",
+                "reference_clock": runtime_reference_clock,
+            })
+        elif expected_reference_clock is not None:
+            raise RuntimeError(
+                "run carries a reference clock without an exact reference pair"
             )
         warm_start_checkpoint: Optional[Path] = None
         warm_start_sha256: Optional[str] = None
@@ -1022,14 +1183,19 @@ def run_sculpt_job(
                         "selection_path"
                     ]
                 )
+                recovery_contract_kwargs: dict[str, Any] = {
+                    "recovery_receipt": verified_recovery_snapshot_receipt,
+                    "target_selection_path": target_selection_path,
+                }
+                if runtime_reference_clock is not None:
+                    recovery_contract_kwargs["reference_clock"] = (
+                        runtime_reference_clock
+                    )
                 verified_warm_start_policy_contract_receipt = (
                     await asyncio.to_thread(
                         build_recovery_snapshot_warm_start_contract_receipt,
                         project_dir,
-                        recovery_receipt=(
-                            verified_recovery_snapshot_receipt
-                        ),
-                        target_selection_path=target_selection_path,
+                        **recovery_contract_kwargs,
                     )
                 )
             except Exception as exc:
@@ -1124,12 +1290,19 @@ def run_sculpt_job(
                     target_selection_path = Path(
                         target_payload["selection_path"]
                     )
+                    iteration_contract_kwargs: dict[str, Any] = {
+                        "target_selection_path": target_selection_path,
+                    }
+                    if runtime_reference_clock is not None:
+                        iteration_contract_kwargs["reference_clock"] = (
+                            runtime_reference_clock
+                        )
                     verified_warm_start_policy_contract_receipt = (
                         await asyncio.to_thread(
                             build_iteration_warm_start_contract_receipt,
                             project_dir,
                             int(warm_start_iteration),
-                            target_selection_path=target_selection_path,
+                            **iteration_contract_kwargs,
                         )
                     )
                 except Exception as exc:
@@ -1293,13 +1466,18 @@ def run_sculpt_job(
             try:
                 from sculptor.skill_bundle import ImportTarget, compatibility_for
 
+                target_kwargs: dict[str, Any] = {
+                    "require_policy_contract": (
+                        initialization_mode != "reference_only"
+                    ),
+                }
+                if runtime_reference_clock is not None:
+                    target_kwargs["reference_clock"] = runtime_reference_clock
                 current_target_payload, current_target_receipt = (
                     await asyncio.to_thread(
                         resolve_starting_skill_target,
                         project_dir,
-                        require_policy_contract=(
-                            initialization_mode != "reference_only"
-                        ),
+                        **target_kwargs,
                     )
                 )
             except Exception as exc:
@@ -1625,6 +1803,7 @@ def run_sculpt_job(
         # subprocess creation.  The route stores a digest pin from
         # verify_tierd_certificate; this closes the TOCTOU window if the clip,
         # rollout, or provenance changes while a job waits in the queue.
+        launch_tierd_receipt: dict[str, Any] | None = None
         if (
             reference_clip_id is not None
             and reference_robot is not None
@@ -1729,13 +1908,12 @@ def run_sculpt_job(
                         "reference feasibility artifacts changed after "
                         "admission; the sculpt subprocess was not started"
                     )
-                job.emit({
-                    "type": "reference_feasibility_admitted",
-                    "source": "ui_launch",
+                launch_tierd_receipt = {
                     "status": "tierd_verified",
                     "tier": "D",
                     "kinematic_only": False,
                     "training_authorized": True,
+                    "reference_tracking_certificate_admitted": True,
                     "reference_robot": str(reference_robot),
                     "target_robot": current_target_robot,
                     "reference_clip_id": str(reference_clip_id),
@@ -1748,6 +1926,12 @@ def run_sculpt_job(
                     "execution_boundary_sha256": (
                         certificate.execution_boundary_sha256
                     ),
+                    "certification_scope": certificate.certification_scope,
+                }
+                job.emit({
+                    "type": "reference_feasibility_admitted",
+                    "source": "ui_launch",
+                    **launch_tierd_receipt,
                 })
             else:
                 if (
@@ -1803,6 +1987,7 @@ def run_sculpt_job(
                     "reference_clip_id": str(reference_clip_id),
                     "clip_sha256": current_clip_sha,
                     "rollout_sha256": None,
+                    "certification_scope": None,
                     "reason": certificate_reason,
                 })
                 # Tier K proves only a kinematic/reference contract.  Returning
@@ -2272,8 +2457,6 @@ def run_sculpt_job(
             raw_reference_sha = reference_feasibility.get("clip_sha256")
             if isinstance(raw_reference_sha, str):
                 reference_sha256 = raw_reference_sha
-        if reference_sha256 is None and starting_skill_record is not None:
-            reference_sha256 = starting_skill_record.reference_sha256
         requested_lineage_mode = (
             str(initialization_mode)
             if (
@@ -2283,6 +2466,57 @@ def run_sculpt_job(
             )
             else "auto_resume"
         )
+        launch_output_target_payload: dict[str, Any] | None = None
+        launch_output_target_receipt: dict[str, Any] | None = None
+        if launch_tierd_receipt is not None:
+            try:
+                target_kwargs: dict[str, Any] = {
+                    "require_policy_contract": True,
+                }
+                if runtime_reference_clock is not None:
+                    target_kwargs["reference_clock"] = runtime_reference_clock
+                (
+                    launch_output_target_payload,
+                    launch_output_target_receipt,
+                ) = await asyncio.to_thread(
+                    resolve_starting_skill_target,
+                    project_dir,
+                    **target_kwargs,
+                )
+                target_contract = launch_output_target_payload.get(
+                    "compatibility_contract"
+                )
+                target_robot = launch_output_target_payload.get("robot_slug")
+                target_contract_sha = launch_output_target_receipt.get(
+                    "policy_contract_sha256"
+                )
+                if (
+                    not isinstance(target_contract, dict)
+                    or target_robot != reference_robot
+                    or not isinstance(target_contract_sha, str)
+                ):
+                    raise ValueError(
+                        "resolved target lacks the selected robot or exact "
+                        "policy contract"
+                    )
+            except Exception as exc:
+                job.emit({
+                    "type": "output_policy_target_resolution_failed",
+                    "source": "worker_launch",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not independently resolve the output policy target; "
+                    "the sculpt subprocess was not started"
+                ) from exc
+            job.params["output_policy_target_receipt"] = (
+                launch_output_target_receipt
+            )
+            job.emit({
+                "type": "output_policy_target_resolved",
+                "source": "worker_launch",
+                **launch_output_target_receipt,
+            })
         lineage = RunLineageSession(
             project_dir=project_dir,
             project_slug=str(job.project_slug or project_dir.name),
@@ -2296,7 +2530,32 @@ def run_sculpt_job(
                 str(reference_clip_id) if reference_clip_id is not None else None
             ),
             reference_sha256=reference_sha256,
+            reference_feasibility_receipt=launch_tierd_receipt,
             starting_skill_record=starting_skill_record,
+            warm_start_policy_contract_receipt=(
+                verified_warm_start_policy_contract_receipt
+            ),
+            expected_iterations=iterations,
+            allowed_early_stop_sources=(
+                ("fitness", "goodhart_onset")
+                if (
+                    resolved_fitness_metric is not None
+                    and final_fitness_mode == "steer"
+                )
+                else ()
+            ),
+            expected_output_robot=(
+                str(launch_output_target_payload["robot_slug"])
+                if launch_output_target_payload is not None else None
+            ),
+            expected_output_policy_contract=(
+                launch_output_target_payload["compatibility_contract"]
+                if launch_output_target_payload is not None else None
+            ),
+            expected_output_policy_contract_sha256=(
+                str(launch_output_target_receipt["policy_contract_sha256"])
+                if launch_output_target_receipt is not None else None
+            ),
         )
 
         # The route admits and pins the promoted world, but jobs can wait in a
@@ -2347,16 +2606,23 @@ def run_sculpt_job(
                 "authored world targets another robot; re-author it for the "
                 "project robot before launching"
             )
-        actual_authored_world_receipt = (
-            None
-            if current_world is None
-            else {
-                "selection_version": current_world.get("selection_version"),
-                "tuple_hash": current_world.get("tuple_hash"),
-                "world_robot": current_world.get("world_robot"),
-                "project_robot": current_world.get("project_robot"),
-            }
-        )
+        try:
+            actual_authored_world_receipt = await asyncio.to_thread(
+                world_store.immutable_training_receipt,
+                project_dir,
+                current_world,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail before process/GPU
+            job.emit({
+                "type": "authored_world_revalidation_failed",
+                "source": "worker_launch",
+                "reason": "immutable_pin_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            raise RuntimeError(
+                "could not pin the exact authored world selection; the "
+                "sculpt subprocess was not started"
+            ) from exc
         if (
             authored_world_receipt_contract_present
             and actual_authored_world_receipt != expected_authored_world_receipt
@@ -2381,6 +2647,29 @@ def run_sculpt_job(
                 "source": "worker_launch",
                 **actual_authored_world_receipt,
             })
+            expected_core_world_pin = {
+                key: actual_authored_world_receipt[key]
+                for key in (
+                    "selection_version",
+                    "selection_path",
+                    "selection_sha256",
+                    "tuple_hash",
+                )
+            }
+            cmd += [
+                "--world-selection",
+                str(expected_core_world_pin["selection_path"]),
+                "--expected-world-selection-sha256",
+                str(expected_core_world_pin["selection_sha256"]),
+                "--expected-world-tuple-hash",
+                str(expected_core_world_pin["tuple_hash"]),
+            ]
+            job.params["authored_world_execution_receipt"] = {
+                "requested": expected_core_world_pin,
+                "observed": None,
+            }
+        else:
+            expected_core_world_pin = None
 
         creationflags = 0
         if sys.platform == "win32":
@@ -2405,23 +2694,150 @@ def run_sculpt_job(
             })
 
         starting_skill_load_required = bool(
-            (
-                (
-                    starting_skill_record is not None
-                    and starting_skill_record.policy_roles
-                )
-                or verified_recovery_snapshot_receipt is not None
-            )
+            warm_start_checkpoint is not None
             and initialization_mode != "reference_only"
         )
+        requested_initialization_roles = (
+            ["actor", "critic"]
+            if initialization_mode == "actor_critic"
+            else ["actor"]
+        )
+        if starting_skill_record is not None:
+            initialization_source_kind = "starting_skill"
+            initialization_source_id = starting_skill_record.skill_id
+        elif verified_recovery_snapshot_receipt is not None:
+            initialization_source_kind = "interrupted_snapshot"
+            initialization_source_id = verified_recovery_snapshot_receipt[
+                "snapshot_id"
+            ]
+        elif warm_start_iteration is not None:
+            initialization_source_kind = "project_iteration"
+            initialization_source_id = f"iter_{int(warm_start_iteration)}"
+        else:
+            initialization_source_kind = "none"
+            initialization_source_id = None
+        requested_policy_initialization = {
+            "kind": initialization_source_kind,
+            "id": initialization_source_id,
+            "initialization_mode": str(initialization_mode),
+            "roles": requested_initialization_roles,
+            "manifest_digest": (
+                starting_skill_record.manifest_digest
+                if starting_skill_record is not None
+                else None
+            ),
+            "trust_status": (
+                starting_skill_record.trust_status
+                if starting_skill_record is not None
+                else "verified_local"
+                if warm_start_checkpoint is not None
+                else None
+            ),
+        }
+        resolved_policy_initialization = {
+            "checkpoint": (
+                str(warm_start_checkpoint)
+                if warm_start_checkpoint is not None
+                else None
+            ),
+            "checkpoint_sha256": warm_start_sha256,
+            "initialization_mode": str(initialization_mode),
+            "roles": requested_initialization_roles,
+            "source_policy_contract_sha256": (
+                verified_warm_start_policy_contract_receipt.get("source", {})
+                .get("contract_sha256")
+                if isinstance(
+                    verified_warm_start_policy_contract_receipt, dict
+                )
+                else None
+            ),
+            "target_policy_contract_sha256": (
+                verified_warm_start_policy_contract_receipt.get("target", {})
+                .get("contract_sha256")
+                if isinstance(
+                    verified_warm_start_policy_contract_receipt, dict
+                )
+                else None
+            ),
+            "policy_contract_migration": (
+                verified_warm_start_policy_contract_receipt.get(
+                    "compatibility"
+                )
+                if isinstance(
+                    verified_warm_start_policy_contract_receipt, dict
+                )
+                else None
+            ),
+        }
         verified_starting_skill_load: dict[str, Any] | None = None
         starting_skill_load_error: str | None = None
         local_checkpoint_phase_skip: dict[str, Any] | None = None
+        starting_policy_initialization_emitted = False
+        verified_authored_world_pin: dict[str, Any] | None = None
+        authored_world_pin_error: str | None = None
 
         def _observe_lineage_event(event: dict[str, Any]) -> None:
             nonlocal verified_starting_skill_load
             nonlocal starting_skill_load_error
             nonlocal local_checkpoint_phase_skip
+            nonlocal starting_policy_initialization_emitted
+            nonlocal verified_authored_world_pin
+            nonlocal authored_world_pin_error
+
+            def emit_verified_policy_initialization(
+                observed: dict[str, Any],
+            ) -> None:
+                nonlocal starting_policy_initialization_emitted
+                if starting_policy_initialization_emitted:
+                    return
+                initialization_event = (
+                    _build_starting_policy_initialization_event(
+                        requested=requested_policy_initialization,
+                        resolved=resolved_policy_initialization,
+                        observed=observed,
+                    )
+                )
+                initialization_receipt = initialization_event["receipt"]
+                lineage.record_verified_initialization(
+                    initialization_receipt
+                )
+                job.params["starting_policy_initialization_receipt"] = (
+                    initialization_receipt
+                )
+                job.emit(initialization_event)
+                starting_policy_initialization_emitted = True
+            if event.get("type") == "authored_world_pinned":
+                try:
+                    if expected_core_world_pin is None:
+                        raise ValueError(
+                            "worker pinned an authored world that was not "
+                            "admitted by the launch"
+                        )
+                    requested = event.get("requested_receipt")
+                    observed = event.get("observed_receipt")
+                    if requested != expected_core_world_pin:
+                        raise ValueError(
+                            "worker requested authored-world receipt differs "
+                            "from launch pin"
+                        )
+                    if observed != expected_core_world_pin:
+                        raise ValueError(
+                            "worker observed authored-world receipt differs "
+                            "from launch pin"
+                        )
+                    verified_authored_world_pin = dict(observed)
+                    job.params["authored_world_execution_receipt"] = {
+                        "requested": dict(expected_core_world_pin),
+                        "observed": dict(observed),
+                    }
+                except Exception as exc:  # noqa: BLE001 - reject after drain
+                    authored_world_pin_error = f"{type(exc).__name__}: {exc}"
+                    job.emit({
+                        "type": "authored_world_pin_rejected",
+                        "source": "worker_stdout",
+                        "error": authored_world_pin_error,
+                    })
+                    return
             if (
                 starting_skill_load_required
                 and verified_recovery_snapshot_receipt is not None
@@ -2465,6 +2881,7 @@ def run_sculpt_job(
                         "type": "warm_start_reuse_verified",
                         **receipt,
                     })
+                    emit_verified_policy_initialization(receipt)
                 except Exception as exc:  # noqa: BLE001 - fail after drain
                     starting_skill_load_error = f"{type(exc).__name__}: {exc}"
                     job.emit({
@@ -2487,6 +2904,9 @@ def run_sculpt_job(
                         require_unadapted=(
                             verified_recovery_snapshot_receipt is not None
                         ),
+                        expected_policy_contract_receipt=(
+                            verified_warm_start_policy_contract_receipt
+                        ),
                     )
                     if receipt is None:
                         raise ValueError("worker load event was not recognized")
@@ -2499,6 +2919,7 @@ def run_sculpt_job(
                         )
                     verified_starting_skill_load = receipt
                     job.params["starting_skill_load_receipt"] = receipt
+                    emit_verified_policy_initialization(receipt)
                 except Exception as exc:  # noqa: BLE001 - fail after drain
                     starting_skill_load_error = f"{type(exc).__name__}: {exc}"
                     job.emit({
@@ -2566,16 +2987,32 @@ def run_sculpt_job(
             elif verified_starting_skill_load is None:
                 starting_skill_load_failure = (
                     "worker exited without an exact warm_start_loaded receipt "
-                    "for the selected starting skill"
+                    "for the selected starting policy"
+                )
+        authored_world_pin_failure = None
+        if expected_core_world_pin is not None:
+            if authored_world_pin_error is not None:
+                authored_world_pin_failure = authored_world_pin_error
+            elif verified_authored_world_pin is None:
+                authored_world_pin_failure = (
+                    "worker exited without an exact authored_world_pinned "
+                    "receipt for the selected immutable world"
                 )
 
         # Final summary from disk (canonical: sculpt wrote these).
         metric_history = _read_metric_history(project_dir)
         iterations_run = len(metric_history)
-        if starting_skill_load_failure is None:
+        strict_reference_lineage = launch_tierd_receipt is not None
+        lineage_proof_failure: str | None = None
+        if (
+            starting_skill_load_failure is None
+            and authored_world_pin_failure is None
+        ):
             try:
                 output_policies = lineage.record_outputs()
             except Exception as exc:  # noqa: BLE001 - outcome remains preserved
+                if strict_reference_lineage:
+                    lineage_proof_failure = f"{type(exc).__name__}: {exc}"
                 job.emit({
                     "type": "lineage_record_failed",
                     "phase": "run_outputs",
@@ -2589,21 +3026,75 @@ def run_sculpt_job(
                             policy.sha256 for policy in output_policies
                         ],
                     })
+                if rc == 0 and strict_reference_lineage:
+                    try:
+                        lineage_proof = lineage.finalize_proof()
+                    except Exception as exc:  # noqa: BLE001 - fail closed below
+                        lineage_proof_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        job.emit({
+                            "type": "run_lineage_proof_rejected",
+                            "source": "worker_completion",
+                            "error": lineage_proof_failure,
+                        })
+                    else:
+                        job.params["run_lineage_proof"] = lineage_proof
+                        job.emit({
+                            "type": "run_lineage_proof_verified",
+                            "source": "worker_completion",
+                            "proof": lineage_proof,
+                        })
         else:
             job.emit({
                 "type": "lineage_outputs_quarantined",
                 "reason": "starting_skill_load_unproven",
                 "detail": starting_skill_load_failure,
             })
-        if rc == 0 and starting_skill_load_failure is None:
+        if (
+            rc == 0
+            and starting_skill_load_failure is None
+            and authored_world_pin_failure is None
+            and lineage_proof_failure is None
+        ):
             job.emit({
                 "type": "run_completed",
                 "return_code": rc,
                 "iterations_run": iterations_run,
                 "primary_metric_history": metric_history,
             })
+        elif authored_world_pin_failure is not None:
+            friendly = "selected authored world was not proven pinned"
+            job.status = "errored"
+            job.error = friendly
+            job.params["error_classification"] = {
+                "kind": "authored_world_pin_unproven",
+                "title": friendly,
+                "detail": authored_world_pin_failure,
+                "suggestions": [
+                    "Inspect the worker log and immutable world receipt.",
+                    "Relaunch only after requested and observed receipts match.",
+                ],
+                "problem_type": "/problems/authored-world-pin-unproven",
+                "action": None,
+            }
+            job.emit({
+                "type": "run_errored",
+                "return_code": rc,
+                "iterations_run": iterations_run,
+                "error": friendly,
+                "error_kind": "authored_world_pin_unproven",
+                "error_detail": authored_world_pin_failure,
+                "error_suggestions": job.params["error_classification"][
+                    "suggestions"
+                ],
+                "error_problem_type": (
+                    "/problems/authored-world-pin-unproven"
+                ),
+                "error_action": None,
+            })
         elif starting_skill_load_failure is not None:
-            friendly = "selected starting skill was not proven loaded"
+            friendly = "selected starting policy was not proven loaded"
             job.status = "errored"
             job.error = friendly
             job.params["error_classification"] = {
@@ -2630,6 +3121,35 @@ def run_sculpt_job(
                 "error_problem_type": (
                     "/problems/starting-skill-load-unproven"
                 ),
+                "error_action": None,
+            })
+        elif lineage_proof_failure is not None:
+            friendly = "reference-guided run lineage was not proven complete"
+            job.status = "errored"
+            job.error = friendly
+            job.params["error_classification"] = {
+                "kind": "run_lineage_unproven",
+                "title": friendly,
+                "detail": lineage_proof_failure,
+                "suggestions": [
+                    "Inspect the rejected runtime, initialization, and output receipts.",
+                    "Relaunch only after every iteration has exact world, mode, "
+                    "policy ancestry, and output-contract evidence.",
+                ],
+                "problem_type": "/problems/run-lineage-unproven",
+                "action": None,
+            }
+            job.emit({
+                "type": "run_errored",
+                "return_code": rc,
+                "iterations_run": iterations_run,
+                "error": friendly,
+                "error_kind": "run_lineage_unproven",
+                "error_detail": lineage_proof_failure,
+                "error_suggestions": job.params["error_classification"][
+                    "suggestions"
+                ],
+                "error_problem_type": "/problems/run-lineage-unproven",
                 "error_action": None,
             })
         else:

@@ -188,6 +188,7 @@ def _resolve_authority(
         clip_sha256=clip_sha256,
         context_refs=context_refs,
         graph=graph,
+        reward_source=reward_source,
     )
     if binding_errors:
         raise ModeEvidenceError(
