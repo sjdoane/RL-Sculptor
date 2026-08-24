@@ -1194,7 +1194,7 @@ export function StartingPointPickerDialog({
             selected={draft.kind === "shared_skill"}
             icon="package"
             title="Imported skill"
-            description="Validate a data-only .rskill containing portable weights, motion, and declarative provenance."
+            description="Validate a data-only .rskill containing portable weights, motion, and declarative provenance. Imports register candidates; they do not certify a reference for live training."
             onSelect={chooseKind}
           />
         </div>
@@ -1466,7 +1466,11 @@ export function StartingPointPickerDialog({
                   a bounded <code className="mono">motion/clip.npz</code> with
                   provenance, or both. A bounded controller JSON and source-world
                   manifest can be validated and hashed, but their uploaded bytes are
-                  discarded and never become executable inputs. Export
+                  discarded and never become executable inputs. Importing a motion
+                  stores its exact clip and provenance as a candidate. Before live
+                  training, run a separate <code className="mono">sculpt refs track</code>{" "}
+                  Tier-D certification job; New Run only re-verifies the resulting
+                  evidence and never creates that certificate. Export
                   a policy bundle with <code className="mono">sculpt export --portable --robot {projectRobot ?? "<project-robot>"} --config &lt;project&gt;/config.toml</code>,
                   or a motion-only bundle with <code className="mono">sculpt refs export-skill --robot {projectRobot ?? "<project-robot>"} --clip &lt;clip&gt; --out motion.rskill</code>.
                   The normal <code className="mono">sculpt export</code> ZIP is a

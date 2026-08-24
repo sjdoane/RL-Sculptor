@@ -719,9 +719,10 @@ def export_reference_starting_skill_bundle(
     ``motion/clip.npz``, and ``motion/provenance.json``; controller, world,
     policy, Python, pickle, and raw checkpoint bytes are never included.
 
-    A reference-only import is still a candidate.  Target-project Tier-D
-    certification/admission happens later at run launch and is intentionally
-    not claimed by this transfer artifact.
+    A reference-only import is still a candidate.  The researcher must run a
+    separate target-project Tier-D physics-tracking certification job before
+    live launch.  Launch only re-verifies the resulting exact evidence; it
+    does not create a certificate, and this transfer artifact claims none.
     """
     from sculptor import reference
     from sculptor.refs import library as refs
@@ -837,9 +838,9 @@ def export_reference_starting_skill_bundle(
     clip_size = clip_path.stat().st_size
     source_provenance_sha = reference_source_provenance_sha256(provenance)
     warnings = [
-        "This upload registers a reference candidate only. Training remains "
-        "blocked until the selected target re-verifies an exact Tier-D "
-        "execution contract and evidence chain."
+        "This upload registers a reference candidate only. Run a separate "
+        "target-project Tier-D physics-tracking certification job before live "
+        "launch; launch only re-verifies the resulting exact evidence."
     ]
     manifest: dict[str, Any] = {
         "schema_version": PORTABLE_SKILL_SCHEMA_VERSION,

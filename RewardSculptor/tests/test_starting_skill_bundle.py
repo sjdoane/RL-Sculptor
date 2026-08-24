@@ -1126,12 +1126,16 @@ def test_reference_only_bundle_needs_no_policy_or_source_contract(
     assert imported.receipt["compatible"] is True
     assert imported.receipt["selectable"] is True
     assert imported.receipt["training_authorized"] is False
+    authorization = imported.receipt["authorization"]
+    reference_gates = authorization["mode_gates"]["reference_only"]
+    assert any("separate Tier-D" in gate for gate in reference_gates)
+    assert any("before live launch" in gate for gate in reference_gates)
     assert any(
-        "Tier-D" in gate
-        for gate in imported.receipt["authorization"]["mode_gates"][
-            "reference_only"
-        ]
+        "re-attest" in gate and "at launch" in gate
+        for gate in reference_gates
     )
+    assert "separate Tier-D" in authorization["detail"]
+    assert "launch only re-verifies" in authorization["detail"]
     assert imported.receipt["compatibility"]["allowed_initialization_modes"] == [
         "reference_only"
     ]
@@ -1139,7 +1143,9 @@ def test_reference_only_bundle_needs_no_policy_or_source_contract(
     admission = imported.receipt["components"]["reference"]["admission"]
     assert admission["status"] == "registered_candidate"
     assert admission["training_authorized"] is False
-    assert "Tier-D" in admission["next_gate"]
+    assert "separate target-specific Tier-D" in admission["next_gate"]
+    assert "before live launch" in admission["next_gate"]
+    assert "launch only re-verifies" in admission["next_gate"]
     with pytest.raises(SkillLibraryError, match="no trainable checkpoint"):
         SkillLibrary(tmp_path / "skill-library").checkpoint_path_for(record)
 

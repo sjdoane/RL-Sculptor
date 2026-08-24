@@ -517,6 +517,15 @@ def test_reference_starting_skill_round_trips_through_importer(
     assert exported.manifest["reference"]["provenance_sha256"] == hashlib.sha256(
         provenance_path.read_bytes()
     ).hexdigest()
+    assert any(
+        "separate target-project Tier-D physics-tracking certification job"
+        in warning
+        for warning in exported.warnings
+    )
+    assert any(
+        "launch only re-verifies" in warning
+        for warning in exported.warnings
+    )
     with zipfile.ZipFile(out) as archive:
         assert set(archive.namelist()) == {
             "manifest.json",
@@ -700,7 +709,9 @@ def test_refs_export_skill_cli_uses_exact_identity_and_clear_candidate_copy(
     assert out.is_file()
     assert "pinned g1/parkour_seed" in result.output
     assert "candidate only" in result.output
-    assert "Tier-D admission remains required" in result.output
+    assert "separate sculpt refs track Tier-D certification job" in result.output
+    assert "before live launch" in result.output
+    assert "launch only re-verifies" in result.output
 
 
 def test_deployment_contract_and_inference_script(tmp_path):

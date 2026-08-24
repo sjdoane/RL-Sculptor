@@ -1144,8 +1144,15 @@ def _authorization_for(
     for mode in compatibility["allowed_initialization_modes"]:
         if mode == "reference_only":
             mode_gates[mode] = [
-                "re-attest exact clip and immutable source provenance at launch",
-                "verify a target-specific Tier-D execution contract and boundary",
+                (
+                    "complete a separate Tier-D physics-tracking certification job "
+                    "for the exact clip and target execution boundary before live "
+                    "launch"
+                ),
+                (
+                    "re-attest the exact clip, immutable provenance, rollout, "
+                    "certificate, execution contract, and boundary at launch"
+                ),
                 "observe the worker executing the exact admitted reference",
             ]
         elif mode == "actor_only":
@@ -1178,17 +1185,31 @@ def _authorization_for(
                 "observe the worker restoring every admitted resume component",
             ]
     selectable = not compatibility["reasons"]
+    detail = "No initialization mode currently passes structural admission."
+    if selectable:
+        detail = (
+            "Import/list admission makes this starting point selectable, not "
+            "trainable."
+        )
+        if "reference_only" in compatibility["allowed_initialization_modes"]:
+            detail += (
+                " A reference requires a separate Tier-D physics-tracking "
+                "certification job before live launch; launch only re-verifies "
+                "that existing evidence."
+            )
+        if any(
+            mode != "reference_only"
+            for mode in compatibility["allowed_initialization_modes"]
+        ):
+            detail += (
+                " Policy modes still require their listed launch and worker proofs."
+            )
     return {
         "status": "candidate" if selectable else "blocked",
         "receipt_scope": "structural_selectability_only",
         "training_authorized": False,
         "mode_gates": mode_gates,
-        "detail": (
-            "Import/list admission makes this starting point selectable; the run "
-            "route and worker must still earn the selected mode's proof."
-            if selectable
-            else "No initialization mode currently passes structural admission."
-        ),
+        "detail": detail,
         "policy_present": bool(record.policy_roles),
     }
 
@@ -1309,8 +1330,9 @@ def receipt_for(record: SkillRecord, target: ImportTarget) -> dict[str, Any]:
                         ],
                         "training_authorized": False,
                         "next_gate": (
-                            "target-specific Tier-D physics tracking "
-                            "certificate verified again at run launch"
+                            "run a separate target-specific Tier-D physics-tracking "
+                            "certification job before live launch; launch only "
+                            "re-verifies the resulting exact evidence"
                         ),
                     },
                 }

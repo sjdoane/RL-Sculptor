@@ -91,10 +91,11 @@ const receipt: StartingSkillReceipt = {
         "observe warm_start_loaded with the exact digest and actor role",
       ],
       reference_only: [
-        "verify a target-specific Tier-D execution contract and boundary",
+        "complete a separate Tier-D physics-tracking certification job for the exact clip and target execution boundary before live launch",
+        "re-attest the exact clip, immutable provenance, rollout, certificate, execution contract, and boundary at launch",
       ],
     },
-    detail: "Import/list admission makes this starting point selectable; the worker must still earn runtime proof.",
+    detail: "Import/list admission makes this starting point selectable, not trainable. A reference requires a separate Tier-D physics-tracking certification job before live launch; launch only re-verifies that existing evidence.",
     policy_present: true,
   },
   compatibility: {
@@ -126,7 +127,7 @@ const receipt: StartingSkillReceipt = {
         status: "registered_candidate",
         structural_checks: ["bounded arrays"],
         training_authorized: false,
-        next_gate: "Run Tier-D feasibility verification.",
+        next_gate: "Run a separate target-specific Tier-D physics-tracking certification job before live launch; launch only re-verifies the resulting exact evidence.",
       },
     },
     world: {
@@ -268,7 +269,10 @@ test("makes policy, motion, world, trust, and initialization semantics explicit"
   expect(screen.getByText("Source digest only")).toBeInTheDocument();
   expect(screen.getByText(/content-attested|trusted/i)).toBeInTheDocument();
   expect(screen.getAllByText(/registered candidate/i)).toHaveLength(2);
-  expect(screen.getByText(/Run Tier-D feasibility verification/i)).toBeInTheDocument();
+  expect(screen.getByText(
+    /Run a separate target-specific Tier-D physics-tracking certification job/i,
+  )).toBeInTheDocument();
+  expect(screen.getAllByText(/launch only re-verifies/i).length).toBeGreaterThan(0);
   expect(screen.getByText("obs 48 / actions 29 / actor 512 -> 256")).toBeInTheDocument();
   expect(screen.getByLabelText("Tensor contract verified")).toBeInTheDocument();
   expect(screen.getByRole("radio", { name: /Actor \+ critic/i })).toBeDisabled();
@@ -623,6 +627,13 @@ test("admits validated reference-only data without granting policy loading", asy
   await user.click(screen.getByRole("radio", { name: /Imported skill/i }));
   await user.click(await screen.findByRole("radio", { name: /G1 motion only/i }));
 
+  expect(screen.getByText(
+    /Imports register candidates; they do not certify a reference for live training/i,
+  )).toBeInTheDocument();
+  expect(screen.getAllByText(
+    /separate Tier-D physics-tracking certification job/i,
+  ).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/launch only re-verifies/i).length).toBeGreaterThan(0);
   expect(screen.getByRole("radio", { name: /^Motion only/i })).toBeEnabled();
   expect(screen.getByRole("radio", { name: /^Motion only/i })).toBeChecked();
   expect(screen.getByRole("radio", { name: /Actor only/i })).toBeDisabled();

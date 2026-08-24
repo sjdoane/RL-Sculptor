@@ -820,6 +820,15 @@ def test_reference_only_bundle_imports_without_policy_contract(
         "reference_only"
     ]
     assert receipt["trust"]["status"] == "validated"
+    authorization = receipt["authorization"]
+    assert "separate Tier-D" in authorization["detail"]
+    assert "launch only re-verifies" in authorization["detail"]
+    reference_gates = authorization["mode_gates"]["reference_only"]
+    assert any("separate Tier-D" in gate for gate in reference_gates)
+    assert any("before live launch" in gate for gate in reference_gates)
+    next_gate = receipt["components"]["reference"]["admission"]["next_gate"]
+    assert "separate target-specific Tier-D" in next_gate
+    assert "launch only re-verifies" in next_gate
 
 
 def test_imported_reference_only_tier_k_cannot_authorize_live_training(
