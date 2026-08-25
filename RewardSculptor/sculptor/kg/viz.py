@@ -255,6 +255,17 @@ def _tooltip_for(node: Any, active_reason: str | None = None) -> str:
         _row("scope", node.scope)
         if node.description:
             _row("description", node.description[:400])
+        if node.parameters:
+            rendered = json.dumps(
+                node.parameters,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            _row(
+                "source parameters",
+                rendered[:1200] + ("…" if len(rendered) > 1200 else ""),
+            )
         if node.code_evidence:
             _row("code evidence", "; ".join(node.code_evidence)[:400])
     elif isinstance(node, ImplementationStatus):

@@ -7,7 +7,6 @@ to synthesize Paper nodes directly in the project's SculptorKG store.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from pathlib import Path
 
@@ -199,6 +198,167 @@ def test_kg_graph_html_renders(
     assert len(r.content) > 500  # pyvis output is ~hundreds of KB
     # Sanity: must contain the pyvis network boilerplate.
     assert b"vis" in r.content.lower()
+
+
+def _materialize_sonic_fixture(client: TestClient, slug: str) -> None:
+    """Install the reviewed SONIC receipt in this test's isolated KG."""
+    from backend.services.kg_store import project_kg_db_path
+    from backend.services.project_store import ProjectStore
+    from sculptor.kg.schema import Paper, make_paper_id
+    from sculptor.kg.sonic_capabilities import (
+        SONIC_ARXIV_ID,
+        SONIC_SOURCE_URL,
+        materialize_sonic_capability_map,
+    )
+    from sculptor.kg.store import SculptorKG
+
+    app = client.app  # type: ignore[attr-defined]
+    project_store: ProjectStore = app.state.project_store
+    detail = project_store.get(slug)
+    assert detail is not None
+    project_dir = Path(detail.project_dir)
+    with SculptorKG(project_kg_db_path(project_dir)) as kg:
+        kg.add_node(
+            Paper(
+                id=make_paper_id(SONIC_ARXIV_ID),
+                arxiv_id=SONIC_ARXIV_ID,
+                title=(
+                    "SONIC: Supersizing Motion Tracking for Natural "
+                    "Humanoid Whole-Body Control"
+                ),
+                authors=["Jihoon Luo"],
+                year=2026,
+                abstract="Universal humanoid motion tracking controller.",
+                rationale=(
+                    "Foundation controller candidate for adaptive policy "
+                    "training."
+                ),
+                tags=[
+                    "humanoid",
+                    "motion-tracking",
+                    "foundation-controller",
+                ],
+                source_url=SONIC_SOURCE_URL,
+            )
+        )
+        materialize_sonic_capability_map(kg)
+
+
+def test_sonic_paper_receipt_is_searchable_and_source_pinned(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    slug = _make_project_with_library(client, "SonicReceipt")
+    _materialize_sonic_fixture(client, slug)
+
+    by_role = client.get(
+        f"/projects/{slug}/kg/papers",
+        params={"search": "foundation controller"},
+    )
+    assert by_role.status_code == 200, by_role.text
+    assert [paper["arxiv_id"] for paper in by_role.json()] == ["2511.07820"]
+
+    by_parameter = client.get(
+        f"/projects/{slug}/kg/papers",
+        params={"search": "flattened_body_token_dimensions"},
+    )
+    assert by_parameter.status_code == 200, by_parameter.text
+    assert [paper["arxiv_id"] for paper in by_parameter.json()] == [
+        "2511.07820"
+    ]
+
+    response = client.get(f"/projects/{slug}/kg/papers/2511.07820")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source_url"] == "https://arxiv.org/html/2511.07820v4"
+    assert len(body["capabilities"]) == 9
+    assert {
+        capability["implementation_status"]
+        for capability in body["capabilities"]
+    } == {"unsupported"}
+    assert {
+        capability["source_version"] for capability in body["capabilities"]
+    } == {"v4"}
+
+    from sculptor.kg.sonic_capabilities import sonic_capability_by_key
+
+    by_id = {
+        capability["id"]: capability for capability in body["capabilities"]
+    }
+    controller = by_id[
+        sonic_capability_by_key(
+            "sonic_universal_controller_contract"
+        ).node_id
+    ]
+    assert controller["parameters"]["controlled_dof"] == 29
+    assert controller["parameters"]["control_rate_hz"] == 50
+    fsq = by_id[
+        sonic_capability_by_key(
+            "sonic_fsq_interface_and_training_loss"
+        ).node_id
+    ]
+    assert fsq["parameters"]["token_count"] == 2
+    assert fsq["parameters"]["token_dimensions"] == 32
+    assert fsq["parameters"]["flattened_body_token_dimensions"] == 64
+    assert fsq["parameters"]["separate_hand_joint_dimensions"] == 14
+    reward = by_id[
+        sonic_capability_by_key(
+            "sonic_motion_tracking_reward_design"
+        ).node_id
+    ]
+    assert reward["parameters"]["penalty_terms"]["joint_limit"][
+        "weight"
+    ] == -10.0
+    randomization = by_id[
+        sonic_capability_by_key(
+            "sonic_domain_randomization_ranges"
+        ).node_id
+    ]
+    assert randomization["parameters"]["physical_parameters"][
+        "static_friction_coefficient"
+    ] == [0.3, 1.6]
+
+
+def test_sonic_paper_receipt_fails_closed_on_ambiguous_status(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    slug = _make_project_with_library(client, "SonicIntegrity")
+    _materialize_sonic_fixture(client, slug)
+
+    from backend.services.kg_store import project_kg_db_path
+    from backend.services.project_store import ProjectStore
+    from sculptor.kg.schema import Edge, ImplementationStatus, Relation
+    from sculptor.kg.sonic_capabilities import sonic_capability_by_key
+    from sculptor.kg.store import SculptorKG
+
+    app = client.app  # type: ignore[attr-defined]
+    project_store: ProjectStore = app.state.project_store
+    detail = project_store.get(slug)
+    assert detail is not None
+    project_dir = Path(detail.project_dir)
+    capability_id = sonic_capability_by_key(
+        "sonic_universal_controller_contract"
+    ).node_id
+    with SculptorKG(project_kg_db_path(project_dir)) as kg:
+        contradictory_id = "implementation_status:test_contradiction"
+        kg.add_node(
+            ImplementationStatus(
+                id=contradictory_id,
+                status="implemented",
+                definition="Contradictory status used only by this test.",
+            )
+        )
+        kg.add_edge(
+            Edge(
+                src=capability_id,
+                dst=contradictory_id,
+                relation=Relation.HAS_IMPLEMENTATION_STATUS,
+            )
+        )
+
+    response = client.get(f"/projects/{slug}/kg/papers/2511.07820")
+    assert response.status_code == 500
+    assert response.json()["type"] == "/problems/kg-integrity"
+    assert "exactly one implementation status" in response.json()["detail"]
 
 
 # ── job 404 ────────────────────────────────────────────────────────────

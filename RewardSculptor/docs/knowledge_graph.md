@@ -21,7 +21,7 @@ As of M7 Phase 1 the KG lives at a **single user-wide path**:
 
 All projects read and write from the same DB. Creating a new project no
 longer triggers a fresh Claude extract — the new project sees the
-existing 46 seed papers (plus any you added via "Research a topic") from
+existing 48 seed papers (plus any you added via "Research a topic") from
 day one.
 
 **Overrides** (highest precedence first, identical in the UI and core):
@@ -38,7 +38,8 @@ day one.
 **First-start bootstrap**: when the backend boots and finds no shared
 DB, it copies the bundled pre-extracted sqlite from
 `RewardSculptor/examples/kg_preextracted.db` into place. Zero Claude
-calls on first launch — you get 46 papers + ~400 entities instantly.
+calls on first launch — you get the reviewed 48-paper seed set plus its
+pre-extracted entities instantly.
 Bootstrap is a no-op when `RS_KG_PATH` or `SCULPTOR_KG_PATH` is set so
 tests don't accidentally seed the tmp DB.
 
@@ -170,8 +171,10 @@ retrieval renders evidence beside a citation from that same source.
 ## Reviewed implementation-capability subgraph
 
 Literature claims and product claims now have separate graph identities.
-`sculptor.kg.capabilities` defines a small reviewed map for OGMP
-(`2403.04205`) and Preferenced OGMP (`2410.01030`): each paper
+`sculptor.kg.capabilities` defines the reviewed map for OGMP
+(`2403.04205`) and Preferenced OGMP (`2410.01030`), while
+`sculptor.kg.sonic_capabilities` defines the source-pinned SONIC v4
+(`2511.07820`) catalog. Each paper
 `GROUNDS_CAPABILITY`, and every `ResearchCapability` has exactly one
 `HAS_IMPLEMENTATION_STATUS` edge to one of these definition nodes:
 
@@ -181,7 +184,7 @@ Literature claims and product claims now have separate graph identities.
   control runtime handover, policy input, reward dispatch, or selection;
 - `unsupported` — the paper mechanism is not executed by this runtime.
 
-The current implemented subset is the deliberately narrower fixed linear
+The current OGMP implemented subset is the deliberately narrower fixed linear
 phase-window scaffold: per-mode reward authoring/dispatch plus immutable
 execution admission and diagnostic evidence. Guard and mode-predicate fields
 are metadata-only. The online receding-horizon oracle, rho-bounded permissible
@@ -195,6 +198,25 @@ persisted mode diagnostics derive their disclosure fields from the same
 catalog. `tests/test_kg_capabilities.py` pins the reviewed statuses and resolves
 every executable evidence symbol, so a renamed path or expanded capability
 requires an explicit claim review rather than silent copy drift.
+
+Call `materialize_sonic_capability_map(store)` only after the exact SONIC Paper
+node exists. It deterministically materializes nine reviewed receipts:
+controller contract, FSQ/token interface and loss, scale/training recipe,
+BONES-SEED release, tracking reward design, domain-randomization ranges,
+separate kinematic planner, VLA interface, and evaluation/limitations. Their
+exact source parameters are structured dictionaries rather than prose blobs.
+The dataset-card-only BONES fields are separately labeled and pinned to the
+reviewed card revision instead of being attributed to the arXiv table. Every
+SONIC capability is currently `unsupported`: the graph makes the paper and its
+reported recipe queryable but does not imply that RewardSculptor executes the
+model or has validated these settings as portable defaults.
+
+The paper list searches title, abstract, rationale, tags, capability text, and
+structured parameter keys/values. Opening a paper shows its source-pinned
+capability receipt before generic extracted entities, with a local parameter
+filter and an explicit product status. A reviewed capability with zero or
+multiple status edges fails closed with a KG-integrity response instead of
+silently inferring a status.
 
 ## Prompt-time research — implemented
 

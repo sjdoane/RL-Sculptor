@@ -202,6 +202,27 @@ def make_arxiv_client(
 ARXIV_PDF_URL_FMT = "https://arxiv.org/pdf/{arxiv_id}.pdf"
 
 
+def _materialize_reviewed_capabilities(
+    store: SculptorKG, arxiv_id: str,
+) -> None:
+    """Attach deterministic, human-reviewed mechanisms when available.
+
+    LLM extraction is intentionally not required for these narrow catalogs.
+    The materializer still requires the real Paper node and records an
+    explicit implementation status, so ingest cannot turn a paper claim into
+    a runtime capability by implication.
+    """
+
+    normalized = _normalize_arxiv_id(arxiv_id)
+    from sculptor.kg.sonic_capabilities import (
+        SONIC_ARXIV_ID,
+        materialize_sonic_capability_map,
+    )
+
+    if normalized == SONIC_ARXIV_ID:
+        materialize_sonic_capability_map(store)
+
+
 # §7.7: exponential backoff schedule for arxiv API retries. Arxiv's
 # rate-limit window is ~2 min; spacing retries at 10/30/60/120 s gives
 # one attempt immediately, two within the rate-limit window, and one
@@ -441,6 +462,7 @@ def ingest_arxiv(
 
         pdf_path = _pdfs_dir(store) / _safe_pdf_name(arxiv_id)
         if existing is not None and not force and pdf_path.exists():
+            _materialize_reviewed_capabilities(store, arxiv_id)
             return existing  # fully idempotent: node + file both present
 
         # ── Metadata: arxiv API → fallback → stub ─────────────────────────
@@ -509,6 +531,7 @@ def ingest_arxiv(
                         if isinstance(existing, Paper) else "seed"),
         )
         store.add_node(paper, upsert=True)
+        _materialize_reviewed_capabilities(store, arxiv_id)
         return paper
     finally:
         if owns_store:
@@ -594,6 +617,7 @@ def ingest_from_seeds(
                     )
                     if enriched != existing:
                         store.add_node(enriched)
+                _materialize_reviewed_capabilities(store, arxiv_id)
                 print(f"[ingest]   skip {arxiv_id} — already present", flush=True)
                 results[arxiv_id] = "already_present"
                 continue

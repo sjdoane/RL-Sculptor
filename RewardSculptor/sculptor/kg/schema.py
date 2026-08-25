@@ -46,7 +46,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-
 # ── Provenance trust tiers ───────────────────────────────────────────────────
 #: §Agentic-data upgrade 1. Free-string rather than an enum (like Relation)
 #: because provenance is advisory metadata for prompt rendering, not a
@@ -255,6 +254,11 @@ class ResearchCapability:
     scope: str = "paper_mechanism"
     code_evidence: list[str] = field(default_factory=list)
     provenance: str = PROVENANCE_SEED
+    #: Machine-queryable parameters reported by the grounding source.  The
+    #: empty default keeps capability rows written before this field was
+    #: introduced readable and avoids turning an absent parameter inventory
+    #: into an implementation claim.
+    parameters: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

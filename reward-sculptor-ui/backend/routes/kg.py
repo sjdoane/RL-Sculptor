@@ -32,7 +32,7 @@ from backend.models.kg import (
 )
 from backend.models.project import ProblemDetail
 from backend.services import kg_store
-from backend.services.job_manager import Job, JobManager
+from backend.services.job_manager import JobManager
 from backend.services.project_store import BusyError, ProjectStore
 
 
@@ -103,7 +103,10 @@ def list_papers(
 @router.get(
     "/projects/{slug}/kg/papers/{arxiv_id}",
     response_model=PaperDetail,
-    responses={404: {"model": ProblemDetail}},
+    responses={
+        404: {"model": ProblemDetail},
+        500: {"model": ProblemDetail},
+    },
 )
 def get_paper(
     slug: str, arxiv_id: str, store: ProjectStore = Depends(get_store)
@@ -114,7 +117,15 @@ def get_paper(
             status.HTTP_404_NOT_FOUND, "project not found",
             detail=f"no project with slug {slug!r}", type_="/problems/not-found",
         )
-    detail = kg_store.get_paper_detail(project_dir, arxiv_id)
+    try:
+        detail = kg_store.get_paper_detail(project_dir, arxiv_id)
+    except kg_store.KGIntegrityError as exc:
+        return _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "knowledge-graph integrity error",
+            detail=str(exc),
+            type_="/problems/kg-integrity",
+        )
     if detail is None:
         return _problem(
             status.HTTP_404_NOT_FOUND, "paper not found",

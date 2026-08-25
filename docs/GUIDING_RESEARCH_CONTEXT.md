@@ -47,6 +47,22 @@ flowchart LR
     I --> E
 ```
 
+The shortest accurate mental model is:
+
+> A motion source proposes **what motion should happen**. SONIC supplies the
+> reusable motor competence to execute a supported motion command. A task or
+> visual policy decides **what is useful now** from the actual world state.
+> RewardSculptor is the harness that trains and evaluates that adaptation; it
+> does not directly emit finished policy weights.
+
+In the public stack, a recorded G1 clip, SONIC's kinematic planner, GEM,
+VR/video, or a VLA supplies a motion reference or token. The camera-free SONIC
+actor combines that command with proprioception and outputs desired G1 joint
+positions. Vision and semantic reasoning, when present, are upstream. A moved
+box is therefore not solved by generic SONIC tracking robustness: the task
+stack needs object/scene input plus explicit selection, transition, and
+recovery training.
+
 The key scientific gap is not ordinary motion playback. A fixed reference can
 work near its nominal state and still fail as a task controller. If a box
 slides away during manipulation, a robust controller must transition from
@@ -251,30 +267,196 @@ hybrid motion commands—not a separate controller for every skill.
 
 ### Public SONIC mechanics relevant to this project
 
-- Motion tracking is the task-agnostic pretraining objective. The source
-  collection contains approximately 700 hours. After retargeting to G1 and
-  filtering infeasible motions, SONIC trains on 611 hours, 317,189 clips, and
-  more than 100 million frames. Its largest model has 42 million parameters
-  and was trained for roughly 21,000 GPU-hours using 128 GPUs for seven days.
-- Specialized robot, human, and hybrid command encoders map heterogeneous
-  motion inputs into a shared finite-scalar-quantized universal token space.
-  The default public representation is two 32-dimensional tokens, exposed as
-  a 64-dimensional command. A decoder combines that token with proprioception
-  to produce robot control; an auxiliary decoder reconstructs robot motion.
-- The G1 control policy runs at 50 Hz and outputs desired joint positions for
-  a lower-level PD controller. The paper's actor uses a ten-step history of
-  joint positions, joint velocities, root angular velocity, root-frame
-  gravity, and prior actions, plus a short-horizon motion command. The
-  asymmetric critic can use privileged simulation state.
-- The tracking objective is dense: it includes reference tracking and
-  regularization terms. “No manual task reward engineering” means the broad
-  pretraining does not require a separate semantic task reward for each
-  motion; it does not mean the tracker has no engineered training objective.
-- Domain randomization, perturbations, and command noise are used to improve
-  robustness.
-- A separate kinematic planner can generate short transitions for interactive
-  behaviors, and separate upstream generators can supply text, music, video,
-  VR, or keypoint motion commands.
+- **Controller contract:** the actor is a 50 Hz, camera-free policy for the
+  29-controlled-joint Unitree G1. It receives a supported motion command and a
+  ten-step history of joint positions, joint velocities, root angular
+  velocity, root-frame gravity, and previous actions. It emits 29 desired
+  body-joint positions, which joint-level PD controllers track. An asymmetric
+  critic receives privileged simulator state during training. Formally,
+  SONIC splits state as $s_t=(s_t^p,s_t^g)$: proprioception/action history plus
+  one robot, human, or hybrid motion command. Every state quantity is expressed
+  in the robot-local frame, rotations use the 6D representation, and Table S1
+  parameterizes the 29-dimensional action distribution as a diagonal Gaussian.
+- **Command timing is modality-specific:** every encoder consumes ten future
+  frames, but robot and hybrid commands space them by 0.1 s, while human
+  commands use 0.02 s. These horizons, the encoder identity, cadence, joint
+  order, normalizers, quantizer, and decoder are compatibility-critical.
+- **Shared motion interface:** specialized robot, human, and hybrid encoders
+  map synchronized descriptions of the same motion into a finite-scalar-
+  quantized representation. The paper's default FSQ-32-32 configuration has
+  two tokens, each with 32 scalar dimensions and 32 quantization levels per
+  dimension. Whole-body VLA use flattens them into a 64-dimensional body-motion
+  command; 14 dexterous hand joints are predicted separately.
+- **Scale:** the source collection is approximately 700 hours. After G1
+  retargeting and feasibility filtering, training uses 611 hours, 317,189
+  clips, and more than 100 million 50 Hz frames. The largest reported model is
+  42 million parameters and uses roughly 21,000 GPU-hours: 128 GPUs for seven
+  days.
+- **Robustness:** domain randomization, simulated pushes, noisy motion
+  commands, planner-side spring filtering, replanning, and crossfading help
+  track imperfect references. They do not supply object semantics or prove
+  same-episode reacquisition after the task state changes.
+
+The word **token** here means a learned, quantized motion command shared across
+three synchronized input descriptions. It is not a text token, a full policy,
+an arbitrary 64-vector, a list of exact joint angles, or a trajectory generator
+by itself. The control decoder $D_c(z,p)$ combines the token $z$ with
+proprioception $p$ to produce motor targets. The auxiliary robot-motion
+decoder $D_r(z)$ reconstructs the paired robot reference during training; it
+is not the motor decoder.
+
+| Motion source | Exact public command path |
+|---|---|
+| Recorded G1 motion or SONIC kinematic planner | robot motion → robot encoder $E_r$ → FSQ → control decoder |
+| GEM video/text/music or full-body VR | human motion → human encoder $E_h$ → FSQ → control decoder |
+| Three-point VR/VLA | head/hands plus planner-generated lower body → hybrid encoder $E_m$ → FSQ → control decoder |
+| Whole-body VLA | predicts the 64-D body-motion token directly, plus a separate 14-D hand command |
+| Final motor path | token + proprioceptive history → $D_c$ → 29 desired body-joint positions → PD control |
+
+### How the universal token is trained
+
+SONIC is not trained with PPO alone. For synchronized robot, human, and hybrid
+descriptions of the same motion, the paper jointly optimizes
+
+\[
+\mathcal L=\mathcal L_{\mathrm{PPO}}+\mathcal L_{\mathrm{recon}}
++\mathcal L_{\mathrm{token}}+\mathcal L_{\mathrm{cycle}}.
+\]
+
+Reconstruction makes every modality token decode to the paired robot motion;
+pairwise token loss brings $z_r,z_h,z_m$ together; and the human-to-robot
+cycle encodes $D_r(z_h)$ back toward $z_r$. Specifically,
+
+\[
+\mathcal L_{\mathrm{recon}}=
+\lVert D_r(z_r)-g_r\rVert^2+
+\lVert D_r(z_h)-g_r\rVert^2+
+\lVert D_r(z_m)-g_r\rVert^2,
+\]
+
+\[
+\mathcal L_{\mathrm{token}}=
+\lVert z_r-z_h\rVert^2+
+\lVert z_r-z_m\rVert^2+
+\lVert z_m-z_h\rVert^2,
+\qquad
+\mathcal L_{\mathrm{cycle}}=
+\lVert E_r(D_r(z_h))-z_r\rVert^2.
+\]
+
+PPO updates the encoders, FSQ
+quantizer, control decoder, and critic. Auxiliary losses update the encoders
+and robot-motion decoder, using straight-through gradients through FSQ. This
+is the paper's pretraining/alignment recipe—not yet a demonstrated
+RewardSculptor task-adaptation recipe. Lokesh still needs to specify which
+modules and auxiliary losses remain active during fine-tuning.
+
+The authors chose FSQ over their comparable multi-head VQ-VAE because it avoids
+codebook collapse and does not require a commitment loss or codebook moving
+average. In the paper's test-content ablation, FSQ reduced MPJPE-L by 8.7 mm;
+removing token and cycle consistency increased cross-encoder divergence by
+about eightfold. These are descriptive results in SONIC's protocol, not
+statistical proof that FSQ is universally superior.
+
+Selected values from the paper's coupled S1–S4 recipe include encoder/reference-
+decoder widths `[2048, 1024, 512, 512]`; control-decoder and critic widths
+`[4096, 4096, 2048, 2048, 1024, 1024, 512, 512]`; 4,096 environments per GPU;
+24-step rollouts; five learning epochs; four minibatches; discount 0.99; GAE
+0.95; PPO clip 0.2; entropy coefficient 0.013; actor learning rate
+`2e-5`; critic learning rate `1e-3`; value-loss coefficient 1.0; maximum
+gradient norm 0.1; desired KL 0.01; adaptive learning-rate range
+`[1e-5, 2e-4]`; initial action-noise standard deviation 0.05; actor-standard-
+deviation clamp `[0.001, 0.5]`; and 50,000 training iterations. The full exact
+receipt is stored as searchable structured KG parameters. Iteration count is
+not a portable compute budget: transitions, batch size, optimizer updates, and
+GPU-hours must also be compared.
+
+### Training recipe: a baseline, not a product default
+
+SONIC is not reward-free. Table S3 is one hand-specified dense tracking
+objective reused across many motions. Claims about avoiding per-motion reward
+engineering mean that the same tracking objective is reused; they do not mean
+that no reward was engineered.
+
+| Table S3 term | Kernel or condition | Weight |
+|---|---:|---:|
+| Root position | exponential squared error, 0.3 m scale | 0.5 |
+| Root orientation | exponential squared error, 0.4 scale | 0.5 |
+| Root-relative body-link position | mean exponential error, 0.3 m scale | 1.0 |
+| Root-relative body-link orientation | mean exponential error, 0.4 scale | 1.0 |
+| Body-link linear velocity | mean exponential error, 1.0 scale | 1.0 |
+| Body-link angular velocity | mean exponential error, 3.14 scale | 1.0 |
+| Five end-effector positions | head, wrists, ankles; 0.1 m scale | 2.0 |
+| Action rate | squared action difference | -0.1 |
+| Joint-limit violation | indicator summed over joints | -10.0 |
+| Undesired contact | non-ankle/non-wrist force above 1 N | -0.1 |
+| Wrist/head anti-shake | angular speed above 1.5 | -0.005 |
+| Feet acceleration | squared ankle acceleration | -0.0000025 |
+
+The magnitudes are not directly comparable because the terms have different
+statistics. In particular, the contact allowlist is a motion-tracking choice;
+an object task must not inherit it if hand contact is part of success. Keep the
+tracker reward, task reward, and objective evaluation metrics separately
+versioned.
+
+Table S4 reports a coupled G1/Isaac Lab randomization recipe, not a safety
+envelope or validated default for another simulator, controller, or task:
+
+- static friction `[0.3, 1.6]`, dynamic friction `[0.3, 1.2]`, restitution
+  `[0, 0.5]`, default-joint offset `±0.01`, and base-COM offsets of `±0.075 m`
+  in x and `±0.1 m` in y/z;
+- root-velocity pushes of `±0.5 m/s` in x/y and `±0.2 m/s` in z for 1–3 s,
+  with roll/pitch rates `±0.52 rad/s` and yaw rate `±0.78 rad/s`;
+- target position jitter of `±0.05 m` in x/y and `±0.01 m` in z; orientation
+  jitter of `±0.1 rad` roll/pitch and `±0.2 rad` yaw; target linear-velocity
+  jitter of `±0.5 m/s` x/y and `±0.2 m/s` z; target angular-velocity jitter of
+  `±0.52 rad/s` roll/pitch and `±0.78 rad/s` yaw; and target-joint jitter
+  `±0.1 rad`.
+
+The table prints compact three-axis ranges for target position and velocity
+beside narrower z-axis parentheticals. The KG preserves both the printed
+expression and the axis-specific interpretation instead of silently resolving
+the ambiguity. Table S4 does not state sampling cadence or independence.
+
+SONIC also prioritizes difficult fixed-reference regions using one-second
+failure bins. Table S2 reports failure cap $\beta=200$ and uniform-blend
+$\alpha=0.1$. In the pinned public release at commit `a0732b6`, 50 frames
+represent one second at 50 Hz; per-bin failure estimates are capped relative
+to the active-bin mean, normalized, then mixed with a 10% uniform component.
+The resolved release configuration additionally carries a pseudocount, a
+four-second pre-failure offset, weighting choices, and saved sampler state.
+Paper numbers alone therefore do not reproduce the sampler.
+
+Three adaptation layers must remain distinct:
+
+1. **Embodiment robustness:** physics randomization, robot pushes, and command
+   jitter.
+2. **Training-distribution adaptation:** failure-prioritized exposure to known
+   fixed-reference bins.
+3. **Deployment/task adaptation:** selecting or generating a recovery behavior
+   from the current world state after an object moves.
+
+SONIC establishes strong baselines for the first two. Lokesh's displaced-box
+example targets the third. RewardSculptor should expose S1–S4 as an immutable
+`paper_reported` profile; exact local reproduction can earn
+`locally_reproduced_exact`, and an experiment must explicitly opt into
+`selected_for_experiment`. None should become a silent global default.
+
+### The separate kinematic planner
+
+SONIC's planner is a separate learned motion generator. Equations 5–7 encode a
+robot-motion sequence into a $T/4$ latent sequence, mask intermediate tokens
+between endpoint keyframes, and iteratively finalize high-confidence tokens.
+It produces 0.8–2.4 s in-betweening segments and can replan every 100 ms. The
+planner's latent variable is **not** established as the controller's two-token
+FSQ command; the planner first produces robot motion, which then goes through
+$E_r$.
+
+Equation 8 is a planner-side critically damped filter for pelvis $x/y$ and
+projected heading. The reported damping values are $5\ln 2$ for position and
+$20\ln 2$ for heading; a velocity command can define a one-second target.
+This makes commands more predictable. It is not a learned physical recovery
+controller or a safety guarantee.
 
 SONIC performs local motion tracking rather than following a globally fixed
 root trajectory. References are heading-aligned to the robot when a motion
@@ -285,12 +467,25 @@ state. The paper also reports that extreme commands can still lose balance and
 that sustained or complex ground-contact motions remain difficult; it does not
 provide formal safety or long-duration energy guarantees.
 
+The scaling runs were trained in Isaac Lab for 50,000 iterations, while the
+shared cross-method comparison was evaluated in MuJoCo under a common
+termination rule. PHUMA contributes 68,326 external motions from a different
+retargeting pipeline; SONIC reports 97.2% success there, but the authors state
+that the baseline comparison is not fully data-matched. The defensible claim
+is that SONIC reports the strongest results among the evaluated trackers under
+the paper's protocol and generalizes well to unseen motion—not that it is
+universally “the best tracker” or that it generalizes to arbitrary tasks and
+objects.
+
 The official [GR00T whole-body control release](https://nvlabs.github.io/GR00T-WholeBodyControl/)
 now exposes checkpoints, training/configuration documentation, deployment
 artifacts, and motion data. Public model variants use a 64-dimensional
-universal token at 50 Hz; their exact lookahead, history, encoder/decoder, and
-normalization contracts vary and must be pinned rather than inferred from the
-name “SONIC.”
+universal token at 50 Hz. The complete model/config tuple must be pinned.
+Released variants demonstrably differ in reference horizon and target-
+orientation conventions; no other contract difference should be inferred
+without inspecting the exact configuration. The paper's VLA experiments use
+GR00T N1.5; the current public workflow uses N1.7 to train the upstream VLA,
+not to fine-tune SONIC itself.
 
 ### Does a SONIC reference specify every joint?
 
@@ -492,13 +687,25 @@ trajectories that SONIC tracks or that downstream training can use as
 demonstrations. Kimodo is a reference generator, not a physics controller, VLM
 research agent, or dynamics-feasibility certificate.
 
-[BONES-SEED](https://huggingface.co/datasets/nvidia/BONES-SEED) provides a
-large motion corpus, and its public timeline annotations divide motions into
-timestamped, language-described atomic segments. Those annotations are useful
-for retrieval and for proposing candidate mode boundaries. They do not supply
-task-success predicates, transition guards, environment feedback, dynamic
-feasibility, or an OGMP oracle. A semantic segment label must not silently
-become a control-authority claim.
+[BONES-SEED](https://huggingface.co/datasets/bones-studio/seed) is a substantial
+public subset rather than the paper's complete training corpus: its card lists
+142,220 annotated sequences—71,132 originals plus 71,088 mirrors—about 288
+hours at 120 Hz, and 522 actors, while SONIC reports 317,189 training clips and
+611 hours after filtering. The repository is public, but file/content access is
+gated: a user must log in, accept the BONES-SEED license, and share contact
+information. Its three motion representations are SOMA Uniform BVH, SOMA
+Proportional BVH, and Unitree G1 MuJoCo-compatible CSV. The card also exposes
+natural-language descriptions, temporal segment labels, motion properties,
+and actor/skeletal metadata.
+
+Those annotations are useful for retrieval and proposing candidate mode
+boundaries. They do not supply task-success predicates, transition guards,
+environment feedback, dynamic feasibility, or an OGMP oracle. “G1
+MuJoCo-compatible CSV” does not mean RewardSculptor-admitted reference,
+controller compatibility, or Tier-D proof. A 120 Hz source must retain its
+cadence or be retimed under a new immutable identity and recertified. Original
+and mirrored variants must stay in the same data split to prevent leakage. A
+semantic segment label must not silently become a control-authority claim.
 
 ## 8. Exact current position of RewardSculptor
 
@@ -569,9 +776,10 @@ a manually authored state-conditioned oracle/curriculum will improve
 perturbed-task completion over fixed-reference training.
 
 **H2 — automation:** under matched rollout, reference, compute, and human-edit
-budgets, automatically mined transition/recovery coverage will match or exceed
-the manual curriculum on sealed-test recovery while requiring fewer human
-edits.
+budgets, automatically mined state-conditioned transition/recovery coverage
+will outperform fixed-reference training, uniform exposure, and SONIC-style
+failure-prioritized sampling, and will match or exceed the manual curriculum on
+sealed-test recovery while requiring fewer human edits.
 
 **H3 — perception:** after H1/H2 are established with privileged object state,
 a frozen visual representation can replace that state with a measurable and
@@ -649,6 +857,7 @@ failures indistinguishable.
 |---|---|
 | Fixed reference and fixed phase schedule | Open-loop reference baseline. |
 | Budget-matched random/open-loop mode sampler | Whether extra reference exposure alone explains improvement. |
+| SONIC-style failure-prioritized one-second-bin sampler | Whether reprioritizing already known hard reference regions explains improvement. |
 | Manually scripted state-conditioned oracle | Upper bound and H1 test for closed-loop selection/coverage. |
 | Automated curriculum versus manual oracle | H2 test under matched rollout, reference, compute, and human-edit budgets. |
 | From-scratch PPO + the same task reward | Optional diagnostic for the value of the motion prior, not the primary comparison. |
@@ -657,6 +866,15 @@ failures indistinguishable.
 The policy/controller architecture and task reward stay fixed for H1/H2. Reward
 co-editing can be evaluated later as a factorial arm rather than silently
 changing along with the curriculum.
+
+All curriculum arms must share candidate references, reset-state support,
+objective failure labels, seeds, and rollout budget. The sampler must learn
+from training outcomes only; validation and sealed-test distributions remain
+fixed. Log exposure per phase/perturbation cell, failure estimates,
+probability entropy/effective sample size, cap activations, and reset lead time.
+Also pin whether fine-tuning restores SONIC sampler statistics or starts them
+fresh: restoring imports curriculum history, while resetting changes the
+initial training distribution.
 
 ### Metrics and evidence
 
@@ -778,8 +996,24 @@ adapter.
 
 ## 13. Knowledge-graph model
 
-The knowledge graph should represent scientific claims and runtime evidence as
-different things. The desired topology is:
+The live schema represents reviewed paper mechanisms and product status with
+these exact node and relation names:
+
+```mermaid
+flowchart LR
+    Paper -->|GROUNDS_CAPABILITY| ResearchCapability
+    ResearchCapability -->|HAS_IMPLEMENTATION_STATUS| ImplementationStatus
+```
+
+`ResearchCapability.parameters` holds structured source facts, while the
+grounding edge carries the exact paper version and section/table locator. The
+status edge answers a different question: whether RewardSculptor executes that
+mechanism. SONIC's reviewed nodes are all `unsupported`; their presence makes
+the paper searchable and inspectable without claiming controller integration.
+
+The graph below is a **proposed longer-term topology**, not the current SQLite
+schema. Names such as `Claim`, `FoundationController`, `OracleRuntime`, and
+`MOTIVATES` remain design candidates until implemented and tested:
 
 ```mermaid
 flowchart TD
@@ -787,7 +1021,7 @@ flowchart TD
     Claim -->|ABOUT| Technique
     Claim -->|SUPPORTED_BY| PublishedEvaluation
     Technique -->|MOTIVATES| ResearchCapability
-    ResearchCapability -->|HAS_STATUS| CapabilityStatus
+    ResearchCapability -->|HAS_IMPLEMENTATION_STATUS| ImplementationStatus
     BehaviorPackage -->|CONTAINS| ReferenceSet
     BehaviorPackage -->|CONTAINS| RewardSpec
     BehaviorPackage -->|CONTAINS| VariationSpec
@@ -819,14 +1053,21 @@ flowchart TD
     FailureCase -->|MOTIVATES| CoverageEdit
 ```
 
-Current OGMP paper-to-capability status is mostly accurate. The next KG pass
-should add SONIC and the adjacent visual/distillation sources, plus explicit
-capabilities for:
+The reviewed subgraph now includes nine SONIC v4 receipts: controller,
+universal-token/alignment loss, scale/training, BONES-SEED, reward design,
+domain randomization, planner, VLA, and evaluation/limitations. Parameters are
+stored as searchable JSON dictionaries with source version and provenance. The
+canonical and research seed sets also include PHUMA so its different-
+retargeting-pipeline caveat is discoverable. SONIC mechanisms remain
+`unsupported` in RewardSculptor. OGMP and Preferenced OGMP keep their separate
+reviewed catalog and current fixed-window implementation boundary.
+
+Future capability additions should remain narrow and include:
 
 - `reference_clock_conditioning = implemented`;
 - `learned_mode_latent_conditioning = unsupported`;
 - `ogmp_task_feedback_conditioning = unsupported`;
-- `trusted_sonic_controller_execution = unsupported`;
+- `trusted_sonic_controller_execution = unsupported` (now present);
 - `behavior_set_variation_sampling = unsupported`;
 - `online_visual_policy_conditioning = unsupported`;
 - `offline_vlm_keyframe_diagnosis = implemented`;
@@ -866,18 +1107,22 @@ splits must be explicit rather than inferred from the graph's presence.
    policy training or an explicit distillation stage?
 4. What exact lab code, checkpoint, visual encoder, simulator, and reference
    data can Sam use, and under what license/access constraints?
-5. What is the contract from Sachin's behavior-generation block: clips,
+5. Which SONIC components should remain frozen versus trainable, should the
+   auxiliary reconstruction/token/cycle losses remain active during task
+   adaptation, and what synchronized robot/human/hybrid data would support
+   those losses?
+6. What is the contract from Sachin's behavior-generation block: clips,
    scene state, variations, task graph, rough reward, or all of these?
-6. Is the selector initially a hand-authored oracle, hybrid automaton, planner,
+7. Is the selector initially a hand-authored oracle, hybrid automaton, planner,
    or learned model?
-7. What benchmark best exposes the lab's real failure mode and is feasible for
+8. What benchmark best exposes the lab's real failure mode and is feasible for
    an AME 590 timeline?
-8. Which baselines, seed count, sealed perturbation families, and success
+9. Which baselines, seed count, sealed perturbation families, and success
    metrics would make the study technically defensible and potentially
    publishable?
-9. Is vision part of Sam's first method or a second-stage ablation after
+10. Is vision part of Sam's first method or a second-stage ablation after
    privileged-state recovery works?
-10. What compute budget and hardware milestone are realistic?
+11. What compute budget and hardware milestone are realistic?
 
 ### Administrative questions
 
@@ -1003,6 +1248,13 @@ verify that no live GPU worker depends on reload-watched files. Before claiming
 a capability, trace the UI choice through its API, immutable artifact, worker
 event, result evidence, and KG relation.
 
+For a no-context SONIC check, search the KG for `2511.07820`, `50 Hz`,
+`FSQ-32-32`, `flattened_body_token_dimensions`, `joint_limit`,
+`static_friction_coefficient`, `failure_rate_cap_beta`, `BONES-SEED`, `planner`,
+or `PHUMA`; open the paper and read **Reviewed paper mechanisms** before generic
+extracted entities. The red `Unsupported in RewardSculptor` badges are
+intentional: they separate paper knowledge from executable product capability.
+
 ## 19. Primary sources
 
 - Luo et al., [SONIC: Supersizing Motion Tracking for Natural Humanoid
@@ -1023,7 +1275,9 @@ event, result evidence, and KG relation.
   Control](https://arxiv.org/abs/2505.03729), 2025.
 - NVIDIA, [Kimodo: Kinematic Motion Diffusion Model for Humanoid
   Control](https://research.nvidia.com/labs/sil/projects/kimodo/).
-- NVIDIA, [BONES-SEED motion dataset](https://huggingface.co/datasets/nvidia/BONES-SEED)
+- Lee et al., [PHUMA: Physically Reliable Humanoid Locomotion
+  Dataset](https://arxiv.org/html/2510.26236), 2025.
+- BONES Studio, [BONES-SEED motion dataset](https://huggingface.co/datasets/bones-studio/seed)
   and [timeline annotations](https://huggingface.co/datasets/nvidia/SEED-Timeline-Annotations).
 
 ## 20. Review record
@@ -1031,10 +1285,16 @@ event, result evidence, and KG relation.
 This revision was built from:
 
 - a direct read of the full second-meeting transcript;
+- a page-by-page reconciliation against Sam's three-page handwritten SONIC
+  notes, treating them as commentary rather than paper authority;
+- a parameter-by-parameter reconciliation of Sam's S1–S4 screenshots and
+  BONES-SEED excerpt against SONIC arXiv v4 and a pinned Hugging Face dataset-
+  card revision;
 - a transcript-reconstruction pass focused on ASR errors, speaker intent, and
   unresolved claims;
 - a public-literature pass separating SONIC, its VLA connection, OGMP,
   visual whole-body control, and video-conditioned imitation;
+- independent researcher, technical-accuracy, and knowledge-graph reviews;
 - a code/system audit mapping every proposed component to implemented,
   partial, unsupported, or unproved RewardSculptor behavior;
 - a final consistency pass against the durable engineering rules and current

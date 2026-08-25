@@ -14,6 +14,33 @@ Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 
 Current git branch: `ship-20-ux-revamp` (do NOT work on `main`). Keep committing to this branch.
 
+## Latest completed slice — SONIC notes and reviewed KG receipt (2026-08-24)
+
+Sam's handwritten SONIC notes and arXiv v4 have been reconciled into
+`docs/GUIDING_RESEARCH_CONTEXT.md`. The guide separates the public camera-free
+SONIC tracker, SONIC's separate kinematic planner and upstream VLA demo,
+Lokesh's unpublished visual adaptation, and RewardSculptor's proposed
+policy-training/recovery role. It records the exact controller, FSQ, loss,
+training-scale, planner, VLA, evaluation, and limitation facts plus the open
+architecture decisions for Lokesh.
+
+The KG seed sets include SONIC v4 and PHUMA. A deterministic nine-item SONIC
+catalog materializes source-pinned controller, FSQ/loss, training, BONES-SEED,
+reward, randomization, planner, VLA, and evaluation receipts. The exact S1–S4
+values are searchable, while the mutable dataset-card facts are separately
+pinned to the reviewed Hugging Face revision. Every item is explicitly
+`unsupported` until a real SONIC execution path exists; the paper recipe is not
+a RewardSculptor default. The KG paper list searches these fields; paper detail
+presents the reviewed capability receipt and fails closed on an ambiguous
+status. This is literature accessibility, not controller integration. See the
+most recent commit for the implementation. Final verification was 3,133 core
+tests passed (one optional JAX skip), 843 backend tests passed, 128 frontend
+tests passed, scoped Ruff F/E9 and Python compile checks, frontend typecheck,
+and a production build. Browser QA on the live project proved the nine-item
+receipt, exact-parameter filtering, unsupported status, and clean console. The
+live graph contains 2,884 nodes / 3,096 edges; the regenerated bundled graph
+contains 852 nodes / 706 edges.
+
 ## 0. Current research program — adaptive policy training (2026-08-24)
 
 Sam's second meeting with Lokesh reframed the proposed contribution as an

@@ -122,6 +122,22 @@ papers:
     authors: ["Wang", "et al."]
     year: 2025
 
+  # ── Humanoid foundation control + external motion evidence ──────────
+  - arxiv_id: "2511.07820"
+    title: "SONIC: Supersizing Motion Tracking for Natural Humanoid Whole-Body Control"
+    authors: ["Zhengyi Luo", "Ye Yuan", "Tingwu Wang", "et al."]
+    year: 2026
+    rationale: "Canonical public foundation-controller source for the current Lokesh research direction. Grounds SONIC's camera-free 29-DoF G1 tracker, shared FSQ motion interface, separate kinematic planner, public VLA boundary, scaling evidence, and limitations; it does not imply RewardSculptor executes SONIC."
+    tags: ["sonic", "g1", "foundation-controller", "motion-tracking", "fsq-token", "whole-body-control"]
+    source_url: "https://arxiv.org/html/2511.07820v4"
+  - arxiv_id: "2510.26236"
+    title: "PHUMA: Physically Reliable Humanoid Locomotion Dataset"
+    authors: ["Kyungmin Lee", "et al."]
+    year: 2025
+    rationale: "External motion corpus used by SONIC for cross-dataset evaluation. Keeps the 68,326-motion comparison and its different retargeting pipeline discoverable so SONIC generalization results are not misread as a fully data-matched benchmark."
+    tags: ["phuma", "humanoid-motion-data", "retargeting", "cross-dataset-evaluation", "g1"]
+    source_url: "https://arxiv.org/html/2510.26236"
+
   # ── Foundational RL (algorithms the sculpt loop is built on) ────────
   - arxiv_id: "1707.06347"
     title: "Proximal Policy Optimization Algorithms"

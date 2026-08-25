@@ -30,7 +30,7 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
     mutationFn: () => ingestGlobalKgSeeds(slug, true),
     onSuccess: (j) => {
       setLastJobId(j.job_id);
-      toast.success("Bulk KG seeding started", { description: `50 canonical papers — job ${j.job_id.slice(0, 8)}…` });
+      toast.success("Bulk KG seeding started", { description: `Canonical paper library — job ${j.job_id.slice(0, 8)}…` });
     },
     onError: (err) => {
       const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;

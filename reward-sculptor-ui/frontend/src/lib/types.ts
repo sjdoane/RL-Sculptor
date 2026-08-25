@@ -248,12 +248,37 @@ export interface PaperEntities {
   environments: KGEntitySummary[];
 }
 
+export type CapabilityImplementationStatus =
+  | "implemented"
+  | "metadata_only"
+  | "unsupported";
+
+export interface ResearchCapabilitySummary {
+  id: string;
+  name: string;
+  description: string;
+  scope: string;
+  parameters: Record<string, unknown>;
+  implementation_status: CapabilityImplementationStatus;
+  status_definition: string;
+  code_evidence: string[];
+  provenance: string;
+  paper_role: string;
+  source_version: string;
+  source_locator: string;
+}
+
 export interface PaperDetail extends PaperSummary {
   abstract: string;
   conclusion_text: string;
+  rationale: string;
+  tags: string[];
+  source_url: string;
+  provenance: string;
   pdf_available: boolean;
   ingested_at: string | null;
   entities: PaperEntities;
+  capabilities: ResearchCapabilitySummary[];
 }
 
 export interface TechniqueSummary {
