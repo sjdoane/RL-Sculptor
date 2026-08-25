@@ -579,9 +579,11 @@ def test_tierd_batched_scores_an_on_target_pose_at_one(tmp_path):
         "base_height": torch.full((4,), z0 + (tz - z0), dtype=torch.float64),
     }
     total, comp = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
-    assert float(comp["joint_tracking"][0]) == pytest.approx(1.0, abs=1e-9)
-    assert float(comp["root_tracking"][0]) == pytest.approx(1.0, abs=1e-9)
-    assert float(total[0]) == pytest.approx(2.0, abs=1e-9)
+    assert float(comp["joint_tracking"][0]) == pytest.approx(
+        mod.JOINT_TERM_COEFFICIENT, abs=1e-9)
+    assert float(comp["root_tracking"][0]) == pytest.approx(
+        mod.ROOT_TERM_COEFFICIENT, abs=1e-9)
+    assert float(total[0]) == pytest.approx(mod.REWARD_TOTAL_SCALE, abs=1e-9)
 
 
 def test_tierd_batched_joint_kernel_matches_the_scalar_path(tmp_path):
@@ -612,8 +614,9 @@ def test_tierd_batched_joint_kernel_matches_the_scalar_path(tmp_path):
 
     assert float(batched["joint_tracking"][0]) == pytest.approx(
         scalar["joint_tracking"], abs=1e-12)
+    expected_kernel = float(np.exp(-mod.JOINT_ERR_WEIGHT * off ** 2))
     assert float(batched["joint_tracking"][0]) == pytest.approx(
-        float(np.exp(-mod.JOINT_ERR_WEIGHT * off ** 2)), abs=1e-12)
+        mod.JOINT_TERM_COEFFICIENT * expected_kernel, abs=1e-12)
 
 
 def test_tierd_batched_root_uses_a_delta_not_an_absolute_height(tmp_path):
@@ -633,4 +636,5 @@ def test_tierd_batched_root_uses_a_delta_not_an_absolute_height(tmp_path):
         "base_height_delta": torch.full((2,), tz - z0, dtype=torch.float64),
     }
     _, comp = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
-    assert float(comp["root_tracking"][0]) == pytest.approx(1.0, abs=1e-9)
+    assert float(comp["root_tracking"][0]) == pytest.approx(
+        mod.ROOT_TERM_COEFFICIENT, abs=1e-9)

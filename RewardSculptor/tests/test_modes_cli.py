@@ -267,9 +267,10 @@ def test_authoring_builds_a_twin_grafts_it_back_and_re_probes(
     root = tmp_path / "refs"
     _write_composite(root, seams=[150, 300], n=444)
     out = tmp_path / "v0.py"
+    goal = "run in and strike at the apex"
     assert _run(monkeypatch, root, [
         "modes", "scaffold", "--clip-id", "novel-jump-kick--g1",
-        "--out", str(out)]).exit_code == 0
+        "--goal", goal, "--out", str(out)]).exit_code == 0
     assert "TARGET_JOINT_POS" in out.read_text(), "backbone is on by default"
 
     project = tmp_path / "proj"
@@ -300,7 +301,7 @@ def test_authoring_builds_a_twin_grafts_it_back_and_re_probes(
     r = _run(monkeypatch, root, [
         "modes", "author", "--clip-id", "novel-jump-kick--g1",
         "--mode", "launch", "--file", str(out), "--project", str(project),
-        "--goal", "run in and strike at the apex"])
+        "--goal", goal])
     assert r.exit_code == 0, r.output
 
     # The twin the model saw: no float tables, but state-dependent.

@@ -638,9 +638,33 @@ def _exact_policy_contract() -> dict[str, Any]:
             "shape": [1],
         },
         "policy": {
-            "actor": {"hidden_dims": [32], "activation": "elu"},
-            "critic": {"hidden_dims": [32], "activation": "elu"},
-            "normalizer": {"actor_present": False, "critic_present": False},
+            "actor": {
+                "class_name": "MlpModel",
+                "hidden_dims": [32],
+                "activation": "elu",
+                "recurrent": {
+                    "type": None,
+                    "hidden_dim": 0,
+                    "num_layers": 0,
+                },
+            },
+            "critic": {
+                "class_name": "MlpModel",
+                "hidden_dims": [32],
+                "activation": "elu",
+                "recurrent": {
+                    "type": None,
+                    "hidden_dim": 0,
+                    "num_layers": 0,
+                },
+            },
+            "normalizer": {
+                "present": False,
+                "actor_present": False,
+                "critic_present": False,
+                "actor_shape": [1],
+                "critic_shape": [1],
+            },
         },
         "timing": {
             "sim_timestep_s": 0.005,
