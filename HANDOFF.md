@@ -1233,10 +1233,11 @@ drawn from a course run before this commit.
   `physics_edit_suggested`-style event would turn the next occurrence from a
   wall of text into a finding.
 - recert5 finished: the composed clip is still **INFEASIBLE**, tier stays K.
-  `mean_joint_err 0.190` and `root_z_rmse 0.014` both pass, but
-  `motion_ratio 1.147` — the tracker is *worse than holding the mean pose*
-  (static baseline `0.165` rad). Item #9 is a clip/tracker problem, not a
-  threshold problem; do not touch `STATIC_BASELINE_RATIO_MAX` to make it pass.
+  `mean_joint_err 0.190` and `root_z_rmse 0.014` both pass, but it does not beat
+  the `0.165 rad` static baseline (`beats_static_baseline=false`). The reported
+  `motion_ratio 1.147` is a separate rollout-motion-amplitude diagnostic, not
+  the static-error ratio. Item #9 is a clip/tracker problem, not a threshold
+  problem; do not touch `STATIC_BASELINE_RATIO_MAX` to make it pass.
 
   Measured the clip to find out why it loses to a static pose. It is **not** a
   low-motion clip — the right knee sweeps 1.708 rad (98°) and leg joints average
@@ -1892,3 +1893,32 @@ changes fail closed. Actor-only imports prove only actor migration;
 actor-plus-critic loads require both mappings at route admission and again at
 the worker load receipt. This remains parameter initialization, never an
 optimizer-resume claim.
+
+## 2026-08-24: concise pre-OGMP scientific boundary and next benchmark
+
+`docs/CURRENT_SYSTEM_SCIENTIFIC_BOUNDARY.md` is the meeting-ready authority for
+the system before OGMP: one immutable elapsed-time reference, one scalar phase
+observation for actor and critic, a frozen tracking backbone, and a bounded
+task residual inside the auditable train/evaluate/diagnose loop. This path is
+implemented and regression-tested, but no local G1 reference has passed the
+fresh Tier-D boundary and no admitted end-to-end difficult-motion result
+exists. It is not SONIC, a reference generator, adaptive selector, visual
+policy, or general recovery controller.
+
+The old iter-36 box-weave acceptance is retracted. It predates the authored
+world grid-pitch fix: intended boxes were aligned, but neighboring copies of
+the course overlapped because the default `2.0 m` pitch was smaller than the
+course footprint. The old physical-scene audit did not test that cross-env
+geometry invariant. Keep the checkpoint and numbers only as diagnostic
+history; no post-fix rerun has restored physical acceptance.
+
+The chosen pre-OGMP experiment is a one-phase privileged-state counterfactual
+object-recovery benchmark. Start from one admitted nominal reference/controller,
+move or rotate the object after commitment, expose exact relative object and
+goal state (not pixels), and use one architecture/input contract across the
+claim-bearing arms. Compare no-reference and fixed-reference expert baselines,
+RewardSculptor, matched-budget Eureka-style reward search, and a
+Preferenced-OGMP-style feedback oracle under sealed held-out interventions.
+The phase-only arm is an observability lower bound, not a matched baseline.
+Only after that isolates a real adaptation gain should the project add
+perception or true OGMP modes.

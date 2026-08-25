@@ -12,7 +12,9 @@ combines the first two meetings with Lokesh, the public literature, and an
 audit of the code that exists today. `docs/RESEARCH_DIRECTION.md` remains a
 useful record of the first meeting, but its proposed scope is historical where
 it conflicts with this guide. `docs/STARTING_POINT_RESEARCH_WORKFLOW.md` remains
-the detailed contract for the implemented upload and launch path.
+the detailed contract for the implemented upload and launch path. For the
+short meeting-ready audit of the single-reference system before OGMP, use
+`docs/CURRENT_SYSTEM_SCIENTIFIC_BOUNDARY.md`.
 
 ## 1. Start here: the research in one page
 
@@ -738,10 +740,12 @@ semantic segment label must not silently become a control-authority claim.
 | Arbitrary controller architectures | Upload accepts bounded data-only portable weights under exact known contracts. It never executes uploaded controller code. |
 | Hardware proof | No current result establishes sim-to-real success for this proposed architecture. |
 
-The active G1 reference-guided rail-hop project is useful integration evidence
-for immutable references, policy clocks, mode windows, reward firewalls, and
-physical metrics. It is not the right scientific benchmark for adaptive
-object-task recovery and should not be presented as one.
+The active G1 reference-guided rail-hop project is useful software-integration
+evidence for immutable references, policy clocks, mode windows, reward
+firewalls, and physical metrics. No fresh G1 Tier-D certificate has passed, so
+it is not yet learned-behavior evidence. It is also not the right scientific
+benchmark for adaptive object-task recovery and should not be presented as
+one.
 
 ### Researcher UX boundary
 
@@ -756,11 +760,12 @@ world declarations do not.
 
 ## 9. The actual research gap
 
-The current system can optimize a policy around one immutable reference and
-one world distribution. The lab's desired controller must remain competent as
-the world moves away from the nominal reference. The missing mechanism is a
-closed loop between observed failure, reference/mode coverage, and policy
-training.
+The current code path is designed and regression-tested to optimize a policy
+around one immutable reference and one world distribution, but no admitted G1
+run has yet demonstrated that end to end. The lab's desired controller must
+remain competent as the world moves away from the nominal reference. The
+missing mechanism is a closed loop between observed failure, reference/mode
+coverage, and policy training.
 
 ### Candidate research question
 

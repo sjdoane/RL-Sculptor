@@ -83,6 +83,15 @@ physical acceptance conjunction later in this runbook.
 The full researcher contract and a G1 parkour-evolution experiment are in
 [`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`](../../docs/STARTING_POINT_RESEARCH_WORKFLOW.md).
 
+> **Authored-world evidence correction (2026-08-24):** every course rollout
+> recorded before environment-grid pitch reconciliation used the simulator's
+> default 2.0 m environment spacing even though the authored course footprint
+> was larger. Neighboring replicated courses therefore overlapped. Treat all
+> pre-fix route, contact, and video figures as diagnostic only, including the
+> former iter 36 acceptance below. The old contact audit covered the intended
+> course objects, not every overlapping neighbor. No fresh post-fix rollout has
+> yet passed the complete physical acceptance conjunction.
+
 > **Evidence correction:** iter 13 is not valid physical slalom evidence.
 > Its policy followed a route expressed in the robot's local environment
 > frame, while the four rendered collision boxes remained in unshifted global
@@ -1472,7 +1481,7 @@ changes. Focused compiler and Mjlab adapter tests are **71 passed**; scoped
 Ruff (`F,E9`), compileall, and diff check pass. Commit this slice, then launch
 the next exact-tuple proof from the preserved iter 35 actor+critic checkpoint.
 
-## Live proof: iter 36 raw-completion dwell alignment
+## Historical iter-36 launch record — acceptance retracted below
 
 UI job `job_81f8bddf6568cccf` is running iter 36 from clean captured commit
 `c6daa6ea4f5d45bd3dac2f295c7437f23bf90cb1`. Exact promoted recovery restored
@@ -1504,16 +1513,26 @@ ordered-route, contact-free, fall-free, upright/default-like, terminal-speed,
 and uninterrupted 100-frame whole-body-hold conjunction in the disclosed
 evidence lane.
 
-## Accepted proof: iter 36 passes the full physical conjunction
+## Historical pre-grid-fix result: iter 36 is not accepted
 
 Iter 36/job `job_81f8bddf6568cccf` completed cleanly. Preserve checkpoint SHA
 `e097634491a7d165924e9ce5e2e359f17062843da3eb5b98545e880da408fb2b`
-as the accepted showcase baseline. The Results scene is aligned at `0.0 m`,
-realism is `ok`, fitness is `0.19907`, and progress is `0.85414`.
+only as diagnostic history. The Results scene reported alignment at `0.0 m`,
+realism `ok`, fitness `0.19907`, and progress `0.85414`, but that audit checked
+the intended per-environment boxes and did not check for neighboring copies of
+the same authored course.
 
-The immutable first-episode batch has `64/64` ordered actual routes/index 5,
-`61/64` authored successes, `61/64` contact-free lanes, and `64/64` lanes
-without a sustained fall. Two lanes provide a strict 100-frame
+This run predates the authored-world grid-pitch correction. Its default
+`2.0 m` environment pitch was smaller than the course footprint, so repeated
+courses overlapped and robots could contact geometry belonging to neighboring
+environments. The route, contact, and video evidence below is therefore
+confounded even though each environment's own boxes were at their requested
+poses.
+
+The immutable first-episode batch reported `64/64` own-course waypoint
+routes/index 5, `61/64` authored successes, `61/64` contact-free lanes under
+the then-scoped four intended-box sensors, and `64/64` lanes without a
+sustained fall. Two lanes reported a strict 100-frame
 horizontal/angular/joint/upright/default-pose hold.
 
 The disclosed evidence lane is one of those passes. `behavior.json` records
@@ -1530,8 +1549,10 @@ speed `0.05336 m/s`, angular speed `0.20480 rad/s`, joint-velocity RMS
 `0.52336 rad`. The keyframes and complete 20-second video visibly show the
 alternating traversal around the actual boxes and sustained upright stop.
 
-This satisfies the unchanged acceptance conjunction. Use iter 36 for the
-physical showcase; do not launch another recovery run.
+These numbers describe the retained pre-fix artifact; they do not satisfy the
+current acceptance conjunction. Do not use iter 36 as physical-showcase or
+scientific method evidence. No fresh post-grid-fix rerun has re-established
+the claim.
 
 ## Imported iter 38 continuation: historical-contract checklist (2026-08-18)
 

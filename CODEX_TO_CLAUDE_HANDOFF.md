@@ -3520,7 +3520,7 @@ The UI resolved iter 34 checkpoint SHA
 `7f49a4c75116e094004431da87e5318ee9e57dd51576419a18f9ad1f63aebca1`;
 startup proves the explicit UI recovery and actor+critic warm start.
 
-This is the first live proof with generic command-only post-entry
+This was the first live run exercising generic command-only post-entry
 follow-through. Intermediate raw disk entry still advances the frozen route
 immediately while an unfinished typed obstacle-away maneuver retains its
 existing safe-cap command and reward firewall. Terminal raw entry likewise
@@ -3597,7 +3597,7 @@ definition, evaluator, robot, or task. Focused compiler + Mjlab adapter tests
 are **71 passed**; scoped Ruff (`F,E9`), compileall, and `git diff --check`
 pass.
 
-## Iter 36 live raw-completion dwell proof 2026-07-26 (Codex)
+## Iter 36 historical launch record 2026-07-26 (acceptance retracted below)
 
 UI New Run job `job_81f8bddf6568cccf` is running iter 36 from clean captured
 commit `c6daa6ea4f5d45bd3dac2f295c7437f23bf90cb1`. Exact promoted recovery
@@ -3612,12 +3612,13 @@ The UI resolved iter 35 checkpoint SHA
 startup proves actor+critic loading from that exact file and PPO iteration
 `0/750`.
 
-This is the first live proof in which terminal stillness supervision becomes
+This launch was the first run intended to make terminal stillness supervision
 eligible on immutable raw route completion, aligned with the unchanged
 authored two-second dwell. The separate bounded center-directed command still
 builds the existing `0.100 m` in-disk retention depth before zero velocity.
 All preceding route, clearance, command, contact, success, and evidence
-semantics remain unchanged.
+semantics remained unchanged. Its later acceptance is retracted below because
+the authored worlds were not isolated across environments.
 
 The visible New Run settings are Auto, one 750-PPO cycle, 1,024 environments
 on `cuda:0`, seed 42, two 1,000-step 1920x1080 episodes, precommitted evidence
@@ -3636,7 +3637,7 @@ official all-lane trajectory/fitness, lane-10 behavior/keyframes/full video,
 and Results physical-scene audit. Acceptance remains the complete physical
 conjunction, including 100 uninterrupted post-success frames inside finish.
 
-## Iter 36 accepted physical showcase 2026-07-26 (Codex)
+## Iter 36 historical pre-grid-fix diagnostic 2026-07-26 (retracted 2026-08-24)
 
 Iter 36/job `job_81f8bddf6568cccf` completed cleanly and preserved checkpoint
 SHA
@@ -3649,17 +3650,19 @@ boxes. Realism is `ok`, frozen fitness is `0.19907`, and progress is
 
 The official first-episode all-lane audit reports:
 
-- all five actual `0.350 m` regions in order and index 5: **64/64**;
+- reported own-course `0.350 m` regions in order and index 5: **64/64**;
 - authored success: **61/64**;
-- forbidden-contact-free: **61/64**, with failures by box `[2, 2, 0, 0]`;
+- reported contact-free under the then-scoped four intended-box sensors:
+  **61/64**, with failures by box `[2, 2, 0, 0]`;
 - no sustained fall: **64/64**;
 - 100-frame horizontal holds: **4/64**;
 - 100-frame horizontal/angular/joint-velocity holds: **2/64**;
 - 100-frame posture-qualified holds: **15/64**;
 - strict 100-frame whole-body holds: **2/64**.
 
-Most importantly, the precommitted rendered evidence is itself an accepted
-full conjunction. `behavior.json` records requested/resolved lane 10,
+At the time, the precommitted rendered evidence was reported as an accepted
+full conjunction; that acceptance is retracted below. `behavior.json` records
+requested/resolved lane 10,
 selection `precommitted`, return percentile `1.0`, and rendered return
 `53.47784`. Lane 10 enters the five actual regions at
 `[161, 310, 510, 642, 757]`, reaches index 5 at 757, declares authored
@@ -3676,10 +3679,13 @@ thresholds. The official keyframes and full 20-second video visibly show an
 upright robot traversing the alternating sides of the actual orange boxes,
 entering the finish, and settling into the sustained terminal stance.
 
-This is the first fresh, precommitted, aligned, contact-free physical proof
-that satisfies the complete showcase conjunction. Preserve iter 36 as the
-accepted checkpoint and evidence baseline. No further recovery run is
-required.
+This was originally recorded as the first fresh physical proof, but that
+acceptance is retracted. The run predates the authored-world grid-pitch fix:
+its intended boxes were aligned, while neighboring copies of the course
+overlapped because the default `2.0 m` pitch was smaller than the course
+footprint. The physical-scene audit did not check absence of neighboring
+collision geometry. Preserve iter 36 only as pre-fix diagnostic history; no
+post-fix rerun has re-established the conjunction.
 
 ## Iter 38 historical policy admission for the visible continuation demo (2026-08-18)
 
