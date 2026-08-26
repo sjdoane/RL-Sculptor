@@ -27,10 +27,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
-import numpy as np
 import pytest
 
 from sculptor.mission import Mission, Stage, save_mission
@@ -409,6 +408,78 @@ def test_run_one_stage_skips_skill_on_unknown_id(
     assert chosen[0]["source"] == "none"
 
 
+def test_skill_resolution_rejects_drifted_reference_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    library = SkillLibrary(root=tmp_path / "lib")
+    hashes = {
+        "clip": "1" * 64,
+        "certificate": "2" * 64,
+        "rollout": "3" * 64,
+        "contract": "4" * 64,
+        "boundary": "5" * 64,
+    }
+    source_stage = Stage(
+        name="source", goal_text="complex motion",
+        success_criterion="metric > 0.5", max_iterations=2,
+        parent_stage=None, reward_seed_prompt="track reference",
+        status="succeeded", iterations_used=1,
+        reference_clip_id="complex_motion", reference_robot="g1",
+        reference_tier="D", reference_clip_sha256=hashes["clip"],
+        reference_certificate_sha256=hashes["certificate"],
+        reference_execution_contract_sha256=hashes["contract"],
+        reference_execution_boundary_sha256=hashes["boundary"],
+    )
+    certificate = SimpleNamespace(
+        clip_id="complex_motion", robot="g1",
+        clip_content_sha256=hashes["clip"],
+        certificate_sha256=hashes["certificate"],
+        rollout_sha256=hashes["rollout"],
+        execution_contract_sha256=hashes["contract"],
+        execution_boundary_sha256=hashes["boundary"],
+    )
+    checkpoint = tmp_path / "source" / "checkpoint.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"POLICY")
+    reward = tmp_path / "source" / "reward.py"
+    reward.write_text(
+        "REWARD_SPEC={'version':'v1'}\n"
+        "def compute_reward(s,a,n,i): return 0.0, {}\n",
+        encoding="utf-8",
+    )
+    record = library.publish_from_stage(
+        stage=source_stage,
+        mission=Mission(
+            goal="source", stages=[source_stage], decomposition_model="x",
+            decomposition_rationale="x",
+        ),
+        adapter_class="A", task_id="T", robot_slug="g1",
+        checkpoint_path=checkpoint, final_metric=0.9, source_iter_index=0,
+        source_reward_path=reward, reference_certificate=certificate,
+    )
+    target = Stage(
+        name="target", goal_text="evolve motion",
+        success_criterion="metric > 0", max_iterations=2,
+        parent_stage=None, reward_seed_prompt="new residual",
+        init_skill_id=record.skill_id,
+    )
+    handle = SkillLibraryHandle(
+        library=library, adapter_class="A", task_id="T",
+        robot_slug="g1", publish=False,
+    )
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_tierd_admission",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            ValueError("clip bytes changed")
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    assert handle.maybe_load_for_stage(target, events.append) is None
+    assert events[-1]["reason"] == "execution_provenance_invalid"
+    assert "clip bytes changed" in events[-1]["detail"]
+
+
 # ── 2. Publish wiring ────────────────────────────────────────────────
 
 def test_run_one_stage_publishes_to_library_on_success(
@@ -437,6 +508,10 @@ def test_run_one_stage_publishes_to_library_on_success(
     pubs = [e for e in events if e.get("type") == "stage_skill_published"]
     assert len(pubs) == 1
     assert pubs[0]["task_id"] == "T"
+    assert pubs[0]["execution_model"] == "reward_sculpting"
+    assert pubs[0]["mode_reuse_supported"] is False
+    assert pubs[0]["active_reward_sha256"]
+    assert pubs[0]["mode_execution_manifest_digest"] is None
     # Library reflects it.
     listed = library.list_compatible(
         adapter_class="sculptor.adapters.mjlab.MjlabAdapter",

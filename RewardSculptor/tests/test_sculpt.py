@@ -11,6 +11,7 @@ No live LLM. No training. Exercises:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import textwrap
@@ -27,9 +28,18 @@ from sculptor.adapters.base import (
 from sculptor.sculpt import (
     _find_resume_start_iteration,
     _should_early_stop,
+    _write_iteration_completion_marker,
     regenerate_reward_template,
     sculpt_init,
     sculpt_run,
+)
+from sculptor.run_manifests import (
+    build_completion_manifest,
+    build_rollout_input_manifest,
+    build_train_input_manifest,
+    file_identity,
+    manifest_sha256,
+    write_json_atomic,
 )
 
 
@@ -44,16 +54,88 @@ def _write_reward_version(rewards_dir: Path, version: int) -> None:
 def _write_completion_marker(runs_dir: Path, version: int, **overrides) -> None:
     iter_dir = runs_dir / f"iter_{version}"
     iter_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema": 1,
-        "state": "completed",
-        "iter": version,
-    }
+    checkpoint = iter_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    _write_required_phase_manifests(iter_dir)
+    payload = _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=version,
+        checkpoint_path=checkpoint,
+        reward_version_before=version,
+        reward_version_after=version + 1,
+        world_selection_hash=None,
+    )
     payload.update(overrides)
     (iter_dir / "iteration_complete.json").write_text(
         json.dumps(payload),
         encoding="utf-8",
     )
+
+
+def _write_required_phase_manifests(iter_dir: Path) -> Path:
+    iteration = int(iter_dir.name.removeprefix("iter_"))
+    checkpoint = iter_dir / "checkpoint.pt"
+    reward = iter_dir / "reward_input.py"
+    reward.write_text("reward = 1\n", encoding="utf-8")
+    adapter = object()
+    request = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        reward_module_path=reward,
+        steps=100,
+        seed=42,
+        init_policy_path=None,
+        init_policy_mode="actor_only",
+    )
+    effective = {
+        **request,
+        "request_manifest_sha256": manifest_sha256(request),
+        "effective_initialization": {
+            "mode": None,
+            "policy": None,
+            "forwarded_to_adapter": False,
+        },
+    }
+    write_json_atomic(iter_dir / "train_request_manifest.json", request)
+    write_json_atomic(iter_dir / "train_input_manifest.json", effective)
+    write_json_atomic(
+        iter_dir / "train_completion_manifest.json",
+        build_completion_manifest(effective, [checkpoint]),
+    )
+
+    rollout = iter_dir / "rollout"
+    rollout.mkdir(exist_ok=True)
+    outputs = [
+        rollout / "rollout.mp4",
+        rollout / "trajectory.npz",
+        rollout / "behavior.json",
+    ]
+    for path, content in zip(outputs, (b"video", b"trajectory", b"{}")):
+        path.write_bytes(content)
+    rollout_input = build_rollout_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        checkpoint_path=checkpoint,
+        reward_module_path=reward,
+        n_episodes=1,
+        seed=42,
+        max_episode_steps=100,
+        playback_speed=1.0,
+        render_every=1,
+        fps=30.0,
+        render_width=320,
+        render_height=240,
+        render_env_index=0,
+    )
+    write_json_atomic(
+        rollout / "rollout_input_manifest.json", rollout_input,
+    )
+    write_json_atomic(
+        rollout / "rollout_completion_manifest.json",
+        build_completion_manifest(rollout_input, outputs),
+    )
+    assert file_identity(reward)["exists"] is True
+    return reward
 
 
 def test_resume_advances_past_completed_no_edit_iteration(tmp_path: Path):
@@ -102,6 +184,64 @@ def test_resume_does_not_jump_over_completion_marker_gap(tmp_path: Path):
     _write_completion_marker(runs, 4)
 
     assert _find_resume_start_iteration(rewards, runs) == 3
+
+
+def test_completion_marker_attests_exact_checkpoint_bytes(tmp_path: Path):
+    iter_dir = tmp_path / "runs" / "iter_7"
+    iter_dir.mkdir(parents=True)
+    checkpoint = iter_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"exact actor and critic bytes")
+    reward_input = _write_required_phase_manifests(iter_dir)
+
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=7,
+        checkpoint_path=checkpoint,
+        reward_version_before=3,
+        reward_version_after=4,
+        world_selection_hash="a" * 64,
+    )
+
+    marker = json.loads(
+        (iter_dir / "iteration_complete.json").read_text(encoding="utf-8")
+    )
+    assert marker["schema"] == 3
+    assert marker["checkpoint_sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    assert marker["checkpoint_bytes"] == checkpoint.stat().st_size
+
+    rewards_dir = tmp_path / "rewards"
+    _write_reward_version(rewards_dir, 7)
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 8
+
+    external = tmp_path / "checkpoint.pt"
+    external.write_bytes(checkpoint.read_bytes())
+    forged = dict(marker)
+    forged["checkpoint"] = str(external)
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps(forged), encoding="utf-8"
+    )
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 7
+
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps(marker), encoding="utf-8"
+    )
+    checkpoint.write_bytes(b"x" * checkpoint.stat().st_size)
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 7
+
+    checkpoint.write_bytes(b"exact actor and critic bytes")
+    _write_required_phase_manifests(iter_dir)
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=7,
+        checkpoint_path=checkpoint,
+        reward_version_before=3,
+        reward_version_after=4,
+        world_selection_hash="a" * 64,
+    )
+    reward_input.write_text("reward = 2\n", encoding="utf-8")
+    assert _find_resume_start_iteration(rewards_dir, iter_dir.parent) == 7
 
 
 # ── Metric-plateau auto-kill compatibility ───────────────────────────────
@@ -320,6 +460,52 @@ def test_write_current_reexport_surfaces_compute_reward_batched(tmp_path: Path):
     assert "compute_reward_batched" in mod.__all__
 
 
+def test_write_current_reexport_is_transparent_to_reference_clock_surface(
+    tmp_path: Path,
+) -> None:
+    """The worker receives current.py, so conditioning helpers must survive it."""
+    import hashlib
+    import importlib.util
+
+    from sculptor.edit import _write_current_reexport
+
+    rewards_dir = tmp_path / "rewards"
+    rewards_dir.mkdir()
+    selected = rewards_dir / "v12.py"
+    selected.write_text(
+        "REWARD_SPEC = {'reference_clock': {'schema': 1}}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n"
+        "def compute_reward_batched(s, a, n, i): return a[:, 0], {}\n"
+        "def reference_clock_batched(step_count, device): return step_count\n"
+        "def reference_target_index_batched(step_count, device): "
+        "return step_count + 1\n",
+        encoding="utf-8",
+    )
+    _write_current_reexport(rewards_dir, selected)
+
+    spec = importlib.util.spec_from_file_location(
+        "reg_test_reference_current", str(rewards_dir / "current.py")
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    for name in (
+        "compute_reward_batched",
+        "reference_clock_batched",
+        "reference_target_index_batched",
+    ):
+        assert getattr(mod, name) is getattr(mod._mod, name)
+        assert name in mod.__all__
+    assert mod.reference_clock_batched(4, "cpu") == 4
+    assert mod.reference_target_index_batched(4, "cpu") == 5
+    assert mod.SCULPTOR_REWARD_SELECTOR == {
+        "schema": 1,
+        "filename": "v12.py",
+        "sha256": hashlib.sha256(selected.read_bytes()).hexdigest(),
+    }
+
+
 def test_write_current_reexport_skips_batched_for_scalar_only_module(
     tmp_path: Path,
 ):
@@ -399,7 +585,10 @@ class _StubAdapter(SculptorAdapter):
             logs_path=output_dir / "logs",
         )
 
-    def rollout(self, checkpoint_path, output_dir, n_episodes):
+    def rollout(
+        self, checkpoint_path, output_dir, n_episodes, *, seed=None,
+        reward_module_path=None,
+    ):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "keyframes").mkdir(exist_ok=True)
@@ -536,6 +725,37 @@ class _ResourceAdapterStub(_TestAdapterStub):
         self.device = device
 
 
+class _SeedEvidenceAdapter(_StubAdapter):
+    """CPU stub with an explicit rollout seed and one injected failure."""
+
+    def __init__(self, **_cfg):
+        super().__init__(Path.cwd(), [1.0])
+
+    def rollout(
+        self, checkpoint_path, output_dir, n_episodes, *, seed=None,
+        reward_module_path=None,
+    ):
+        if seed == 10_001:
+            raise RuntimeError("injected seed failure")
+        return super().rollout(checkpoint_path, output_dir, n_episodes)
+
+
+class _PrimarySeedFailureAdapter(_SeedEvidenceAdapter):
+    def rollout(
+        self, checkpoint_path, output_dir, n_episodes, *, seed=None,
+        reward_module_path=None,
+    ):
+        if seed == 10_000:
+            raise RuntimeError("primary seed failed")
+        return super().rollout(
+            checkpoint_path,
+            output_dir,
+            n_episodes,
+            seed=seed,
+            reward_module_path=reward_module_path,
+        )
+
+
 def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
     """3 iterations, dry-run, stub adapter — exercises the full orchestration
     path including CHANGELOG, provenance, git commits."""
@@ -564,6 +784,12 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         )
         assert completion["state"] == "completed"
         assert completion["iter"] == i
+        assert completion["schema"] == 3
+        checkpoint = proj / "runs" / f"iter_{i}" / "checkpoint.zip"
+        assert completion["checkpoint_sha256"] == hashlib.sha256(
+            checkpoint.read_bytes()
+        ).hexdigest()
+        assert completion["checkpoint_bytes"] == checkpoint.stat().st_size
     for n in (1, 2, 3):
         assert (proj / "rewards" / f"v{n}.py").is_file()
     # current.py now re-exports v3
@@ -591,6 +817,112 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         capture_output=True, text=True, check=True).stdout
     iter_commits = [line for line in log.splitlines() if "iter " in line]
     assert len(iter_commits) == 3
+
+
+def test_incomplete_multiseed_batch_is_recorded_and_aborts_iteration(
+    tmp_path: Path,
+):
+    proj = _write_minimal_project(tmp_path)
+    config = proj / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "tests.test_sculpt._TestAdapterStub",
+            "tests.test_sculpt._SeedEvidenceAdapter",
+        ),
+        encoding="utf-8",
+    )
+
+    def fitness(_iter_dir):
+        return 0.5
+
+    fitness.detail = lambda _iter_dir: {"spec_score": 0.5}  # type: ignore[attr-defined]
+    fitness.detail_dir = lambda _rollout_dir: {  # type: ignore[attr-defined]
+        "spec_score": 0.6
+    }
+
+    with pytest.raises(RuntimeError, match="objective evaluation incomplete"):
+        sculpt_run(
+            config_path=config,
+            behavior_goal="record every requested evaluation seed",
+            iterations=1,
+            no_kg=True,
+            dry_run=True,
+            fitness_fn=fitness,
+            eval_seeds=3,
+            fresh_eval_seeds=0,
+        )
+
+    iter_dir = proj / "runs" / "iter_0"
+    plan = json.loads(
+        (iter_dir / "evaluation_plan.json").read_text(encoding="utf-8")
+    )
+    receipt = json.loads(
+        (iter_dir / "evaluation_results.json").read_text(encoding="utf-8")
+    )
+    assert plan["requested_seeds"] == [10_000, 10_001, 10_002]
+    assert receipt["requested_count"] == 3
+    assert receipt["completed_count"] == 2
+    assert receipt["complete"] is False
+    assert [item["status"] for item in receipt["results"]] == [
+        "succeeded", "failed", "succeeded",
+    ]
+    assert not (iter_dir / "fitness.json").exists()
+    assert not (iter_dir / "diagnosis.json").exists()
+    assert not (iter_dir / "iteration_complete.json").exists()
+    assert _find_resume_start_iteration(
+        proj / "rewards", proj / "runs",
+    ) == 0
+
+
+def test_primary_evaluation_failure_records_all_requested_seeds(
+    tmp_path: Path,
+):
+    proj = _write_minimal_project(tmp_path)
+    config = proj / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "tests.test_sculpt._TestAdapterStub",
+            "tests.test_sculpt._PrimarySeedFailureAdapter",
+        ),
+        encoding="utf-8",
+    )
+
+    def fitness(_iter_dir):
+        return 0.5
+
+    fitness.detail = lambda _iter_dir: {"spec_score": 0.5}  # type: ignore[attr-defined]
+    fitness.detail_dir = lambda _rollout_dir: {  # type: ignore[attr-defined]
+        "spec_score": 0.5
+    }
+
+    with pytest.raises(RuntimeError, match="primary seed failed"):
+        sculpt_run(
+            config_path=config,
+            behavior_goal="fail visibly",
+            iterations=1,
+            no_kg=True,
+            dry_run=True,
+            fitness_fn=fitness,
+            eval_seeds=3,
+            fresh_eval_seeds=0,
+        )
+
+    receipt = json.loads(
+        (proj / "runs" / "iter_0" / "evaluation_results.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [item["status"] for item in receipt["results"]] == [
+        "failed", "not_run", "not_run",
+    ]
+    assert [item["seed"] for item in receipt["results"]] == [
+        10_000, 10_001, 10_002,
+    ]
+    iter_dir = proj / "runs" / "iter_0"
+    assert not (iter_dir / "iteration_complete.json").exists()
+    assert _find_resume_start_iteration(
+        proj / "rewards", proj / "runs",
+    ) == 0
 
 
 def test_sculpt_run_applies_resource_overrides_without_mutating_project(
@@ -684,13 +1016,9 @@ def test_sculpt_run_resume_picks_up_at_latest_v(tmp_path: Path):
 
 
 # ── Per-phase resume regression: skip train when ckpt is on disk ────
-def test_train_or_resume_skips_when_checkpoint_present(tmp_path: Path):
-    """Phase C2 (overnight reliability): `_train_or_resume` must skip
-    `adapter.train` when `iter_dir/checkpoint.pt` is already on disk
-    and loads cleanly. The bolt-on `--resume` for sculpt_run picks up
-    on `rewards/v<N>.py`, but if a prior run got through train and
-    died mid-rollout the iter's ckpt is there and retraining it is
-    ~22 min wasted."""
+def test_train_or_resume_rejects_unattested_checkpoint(tmp_path: Path):
+    """A parseable checkpoint without exact input/completion receipts is
+    stale evidence and must retrain rather than inherit the new request."""
     import torch
     from sculptor.adapters.base import TrainResult
     from sculptor.sculpt import _train_or_resume
@@ -701,23 +1029,34 @@ def test_train_or_resume_skips_when_checkpoint_present(tmp_path: Path):
     torch.save({"model": "ok"}, iter_dir / "checkpoint.pt")
     (iter_dir / "metrics.json").write_text('{"steps": 1500}', encoding="utf-8")
 
-    class _BoomAdapter:
+    reward = tmp_path / "reward.py"
+    reward.write_text("reward = 1\n", encoding="utf-8")
+
+    class _Adapter:
+        called = False
+
         def train(self, **_kw):
-            raise AssertionError(
-                "adapter.train must not run when checkpoint.pt exists"
+            self.called = True
+            torch.save({"model": "new"}, iter_dir / "checkpoint.pt")
+            return TrainResult(
+                checkpoint_path=iter_dir / "checkpoint.pt",
+                metrics_dict={}, component_means={}, logs_path=iter_dir / "logs",
             )
 
+    adapter = _Adapter()
     result = _train_or_resume(
-        adapter=_BoomAdapter(),
+        adapter=adapter,
         iter_index=0,
         iter_dir=iter_dir,
-        reward_module_path=tmp_path / "nonexistent.py",
+        reward_module_path=reward,
         steps=1500,
         seed=0,
     )
     assert isinstance(result, TrainResult)
     assert result.checkpoint_path == iter_dir / "checkpoint.pt"
-    assert result.metrics_dict == {"steps": 1500.0}
+    assert adapter.called is True
+    assert (iter_dir / "train_input_manifest.json").is_file()
+    assert (iter_dir / "train_completion_manifest.json").is_file()
 
 
 def test_train_or_resume_falls_through_on_corrupt_checkpoint(tmp_path: Path):
@@ -729,6 +1068,8 @@ def test_train_or_resume_falls_through_on_corrupt_checkpoint(tmp_path: Path):
     iter_dir = tmp_path / "iter_0"
     iter_dir.mkdir()
     (iter_dir / "checkpoint.pt").write_bytes(b"not-a-torch-pickle")
+    reward = tmp_path / "reward.py"
+    reward.write_text("reward = 1\n", encoding="utf-8")
 
     class _StubAdapter:
         def __init__(self):
@@ -748,16 +1089,68 @@ def test_train_or_resume_falls_through_on_corrupt_checkpoint(tmp_path: Path):
     adapter = _StubAdapter()
     result = _train_or_resume(
         adapter=adapter, iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "nonexistent.py",
+        reward_module_path=reward,
         steps=1500, seed=0,
     )
     assert adapter.train_called, "corrupt ckpt must trigger a fresh train"
     assert result is not None
 
 
-def test_rollout_or_resume_skips_when_artifacts_present(tmp_path: Path):
-    """Rollout artifacts on disk → skip `adapter.rollout`. Partial
-    artifacts (missing one) → re-run."""
+def test_mode_admission_event_is_emitted_only_at_fresh_train_boundary(
+    tmp_path: Path, monkeypatch,
+):
+    import sculptor.sculpt as sculpt_mod
+    from sculptor.adapters.base import TrainResult
+
+    event = {"type": "mode_execution_admitted", "reward_sha256": "a" * 64}
+    observed: list[dict] = []
+    monkeypatch.setattr(sculpt_mod, "_emit_event", observed.append)
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    reward = tmp_path / "reward.py"
+    reward.write_text("reward = 1\n", encoding="utf-8")
+
+    class _Adapter:
+        def train(self, output_dir, **_kwargs):
+            import torch
+
+            assert observed == [event]
+            checkpoint = Path(output_dir) / "checkpoint.pt"
+            torch.save({"model": "ok"}, checkpoint)
+            return TrainResult(
+                checkpoint_path=checkpoint,
+                metrics_dict={},
+                component_means={},
+                logs_path=fresh / "logs",
+            )
+
+    sculpt_mod._train_or_resume(
+        adapter=_Adapter(),
+        iter_index=0,
+        iter_dir=fresh,
+        reward_module_path=reward,
+        steps=1,
+        seed=0,
+        pre_train_event=event,
+    )
+
+    observed.clear()
+    sculpt_mod._train_or_resume(
+        adapter=_Adapter(),
+        iter_index=0,
+        iter_dir=fresh,
+        reward_module_path=reward,
+        steps=1,
+        seed=0,
+        pre_train_event=event,
+    )
+    assert not any(item.get("type") == "mode_execution_admitted" for item in observed)
+
+
+def test_rollout_or_resume_requires_exact_receipts(tmp_path: Path):
+    """Legacy artifacts rerun once; exact receipts then skip; a partial
+    output reruns again."""
     from sculptor.sculpt import _rollout_or_resume
 
     rollout_dir = tmp_path / "rollout"
@@ -765,31 +1158,41 @@ def test_rollout_or_resume_skips_when_artifacts_present(tmp_path: Path):
     for name in ("rollout.mp4", "trajectory.npz", "behavior.json"):
         (rollout_dir / name).write_bytes(b"x")  # non-empty so the size check passes
 
-    class _BoomAdapter:
-        def rollout(self, **_kw):
-            raise AssertionError("must skip when all three artifacts exist")
-
-    _rollout_or_resume(
-        adapter=_BoomAdapter(), iter_index=0, rollout_dir=rollout_dir,
-        checkpoint_path=tmp_path / "ckpt.pt", n_episodes=6,
-    )
-
-    # Remove one artifact → rollout must re-run.
-    (rollout_dir / "behavior.json").unlink()
+    checkpoint = tmp_path / "ckpt.pt"
+    checkpoint.write_bytes(b"checkpoint")
 
     class _StubAdapter:
         def __init__(self):
-            self.called = False
+            self.calls = 0
 
         def rollout(self, **_kw):
-            self.called = True
+            self.calls += 1
+            for name in ("rollout.mp4", "trajectory.npz", "behavior.json"):
+                (rollout_dir / name).write_bytes(
+                    f"{name}:{self.calls}".encode()
+                )
 
     adapter = _StubAdapter()
     _rollout_or_resume(
         adapter=adapter, iter_index=0, rollout_dir=rollout_dir,
-        checkpoint_path=tmp_path / "ckpt.pt", n_episodes=6,
+        checkpoint_path=checkpoint, n_episodes=6,
     )
-    assert adapter.called, "missing behavior.json must trigger re-run"
+    assert adapter.calls == 1
+
+    _rollout_or_resume(
+        adapter=adapter, iter_index=0, rollout_dir=rollout_dir,
+        checkpoint_path=checkpoint, n_episodes=6,
+    )
+    assert adapter.calls == 1
+
+    # Remove one artifact → rollout must re-run.
+    (rollout_dir / "behavior.json").unlink()
+
+    _rollout_or_resume(
+        adapter=adapter, iter_index=0, rollout_dir=rollout_dir,
+        checkpoint_path=checkpoint, n_episodes=6,
+    )
+    assert adapter.calls == 2, "missing behavior.json must trigger re-run"
 
 
 # ── Metric-plateau early-stop compatibility ───────────────────────────────
@@ -1044,6 +1447,11 @@ def test_iter_fitness_event_carries_components_dict(
                 "error": None,
             }
 
+        metric_id = "test-metric"
+        metric_version = "v1"
+        metric_source = "test"
+        metric_sha256 = "d" * 64
+
     result = sculpt_run(
         config_path=proj / "config.toml", behavior_goal="dummy goal",
         iterations=1, no_kg=True, dry_run=True,
@@ -1071,6 +1479,12 @@ def test_iter_fitness_event_carries_components_dict(
     assert record["fitness"] == pytest.approx(0.0)
     assert record["components"] == {
         "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+    assert record["metric"] == {
+        "id": "test-metric",
+        "version": "v1",
+        "source": "test",
+        "sha256": "d" * 64,
     }
     assert record["source"] == "live"
     assert record["observe_only"] is False
@@ -1119,10 +1533,15 @@ def test_iter_fitness_event_components_null_on_plain_float_fallback(
     assert fitness_events[0]["components"] is None
 
 
-def test_dangling_current_reexport_is_repaired(tmp_path: Path):
-    """A generated current.py whose target v<n>.py was deleted would crash
-    mid-train on import; the iter must repair the re-export to the latest
-    version before training."""
+def test_dangling_current_reexport_fails_closed_without_latest_fallback(
+    tmp_path: Path,
+):
+    """A missing selected reward is lost authority, not permission to guess.
+
+    Selecting the newest surviving version would silently change the reward
+    the researcher chose. Launch must stop before adapter work and leave the
+    selector untouched so the repair is explicit and reviewable.
+    """
     global _SCHEDULE
     _SCHEDULE = [1.0]
     proj = _write_minimal_project(tmp_path)
@@ -1136,15 +1555,13 @@ def test_dangling_current_reexport_is_repaired(tmp_path: Path):
     (rewards / "v0.py").unlink()
     assert _current_reward_target(rewards) is None
 
-    result = sculpt_run(
-        config_path=proj / "config.toml", behavior_goal="dummy goal",
-        iterations=1, resume=True, no_kg=True, dry_run=True,
-    )
-    (outcome,) = result.completed_iters
-    # Repaired: trained the latest surviving version, records agree.
-    assert outcome.reward_path_trained == rewards / "v1.py"
-    assert "v1.py" in (rewards / "current.py").read_text(encoding="utf-8") \
-        or "v2.py" in (rewards / "current.py").read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="selects a missing"):
+        sculpt_run(
+            config_path=proj / "config.toml", behavior_goal="dummy goal",
+            iterations=1, resume=True, no_kg=True, dry_run=True,
+        )
+    assert "v0.py" in (rewards / "current.py").read_text(encoding="utf-8")
+    assert (rewards / "v1.py").is_file()
 
 
 def test_current_reward_target_parses_ui_backend_format(tmp_path: Path):

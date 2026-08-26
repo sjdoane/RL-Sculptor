@@ -7,7 +7,7 @@ import { useLiveClips } from "@/hooks/useLiveClips";
 import { useProjectPreview } from "@/hooks/useProjectPreview";
 import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { useRunEvents } from "@/hooks/useRunEvents";
-import { useRuns } from "@/hooks/useRuns";
+import { useProjectIterations, useRuns } from "@/hooks/useRuns";
 import {
   clipUrl, getStageIterations, iterRolloutUrl, previewUrl, projectIterRolloutUrl,
   stageExportUrl, stageRolloutUrl,
@@ -111,13 +111,21 @@ export function RobotViewer({
   // Once the mission is terminal (no active job), default to the most
   // recent stage that actually has a rollout on disk, so an errored
   // final stage never blanks the viewer.
+  //
+  // …but only when a mission stage IS the project's latest activity. A
+  // project can own a mission whose last stage ran days before its newest
+  // plain sculpt run; auto-selecting a stage there silently redirected
+  // Replay to that older stage's rollout, so the run the user just
+  // finished was unreachable without touching the stage picker. Follow
+  // the most recent run instead — an explicit stage pick still wins.
   useEffect(() => {
     if (selectedStage || !setSelectedStage) return;
     if (missionActive) return;
+    if (liveRun && liveRun.kind !== "mission_stage_run") return;
     if (!missionDetail.data || missionDetail.data.active_job_id != null) return;
     const fallback = pickDefaultStage(missionDetail.data.stages);
     if (fallback) setSelectedStage({ missionSlug: missionDetail.data.mission_slug, stageName: fallback });
-  }, [selectedStage, setSelectedStage, missionActive, missionDetail.data]);
+  }, [selectedStage, setSelectedStage, missionActive, missionDetail.data, liveRun]);
 
   const showStagePicker = !!missionSlugForPicker && (missionDetail.data?.stages.length ?? 0) > 1;
   // §UX honesty pass (Replay stage nav): whether ANY iteration has a
@@ -625,12 +633,14 @@ function StageReplayLayer({
   }, [src]);
 
   const noRolloutAtAll = !iters.isLoading && !iters.error && rowsWithRollout.length === 0;
+  const { duration, onLoadedMetadata } = useClipDuration(src);
 
   return (
     <>
       <div className="rs-overlay">
         <Icon name="history" size={13} />
         replay · {stageName}{activeIter !== null ? ` · iter ${activeIter}` : ""}
+        <DurationNote duration={duration} />
       </div>
       {(src || activeRow?.has_checkpoint) && (
         <div className="rs-overlay" style={{ left: "auto", right: 12, gap: 10 }}>
@@ -672,6 +682,7 @@ function StageReplayLayer({
           style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
           controls
           playsInline
+          onLoadedMetadata={onLoadedMetadata}
         />
       )}
       {rowsWithRollout.length > 0 && (
@@ -779,15 +790,42 @@ function ReplayLayer({
   // disk-truth endpoint instead.
   const isDiskRow = !!run && run.run_id.startsWith("disk:");
   const liveState = useLiveClips(slug, isDiskRow ? undefined : run?.run_id);
+
+  // Iteration DIRECTORY indices are not a 0..iterations_completed range:
+  // plain sculpt runs number them from 1, mission stages from 0, and a
+  // resumed run starts above 0. Deriving the list from the *count* pointed
+  // the player at an iter with no rollout on disk, so both the mp4 and the
+  // live-clip fallback 404'd and the <video> rendered as a dead 0:00 frame.
+  // Ask disk truth instead — the same endpoints the run list already uses.
+  const isStageRun = !!run?.mission_slug && !!run?.stage_name;
+  const isTraining = run?.status === "running";
+  const stageIters = useStageIterations(
+    slug, run?.mission_slug ?? undefined, run?.stage_name ?? undefined,
+    { enabled: isStageRun, refetchIntervalMs: isTraining ? 5000 : null },
+  );
+  const projectIters = useProjectIterations(slug, {
+    enabled: !!run && !isStageRun,
+    refetchIntervalMs: isTraining ? 5000 : null,
+  });
+
   const availableIters = useMemo(() => {
     const set = new Set<number>();
     liveState.clips.forEach((c) => set.add(c.iter));
-    if (run) for (let i = 0; i < run.iterations_completed; i++) set.add(i);
+    const rows = isStageRun ? stageIters.data : projectIters.data;
+    (rows ?? []).forEach((row) => {
+      if (row.has_rollout) set.add(row.iter_index);
+    });
     return Array.from(set).sort((a, b) => a - b);
-  }, [liveState.clips, run]);
+  }, [liveState.clips, isStageRun, stageIters.data, projectIters.data]);
 
+  // Also re-pick when the current selection is not on disk for this run —
+  // switching between runs whose iterations start at different indices
+  // would otherwise strand the player on a stale index.
   useEffect(() => {
-    if (iter === null && availableIters.length > 0) onPickIter(availableIters[availableIters.length - 1]);
+    if (availableIters.length === 0) return;
+    if (iter === null || !availableIters.includes(iter)) {
+      onPickIter(availableIters[availableIters.length - 1]);
+    }
   }, [iter, availableIters, onPickIter]);
 
   const src = useMemo(() => {
@@ -809,11 +847,28 @@ function ReplayLayer({
     return clipUrl(slug, run.run_id, iter);
   }, [slug, run, iter, isDiskRow]);
 
+  // A <video> whose source 404s renders as a black 0:00 frame with no
+  // explanation. Say so instead.
+  const [loadFailed, setLoadFailed] = useState(false);
+  useEffect(() => { setLoadFailed(false); }, [src]);
+  const { duration, onLoadedMetadata } = useClipDuration(src);
+
   if (!run) return <EmptyOverlay title="No runs yet" />;
+  if (src && loadFailed) {
+    return (
+      <EmptyOverlay
+        title={`No replay on disk for iter ${iter}`}
+        error={`${src} did not load. The rollout mp4 for this iteration was never written — check the run's event log for a render error.`}
+      />
+    );
+  }
 
   return (
     <>
-      <div className="rs-overlay"><Icon name="history" size={13} />replay{iter !== null ? ` · iter ${iter}` : ""}</div>
+      <div className="rs-overlay">
+        <Icon name="history" size={13} />replay{iter !== null ? ` · iter ${iter}` : ""}
+        <DurationNote duration={duration} />
+      </div>
       {src && (
         <a
           href={src}
@@ -832,9 +887,14 @@ function ReplayLayer({
           aria-label={`Replay of robot rollout, iteration ${iter}`}
           style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
           controls playsInline
+          onLoadedMetadata={onLoadedMetadata}
           onError={(e) => {
             const video = e.currentTarget;
-            if (clipSrc && video.src !== window.location.origin + clipSrc) video.src = clipSrc;
+            if (clipSrc && video.src !== window.location.origin + clipSrc) {
+              video.src = clipSrc;
+              return;
+            }
+            setLoadFailed(true);
           }}
         />
       )}
@@ -858,6 +918,45 @@ function ReplayLayer({
         </div>
       )}
     </>
+  );
+}
+
+// ── Replay duration badge ─────────────────────────────────────────────
+// A rollout whose episode died after a handful of steps still encodes as a
+// perfectly valid mp4 — it just plays for a fraction of a second. Without
+// the length on screen that reads as "the video player is broken" rather
+// than "the episode terminated immediately", which is the actual finding.
+function useClipDuration(src: string | null) {
+  const [duration, setDuration] = useState<number | null>(null);
+  useEffect(() => { setDuration(null); }, [src]);
+  const onLoadedMetadata = useCallback(
+    (e: React.SyntheticEvent<HTMLVideoElement>) => {
+      const d = e.currentTarget.duration;
+      setDuration(Number.isFinite(d) && d > 0 ? d : null);
+    },
+    [],
+  );
+  return { duration, onLoadedMetadata };
+}
+
+const TRUNCATED_ROLLOUT_S = 1.0;
+
+function DurationNote({ duration }: { duration: number | null }) {
+  if (duration === null) return null;
+  const truncated = duration < TRUNCATED_ROLLOUT_S;
+  return (
+    <span
+      style={truncated ? { color: "#f0b429", fontWeight: 600 } : undefined}
+      title={
+        truncated
+          ? "The episode ended after a few steps, so there is almost nothing to play. "
+            + "This is a truncated rollout, not a playback problem — check the run's "
+            + "termination reason."
+          : undefined
+      }
+    >
+      {` · ${duration.toFixed(2)}s`}{truncated ? " truncated" : ""}
+    </span>
   );
 }
 

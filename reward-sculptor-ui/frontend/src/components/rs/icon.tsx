@@ -3,9 +3,9 @@ import {
   Book, Bot, Camera, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight,
   ChevronUp, Circle, CircleDot, Clock, Command, Copy, Cpu, Download, ExternalLink,
   Eye, EyeOff, FileCode, FileText, Filter, Flag, Folder, Gauge, GitBranch, GitCommitHorizontal,
-  GitCompare, History, Info, Key, Layers, LayoutGrid, Library, List, Loader2,
+  GitCompare, Globe, History, Info, Key, Layers, LayoutGrid, Library, List, Loader2,
   Maximize2, Menu, Minus, Moon, Network, Package, PanelLeft, Pause, Pencil, Play,
-  Plus, RefreshCw, ScrollText, Search, Settings, SkipForward, SlidersHorizontal, Sparkles,
+  Plus, RefreshCw, ScrollText, Search, Settings, ShieldCheck, SkipForward, SlidersHorizontal, Sparkles,
   Square, Sun, Target, Terminal, Thermometer, TrendingUp, Trash2, Upload, User,
   Video, X, Zap, type LucideIcon,
 } from "lucide-react";
@@ -86,6 +86,8 @@ const ICON_MAP: Record<string, LucideIcon> = {
   minus: Minus,
   history: History,
   "skip-forward": SkipForward,
+  globe: Globe,
+  "shield-check": ShieldCheck,
 };
 
 export interface IconProps {
@@ -98,9 +100,22 @@ export interface IconProps {
 
 /** Decorative by default (aria-hidden). For a standalone meaningful icon,
  *  wrap it in a labelled control (e.g. IconBtn provides aria-label). */
+/** Names already reported missing, so the warning is once per name and not
+ *  once per render. */
+const warned = new Set<string>();
+
 export function Icon({ name, size = 18, className, color, strokeWidth = 2 }: IconProps) {
-  const Cmp = ICON_MAP[name] ?? Circle;
+  const Cmp = ICON_MAP[name];
+  // A missing key renders a bare Circle, which reads as a deliberate glyph
+  // rather than a bug — `globe` and `shield-check` sat unmapped long enough
+  // that the World tab's icon in the main tablist was a plain circle. Say so
+  // out loud; still fall back, so a typo can never blank a screen.
+  if (!Cmp && !warned.has(name)) {
+    warned.add(name);
+    console.warn(`[Icon] no glyph mapped for "${name}" — falling back to circle`);
+  }
+  const Resolved = Cmp ?? Circle;
   return (
-    <Cmp size={size} className={className} color={color} strokeWidth={strokeWidth} aria-hidden />
+    <Resolved size={size} className={className} color={color} strokeWidth={strokeWidth} aria-hidden />
   );
 }

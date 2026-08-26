@@ -1,15 +1,16 @@
-"""Policy export — self-contained deployment bundles for sim-to-real.
+"""Policy export — byte-pinned reproducibility bundles.
 
-A bundle is a single zip that carries everything needed to reproduce or
-deploy one trained iteration:
+A bundle is a single zip that carries retained policy and experiment artifacts
+for inspection and trusted local reproduction.  Downloadability is not a
+task-success, transfer, hardware-safety, or sim-to-real certification:
 
     policy_<project>_iter<N>.zip
     ├── manifest.json        # schema, provenance, dims, hashes, deployment
     ├── checkpoint.pt|zip    # the raw trained checkpoint, byte-exact
     ├── policy.onnx          # actor network, ONNX (best-effort)
     ├── policy_ts.pt         # actor network, TorchScript (best-effort)
-    ├── inference.py         # runnable hardware skeleton (obs order + action
-    │                        #   formula + rate baked in; 2 robot-SDK seams)
+    ├── inference.py         # illustrative interface skeleton; not a safety
+    │                        #   controller or hardware integration
     ├── reward/
     │   ├── reward_spec.json # REWARD_SPEC snapshot the iter trained under
     │   └── v<n>.py          # exact reward source (when resolvable)
@@ -18,14 +19,13 @@ deploy one trained iteration:
     ├── config.toml          # project config snapshot
     ├── metrics.json         # the iter's training/eval metrics
     ├── run_context.json     # package versions / SHAs / seeds (if recorded)
-    └── DEPLOY.md            # loading recipes + sim→real hardware contract
+    └── DEPLOY.md            # interface notes + explicit certification status
 
-The manifest ``deployment`` block is the sim→real interface contract the raw
-network cannot carry: the joint ORDER the action/obs vectors index (from the
-robot manifest), the action→joint-target formula + per-joint scale + default
-pose, the control rate (sim dt × decimation), and the ordered observation
-layout — all read best-effort from the mjlab task cfg, degrading to the joint
-order + a flag when mjlab is not importable.
+The manifest ``deployment`` block records a best-effort policy interface.  It
+does not prove hardware integration or safety.  A separate
+``deployment_authority`` receipt records whether the exact selection,
+objective, physical-scene, origin tuple/runtime sidecar, and lineage gates
+passed; without that receipt the bundle is explicitly non-certified.
 
 Checkpoint formats understood:
 
@@ -42,22 +42,40 @@ Checkpoint formats understood:
 Everything network-related is best-effort by design: the raw checkpoint +
 DEPLOY.md recipe are always present, so a bundle is never useless even
 when torch/onnx/sb3 are missing from the environment doing the export.
+
+This raw reproducibility ZIP is intentionally not a portable upload.  Use
+``export_starting_skill_bundle`` (CLI: ``sculptor export --portable``) for the
+closed, data-only ``.rskill`` format accepted at the hostile-upload boundary.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO, Optional
 
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 2
+REPRODUCIBILITY_BUNDLE_KIND = "reward-sculptor-reproducibility-bundle"
+# Compatibility import for callers that referenced the old constant. New
+# manifests intentionally use the neutral reproducibility kind above.
+DEPLOYMENT_BUNDLE_KIND = REPRODUCIBILITY_BUNDLE_KIND
+PORTABLE_SKILL_SCHEMA_VERSION = 2
+PORTABLE_TRACKER_SKILL_SCHEMA_VERSION = 3
+PORTABLE_SKILL_BUNDLE_KIND = "reward-sculptor-starting-skill"
+
+_PORTABLE_ROBOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_REFERENCE_ARCHIVE_MAX_BYTES = 512 * 1024**2
+_REFERENCE_EXPANDED_MAX_BYTES = 1024**3
+_REFERENCE_MEMBER_MAX = 128
 
 _ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
 _MLP_KEY_RE = re.compile(r"^mlp\.(\d+)\.(weight|bias)$")
@@ -72,6 +90,115 @@ class ExportResult:
     bundle_path: Path
     manifest: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
+
+
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _deployment_authority_for_bundle(
+    authority_receipt: dict[str, Any] | None,
+    *,
+    iter_index: int,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Accept only a self-consistent, exact-iteration authority receipt."""
+    fallback = {
+        "schema": 1,
+        "status": "not_certified",
+        "purpose": "reproducibility",
+        "iter_index": iter_index,
+        "checks": {},
+        "blockers": [
+            "no valid server-verified deployment authority receipt was supplied"
+        ],
+    }
+    if not isinstance(authority_receipt, dict):
+        fallback["authority_digest"] = _canonical_digest(fallback)
+        return fallback
+    candidate = json.loads(json.dumps(authority_receipt, allow_nan=False))
+    claimed_digest = candidate.pop("authority_digest", None)
+    checks = candidate.get("checks")
+    origin = checks.get("origin_lineage") if isinstance(checks, dict) else None
+    physical = checks.get("physical_scene") if isinstance(checks, dict) else None
+    blockers = candidate.get("blockers")
+    status = candidate.get("status")
+    valid = (
+        candidate.get("schema") == 1
+        and candidate.get("purpose") == "reproducibility"
+        and candidate.get("iter_index") == iter_index
+        and status in {"qualified", "not_certified"}
+        and isinstance(blockers, list)
+        and all(isinstance(item, str) and item for item in blockers)
+        and isinstance(claimed_digest, str)
+        and claimed_digest == _canonical_digest(candidate)
+    )
+    if status == "qualified":
+        origin_digest = (
+            origin.get("origin_receipt_sha256")
+            if isinstance(origin, dict) else None
+        )
+        unsigned_origin = (
+            {key: value for key, value in origin.items()
+             if key != "origin_receipt_sha256"}
+            if isinstance(origin, dict) else None
+        )
+        required_origin_digests = (
+            "artifact_tuple_sha256",
+            "selection_sha256",
+            "tuple_hash",
+            "checkpoint_sha256",
+            "policy_contract_sidecar_sha256",
+            "policy_contract_sha256",
+            "runtime_artifacts_sha256",
+        )
+        valid = (
+            valid
+            and blockers == []
+            and isinstance(checks, dict)
+            and checks.get("completion") == "attested"
+            and checks.get("canonical_selection") is True
+            and checks.get("objective_proof") == "passed"
+            and isinstance(physical, dict)
+            and physical.get("status") in {"aligned", "not_applicable"}
+            and isinstance(origin, dict)
+            and origin.get("checkpoint_sha256") == checkpoint_sha256
+            and origin.get("iter_index") == iter_index
+            and origin.get("schema") == 1
+            and all(
+                isinstance(origin.get(key), str)
+                and re.fullmatch(r"[0-9a-f]{64}", origin[key]) is not None
+                for key in required_origin_digests
+            )
+            and isinstance(origin_digest, str)
+            and unsigned_origin is not None
+            and origin_digest == _canonical_digest(unsigned_origin)
+            and type(origin.get("reference_conditioned")) is bool
+            and (
+                origin.get("reference_conditioned") is False
+                and origin.get("reference_clock_sha256") is None
+                or origin.get("reference_conditioned") is True
+                and isinstance(origin.get("reference_clock_sha256"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", origin["reference_clock_sha256"]
+                ) is not None
+            )
+        )
+    if not valid:
+        fallback["blockers"] = [
+            "deployment authority receipt is malformed or does not bind the "
+            "exported checkpoint"
+        ]
+        fallback["authority_digest"] = _canonical_digest(fallback)
+        return fallback
+    candidate["authority_digest"] = claimed_digest
+    return candidate
 
 
 # ── discovery ──────────────────────────────────────────────────────────────
@@ -135,22 +262,278 @@ def _find_checkpoint(iter_dir: Path) -> Optional[Path]:
 
 # ── bundle builder ─────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class _CapturedExportFile:
+    """One immutable, server-owned input to a reproducibility ZIP."""
+
+    path: Path
+    archive_name: str
+    sha256: str
+    bytes: int
+
+
+def _source_stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Return the fields that must remain stable throughout one capture."""
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _copy_export_source(
+    source: Path,
+    source_handle: BinaryIO,
+    destination_handle: BinaryIO,
+) -> tuple[str, int]:
+    """Copy and hash one source stream.
+
+    Kept as a small seam so tests can deterministically mutate ``source``
+    before the caller performs its post-copy identity checks.
+    """
+    digest = hashlib.sha256()
+    copied = 0
+    for chunk in iter(lambda: source_handle.read(1 << 20), b""):
+        destination_handle.write(chunk)
+        digest.update(chunk)
+        copied += len(chunk)
+    destination_handle.flush()
+    os.fsync(destination_handle.fileno())
+    return digest.hexdigest(), copied
+
+
+def _safe_export_archive_name(archive_name: str) -> PurePosixPath:
+    candidate = PurePosixPath(archive_name)
+    if (
+        not archive_name
+        or "\\" in archive_name
+        or candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in archive_name.split("/"))
+        or candidate.as_posix() == "manifest.json"
+    ):
+        raise ExportError(f"unsafe export archive member {archive_name!r}")
+    return candidate
+
+
+def _assert_unlinked_source_path(source: Path, admitted_root: Path) -> None:
+    """Reject symlinked or non-directory traversal below an admitted root."""
+    source_absolute = Path(os.path.abspath(source))
+    root_absolute = Path(os.path.abspath(admitted_root))
+    try:
+        relative = source_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ExportError(
+            f"export source escapes its admitted root: {source}"
+        ) from exc
+    try:
+        root_stat = root_absolute.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ExportError(
+                f"export source root is linked or not a directory: "
+                f"{root_absolute}"
+            )
+        cursor = root_absolute
+        for part in relative.parts[:-1]:
+            cursor = cursor / part
+            current = cursor.lstat()
+            if not stat.S_ISDIR(current.st_mode):
+                raise ExportError(
+                    "export source traverses a symlink or non-directory: "
+                    f"{cursor}"
+                )
+    except ExportError:
+        raise
+    except OSError as exc:
+        raise ExportError(
+            f"export source path cannot be verified: {source}"
+        ) from exc
+
+
+def _paths_alias(first: Path, second: Path) -> bool:
+    """Return whether two paths name, or would name, the same output."""
+    try:
+        if first.exists() and second.exists() and first.samefile(second):
+            return True
+    except OSError:
+        pass
+    try:
+        return first.resolve(strict=False) == second.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(first)) == Path(os.path.abspath(second))
+
+
+def _capture_export_source(
+    source: Path,
+    snapshot_root: Path,
+    archive_name: str,
+) -> _CapturedExportFile:
+    """Capture one plain source exactly once into a private temp snapshot.
+
+    The path and open descriptor must name the same regular file before and
+    after streaming. A symlink, special file, replacement, truncation, or
+    in-place mutation therefore aborts the export before publication.
+    """
+    member = _safe_export_archive_name(archive_name)
+    source = Path(source)
+    destination = snapshot_root.joinpath(*member.parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        before_path = source.lstat()
+    except OSError as exc:
+        raise ExportError(
+            f"export source is unavailable: {source} ({type(exc).__name__})"
+        ) from exc
+    if not stat.S_ISREG(before_path.st_mode):
+        raise ExportError(f"export source is not a plain file: {source}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(source, flags)
+        before_fd = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before_fd.st_mode)
+            or _source_stat_identity(before_fd)
+            != _source_stat_identity(before_path)
+        ):
+            raise ExportError(
+                f"export source changed before capture: {source}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as source_handle:
+            with destination.open("xb") as destination_handle:
+                digest, copied = _copy_export_source(
+                    source, source_handle, destination_handle,
+                )
+        after_fd = os.fstat(descriptor)
+        after_path = source.lstat()
+        expected_identity = _source_stat_identity(before_path)
+        if (
+            copied != before_path.st_size
+            or _source_stat_identity(after_fd) != expected_identity
+            or _source_stat_identity(after_path) != expected_identity
+        ):
+            raise ExportError(
+                f"export source changed during capture: {source}"
+            )
+        captured = destination.stat()
+        if (
+            not stat.S_ISREG(captured.st_mode)
+            or captured.st_size != copied
+            or _sha256(destination) != digest
+        ):
+            raise ExportError(
+                f"server-owned export snapshot could not be verified: {source}"
+            )
+        destination.chmod(stat.S_IRUSR)
+        return _CapturedExportFile(
+            path=destination,
+            archive_name=member.as_posix(),
+            sha256=digest,
+            bytes=copied,
+        )
+    except ExportError:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise ExportError(
+            f"export source capture failed for {source}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verify_export_archive(
+    archive_path: Path,
+    expected: dict[str, tuple[str, int]],
+) -> None:
+    """Re-read every published candidate member before atomic promotion."""
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            infos = archive.infolist()
+            if any(info.is_dir() for info in infos):
+                raise ExportError(
+                    "export archive unexpectedly contains a directory entry"
+                )
+            names = [info.filename for info in infos]
+            folded_names = [name.casefold() for name in names]
+            folded_expected = {name.casefold() for name in expected}
+            if (
+                len(folded_names) != len(set(folded_names))
+                or set(names) != set(expected)
+                or set(folded_names) != folded_expected
+            ):
+                raise ExportError(
+                    "export archive members differ from the captured snapshot"
+                )
+            for info in infos:
+                expected_sha256, expected_bytes = expected[info.filename]
+                digest = hashlib.sha256()
+                observed_bytes = 0
+                with archive.open(info, "r") as member:
+                    for chunk in iter(lambda: member.read(1 << 20), b""):
+                        digest.update(chunk)
+                        observed_bytes += len(chunk)
+                if (
+                    observed_bytes != expected_bytes
+                    or digest.hexdigest() != expected_sha256
+                ):
+                    raise ExportError(
+                        "export archive member differs from its manifest: "
+                        f"{info.filename}"
+                    )
+    except ExportError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise ExportError(
+            f"export archive verification failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def export_policy_bundle(
     project_dir: Path | str,
     *,
     iter_index: Optional[int] = None,
     runs_root: Path | str | None = None,
     out_path: Path | str | None = None,
+    authority_receipt: dict[str, Any] | None = None,
 ) -> ExportResult:
-    """Build a self-contained deployment bundle for one trained iteration.
+    """Build a raw reproducibility bundle for one retained iteration.
 
     ``iter_index=None`` picks the latest iteration that has a checkpoint.
     ``runs_root`` defaults to ``<project>/runs`` (mission stages pass their
     own ``.missions/<m>/stages/<s>/runs``). ``out_path`` defaults to
     ``<project>/exports/policy_<project>_iter<N>.zip``.
     """
-    project = Path(project_dir).resolve()
-    root = Path(runs_root).resolve() if runs_root else project / "runs"
+    raw_project = Path(project_dir).expanduser().absolute()
+    if raw_project.is_symlink() or not raw_project.is_dir():
+        raise ExportError(
+            f"project root is linked or not a directory: {raw_project}"
+        )
+    project = raw_project.resolve(strict=True)
+    raw_root = (
+        Path(runs_root).expanduser().absolute()
+        if runs_root is not None else project / "runs"
+    )
+    if raw_root.exists() or raw_root.is_symlink():
+        try:
+            raw_root.relative_to(project)
+        except ValueError:
+            if raw_root.is_symlink() or not raw_root.is_dir():
+                raise ExportError(
+                    f"runs root is linked or not a directory: {raw_root}"
+                )
+        else:
+            _assert_unlinked_source_path(
+                raw_root / "__path_check__", project,
+            )
+    root = raw_root.resolve(strict=False)
 
     avail = list_exportable_iters(root)
     if not avail:
@@ -163,30 +546,102 @@ def export_policy_bundle(
             f"(available: {[r['iter_index'] for r in avail]})")
 
     iter_dir = root / f"iter_{iter_index}"
-    ckpt = _find_checkpoint(iter_dir)
-    assert ckpt is not None  # guaranteed by list_exportable_iters
-    warnings: list[str] = []
+    source_checkpoint = _find_checkpoint(iter_dir)
+    assert source_checkpoint is not None  # guaranteed by inventory above
 
     if out_path is None:
         exports_dir = project / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)
         out = exports_dir / f"policy_{project.name}_iter{iter_index}.zip"
     else:
-        out = Path(out_path)
+        out = Path(out_path).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="rs_export_") as td:
+    # Keep the candidate archive on the destination filesystem so the only
+    # publication step is an atomic os.replace after full ZIP verification.
+    with tempfile.TemporaryDirectory(
+        prefix=".rs_export_", dir=out.parent,
+    ) as td:
         stage = Path(td)
+        snapshot_root = stage / "snapshot"
+        generated_root = stage / "generated"
+        snapshot_root.mkdir()
+        generated_root.mkdir()
+        captured_files: list[_CapturedExportFile] = []
+        captured_names: set[str] = set()
 
-        files: list[tuple[Path, str]] = [(ckpt, ckpt.name)]
+        def capture(source: Path, archive_name: str) -> _CapturedExportFile:
+            member = _safe_export_archive_name(archive_name).as_posix()
+            if member.casefold() in captured_names:
+                raise ExportError(
+                    f"duplicate export archive member {member!r}"
+                )
+            source_absolute = Path(os.path.abspath(source))
+            for admitted_root in (stage, project, root.parent):
+                try:
+                    source_absolute.relative_to(
+                        Path(os.path.abspath(admitted_root))
+                    )
+                except ValueError:
+                    continue
+                _assert_unlinked_source_path(source_absolute, admitted_root)
+                break
+            else:
+                raise ExportError(
+                    f"export source is outside admitted roots: {source}"
+                )
+            if _paths_alias(source_absolute, out):
+                raise ExportError(
+                    "export destination aliases a source artifact: "
+                    f"{source_absolute}"
+                )
+            captured = _capture_export_source(
+                source_absolute, snapshot_root, member,
+            )
+            captured_names.add(member.casefold())
+            captured_files.append(captured)
+            return captured
 
-        # Reward: spec snapshot + exact source when resolvable.
-        reward_spec = _load_json(iter_dir / "reward_spec.json")
-        reward_version = (reward_spec or {}).get("version")
-        if reward_spec is not None:
-            files.append((iter_dir / "reward_spec.json",
-                          "reward/reward_spec.json"))
+        def source_exists(source: Path) -> bool:
+            # Broken symlinks and special files must reach capture() so they
+            # fail closed instead of looking like absent optional evidence.
+            return source.exists() or source.is_symlink()
+
+        checkpoint_capture = capture(
+            source_checkpoint, source_checkpoint.name,
+        )
+        ckpt = checkpoint_capture.path
+        checkpoint_sha256 = checkpoint_capture.sha256
+        deployment_authority = _deployment_authority_for_bundle(
+            authority_receipt,
+            iter_index=iter_index,
+            checkpoint_sha256=checkpoint_sha256,
+        )
+        warnings: list[str] = []
+        if deployment_authority["status"] != "qualified":
+            warnings.append(
+                "NOT DEPLOYMENT CERTIFIED: this is a raw reproducibility "
+                "bundle; "
+                + "; ".join(deployment_authority.get("blockers") or [])
+            )
         else:
+            warnings.append(
+                "Research deployment preconditions passed, but this bundle "
+                "is not a hardware-safety certification; validate limits, "
+                "watchdogs, and emergency-stop behavior on the target system."
+            )
+
+        # Parse only the captured reward spec, then capture the exact source
+        # it names. Mutable project paths are never reopened by the ZIP step.
+        reward_spec_path = iter_dir / "reward_spec.json"
+        reward_spec = None
+        if source_exists(reward_spec_path):
+            reward_spec_capture = capture(
+                reward_spec_path, "reward/reward_spec.json",
+            )
+            reward_spec = _load_json(reward_spec_capture.path)
+        reward_version = (reward_spec or {}).get("version")
+        if reward_spec is None:
             warnings.append("reward_spec.json missing from the iter dir")
         if isinstance(reward_version, str):
             # reward_spec.json is on-disk data — validate before it becomes
@@ -194,8 +649,8 @@ def export_policy_bundle(
             # the project once this is HTTP-triggered).
             if re.fullmatch(r"v\d+", reward_version):
                 cand = project / "rewards" / f"{reward_version}.py"
-                if cand.is_file():
-                    files.append((cand, f"reward/{cand.name}"))
+                if source_exists(cand):
+                    capture(cand, f"reward/{cand.name}")
                 else:
                     warnings.append(
                         f"reward source {cand.name} not found under rewards/")
@@ -209,95 +664,1364 @@ def export_policy_bundle(
         env_spec_source = None
         iter_env = iter_dir / "env_spec.json"
         cur_env = project / "env" / "current.json"
-        if iter_env.is_file():
-            files.append((iter_env, "env_spec.json"))
+        if source_exists(iter_env):
+            capture(iter_env, "env_spec.json")
             env_spec_source = "iter_snapshot"
-        elif cur_env.is_file():
-            files.append((cur_env, "env_spec.json"))
+        elif source_exists(cur_env):
+            capture(cur_env, "env_spec.json")
             env_spec_source = "project_current"
             warnings.append(
                 "env_spec.json is the project's CURRENT spec — this run "
                 "predates per-iter env snapshots, so the exact trained "
                 "version is not guaranteed")
 
-        # Project config + iter metrics + reproducibility context.
+        # Project config + iteration evidence. The artifact tuple is parsed
+        # from this exact captured copy below.
+        artifact_tuple_capture: _CapturedExportFile | None = None
+        config_capture: _CapturedExportFile | None = None
         for src, arc in (
             (project / "config.toml", "config.toml"),
             (iter_dir / "metrics.json", "metrics.json"),
             (iter_dir / "run_context.json", "run_context.json"),
+            (iter_dir / "iteration_complete.json", "evidence/iteration_complete.json"),
+            (iter_dir / "artifact_tuple.json", "evidence/artifact_tuple.json"),
+            (iter_dir / "fitness.json", "evidence/fitness.json"),
+            (iter_dir / "rollout" / "behavior.json", "evidence/behavior.json"),
+            (
+                iter_dir / "physical_acceptance_contract.json",
+                "evidence/physical_acceptance_contract.json",
+            ),
+            (
+                iter_dir / "physical_acceptance_receipt.json",
+                "evidence/physical_acceptance_receipt.json",
+            ),
+            (
+                Path(str(source_checkpoint) + ".policy_contract.json"),
+                "evidence/output_policy_contract.json",
+            ),
+            (
+                root.parent / "reports" / "selection.json",
+                "evidence/selection.json",
+            ),
         ):
-            if src.is_file():
-                files.append((src, arc))
+            if source_exists(src):
+                captured = capture(src, arc)
+                if arc == "evidence/artifact_tuple.json":
+                    artifact_tuple_capture = captured
+                elif arc == "config.toml":
+                    config_capture = captured
             elif arc == "config.toml":
                 warnings.append("config.toml missing from the project dir")
 
+        artifact_tuple = (
+            _load_json(artifact_tuple_capture.path)
+            if artifact_tuple_capture is not None else {}
+        ) or {}
+        selection_version = artifact_tuple.get("selection_version")
+        if (
+            type(selection_version) is int
+            and selection_version > 0
+        ):
+            origin_selection = (
+                root.parent / "env" / f"selection_v{selection_version}.json"
+            )
+            if source_exists(origin_selection):
+                capture(
+                    origin_selection,
+                    "evidence/origin_world_selection.json",
+                )
+
         # Neural-net exports (best-effort, never fatal).
+        generated_files: list[tuple[Path, str]] = []
         net_meta: dict[str, Any] = {}
+        captured_config_path = (
+            config_capture.path
+            if config_capture is not None
+            else snapshot_root / "missing-config.toml"
+        )
         if ckpt.suffix == ".pt":
             net_meta = _export_rsl_rl_actor(
-                ckpt, project, stage, files, warnings)
+                ckpt,
+                captured_config_path,
+                generated_root,
+                generated_files,
+                warnings,
+            )
+            # The actor reconstruction performs the strict architecture and
+            # normalizer checks. Only expose a trainable interchange payload
+            # after those checks prove the policy surface is understood; a
+            # safetensors file is memory-safe, but that alone does not make an
+            # unknown architecture semantically loadable.
+            if "obs_dim" in net_meta and "action_dim" in net_meta:
+                trainable_meta = _export_rsl_rl_safetensors(
+                    ckpt, generated_root, generated_files, warnings,
+                )
+                if trainable_meta:
+                    net_meta["trainable_checkpoint"] = trainable_meta
         elif ckpt.suffix == ".zip":
-            net_meta = _export_sb3_actor(ckpt, stage, files, warnings)
+            net_meta = _export_sb3_actor(
+                ckpt, generated_root, generated_files, warnings,
+            )
 
-        # Sim→real hardware contract (joint order, action scale/offset, control
-        # rate, obs layout) — the interface the raw network cannot carry.
-        deployment = _deployment_contract(project, net_meta, warnings)
+        # Best-effort policy interface (joint order, action scale/offset,
+        # control rate, obs layout) — useful metadata, not a safety certificate.
+        deployment = _deployment_contract(
+            captured_config_path, net_meta, warnings,
+        )
+        compatibility_contract = None
+        compatibility_contract_digest = None
+        if net_meta.get("trainable_checkpoint"):
+            warnings.append(
+                "portable compatibility contract intentionally omitted from "
+                "the raw reproducibility ZIP; use the .rskill export, which "
+                "revalidates the immutable origin tuple and policy sidecar"
+            )
 
         manifest: dict[str, Any] = {
             "schema_version": EXPORT_SCHEMA_VERSION,
-            "kind": "reward-sculptor-policy-bundle",
+            "kind": REPRODUCIBILITY_BUNDLE_KIND,
+            "artifact_purpose": "reproducibility",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "sculptor_version": _sculptor_version(),
             "project": project.name,
             "iter_index": iter_index,
             "checkpoint": {
-                "file": ckpt.name,
+                "file": source_checkpoint.name,
                 "format": "rsl_rl" if ckpt.suffix == ".pt" else "sb3",
-                "sha256": _sha256(ckpt),
+                "sha256": checkpoint_sha256,
             },
             "reward_version": reward_version,
             "env_spec_source": env_spec_source,
             "network": net_meta,
             "deployment": deployment,
+            "deployment_status": deployment_authority["status"],
+            "deployment_authority": deployment_authority,
+            "compatibility_contract": compatibility_contract,
+            "compatibility_contract_digest": compatibility_contract_digest,
             "warnings": warnings,
         }
 
         deploy_md = _render_deploy_md(manifest)
-        (stage / "DEPLOY.md").write_text(deploy_md, encoding="utf-8")
-        files.append((stage / "DEPLOY.md", "DEPLOY.md"))
+        (generated_root / "DEPLOY.md").write_text(
+            deploy_md, encoding="utf-8",
+        )
+        generated_files.append((
+            generated_root / "DEPLOY.md", "DEPLOY.md",
+        ))
 
         # Runnable inference skeleton (obs order + action formula + rate baked
         # in; only the two robot-SDK seams are left for the operator).
-        (stage / "inference.py").write_text(
+        (generated_root / "inference.py").write_text(
             _render_inference_py(manifest), encoding="utf-8")
-        files.append((stage / "inference.py", "inference.py"))
+        generated_files.append((
+            generated_root / "inference.py", "inference.py",
+        ))
 
-        # File table with hashes (manifest lists everything but itself).
+        # Generated products go through the same one-capture path. This also
+        # rejects an unexpected generated symlink or mutation.
+        for generated_path, archive_name in generated_files:
+            capture(generated_path, archive_name)
+
+        # The manifest table is derived only from captured snapshot records.
         manifest["files"] = [
-            {"path": arc, "sha256": _sha256(src), "bytes": src.stat().st_size}
-            for src, arc in files
+            {
+                "path": captured.archive_name,
+                "sha256": captured.sha256,
+                "bytes": captured.bytes,
+            }
+            for captured in captured_files
         ]
 
-        manifest_path = stage / "manifest.json"
+        manifest_path = snapshot_root / "manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True, default=str),
             encoding="utf-8")
+        manifest_sha256 = _sha256(manifest_path)
+        manifest_bytes = manifest_path.stat().st_size
 
-        tmp_zip = stage / "bundle.zip"
-        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(manifest_path, "manifest.json")
-            for src, arc in files:
-                zf.write(src, arc)
-        # Atomic-ish move into place (same-filesystem rename when possible).
-        shutil.move(str(tmp_zip), str(out))
+        pending = stage / "bundle.pending.zip"
+        with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED) as archive:
+            _write_zip_member_verified(
+                archive,
+                manifest_path,
+                "manifest.json",
+                expected_sha256=manifest_sha256,
+                expected_bytes=manifest_bytes,
+                source_label="export manifest snapshot",
+            )
+            for captured in captured_files:
+                _write_zip_member_verified(
+                    archive,
+                    captured.path,
+                    captured.archive_name,
+                    expected_sha256=captured.sha256,
+                    expected_bytes=captured.bytes,
+                    source_label="export artifact snapshot",
+                )
+        expected_members = {
+            "manifest.json": (manifest_sha256, manifest_bytes),
+            **{
+                captured.archive_name: (
+                    captured.sha256, captured.bytes,
+                )
+                for captured in captured_files
+            },
+        }
+        _verify_export_archive(pending, expected_members)
+        os.replace(pending, out)
 
     return ExportResult(bundle_path=out, manifest=manifest, warnings=warnings)
+
+
+def _portable_iteration_policy_contract(
+    project: Path,
+    *,
+    runs_root: Path | str | None,
+    iter_index: int,
+    observed_network: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """Attest the policy interface against the iteration-owned world tuple.
+
+    Historical checkpoints must never inherit a newly promoted project world.
+    The iteration's artifact tuple is therefore required to match, byte for
+    canonical byte, the immutable ``selection_vN`` that it names before that
+    selection can define the portable policy contract.
+    """
+    from sculptor.policy_contract import (
+        build_project_policy_contract,
+        contract_fingerprint,
+    )
+    from sculptor.world.artifacts import (
+        WorldArtifactStore,
+        canonical_json_bytes,
+        file_sha256,
+    )
+
+    root = Path(runs_root).resolve() if runs_root else project / "runs"
+    tuple_path = root / f"iter_{iter_index}" / "artifact_tuple.json"
+    if not tuple_path.is_file():
+        raise ExportError(
+            "portable starting-skill export requires the iteration-owned "
+            f"artifact tuple: {tuple_path}"
+        )
+    try:
+        tuple_payload = json.loads(tuple_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ExportError(
+            f"iteration artifact tuple is unreadable: {tuple_path}"
+        ) from exc
+    if not isinstance(tuple_payload, dict):
+        raise ExportError("iteration artifact tuple must be a JSON object")
+    selection_version = tuple_payload.get("selection_version")
+    if (
+        not isinstance(selection_version, int)
+        or isinstance(selection_version, bool)
+        or selection_version <= 0
+    ):
+        raise ExportError(
+            "iteration artifact tuple has no valid selection_version"
+        )
+
+    selection_path = project / "env" / f"selection_v{selection_version}.json"
+    try:
+        selection = WorldArtifactStore(project).read_selection(selection_path)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise ExportError(
+            "portable starting-skill source selection failed verification: "
+            f"{exc}"
+        ) from exc
+    if selection is None:
+        raise ExportError(
+            f"immutable source selection is absent: {selection_path}"
+        )
+    if canonical_json_bytes(tuple_payload) != canonical_json_bytes(
+        selection.to_dict()
+    ):
+        raise ExportError(
+            "iteration artifact tuple does not exactly match its immutable "
+            "source selection"
+        )
+    try:
+        contract = build_project_policy_contract(
+            project,
+            observed_network=observed_network,
+            world_selection_path=selection_path,
+        )
+        contract_digest = contract_fingerprint(contract)
+    except Exception as exc:  # noqa: BLE001 - normalize researcher boundary
+        raise ExportError(
+            "iteration-owned policy compatibility contract is unavailable "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    receipt = {
+        "schema": 1,
+        "iter_index": iter_index,
+        "artifact_tuple_sha256": file_sha256(tuple_path),
+        "selection_version": selection.selection_version,
+        "selection_sha256": file_sha256(selection_path),
+        "tuple_hash": selection.tuple_hash,
+        "compatibility_contract_digest": contract_digest,
+    }
+    return contract, contract_digest, receipt
+
+
+def export_starting_skill_bundle(
+    project_dir: Path | str,
+    *,
+    iter_index: Optional[int] = None,
+    runs_root: Path | str | None = None,
+    out_path: Path | str | None = None,
+    robot_slug: Optional[str] = None,
+    legacy_origin_job_log: Path | str | None = None,
+    legacy_source_selection: Path | str | None = None,
+    legacy_observed_selection: Path | str | None = None,
+) -> ExportResult:
+    """Build a strict data-only `.rskill` policy-transfer artifact.
+
+    Deployment exports intentionally retain the raw checkpoint, generated
+    Python, TorchScript/ONNX, reward source, and environment snapshots.  Those
+    files are useful to a trusted operator but are forbidden at an untrusted
+    upload boundary.  This exporter reuses the local checkpoint conversion and
+    contract checks, then emits only canonical safetensors plus a descriptor-
+    complete portable manifest.
+    """
+    project = Path(project_dir).resolve()
+    if out_path is not None and Path(out_path).suffix.lower() != ".rskill":
+        raise ExportError("portable starting-skill output must end in .rskill")
+    try:
+        from sculptor.project_robot import resolve_project_reference_robot
+
+        project_robot = resolve_project_reference_robot(project)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ExportError(
+            "portable starting-skill export requires the project's exact "
+            f"reference robot namespace: {exc}"
+        ) from exc
+    if robot_slug and robot_slug != project_robot:
+        raise ExportError(
+            "portable robot identity conflicts with the project's canonical "
+            f"reference robot namespace ({robot_slug!r} != {project_robot!r})"
+        )
+    resolved_robot_slug = project_robot
+    with tempfile.TemporaryDirectory(prefix="rs_portable_export_") as td:
+        stage = Path(td)
+        deployment_result = export_policy_bundle(
+            project,
+            iter_index=iter_index,
+            runs_root=runs_root,
+            out_path=stage / "deployment.zip",
+        )
+        source_manifest = deployment_result.manifest
+        source_network = source_manifest.get("network") or {}
+        trainable = source_network.get("trainable_checkpoint")
+        if not isinstance(trainable, dict):
+            raise ExportError(
+                "iteration cannot produce a portable starting skill: "
+                "canonical safetensors and an exact compatibility contract "
+                "are required"
+            )
+        contract, contract_digest, source_tuple_receipt = (
+            _portable_iteration_policy_contract(
+                project,
+                runs_root=runs_root,
+                iter_index=int(source_manifest["iter_index"]),
+                observed_network=source_network,
+            )
+        )
+        weights_name = trainable.get("file")
+        roles = trainable.get("policy_roles")
+        if (
+            weights_name != "policy/weights.safetensors"
+            or not isinstance(roles, list)
+            or "actor" not in roles
+            or any(role not in {"actor", "critic"} for role in roles)
+        ):
+            raise ExportError(
+                "iteration produced an unsupported portable policy payload"
+            )
+        identity = contract.get("identity") or {}
+        adapter_class = identity.get("adapter_class")
+        task_id = identity.get("task_id")
+        if not isinstance(adapter_class, str) or not adapter_class:
+            raise ExportError("portable policy contract has no adapter identity")
+        if not isinstance(task_id, str) or not task_id:
+            raise ExportError("portable policy contract has no task identity")
+
+        try:
+            with zipfile.ZipFile(deployment_result.bundle_path, "r") as source:
+                weights = source.read(weights_name)
+        except (KeyError, OSError, zipfile.BadZipFile) as exc:
+            raise ExportError(
+                "deployment conversion did not produce readable safetensors"
+            ) from exc
+        weights_sha = hashlib.sha256(weights).hexdigest()
+        from sculptor.compatibility_provenance import (
+            LEGACY_CONFIG_MEMBER,
+            LEGACY_LOG_MEMBER,
+            LEGACY_OBSERVED_SELECTION_MEMBER,
+            LEGACY_SOURCE_SELECTION_MEMBER,
+            ORIGIN_CONTRACT_MEMBER,
+            build_legacy_reconstructed_provenance,
+            build_origin_persisted_provenance,
+            canonical_json_bytes,
+            evidence_member_paths,
+            provenance_fingerprint,
+        )
+
+        legacy_paths = (
+            legacy_origin_job_log,
+            legacy_source_selection,
+            legacy_observed_selection,
+        )
+        if any(path is not None for path in legacy_paths) and not all(
+            path is not None for path in legacy_paths
+        ):
+            raise ExportError(
+                "legacy contract reconstruction requires --legacy-origin-job-log, "
+                "--legacy-source-selection, and --legacy-observed-selection together"
+            )
+        provenance_payloads: dict[str, bytes]
+        if all(path is not None for path in legacy_paths):
+            try:
+                origin_log = Path(legacy_origin_job_log).resolve().read_bytes()
+                source_config = (project / "config.toml").read_bytes()
+                source_selection = Path(legacy_source_selection).resolve().read_bytes()
+                observed_selection = Path(
+                    legacy_observed_selection
+                ).resolve().read_bytes()
+                contract_provenance = build_legacy_reconstructed_provenance(
+                    origin_log=origin_log,
+                    source_config=source_config,
+                    source_selection=source_selection,
+                    observed_selection=observed_selection,
+                    contract=contract,
+                    policy_roles=list(roles),
+                    iter_index=int(source_manifest["iter_index"]),
+                )
+            except (OSError, ValueError) as exc:
+                raise ExportError(
+                    "legacy compatibility-contract evidence failed verification: "
+                    f"{exc}"
+                ) from exc
+            provenance_payloads = {
+                LEGACY_LOG_MEMBER: origin_log,
+                LEGACY_CONFIG_MEMBER: source_config,
+                LEGACY_SOURCE_SELECTION_MEMBER: source_selection,
+                LEGACY_OBSERVED_SELECTION_MEMBER: observed_selection,
+            }
+        else:
+            root = Path(runs_root).resolve() if runs_root else project / "runs"
+            origin_contract_path = (
+                root
+                / f"iter_{int(source_manifest['iter_index'])}"
+                / "warm_start_effective_policy_contract.json"
+            )
+            if not origin_contract_path.is_file():
+                raise ExportError(
+                    "portable policy export requires the contract sidecar persisted "
+                    "when training ran. This historical iteration has no origin "
+                    "sidecar; use all three explicit --legacy-* evidence options "
+                    "to request a visibly disclosed actor/critic-only reconstruction."
+                )
+            try:
+                origin_contract_bytes = origin_contract_path.read_bytes()
+                origin_contract = json.loads(origin_contract_bytes.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ExportError(
+                    "origin policy-contract sidecar is unreadable"
+                ) from exc
+            if (
+                not isinstance(origin_contract, dict)
+                or canonical_json_bytes(origin_contract) != canonical_json_bytes(contract)
+            ):
+                raise ExportError(
+                    "origin policy-contract sidecar does not match the exported "
+                    "compatibility contract"
+                )
+            contract_provenance = build_origin_persisted_provenance(
+                contract_bytes=origin_contract_bytes,
+                policy_roles=list(roles),
+            )
+            provenance_payloads = {ORIGIN_CONTRACT_MEMBER: origin_contract_bytes}
+        contract_provenance_digest = provenance_fingerprint(contract_provenance)
+        portable_warnings = [
+            "Portable transfer excludes the raw checkpoint, optimizer state, "
+            "reward/environment source, Python, ONNX, and TorchScript; use the "
+            "separate raw reproducibility ZIP for trusted local inspection."
+        ]
+        starting_skill: dict[str, Any] = {
+            "name": f"{project.name} iter {source_manifest['iter_index']}",
+            "weights_file": weights_name,
+            "policy_roles": list(roles),
+            "adapter_class": adapter_class,
+            "task_id": task_id,
+        }
+        starting_skill["robot_slug"] = str(resolved_robot_slug)
+        manifest: dict[str, Any] = {
+            "schema_version": PORTABLE_SKILL_SCHEMA_VERSION,
+            "kind": PORTABLE_SKILL_BUNDLE_KIND,
+            "created_at": source_manifest.get("created_at"),
+            "sculptor_version": source_manifest.get("sculptor_version"),
+            "project": project.name,
+            "iter_index": source_manifest["iter_index"],
+            "starting_skill": starting_skill,
+            "deployment": {
+                "task_id": task_id,
+                "robot_slug": str(resolved_robot_slug),
+            },
+            "checkpoint": {
+                "format": (source_manifest.get("checkpoint") or {}).get("format"),
+                "sha256": (source_manifest.get("checkpoint") or {}).get("sha256"),
+                "included": False,
+            },
+            "network": {
+                key: value
+                for key, value in source_network.items()
+                if key != "exports"
+            },
+            "compatibility_contract": contract,
+            "compatibility_contract_digest": contract_digest,
+            "compatibility_contract_provenance": contract_provenance,
+            "compatibility_contract_provenance_digest": (
+                contract_provenance_digest
+            ),
+            "source_artifact_tuple": source_tuple_receipt,
+            "warnings": portable_warnings,
+            "files": [
+                {
+                    "path": weights_name,
+                    "sha256": weights_sha,
+                    "bytes": len(weights),
+                },
+                *[
+                    {
+                        "path": member_name,
+                        "sha256": hashlib.sha256(
+                            provenance_payloads[member_name]
+                        ).hexdigest(),
+                        "bytes": len(provenance_payloads[member_name]),
+                    }
+                    for member_name in evidence_member_paths(contract_provenance)
+                ],
+            ],
+        }
+
+        if out_path is None:
+            exports_dir = project / "exports"
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            out = exports_dir / (
+                f"skill_{project.name}_iter{source_manifest['iter_index']}.rskill"
+            )
+        else:
+            out = Path(out_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path = stage / "portable-manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        pending = stage / "portable.rskill"
+        with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(manifest_path, "manifest.json")
+            archive.writestr(weights_name, weights)
+            for member_name in evidence_member_paths(contract_provenance):
+                archive.writestr(member_name, provenance_payloads[member_name])
+        shutil.move(str(pending), str(out))
+    return ExportResult(
+        bundle_path=out,
+        manifest=manifest,
+        warnings=portable_warnings,
+    )
+
+
+def export_tierd_tracker_starting_skill_bundle(
+    tracker_project_dir: Path | str,
+    *,
+    robot_slug: str,
+    clip_id: str,
+    out_path: Path | str | None = None,
+    name: str | None = None,
+    references_root: Path | str | None = None,
+) -> ExportResult:
+    """Export one certified tracker checkpoint as an actor-only ``.rskill``.
+
+    The raw local ``checkpoint.pt`` is loaded only by this trusted exporter.
+    The portable archive contains canonical safetensors and immutable source
+    evidence; it excludes critic/optimizer state and does not bundle or select
+    the source reference, controller, reward, world, or phase executor.
+    """
+    from sculptor.compatibility_provenance import (
+        ORIGIN_CONTRACT_MEMBER,
+        build_origin_persisted_provenance,
+        evidence_member_paths,
+        provenance_fingerprint,
+    )
+    from sculptor.policy_contract import contract_fingerprint
+    from sculptor.refs import library as refs
+    from sculptor.refs.track import (
+        TIER_D_CERTIFICATE_SCHEMA,
+        _read_tierd_train_runtime_receipt,
+        _verify_checkpoint_policy_contract_sidecar,
+        require_tierd_admission,
+    )
+    from sculptor.tierd_tracker_policy import (
+        TIERD_TRACKER_POLICY_ORIGIN_KIND,
+        TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+        build_tierd_tracker_policy_origin,
+        canonical_json_bytes,
+    )
+
+    try:
+        from sculptor.project_robot import validate_robot_namespace
+
+        robot_slug = validate_robot_namespace(robot_slug)
+        refs.validate_clip_id(clip_id)
+    except (TypeError, ValueError) as exc:
+        raise ExportError(f"invalid Tier-D tracker source identity: {exc}") from exc
+    if out_path is not None and Path(out_path).suffix.lower() != ".rskill":
+        raise ExportError("portable starting-skill output must end in .rskill")
+
+    raw_project = Path(tracker_project_dir).expanduser()
+    if raw_project.is_symlink():
+        raise ExportError("Tier-D tracker project directory must not be a symlink")
+    try:
+        project = raw_project.resolve(strict=True)
+    except OSError as exc:
+        raise ExportError(f"Tier-D tracker project is unavailable: {exc}") from exc
+    if not project.is_dir():
+        raise ExportError("Tier-D tracker project path is not a directory")
+
+    def required_file(relative: str, *, label: str, max_bytes: int) -> Path:
+        relative_path = Path(relative)
+        candidate = project
+        for part in relative_path.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise ExportError(f"{label} must not traverse a symlink")
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(project)
+        except (OSError, ValueError) as exc:
+            raise ExportError(f"{label} is missing or escapes the tracker project") from exc
+        if not resolved.is_file():
+            raise ExportError(f"{label} is not a regular file")
+        size = resolved.stat().st_size
+        if size <= 0 or size > max_bytes:
+            raise ExportError(
+                f"{label} must contain 1..{max_bytes} bytes (found {size})"
+            )
+        return resolved
+
+    checkpoint_path = required_file(
+        "train/checkpoint.pt",
+        label="Tier-D tracker checkpoint",
+        max_bytes=2 * 1024**3,
+    )
+    checkpoint_sidecar_path = required_file(
+        "train/checkpoint.pt.policy_contract.json",
+        label="Tier-D tracker checkpoint policy-contract sidecar",
+        max_bytes=2 * 1024**2,
+    )
+    origin_contract_path = required_file(
+        "train/warm_start_effective_policy_contract.json",
+        label="Tier-D tracker origin policy contract",
+        max_bytes=2 * 1024**2,
+    )
+    metrics_path = required_file(
+        "train/metrics.json",
+        label="Tier-D tracker metrics receipt",
+        max_bytes=64 * 1024**2,
+    )
+    config_path = required_file(
+        "config.toml",
+        label="Tier-D certification config",
+        max_bytes=2 * 1024**2,
+    )
+    reward_path = required_file(
+        "rewards/current.py",
+        label="Tier-D tracker reward",
+        max_bytes=256 * 1024**2,
+    )
+
+    library_root = Path(
+        references_root if references_root is not None else refs.references_root()
+    ).expanduser().resolve()
+    try:
+        certificate = require_tierd_admission(
+            robot_slug, clip_id, root=library_root,
+        )
+        clip_dir = refs.require_confined_clip_dir(
+            robot_slug, clip_id, root=library_root,
+        )
+    except Exception as exc:  # normalize the researcher-facing export boundary
+        raise ExportError(
+            "tracker actor export requires a currently verified Tier-D "
+            f"certificate for {robot_slug}/{clip_id}: {exc}"
+        ) from exc
+    provenance_path = clip_dir / refs.PROVENANCE_FILENAME
+    if (
+        not provenance_path.is_file()
+        or provenance_path.is_symlink()
+        or provenance_path.stat().st_size > 64 * 1024**2
+    ):
+        raise ExportError("Tier-D source provenance is missing, linked, or oversized")
+    try:
+        provenance = _load_strict_json_object(
+            provenance_path.read_bytes(), label="Tier-D source provenance",
+        )
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"Tier-D source provenance is unreadable: {exc}") from exc
+    tier_d = provenance.get("tierD")
+    if not isinstance(tier_d, dict):
+        raise ExportError("Tier-D source provenance has no certificate block")
+    if certificate.certificate_sha256 != hashlib.sha256(
+        canonical_json_bytes({
+            "schema": TIER_D_CERTIFICATE_SCHEMA,
+            "robot": robot_slug,
+            "clip_id": clip_id,
+            "tierD": tier_d,
+        })
+    ).hexdigest():
+        raise ExportError(
+            "Tier-D source provenance changed after certificate admission"
+        )
+
+    execution_contract = certificate.execution_contract
+    if tier_d.get("execution_contract") != execution_contract:
+        raise ExportError(
+            "Tier-D provenance execution contract differs from admission"
+        )
+    donor = execution_contract.get("donor") or {}
+    runtime = execution_contract.get("runtime_artifacts") or {}
+    observations = runtime.get("train_observations") or []
+    if not isinstance(donor, dict) or not isinstance(runtime, dict) or not observations:
+        raise ExportError("Tier-D certificate has no complete tracker runtime chain")
+    source_contract = donor.get("policy_contract")
+    if not isinstance(source_contract, dict):
+        raise ExportError("Tier-D certificate has no tracker policy contract")
+    source_contract_digest = contract_fingerprint(source_contract)
+    identity = source_contract.get("identity") or {}
+    adapter_class = identity.get("adapter_class")
+    task_id = identity.get("task_id")
+    if not isinstance(adapter_class, str) or not adapter_class:
+        raise ExportError("Tier-D tracker policy contract has no adapter identity")
+    if not isinstance(task_id, str) or not task_id:
+        raise ExportError("Tier-D tracker policy contract has no task identity")
+
+    checkpoint_sha = _sha256(checkpoint_path)
+    config_sha = _sha256(config_path)
+    reward_sha = _sha256(reward_path)
+    sidecar_sha = _sha256(checkpoint_sidecar_path)
+    if checkpoint_sha != runtime.get("final_checkpoint_sha256"):
+        raise ExportError(
+            "tracker checkpoint bytes differ from the certified final checkpoint"
+        )
+    if config_sha != donor.get("certification_config_sha256"):
+        raise ExportError(
+            "tracker config bytes differ from the Tier-D certification config"
+        )
+    if reward_sha != runtime.get("requested_reward_module_sha256"):
+        raise ExportError(
+            "tracker reward bytes differ from the certified reward module"
+        )
+    last_observation = observations[-1]
+    if not isinstance(last_observation, dict):
+        raise ExportError("Tier-D final training observation is invalid")
+    expected_sidecar_sha = last_observation.get(
+        "output_policy_contract_sidecar_sha256"
+    )
+    if sidecar_sha != expected_sidecar_sha:
+        raise ExportError(
+            "tracker checkpoint sidecar bytes differ from the certified output"
+        )
+    try:
+        runtime_receipt = _read_tierd_train_runtime_receipt(
+            metrics_path, iteration=certificate.iterations,
+        )
+        if runtime_receipt != last_observation:
+            raise ExportError(
+                "tracker metrics receipt is not the certified final observation"
+            )
+        _verify_checkpoint_policy_contract_sidecar(
+            checkpoint_path,
+            checkpoint_sha256=checkpoint_sha,
+            expected_policy_contract=source_contract,
+            expected_policy_contract_sha256=source_contract_digest,
+            expected_sidecar_sha256=sidecar_sha,
+        )
+    except ExportError:
+        raise
+    except Exception as exc:
+        raise ExportError(
+            f"tracker runtime evidence failed verification: {exc}"
+        ) from exc
+    try:
+        checkpoint_sidecar_bytes = checkpoint_sidecar_path.read_bytes()
+        checkpoint_sidecar = _load_strict_json_object(
+            checkpoint_sidecar_bytes,
+            label="Tier-D checkpoint policy-contract sidecar",
+        )
+        origin_contract_bytes = origin_contract_path.read_bytes()
+        origin_contract = _load_strict_json_object(
+            origin_contract_bytes,
+            label="Tier-D origin policy contract",
+        )
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"tracker policy-contract evidence is unreadable: {exc}") from exc
+    if origin_contract != source_contract:
+        raise ExportError(
+            "tracker origin policy contract differs from the certified interface"
+        )
+
+    contract_provenance = build_origin_persisted_provenance(
+        contract_bytes=origin_contract_bytes,
+        policy_roles=["actor"],
+    )
+    contract_provenance_digest = provenance_fingerprint(contract_provenance)
+    if name is None:
+        display_name = f"{robot_slug}/{clip_id} Tier-D tracker actor"
+    elif not isinstance(name, str) or not name.strip():
+        raise ExportError("starting-skill name must be non-empty")
+    else:
+        display_name = name.strip()
+    if len(display_name) > 160 or any(ord(char) < 32 for char in display_name):
+        raise ExportError(
+            "starting-skill name must be at most 160 printable characters"
+        )
+
+    portable_warnings = [
+        (
+            "This artifact initializes actor weights only. Critic and optimizer "
+            "state are excluded; it is not an exact training resume."
+        ),
+        (
+            "The Tier-D certificate is retained as source-training provenance "
+            "only. Its reference, reward, world, controller, and phase executor "
+            "are not bundled, selected, or activated in the importing project."
+        ),
+        (
+            "The raw trusted-local checkpoint.pt is excluded. Upload admission "
+            "consumes only canonical safetensors and bounded JSON evidence."
+        ),
+    ]
+    if out_path is None:
+        out_dir = project / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"skill_tierd_tracker_{robot_slug}_{clip_id}.rskill"
+    else:
+        out = Path(out_path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out = out.resolve(strict=False)
+
+    with tempfile.TemporaryDirectory(prefix="rs_tierd_tracker_export_") as td:
+        stage = Path(td)
+        generated_files: list[tuple[Path, str]] = []
+        conversion_warnings: list[str] = []
+        trainable = _export_rsl_rl_safetensors(
+            checkpoint_path,
+            stage,
+            generated_files,
+            conversion_warnings,
+            include_roles=("actor",),
+        )
+        if (
+            trainable.get("file") != "policy/weights.safetensors"
+            or trainable.get("policy_roles") != ["actor"]
+            or len(generated_files) != 1
+        ):
+            detail = "; ".join(conversion_warnings) or "actor tensors unavailable"
+            raise ExportError(
+                f"Tier-D tracker checkpoint cannot produce an actor-only export: {detail}"
+            )
+        weights_path, weights_member = generated_files[0]
+        weights_sha = _sha256(weights_path)
+        weights_size = weights_path.stat().st_size
+        tracker_origin = build_tierd_tracker_policy_origin(
+            robot=robot_slug,
+            clip_id=clip_id,
+            tier_d=tier_d,
+            certificate_sha256=certificate.certificate_sha256,
+            checkpoint_policy_contract_sidecar=checkpoint_sidecar,
+            checkpoint_policy_contract_sidecar_sha256=sidecar_sha,
+            certification_config_sha256=config_sha,
+            reward_module_sha256=reward_sha,
+            portable_actor_safetensors_sha256=weights_sha,
+        )
+        tracker_origin_bytes = canonical_json_bytes(tracker_origin)
+
+        # Conversion deserializes trusted local bytes and can take time. Re-pin
+        # every source artifact and the external admission before publication.
+        expected_files = {
+            checkpoint_path: checkpoint_sha,
+            checkpoint_sidecar_path: sidecar_sha,
+            origin_contract_path: hashlib.sha256(
+                origin_contract_bytes
+            ).hexdigest(),
+            config_path: config_sha,
+            reward_path: reward_sha,
+        }
+        for source_path, expected_sha in expected_files.items():
+            if source_path.is_symlink() or _sha256(source_path) != expected_sha:
+                raise ExportError(
+                    "Tier-D tracker source bytes changed during actor conversion"
+                )
+        try:
+            require_tierd_admission(
+                robot_slug,
+                clip_id,
+                expected_clip_sha256=certificate.clip_content_sha256,
+                expected_certificate_sha256=certificate.certificate_sha256,
+                expected_rollout_sha256=certificate.rollout_sha256,
+                expected_execution_contract_sha256=(
+                    certificate.execution_contract_sha256
+                ),
+                expected_execution_boundary_sha256=(
+                    certificate.execution_boundary_sha256
+                ),
+                root=library_root,
+            )
+        except Exception as exc:
+            raise ExportError(
+                "Tier-D admission changed during actor conversion"
+            ) from exc
+
+        tracker_origin_sha = hashlib.sha256(tracker_origin_bytes).hexdigest()
+        contract_payloads = {
+            ORIGIN_CONTRACT_MEMBER: origin_contract_bytes,
+        }
+        manifest: dict[str, Any] = {
+            "schema_version": PORTABLE_TRACKER_SKILL_SCHEMA_VERSION,
+            "kind": PORTABLE_SKILL_BUNDLE_KIND,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "sculptor_version": _sculptor_version(),
+            "project": f"tierd-tracker:{robot_slug}/{clip_id}",
+            "iter_index": certificate.iterations,
+            "starting_skill": {
+                "name": display_name,
+                "weights_file": weights_member,
+                "policy_roles": ["actor"],
+                "adapter_class": adapter_class,
+                "task_id": task_id,
+                "robot_slug": robot_slug,
+            },
+            "deployment": {
+                "task_id": task_id,
+                "robot_slug": robot_slug,
+            },
+            "checkpoint": {
+                "format": "rsl_rl_pt",
+                "sha256": checkpoint_sha,
+                "included": False,
+            },
+            "network": {"trainable_checkpoint": trainable},
+            "compatibility_contract": source_contract,
+            "compatibility_contract_digest": source_contract_digest,
+            "compatibility_contract_provenance": contract_provenance,
+            "compatibility_contract_provenance_digest": (
+                contract_provenance_digest
+            ),
+            "source_training_provenance": {
+                "kind": TIERD_TRACKER_POLICY_ORIGIN_KIND,
+                "member": TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                "sha256": tracker_origin_sha,
+            },
+            "warnings": portable_warnings,
+            "files": [
+                {
+                    "path": weights_member,
+                    "sha256": weights_sha,
+                    "bytes": weights_size,
+                },
+                {
+                    "path": ORIGIN_CONTRACT_MEMBER,
+                    "sha256": hashlib.sha256(origin_contract_bytes).hexdigest(),
+                    "bytes": len(origin_contract_bytes),
+                },
+                {
+                    "path": TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                    "sha256": tracker_origin_sha,
+                    "bytes": len(tracker_origin_bytes),
+                },
+            ],
+        }
+        if evidence_member_paths(contract_provenance) != [ORIGIN_CONTRACT_MEMBER]:
+            raise ExportError(
+                "tracker compatibility provenance member set is non-canonical"
+            )
+        manifest_bytes = json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+        fd, pending_name = tempfile.mkstemp(
+            prefix=f".{out.name}.", suffix=".tmp", dir=out.parent,
+        )
+        os.close(fd)
+        pending = Path(pending_name)
+        try:
+            with zipfile.ZipFile(
+                pending,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+            ) as archive:
+                archive.writestr("manifest.json", manifest_bytes)
+                _write_zip_member_verified(
+                    archive,
+                    weights_path,
+                    weights_member,
+                    expected_sha256=weights_sha,
+                    expected_bytes=weights_size,
+                    source_label="tracker policy weights",
+                )
+                for member_name, payload in contract_payloads.items():
+                    archive.writestr(member_name, payload)
+                archive.writestr(
+                    TIERD_TRACKER_POLICY_ORIGIN_MEMBER,
+                    tracker_origin_bytes,
+                )
+            with pending.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(pending, out)
+        except Exception:
+            pending.unlink(missing_ok=True)
+            raise
+
+    return ExportResult(
+        bundle_path=out,
+        manifest=manifest,
+        warnings=portable_warnings,
+    )
+
+
+def export_reference_starting_skill_bundle(
+    *,
+    robot_slug: str,
+    clip_id: str,
+    out_path: Path | str | None = None,
+    name: str | None = None,
+    references_root: Path | str | None = None,
+) -> ExportResult:
+    """Export one exact library trajectory as a data-only ``.rskill``.
+
+    The reference library remains the authority: the caller selects a
+    robot-scoped ``(robot_slug, clip_id)`` identity, and this function refuses
+    to substitute an index row, a filename, or target-project metadata.  Both
+    source files are revalidated and content-attested immediately before the
+    archive is written.  The output contains only ``manifest.json``,
+    ``motion/clip.npz``, and ``motion/provenance.json``; controller, world,
+    policy, Python, pickle, and raw checkpoint bytes are never included.
+
+    A reference-only import is still a candidate.  The researcher must run a
+    separate target-project Tier-D exact-schedule tracking evidence job before
+    live launch.  Launch only re-verifies the resulting exact evidence; it
+    does not create a certificate, and this transfer artifact claims none.
+    """
+    from sculptor import reference
+    from sculptor.refs import library as refs
+    from sculptor.skill_bundle import reference_source_provenance_sha256
+
+    if (
+        not isinstance(robot_slug, str)
+        or not _PORTABLE_ROBOT_RE.fullmatch(robot_slug)
+    ):
+        raise ExportError(
+            "reference robot must be a safe stable library identifier"
+        )
+    try:
+        refs.validate_clip_id(clip_id)
+    except (TypeError, ValueError) as exc:
+        raise ExportError(f"invalid reference clip identity: {exc}") from exc
+
+    library_root = Path(
+        references_root if references_root is not None else refs.references_root()
+    ).expanduser().resolve()
+    source_dir = (library_root / robot_slug / clip_id).resolve()
+    try:
+        source_dir.relative_to(library_root)
+    except ValueError as exc:
+        raise ExportError(
+            "reference identity resolves outside the configured library"
+        ) from exc
+
+    clip_path = source_dir / refs.CLIP_FILENAME
+    provenance_path = source_dir / refs.PROVENANCE_FILENAME
+    if not clip_path.is_file():
+        raise ExportError(
+            f"reference clip bytes are missing for {robot_slug}/{clip_id}"
+        )
+    if not provenance_path.is_file():
+        raise ExportError(
+            f"reference provenance is missing for {robot_slug}/{clip_id}"
+        )
+    if provenance_path.stat().st_size > 2 * 1024**2:
+        raise ExportError("reference provenance exceeds the 2 MiB limit")
+
+    try:
+        provenance_bytes = provenance_path.read_bytes()
+        provenance = _load_strict_json_object(
+            provenance_bytes, label="reference provenance",
+        )
+    except (OSError, ValueError) as exc:
+        raise ExportError(f"invalid reference provenance: {exc}") from exc
+    provenance_errors = refs.validate_provenance(provenance)
+    if provenance_errors:
+        raise ExportError(
+            "invalid reference provenance: " + "; ".join(provenance_errors)
+        )
+    if provenance.get("schema") != refs.PROVENANCE_SCHEMA:
+        raise ExportError(
+            "reference provenance schema is unsupported "
+            f"({provenance.get('schema')!r})"
+        )
+    if provenance.get("robot") != robot_slug:
+        raise ExportError(
+            "reference provenance robot does not match the selected library "
+            f"identity ({provenance.get('robot')!r} != {robot_slug!r})"
+        )
+    if provenance.get("clip_id") != clip_id:
+        raise ExportError(
+            "reference provenance clip_id does not match the selected library "
+            f"identity ({provenance.get('clip_id')!r} != {clip_id!r})"
+        )
+
+    expected_clip_sha = provenance.get("content_sha256")
+    if (
+        not isinstance(expected_clip_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_clip_sha)
+    ):
+        raise ExportError(
+            "reference provenance content_sha256 must be lowercase SHA-256"
+        )
+    _validate_reference_clip_container(clip_path)
+    actual_clip_sha = _sha256(clip_path)
+    if actual_clip_sha != expected_clip_sha:
+        raise ExportError(
+            "reference clip digest does not match provenance "
+            f"({actual_clip_sha} != {expected_clip_sha})"
+        )
+    try:
+        reference.load_clip(clip_path)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+        raise ExportError(f"reference clip is invalid: {exc}") from exc
+
+    if name is None:
+        display_name = f"{robot_slug}/{clip_id} reference"
+    elif not isinstance(name, str) or not name.strip():
+        raise ExportError("starting-skill name must be non-empty")
+    else:
+        display_name = name.strip()
+    if len(display_name) > 160 or any(ord(char) < 32 for char in display_name):
+        raise ExportError(
+            "starting-skill name must be at most 160 characters with no "
+            "control characters"
+        )
+
+    if out_path is None:
+        exports_dir = library_root / "exports"
+        out = exports_dir / f"reference_{robot_slug}_{clip_id}.rskill"
+    else:
+        out = Path(out_path).expanduser()
+    if out.suffix.lower() != ".rskill":
+        raise ExportError("reference starting-skill output must end in .rskill")
+    out = out.resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    provenance_sha = hashlib.sha256(provenance_bytes).hexdigest()
+    clip_size = clip_path.stat().st_size
+    source_provenance_sha = reference_source_provenance_sha256(provenance)
+    warnings = [
+        "This upload registers a reference candidate only. Run a separate "
+        "target-project Tier-D exact-schedule tracking evidence job before live "
+        "launch; launch only re-verifies the resulting exact evidence."
+    ]
+    manifest: dict[str, Any] = {
+        "schema_version": PORTABLE_SKILL_SCHEMA_VERSION,
+        "kind": PORTABLE_SKILL_BUNDLE_KIND,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "project": f"reference:{robot_slug}/{clip_id}",
+        "starting_skill": {
+            "name": display_name,
+            "robot_slug": robot_slug,
+        },
+        "deployment": {"robot_slug": robot_slug},
+        "reference": {
+            "robot_slug": robot_slug,
+            "clip_id": clip_id,
+            "clip_member": "motion/clip.npz",
+            "provenance_member": "motion/provenance.json",
+            "content_sha256": actual_clip_sha,
+            "provenance_sha256": provenance_sha,
+            "source_provenance_sha256": source_provenance_sha,
+            "tier_at_export": provenance.get("tier", "K"),
+        },
+        "warnings": warnings,
+        "files": [
+            {
+                "path": "motion/clip.npz",
+                "sha256": actual_clip_sha,
+                "bytes": clip_size,
+            },
+            {
+                "path": "motion/provenance.json",
+                "sha256": provenance_sha,
+                "bytes": len(provenance_bytes),
+            },
+        ],
+    }
+    manifest_bytes = json.dumps(
+        manifest,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    fd, pending_name = tempfile.mkstemp(
+        prefix=f".{out.name}.", suffix=".tmp", dir=out.parent,
+    )
+    os.close(fd)
+    pending = Path(pending_name)
+    try:
+        with zipfile.ZipFile(
+            pending, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True,
+        ) as archive:
+            archive.writestr("manifest.json", manifest_bytes)
+            _write_zip_member_verified(
+                archive,
+                clip_path,
+                "motion/clip.npz",
+                expected_sha256=actual_clip_sha,
+                expected_bytes=clip_size,
+                source_label="reference clip",
+            )
+            archive.writestr("motion/provenance.json", provenance_bytes)
+        with pending.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(pending, out)
+    except Exception:
+        pending.unlink(missing_ok=True)
+        raise
+
+    return ExportResult(bundle_path=out, manifest=manifest, warnings=warnings)
+
+
+def _export_rsl_rl_safetensors(
+    ckpt: Path,
+    stage: Path,
+    files: list[tuple[Path, str]],
+    warnings: list[str],
+    *,
+    include_roles: tuple[str, ...] = ("actor", "critic"),
+) -> dict[str, Any]:
+    """Export the trainable actor/critic maps without Python pickle.
+
+    The raw checkpoint remains in the reproducibility bundle for local recovery,
+    but an importer never needs to deserialize it: it consumes this
+    safetensors member and constructs a fresh server-owned checkpoint.
+    """
+    try:
+        import torch
+        from safetensors.torch import save_file
+    except ImportError:
+        warnings.append(
+            "safetensors unavailable — only the trusted-local raw bundle is usable"
+        )
+        return {}
+    try:
+        try:
+            payload = torch.load(ckpt, map_location="cpu", weights_only=True)
+        except Exception:  # local, server-produced historical checkpoint
+            payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    except Exception as exc:  # noqa: BLE001 — export remains best-effort
+        warnings.append(
+            "could not create trainable safetensors export "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if (
+        not include_roles
+        or len(include_roles) != len(set(include_roles))
+        or any(role not in {"actor", "critic"} for role in include_roles)
+    ):
+        warnings.append("invalid safetensors policy-role export request")
+        return {}
+    allowed: list[str] = []
+    if "actor" in include_roles:
+        allowed.extend((
+            "actor_state_dict",
+            "actor_obs_normalizer_state_dict",
+        ))
+    if "critic" in include_roles:
+        allowed.extend((
+            "critic_state_dict",
+            "critic_obs_normalizer_state_dict",
+        ))
+    tensors: dict[str, Any] = {}
+    roles: list[str] = []
+    for group in allowed:
+        state = payload.get(group)
+        if not isinstance(state, dict):
+            continue
+        for key, value in state.items():
+            if isinstance(key, str) and torch.is_tensor(value):
+                tensors[f"{group}::{key}"] = value.detach().cpu().contiguous()
+        if group == "actor_state_dict" and any(
+            key.startswith(f"{group}::") for key in tensors
+        ):
+            roles.append("actor")
+        if group == "critic_state_dict" and any(
+            key.startswith(f"{group}::") for key in tensors
+        ):
+            roles.append("critic")
+    # Historical rsl_rl checkpoints may keep EmpiricalNormalization in
+    # ``obs_norm_state_dict`` rather than the newer explicit actor group.
+    # The strict actor-export gate above has already validated this mapping;
+    # preserve its tensor stats under the canonical data-only group name.
+    legacy_norm = payload.get("obs_norm_state_dict")
+    if "actor" in include_roles and isinstance(legacy_norm, dict):
+        for key, value in legacy_norm.items():
+            if isinstance(key, str) and torch.is_tensor(value):
+                tensors[
+                    f"actor_obs_normalizer_state_dict::{key}"
+                ] = value.detach().cpu().contiguous()
+    if "actor" not in roles:
+        warnings.append(
+            "checkpoint has no tensor-only actor_state_dict; "
+            "bundle cannot be imported as a starting skill"
+        )
+        return {}
+    path = stage / "policy_weights.safetensors"
+    try:
+        save_file(
+            tensors,
+            str(path),
+            metadata={"format": "reward-sculptor-rsl-rl-v1"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(
+            "safetensors export failed "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return {}
+    arcname = "policy/weights.safetensors"
+    files.append((path, arcname))
+    return {
+        "file": arcname,
+        "format": "reward-sculptor-rsl-rl-v1",
+        "policy_roles": roles,
+    }
 
 
 # ── rsl_rl (.pt) actor reconstruction ──────────────────────────────────────
 
 def _export_rsl_rl_actor(
-    ckpt: Path, project: Path, stage: Path,
+    ckpt: Path, config_path: Path, stage: Path,
     files: list[tuple[Path, str]], warnings: list[str],
 ) -> dict[str, Any]:
     """Rebuild the actor MLP from the checkpoint state dict and export it.
@@ -358,7 +2082,9 @@ def _export_rsl_rl_actor(
     act_dim = layers[-1][2]
     hidden = [out for (_, _, out) in layers[:-1]]
 
-    activation, activation_assumed = _resolve_activation(project, warnings)
+    activation, activation_assumed = _resolve_activation(
+        config_path, warnings,
+    )
     if activation not in _ACTIVATIONS:
         # Never guess: an unmapped activation (lrelu/silu/mish/crelu...)
         # built as ELU would ship a silently wrong policy that even the
@@ -608,7 +2334,9 @@ def _build_mlp(
     return _Actor(model, norm=norm)
 
 
-def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
+def _resolve_activation(
+    config_path: Path, warnings: list[str],
+) -> tuple[str, bool]:
     """(activation, assumed?) — exact from the mjlab task cfg when possible."""
     task_id = None
     try:
@@ -616,7 +2344,7 @@ def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
             import tomllib
         except ImportError:  # pragma: no cover - py<3.11
             import tomli as tomllib  # type: ignore[no-redef]
-        with (project / "config.toml").open("rb") as f:
+        with config_path.open("rb") as f:
             cfg = tomllib.load(f)
         task_id = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
     except Exception:  # noqa: BLE001
@@ -639,14 +2367,14 @@ def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
     return "elu", True
 
 
-def _task_id_from_config(project: Path) -> Optional[str]:
+def _task_id_from_config(config_path: Path) -> Optional[str]:
     """The adapter's mjlab `task_id` from the project config.toml (or None)."""
     try:
         try:
             import tomllib
         except ImportError:  # pragma: no cover - py<3.11
             import tomli as tomllib  # type: ignore[no-redef]
-        with (project / "config.toml").open("rb") as f:
+        with config_path.open("rb") as f:
             cfg = tomllib.load(f)
         tid = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
         return tid if isinstance(tid, str) and tid else None
@@ -679,12 +2407,13 @@ def _resolve_per_joint(
 
 
 def _deployment_contract(
-    project: Path, net_meta: dict[str, Any], warnings: list[str],
+    config_path: Path, net_meta: dict[str, Any], warnings: list[str],
 ) -> dict[str, Any]:
-    """The sim→real interface contract a hardware controller needs but the raw
-    checkpoint/ONNX cannot carry: the joint ORDER the action/obs vectors index,
-    the action target formula + per-joint scale + default pose, the control
-    rate, and the ordered observation layout.
+    """Best-effort policy-interface metadata the raw network cannot carry.
+
+    The joint order, action formula, control rate, and observation layout are
+    descriptive training context. They do not prove that a target controller
+    consumes the same interface or satisfies a physical safety envelope.
 
     `joint_names` (order) come from the captured robot manifest and are ALWAYS
     present for a known robot. The rest is read best-effort from the mjlab task
@@ -693,7 +2422,7 @@ def _deployment_contract(
     guess."""
     from sculptor.eval.robot_manifest import robot_joint_names
 
-    task_id = _task_id_from_config(project)
+    task_id = _task_id_from_config(config_path)
     joint_names = robot_joint_names(task_id) if task_id else None
     contract: dict[str, Any] = {
         "task_id": task_id,
@@ -1018,6 +2747,114 @@ def _export_sb3_actor(
 
 # ── misc ───────────────────────────────────────────────────────────────────
 
+def _load_strict_json_object(data: bytes, *, label: str) -> dict[str, Any]:
+    """Parse a bounded JSON object without duplicate keys or non-finite data."""
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{label} contains forbidden constant {value!r}")
+
+    def reject_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} root must be an object")
+    return parsed
+
+
+def _validate_reference_clip_container(path: Path) -> None:
+    """Bound the nested NPZ before NumPy allocates any of its arrays."""
+    size = path.stat().st_size
+    if size <= 0:
+        raise ExportError("reference clip is empty")
+    if size > _REFERENCE_ARCHIVE_MAX_BYTES:
+        raise ExportError(
+            "reference clip exceeds the 512 MiB portable-export limit"
+        )
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            infos = archive.infolist()
+            if len(infos) > _REFERENCE_MEMBER_MAX:
+                raise ExportError("reference clip has too many NPZ members")
+            seen: set[str] = set()
+            expanded = 0
+            for info in infos:
+                if info.flag_bits & 0x1:
+                    raise ExportError("reference clip contains encrypted data")
+                unix_mode = (info.external_attr >> 16) & 0xFFFF
+                file_kind = unix_mode & 0o170000
+                if file_kind not in (0, 0o100000):
+                    raise ExportError(
+                        "reference clip contains a link or special NPZ member"
+                    )
+                member = info.filename
+                if (
+                    not member
+                    or "\\" in member
+                    or member.startswith("/")
+                    or any(part in ("", ".", "..") for part in member.split("/"))
+                ):
+                    raise ExportError(
+                        f"reference clip contains unsafe NPZ member {member!r}"
+                    )
+                if info.is_dir() or not member.endswith(".npy"):
+                    raise ExportError(
+                        f"reference clip contains non-array member {member!r}"
+                    )
+                folded = member.casefold()
+                if folded in seen:
+                    raise ExportError(
+                        f"reference clip contains colliding member {member!r}"
+                    )
+                seen.add(folded)
+                expanded += int(info.file_size)
+                if expanded > _REFERENCE_EXPANDED_MAX_BYTES:
+                    raise ExportError(
+                        "expanded reference clip exceeds the 1 GiB limit"
+                    )
+    except zipfile.BadZipFile as exc:
+        raise ExportError("reference clip is not a valid NPZ container") from exc
+
+
+def _write_zip_member_verified(
+    archive: zipfile.ZipFile,
+    source_path: Path,
+    archive_name: str,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
+    source_label: str = "source artifact",
+) -> None:
+    """Stream one file into the ZIP and attest the bytes actually written."""
+    digest = hashlib.sha256()
+    written = 0
+    with source_path.open("rb") as source, archive.open(
+        archive_name, "w", force_zip64=True,
+    ) as destination:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            destination.write(chunk)
+            digest.update(chunk)
+            written += len(chunk)
+    if written != expected_bytes or digest.hexdigest() != expected_sha256:
+        raise ExportError(
+            f"{source_label} changed while it was being exported; retry from "
+            "a stable server-owned snapshot"
+        )
+
+
 def _sha256(p: Path) -> str:
     h = hashlib.sha256()
     with p.open("rb") as f:
@@ -1049,11 +2886,29 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
     obs = net.get("obs_dim", "?")
     act = net.get("action_dim", "?")
     activation = net.get("activation", "elu")
+    authority = manifest.get("deployment_authority") or {}
+    qualified = authority.get("status") == "qualified"
+    authority_heading = (
+        "Research deployment preconditions verified"
+        if qualified else "NOT DEPLOYMENT CERTIFIED"
+    )
+    authority_detail = (
+        "The exact selection, objective, physical-scene, origin-runtime, and "
+        "lineage checks recorded in `manifest.json` passed. This still is not "
+        "a hardware-safety certification."
+        if qualified else
+        "This archive is a raw reproducibility artifact. It does not establish "
+        "task success, transfer validity, physical safety, or sim-to-real "
+        "readiness. See `manifest.json` → `deployment_authority.blockers`."
+    )
     lines = [
-        f"# Policy bundle — {manifest['project']} · iter {manifest['iter_index']}",
+        f"# Policy reproducibility bundle — {manifest['project']} · "
+        f"iter {manifest['iter_index']}",
         "",
         f"Exported by Reward Sculptor {manifest['sculptor_version']} "
         f"on {manifest['created_at']}.",
+        "",
+        f"> **{authority_heading}.** {authority_detail}",
         "",
         "| | |",
         "|---|---|",
@@ -1063,10 +2918,10 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         f"| Reward version | `{manifest.get('reward_version')}` |",
         f"| Env spec source | `{manifest.get('env_spec_source')}` |",
         "",
-        "The network outputs the **mean action** of the Gaussian policy "
-        "(deterministic deployment). Observation layout, scaling, and "
-        "action post-processing must match training — the sim→real contract "
-        "below (and `manifest.json` → `deployment`) captures exactly that.",
+        "The exported inference formats produce the **mean action** of the "
+        "Gaussian policy. The best-effort interface notes below describe "
+        "recorded training metadata; they do not prove a complete target "
+        "controller, sensor pipeline, or safety envelope.",
         "",
     ]
     dep = manifest.get("deployment") or {}
@@ -1075,11 +2930,12 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         act = dep.get("action") or {}
         ctrl = dep.get("control") or {}
         lines += [
-            "## Sim→real hardware contract",
+            "## Recorded policy interface",
             "",
-            "**`inference.py` is a runnable skeleton** with all of this baked "
-            "in — you only fill the two `TODO(hardware)` seams (`read_robot_"
-            "state`, `send_joint_targets`) for your robot's SDK.",
+            "`inference.py` is an illustrative inference skeleton, not a "
+            "hardware controller. Integration also requires independently "
+            "validated state transforms, limits, latency handling, watchdogs, "
+            "fault responses, and emergency-stop behavior.",
             "",
             f"- **Joints ({len(jn)})**, in the order the action/obs vectors "
             f"index (source: {dep.get('joint_order_source')}):",

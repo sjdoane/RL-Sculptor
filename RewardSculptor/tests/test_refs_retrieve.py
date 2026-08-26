@@ -155,12 +155,18 @@ def test_search_public_api_reads_disk_index(tmp_path: Path) -> None:
     """`search()` (not `search_rows()`) reads a real on-disk index via
     `library.read_index` — exercise the full disk path once."""
     for row in FIXTURE_ROWS:
+        clip_path = (
+            library.clip_dir("g1", row["clip_id"], root=tmp_path)
+            / library.CLIP_FILENAME
+        )
+        clip_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_path.write_bytes(f"artifact:{row['clip_id']}".encode())
         prov = library.make_provenance(
             clip_id=row["clip_id"], robot="g1",
             source={"kind": "hf_dataset", "repo": "r",
                     "path": row["clip_id"], "url": "u"},
             license=row["license"], attribution="a",
-            content_sha256_=f"{hash(row['clip_id']) & 0xffffffffffffffff:016x}" * 4,
+            content_sha256_=library.content_sha256(clip_path.read_bytes()),
             labels=row["labels"], text=row["text"],
             qc={"duration_s": row["duration_s"], "n_frames": row["n_frames"],
                 "root_z_range": row["root_z_range"]})
@@ -185,12 +191,20 @@ def test_search_filters_by_robot_symmetrically(tmp_path: Path) -> None:
     robot filter is not a g1-specific special case, it treats every
     robot slug the same way."""
     for robot in ("g1", "t1"):
+        clip_id = f"fallandgetup1_subject1--{robot}"
+        clip_path = (
+            library.clip_dir(robot, clip_id, root=tmp_path)
+            / library.CLIP_FILENAME
+        )
+        clip_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_path.write_bytes(f"artifact:{robot}".encode())
         prov = library.make_provenance(
-            clip_id=f"fallandgetup1_subject1--{robot}", robot=robot,
+            clip_id=clip_id, robot=robot,
             source={"kind": "hf_dataset", "repo": "r",
                     "path": "p", "url": "u"},
             license="cc-by-4.0", attribution="a",
-            content_sha256_=f"{robot}".ljust(64, "0"),
+                content_sha256_=library.content_sha256(
+                    clip_path.read_bytes()),
             labels=["fall", "and", "get", "up", "1", "subject", "1"],
             text="fall and get up 1 subject 1",
             qc={"duration_s": 5.0, "n_frames": 150, "root_z_range": [0.1, 0.8]})
@@ -216,6 +230,59 @@ def test_deterministic_rank_walk_query_prefers_walk_over_getup() -> None:
 
 def test_deterministic_rank_no_overlap_returns_empty() -> None:
     assert deterministic_rank("xyzzy plugh", FIXTURE_ROWS) == []
+
+
+def test_exact_robot_scoped_id_wins_an_identical_semantic_tie() -> None:
+    """A derived clip can intentionally retain its parent's human-readable
+    description.  Pasting the identity shown by the UI must select the exact
+    derived artifact rather than let the lexical tie-break prefer its parent.
+    """
+    labels = ["50009", "one", "leg", "jump", "poses", "60", "jpos"]
+    rows = [
+        _row("50009_one_leg_jump_poses_60_jpos", labels),
+        _row("50009_one_leg_jump_poses_60_jpos--origin-relative", labels),
+    ]
+
+    results = deterministic_rank(
+        "g1/50009_one_leg_jump_poses_60_jpos--origin-relative", rows, k=2,
+    )
+
+    assert [match.clip_id for match in results] == [
+        "50009_one_leg_jump_poses_60_jpos--origin-relative",
+        "50009_one_leg_jump_poses_60_jpos",
+    ]
+    # Exact identity is an ordering authority, not a fabricated relevance
+    # score.  The underlying semantic tie remains honestly visible.
+    assert results[0].score == pytest.approx(results[1].score)
+
+
+def test_exact_id_is_included_without_semantic_overlap_and_respects_robot() -> None:
+    g1 = _row("opaque-derived-id", ["unrelated", "motion"])
+    t1 = _row("opaque-derived-id", ["unrelated", "motion"], robot="t1")
+
+    results = deterministic_rank("g1/opaque-derived-id", [t1, g1], k=10)
+
+    assert [match.clip_id for match in results] == ["opaque-derived-id"]
+    assert results[0].score == 0.0
+
+
+def test_exact_id_query_bypasses_optional_llm_reranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact artifact identity is a selection, not a rerank prompt."""
+    import sculptor.refs.retrieve as retrieve_mod
+
+    def _unexpected_rerank(*args, **kwargs):
+        raise AssertionError("exact ID lookup must not invoke the LLM")
+
+    monkeypatch.setattr(retrieve_mod, "_rerank_with_llm", _unexpected_rerank)
+    rows = [_row("opaque-derived-id", ["unrelated", "motion"])]
+
+    results = search_rows(
+        "g1/opaque-derived-id", rows, k=10, use_llm=True, client=object(),
+    )
+
+    assert [match.clip_id for match in results] == ["opaque-derived-id"]
 
 
 def test_deterministic_rank_score_tie_prefers_denser_match() -> None:

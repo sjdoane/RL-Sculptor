@@ -775,7 +775,6 @@ def test_post_validate_unlinks_staging_on_validation_failure(tmp_path):
     check, so a failed validation left a broken v1.py that the UI then
     loaded on subsequent tab visits."""
     from sculptor.edit import _post_validate, EditValidationError
-    from sculptor.kg.store import SculptorKG
 
     class _KG:
         def get_node(self, _id):
@@ -839,10 +838,11 @@ def test_apply_prompt_edit_threads_kg_arxiv_ids_into_paper_refs(monkeypatch, tmp
 
     def fake_apply_edits(
         current_reward_path, diagnosis, new_iter_id, reward_contract,
-        *, kg_store=None, client=None, on_event=None,
+        *, kg_store=None, client=None, on_event=None, max_tokens=None,
     ):
         captured["paper_refs"] = list(diagnosis.proposed_edits[0].paper_refs)
         captured["lit_context_count"] = len(diagnosis.literature_context)
+        captured["max_tokens"] = max_tokens
         return tmp_path / "v1.py"
 
     monkeypatch.setattr(edit_mod, "apply_edits", fake_apply_edits)
@@ -873,6 +873,96 @@ def test_apply_prompt_edit_threads_kg_arxiv_ids_into_paper_refs(monkeypatch, tmp
     assert captured["lit_context_count"] == 1
 
 
+def test_prompt_edit_repairs_omitted_or_substituted_explicit_paper_pin(
+    monkeypatch, v0_path, kg,
+):
+    """Explicit prompt pins are a post-validation authority, not suggestions.
+
+    The first model response substitutes another valid KG paper (the live
+    failure mode); validation must reject it and the normal repair retry must
+    commit only the response whose references + grounding carry the exact pin.
+    """
+    import hashlib
+
+    from sculptor.edit import apply_prompt_edit
+    from sculptor.kg import query as kg_query_mod
+    from sculptor.kg.query import cite
+
+    pinned = "2401.16337"
+    kg.add_node(Paper(
+        id=make_paper_id(pinned), arxiv_id=pinned,
+        title="Pinned Humanoid Motion Paper", authors=["A Researcher"],
+        year=2024,
+    ))
+    monkeypatch.setattr(kg_query_mod, "query_semantic", lambda *a, **kw: [])
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")
+    ).hexdigest()[:16]
+
+    def _source(arxiv_id: str) -> str:
+        spec = {
+            "version": "v1",
+            "description": "explicit-paper prompt rewrite",
+            "author": "sculptor",
+            "parent_hash": parent_hash,
+            "hyperparameters": {"gain": 1.0},
+            "references": [{
+                "arxiv_id": arxiv_id,
+                "citation": cite(arxiv_id, store=kg),
+                "how_used": "grounds the requested shaping",
+            }],
+            "grounding": {
+                "gain": f"arXiv:{arxiv_id} grounds the requested shaping",
+            },
+        }
+        return (
+            f"REWARD_SPEC = {spec!r}\n"
+            "def compute_reward(state, action, next_state, info):\n"
+            "    value = float(state[0]) + 1.0\n"
+            "    return value, {'human_prompt': value}\n"
+        )
+
+    client = _StubClient(_source("1801.00690"), _source(pinned))
+    out = apply_prompt_edit(
+        current_reward_path=v0_path,
+        user_prompt=(
+            "Use exactly these paper IDs in REWARD_SPEC grounding/references, "
+            "in this order, with no additional references: "
+            "paper:2401.16337 paper:2401.16337"
+        ),
+        new_iter_id="v1",
+        reward_contract=_hopper_contract(),
+        kg_store=kg,
+        client=client,
+    )
+
+    assert len(client.messages.calls) == 2
+    first_prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "EXPLICIT_PAPER_PINS (HARD VALIDATION)" in first_prompt
+    assert 'ordered_arxiv_ids: ["2401.16337"]' in first_prompt
+    retry_prompt = client.messages.calls[1]["messages"][0]["content"]
+    assert "order exactly ['2401.16337']" in retry_prompt
+
+    spec = importlib.util.spec_from_file_location("pinned_v1", out)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert [r["arxiv_id"] for r in module.REWARD_SPEC["references"]] == [pinned]
+    assert f"arXiv:{pinned}" in module.REWARD_SPEC["grounding"]["gain"]
+
+
+def test_explicit_paper_pin_must_resolve_to_matching_paper_metadata(kg):
+    from sculptor.edit import _attest_explicit_paper_refs
+    from sculptor.kg.schema import Technique
+
+    bad_id = "2507.01243"
+    kg.add_node(Technique(
+        id=make_paper_id(bad_id), name="not actually a paper",
+    ))
+    with pytest.raises(EditValidationError, match="does not resolve to a Paper"):
+        _attest_explicit_paper_refs((bad_id,), kg)
+
+
 def test_post_validate_rejects_grounding_referencing_uncited_arxiv(monkeypatch, tmp_path):
     """Issue B cross-check (Test 1 2026-04-22): if `grounding` cites an
     arxiv_id that is NOT in `references`, `_post_validate` must reject.
@@ -881,7 +971,6 @@ def test_post_validate_rejects_grounding_referencing_uncited_arxiv(monkeypatch, 
     the edit would commit.
     """
     from sculptor.edit import EditValidationError, _post_validate
-    from sculptor.kg.store import SculptorKG
 
     # Minimal KG that asserts ID presence — stub has_node to True for
     # anything so references-in-KG doesn't fire. We're testing the
@@ -1717,3 +1806,359 @@ def test_apply_prompt_edit_injects_reference_signature_when_stage_dir_has_file(
     user_msg = client.messages.calls[0]["messages"][0]["content"]
     assert "# REFERENCE MOTION SIGNATURE" in user_msg
     assert "g1_jump_ref_01" in user_msg
+
+
+# ── token ceiling ─────────────────────────────────────────────────────────
+class _StoppedClient(_StubClient):
+    """`_StubClient` whose response carries a `stop_reason`."""
+
+    def __init__(self, text: str, stop_reason: str):
+        super().__init__(text)
+        inner = self.messages.create
+
+        def create(**kw):
+            resp = inner(**kw)
+            resp.stop_reason = stop_reason
+            return resp
+
+        self.messages.create = create
+
+
+def test_a_truncated_response_says_so_instead_of_a_syntax_error():
+    """Every real `sculpt modes author` run had attempt 1 come back as
+    `SyntaxError: '(' was never closed` — a complete module cut in half. The
+    stop reason says exactly that, and the message is what the retry sees."""
+    from sculptor.edit import _call_llm
+
+    client = _StoppedClient("def compute_reward(", "max_tokens")
+    with pytest.raises(EditValidationError) as e:
+        _call_llm(client, "sys", "user")
+    assert "cut off" in str(e.value)
+    assert "16000-token ceiling" in str(e.value)
+    assert "incomplete, not wrong" in str(e.value)
+
+
+def test_a_complete_response_at_the_ceiling_is_not_flagged():
+    from sculptor.edit import _call_llm
+
+    client = _StoppedClient("x = 1\n", "end_turn")
+    assert _call_llm(client, "sys", "user") == "x = 1\n"
+
+
+def test_max_tokens_overrides_the_default_without_changing_it():
+    """`modes author` needs a bigger ceiling than a training-mission edit,
+    whose 240s HTTP timeout is calibrated against the 16K default."""
+    from sculptor.edit import MAX_TOKENS, _call_llm
+
+    client = _StubClient("x = 1\n")
+    _call_llm(client, "sys", "user")
+    assert client.messages.calls[0]["max_tokens"] == MAX_TOKENS
+
+    client = _StubClient("x = 1\n")
+    _call_llm(client, "sys", "user", max_tokens=32000)
+    assert client.messages.calls[0]["max_tokens"] == 32000
+    assert MAX_TOKENS == 16000, "the shared default is unchanged"
+
+
+# ── rewrite ceiling scales with the module ────────────────────────────
+def test_small_rewards_keep_the_original_ceiling_exactly():
+    """The scaling must be a floor, not a replacement — every existing gym /
+    hand-written reward keeps its calibrated 16K budget byte-for-byte."""
+    from sculptor.edit import MAX_TOKENS, _rewrite_token_ceiling
+
+    assert _rewrite_token_ceiling("") == MAX_TOKENS
+    assert _rewrite_token_ceiling("def compute_reward(s,a,n,i): return 0.0, {}") == MAX_TOKENS
+    assert _rewrite_token_ceiling("x = 1\n" * 500) == MAX_TOKENS
+
+
+def test_a_generated_per_mode_reward_gets_room_to_be_rewritten():
+    """The bug: the first sculpt run over an authored per-mode reward died with
+    `response was cut off at the 16000-token ceiling`, so the loop could TRAIN
+    the reward but never evolve it. The live module is ~49 KB / ~12.4k tokens,
+    ~2.5k of which is inlined reference tables the editor must restate."""
+    from sculptor.edit import MAX_TOKENS, _rewrite_token_ceiling
+
+    source = "y = 0\n" * 8300           # ~49 KB, the size of the live v1.py
+    ceiling = _rewrite_token_ceiling(source)
+
+    assert ceiling > MAX_TOKENS
+    # Must clear the module's own token count with room for BOTH the edit and
+    # the adaptive thinking charged against the same ceiling. The live v1.py
+    # measures 20,173 real tokens at 49,310 bytes (2.44 B/tok); a first pass
+    # assumed 3.5 B/tok, issued 22,541, and truncated on both attempts.
+    MEASURED_BYTES_PER_TOKEN = 2.44
+    module_tokens = len(source) / MEASURED_BYTES_PER_TOKEN
+    assert ceiling > module_tokens * 2.0
+
+
+def test_rewrite_ceiling_grows_monotonically_with_source_size():
+    from sculptor.edit import _rewrite_token_ceiling
+
+    sizes = [_rewrite_token_ceiling("z = 0\n" * n) for n in (100, 4000, 8000, 16000)]
+    assert sizes == sorted(sizes)
+    assert sizes[-1] > sizes[0]
+
+
+def test_apply_edits_ceiling_is_derived_from_the_reward_being_rewritten(
+        tmp_path, monkeypatch):
+    """End of the wire: apply_edits must hand _call_llm a ceiling sized for the
+    module on disk, not the module-level default."""
+    from sculptor import edit as edit_mod
+
+    seen: dict = {}
+
+    def fake_call_llm(client, system, user, *, max_tokens=None, **kw):
+        seen["max_tokens"] = max_tokens
+        raise EditValidationError("stop here — we only need the ceiling")
+
+    monkeypatch.setattr(edit_mod, "_call_llm", fake_call_llm)
+
+    big = "# pad\n" * 9000              # ~54 KB
+    assert edit_mod._rewrite_token_ceiling(big) > edit_mod.MAX_TOKENS
+    # The derivation itself is the contract; assert it directly rather than
+    # standing up a full Diagnosis + contract just to reach the call.
+    assert edit_mod._rewrite_token_ceiling(big) == max(
+        edit_mod.MAX_TOKENS,
+        int(len(big) / edit_mod._BYTES_PER_TOKEN * edit_mod._REWRITE_HEADROOM))
+
+
+def test_http_timeout_scales_with_the_token_ceiling():
+    """Raising the output ceiling without raising the HTTP ceiling just moves
+    the failure from `response was cut off` to APITimeoutError. Measured: the
+    first replay of a per-mode edit at a 22,541 ceiling died on the 240s wall."""
+    from sculptor.edit import (
+        BASE_HTTP_TIMEOUT_S, MAX_TOKENS, _rewrite_http_timeout_s,
+    )
+
+    # Existing call sites keep their calibrated budget exactly.
+    assert _rewrite_http_timeout_s(None) == BASE_HTTP_TIMEOUT_S
+    assert _rewrite_http_timeout_s(MAX_TOKENS) == BASE_HTTP_TIMEOUT_S
+    assert _rewrite_http_timeout_s(MAX_TOKENS // 2) == BASE_HTTP_TIMEOUT_S
+
+    # A doubled ceiling needs roughly a doubled wall.
+    assert _rewrite_http_timeout_s(2 * MAX_TOKENS) == 2 * BASE_HTTP_TIMEOUT_S
+    assert _rewrite_http_timeout_s(22541) > BASE_HTTP_TIMEOUT_S
+
+
+def test_a_big_module_gets_both_ceilings_raised_together():
+    """The two knobs have to move as a pair — that pairing is the fix."""
+    from sculptor.edit import (
+        BASE_HTTP_TIMEOUT_S, MAX_TOKENS, _rewrite_http_timeout_s,
+        _rewrite_token_ceiling,
+    )
+
+    big = "# pad\n" * 9000
+    ceiling = _rewrite_token_ceiling(big)
+    assert ceiling > MAX_TOKENS
+    assert _rewrite_http_timeout_s(ceiling) > BASE_HTTP_TIMEOUT_S
+
+
+def test_the_bytes_per_token_estimate_stays_conservative():
+    """Measured with `messages.count_tokens` on the live per-mode reward:
+    49,310 bytes -> 20,173 tokens (2.44 B/tok), and its float tables alone run
+    1.50 B/tok. The constant must stay at or under the measured mixed case —
+    erring low errs toward a larger ceiling, which is the safe direction."""
+    from sculptor.edit import _BYTES_PER_TOKEN
+
+    MEASURED_WHOLE_MODULE = 2.44
+    MEASURED_FLOAT_TABLE = 1.50
+    assert _BYTES_PER_TOKEN <= MEASURED_WHOLE_MODULE
+    # Below the float-table ratio would be pure waste on every ordinary reward.
+    assert _BYTES_PER_TOKEN >= MEASURED_FLOAT_TABLE
+
+
+def test_the_rewrite_ceiling_is_hard_capped():
+    """A pathological module must not request a budget the API rejects."""
+    from sculptor.edit import MAX_REWRITE_TOKENS, _rewrite_token_ceiling
+
+    assert _rewrite_token_ceiling("z" * 10_000_000) == MAX_REWRITE_TOKENS
+    # Probed against claude-opus-5, which accepted 96000.
+    assert MAX_REWRITE_TOKENS <= 96000
+
+
+# ── Mode-automaton component discovery ─────────────────────────────────────
+def _mode_contract():
+    """An mjlab-shaped contract carrying the clock a mode automaton reads."""
+    from sculptor.adapters.base import RewardContract
+
+    return RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["episode_length", "step_dt", "base_height"],
+        supports_batched=True,
+        state_schema={"actuator_force": (2,)},
+        info_schema={},
+    )
+
+
+class _ModeReward:
+    """Three time-windowed modes, each paying a differently-named term.
+
+    Deliberately mirrors the generated per-mode rewards: the dispatcher
+    reads `episode_length * step_dt` and only the owning mode's components
+    come back from any single call.
+    """
+
+    DEFAULT_STEP_DT = 0.02
+    REWARD_SPEC = {
+        "version": "v4",
+        "hyperparameters": {},
+        "mode_windows_s": {
+            "approach": [0.0, 2.0],
+            "bound": [2.0, 6.0],
+            "settle": [6.0, 10.0],
+        },
+    }
+
+    @staticmethod
+    def compute_reward(state, action, next_state, info):
+        step = float(info.get("episode_length", 0.0) or 0.0)
+        dt = float(info.get("step_dt", 0.0) or 0.0) or _ModeReward.DEFAULT_STEP_DT
+        t = step * dt
+        if t < 2.0:
+            name = "approach"
+        elif t < 6.0:
+            name = "bound"
+        else:
+            name = "settle"
+        term = {"approach": "goal_progress", "bound": "push_off",
+                "settle": "stance_support"}[name]
+        return 1.0, {f"{name}.{term}": 1.0, "tracking": 0.5}
+
+
+def test_component_discovery_reaches_every_mode_not_just_the_first():
+    """The entry mode used to be the only one the grounding check ever saw.
+
+    Its consequence was not cosmetic: the diagnoser's edits to `bound.*` and
+    `settle.*` were rejected as unknown terms, so a four-mode reward could
+    only ever be edited in its first mode.
+    """
+    keys = _current_reward_component_keys(_ModeReward(), _mode_contract())
+
+    assert {"approach.goal_progress", "bound.push_off",
+            "settle.stance_support"} <= keys
+
+
+def test_a_mode_qualified_component_also_grounds_its_bare_name():
+    """`gate goal_progress` means every mode's goal_progress at once."""
+    keys = _current_reward_component_keys(_ModeReward(), _mode_contract())
+
+    assert {"goal_progress", "push_off", "stance_support"} <= keys
+
+
+def test_a_reward_without_an_automaton_is_probed_exactly_once():
+    """No `mode_windows_s` → no extra probes, so nothing new can leak in."""
+    from sculptor.edit import _mode_probe_clocks
+
+    class _Plain:
+        REWARD_SPEC = {"version": "v0", "hyperparameters": {}}
+
+        @staticmethod
+        def compute_reward(state, action, next_state, info):
+            return 1.0, {"forward_velocity": 1.0}
+
+    assert _mode_probe_clocks(_Plain()) == []
+    assert _current_reward_component_keys(_Plain(), _mode_contract()) == {
+        "forward_velocity"}
+
+
+def test_a_mode_that_crashes_costs_only_its_own_term_names():
+    """Best-effort: the t=0 probe is what judges contract conformance."""
+
+    class _HalfBroken(_ModeReward):
+        @staticmethod
+        def compute_reward(state, action, next_state, info):
+            step = float(info.get("episode_length", 0.0) or 0.0)
+            dt = float(info.get("step_dt", 0.0) or 0.0) or 0.02
+            if step * dt >= 6.0:
+                raise ZeroDivisionError("settle divides by a zero it assumed")
+            return _ModeReward.compute_reward(state, action, next_state, info)
+
+    keys = _current_reward_component_keys(_HalfBroken(), _mode_contract())
+
+    assert "bound.push_off" in keys
+    assert "settle.stance_support" not in keys
+
+
+def test_mode_probes_use_the_modules_own_step_dt():
+    """A clock the module and the probe disagree on lands in the wrong mode."""
+    from sculptor.edit import _mode_probe_clocks
+
+    clocks = _mode_probe_clocks(_ModeReward())
+
+    assert [dt for _, dt in clocks] == [0.02, 0.02, 0.02]
+    # Midpoints of (0,2), (2,6), (6,10) seconds, in steps.
+    assert [round(step * dt, 3) for step, dt in clocks] == [1.0, 4.0, 8.0]
+
+
+def test_probe_clocks_fall_back_to_the_module_level_window_table():
+    """A reward carrying the automaton only in code is still walkable."""
+    from sculptor.edit import _reward_mode_windows
+
+    class _CodeOnly:
+        REWARD_SPEC = {"version": "v1", "hyperparameters": {}}
+        MODE_WINDOWS_S = {"a": (0.0, 1.0), "b": (1.0, 3.0)}
+
+    assert _reward_mode_windows(_CodeOnly()) == {
+        "a": (0.0, 1.0), "b": (1.0, 3.0)}
+
+
+def test_a_malformed_window_is_skipped_not_fatal():
+    """Half-written automata shouldn't take the whole grounding check down."""
+    from sculptor.edit import _reward_mode_windows
+
+    class _Malformed:
+        REWARD_SPEC = {
+            "version": "v1",
+            "mode_windows_s": {
+                "ok": [0.0, 1.0],
+                "backwards": [3.0, 1.0],   # hi <= lo
+                "short": [1.0],
+                "junk": "not a span",
+            },
+        }
+
+    assert _reward_mode_windows(_Malformed()) == {"ok": (0.0, 1.0)}
+
+
+def test_the_dummy_clock_only_fills_keys_the_contract_advertises():
+    """`step_dt` is an mjlab key; a gym contract must not grow one."""
+    from sculptor.edit import _build_dummy_inputs
+
+    contract = _hopper_contract()
+    _, _, _, info = _build_dummy_inputs(contract, clock=(200.0, 0.02))
+
+    assert "episode_length" not in info and "step_dt" not in info
+
+
+def test_dead_mode_terms_become_editable(tmp_path: Path):
+    """The end-to-end effect: `replace bound.push_off` used to be rejected.
+
+    That edit is the one that turns a climb bonus gated on having already
+    climbed into a dense ascent term, so losing it cost the whole mission.
+    """
+    kg_store = SculptorKG(tmp_path / "kg.db")
+    kg_store.add_node(Paper(
+        id=make_paper_id("2509.06342"), arxiv_id="2509.06342",
+        title="Towards bridging the gap", authors=["Bjelonic"], year=2025))
+    diagnosis = Diagnosis(
+        behavior_goal="ascend the platforms",
+        failure_modes=["sparse_reward"],
+        evidence="bound.push_off is pinned at 0.00 for all 10 windows",
+        proposed_edits=[
+            ProposedEdit(
+                operation="replace",
+                target_term="bound.push_off",
+                rationale="re-shape the dead bonus into a dense ascent term",
+                suggested_value="0.4 * base_height",
+                paper_refs=["2509.06342"],
+            ),
+        ],
+    )
+
+    plan = _pre_validate(
+        diagnosis=diagnosis, contract=_mode_contract(),
+        current_module=_ModeReward(), kg_store=kg_store)
+
+    assert [e.target_term for e in plan.applicable_edits] == ["bound.push_off"]
+    assert plan.rejected_edits == []

@@ -13,6 +13,10 @@ from sculptor.eval.generated_metric import (
 from sculptor.eval.metric_validate import (
     _abstract_objective_program,
     _abstract_objective_probe,
+    _abstract_phase_bounds,
+    _abstract_route_window,
+    _abstract_traveling_jump_route_schedule,
+    _route_first_stationary_hops_probe,
     discrimination_of_metric,
     validate_generated_metric,
 )
@@ -47,6 +51,69 @@ def test_slalom_boxes_compile_as_planar_route_not_climbs():
     ]
 
 
+def test_explicit_repeated_hops_preserve_takeoff_landing_cardinality():
+    goal = (
+        "Move forward and perform four distinct one-leg hops over four low "
+        "rails, landing after each, then recover upright and hold still."
+    )
+    assert _abstract_objective_program(goal) == [
+        "move_forward",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "recover", "dwell",
+    ]
+
+
+def test_support_cycle_hops_preserve_takeoff_landing_cardinality():
+    goal = (
+        "Move forward and perform four distinct support-cycle hops over four "
+        "low rails, landing after each, then recover upright and hold still."
+    )
+    assert _abstract_objective_program(goal) == [
+        "move_forward",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "jump_off", "land",
+        "recover", "dwell",
+    ]
+
+
+def test_geometry_count_does_not_invent_repeated_jumps():
+    assert _abstract_objective_program(
+        "Jump over four obstacles, land, recover upright, and hold still"
+    ).count("jump_off") == 1
+
+
+def test_repeated_hop_probe_preserves_four_flights_and_full_quiet_tail():
+    goal = (
+        "Perform four distinct one-leg hops over four low rails, landing "
+        "after each, then recover upright and hold with horizontal, angular, "
+        "joint, upright, and default-pose quiet for 100 uninterrupted frames."
+    )
+    program = _abstract_objective_program(goal)
+    probe = _abstract_objective_probe(program, behavior_goal=goal)
+    assert probe is not None
+    air = (
+        (probe["left_foot_contact"][:, 0] == 0.0)
+        & (probe["right_foot_contact"][:, 0] == 0.0)
+    )
+    flight_starts = np.flatnonzero(air & ~np.r_[False, air[:-1]])
+    assert flight_starts.size == 4
+
+    tail = slice(-100, None)
+    assert np.all(probe["left_foot_contact"][tail, 0] == 1.0)
+    assert np.all(probe["right_foot_contact"][tail, 0] == 1.0)
+    root_xy = probe["root_link_pos_w"][tail, 0, :2]
+    assert np.max(np.linalg.norm(np.diff(root_xy, axis=0), axis=1)) == 0.0
+    assert np.max(np.abs(probe["root_link_ang_vel_b"][tail, 0])) == 0.0
+    assert np.max(np.abs(probe["joint_vel"][tail, 0])) == 0.0
+    assert np.max(probe["default_pose_rms"][tail, 0]) == 0.0
+    assert np.min(-probe["projected_gravity_b"][tail, 0, 2]) == 1.0
+
+
 def test_competent_route_fixture_visits_regions_in_order_and_holds_finish():
     draft = author_environment(
         "Build a slalom around four boxes with ordered waypoints and a finish zone",
@@ -72,6 +139,100 @@ def test_competent_route_fixture_visits_regions_in_order_and_holds_finish():
     assert len(set(first_hits)) == len(first_hits)
     finish_distance = np.linalg.norm(arrays[route_specs[-1].name], axis=-1)
     assert np.all(finish_distance[-100:] < 0.75)
+
+
+def test_compound_event_catalog_exposes_phase_local_shaping_with_provenance():
+    draft = author_environment(
+        "Slalom around four boxes, then jump at the finish and hold still "
+        "for 2 seconds.",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    by_name = catalog.by_name()
+    expected = {
+        "event__route_jump_hold__phase": "event_phase_state",
+        "event__route_jump_hold__phase_height_delta": (
+            "event_phase_height_delta"),
+        "event__route_jump_hold__base_vertical_velocity": (
+            "event_phase_vertical_velocity"),
+    }
+    for name, producer in expected.items():
+        spec = by_name[name]
+        assert spec.access == "shared_shaping"
+        assert spec.producer == producer
+        assert spec.source["event_sequence"] == "route_jump_hold"
+        assert spec.source["phase_ids"] == ["route", "jump", "hold"]
+        assert spec.source["event_program"]["phases"][1]["until"][
+            "min_height_delta_m"
+        ] == 0.18
+    violation = by_name["event__route_jump_hold__violation"]
+    assert violation.access == "metric_only"
+    assert violation.producer == "event_sequence_violation"
+    assert violation.source["event_program"]["phases"][2][
+        "minimum_hold_s"
+    ] == 2.0
+    adversarial = catalog_fixture_arrays(
+        catalog, time_steps=180, num_envs=1, case="event_violation")
+    assert adversarial[violation.name][-1, 0]
+    assert violation.name not in catalog.names(reward=True)
+    supports = [
+        by_name[f"event__route_jump_hold__support__{index}"]
+        for index in range(2)
+    ]
+    assert [spec.source["support_selector"] for spec in supports] == [
+        ["robot:left_foot", "world:terrain"],
+        ["robot:right_foot", "world:terrain"],
+    ]
+    assert all(spec.access == "metric_only" for spec in supports)
+    assert all(spec.name not in catalog.names(reward=True) for spec in supports)
+
+
+def test_event_violation_fixture_must_fail_completion_gate(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Slalom around four boxes, then jump at the finish and hold still "
+        "for 2 seconds.",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    source = '''
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {"phases": [
+    "move_forward", "jump", "land", "dwell",
+]}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays["first_episode_valid_mask"]
+    success = arrays["goal__complete_slalom_and_stop__success"]
+    violation = arrays["event__route_jump_hold__violation"]
+    completed = bool(np.any(success & valid))
+    invalid = bool(np.any(violation & valid))
+    score = 0.6 if (completed and invalid) else (0.9 if completed else 0.0)
+    return {"spec_score": score, "completion_gate": score}
+'''
+    path = _write_metric(tmp_path, source, "soft_violation.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "navigate through four boxes, jump exactly once after the route, "
+            "land bilaterally, and hold still for 2 seconds"
+        ),
+        channel_catalog=catalog,
+    )
+    assert result["archetype_scores"]["catalog_competent"] == pytest.approx(
+        0.9
+    )
+    assert result["archetype_scores"][
+        "catalog_event_violation"
+    ] == pytest.approx(0.6)
+    assert not result["gates"]["catalog_event_violation_fail_zero"]
+    assert any(
+        "invalid event attempts must fail" in reason
+        for reason in result["reasons"]
+    )
 
 
 def _catalog() -> ChannelCatalog:
@@ -115,6 +276,62 @@ def compute_spec(arrays, behavior, meta):
 '''
 
 
+FOOT_REGION_RETENTION_METRIC = '''
+import numpy as np
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays.get("first_episode_valid_mask")
+    root = arrays.get("root_link_pos_w")
+    finish = arrays.get("region__goal_mouth__relative")
+    left = arrays.get("left_foot_pos_w")
+    right = arrays.get("right_foot_pos_w")
+    left_contact = arrays.get("left_foot_contact")
+    right_contact = arrays.get("right_foot_contact")
+    if any(x is None for x in (
+        valid, root, finish, left, right, left_contact, right_contact,
+    )):
+        return {"spec_score": 0.0}
+    passed = []
+    landing_inside = []
+    retained = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 3:
+            passed.append(False); landing_inside.append(False); retained.append(False)
+            continue
+        lc = left_contact[keep, env] > 0.5
+        rc = right_contact[keep, env] > 0.5
+        both_air = (~lc) & (~rc)
+        land = -1
+        seen_air = False
+        for index in range(keep.size):
+            if both_air[index]:
+                seen_air = True
+            elif seen_air and lc[index] and rc[index]:
+                land = index
+                break
+        foot_center = []
+        for foot in (left, right):
+            relative = (
+                (foot[keep, env] - root[keep, env])[:, :2]
+                - finish[keep, env, :2]
+            )
+            foot_center.append(np.linalg.norm(relative, axis=-1) <= 0.35)
+        both_inside = foot_center[0] & foot_center[1]
+        at_landing = bool(land >= 0 and both_inside[land])
+        never_exited = bool(land >= 0 and np.all(both_inside[land:]))
+        landing_inside.append(at_landing)
+        retained.append(never_exited)
+        passed.append(at_landing and never_exited)
+    score = float(np.mean(passed))
+    return {
+        "spec_score": score,
+        "landing_feet_inside_frac": float(np.mean(landing_inside)),
+        "post_landing_retained_frac": float(np.mean(retained)),
+    }
+'''
+
+
 DISTANCE_ONLY_METRIC = '''
 import numpy as np
 
@@ -143,33 +360,36 @@ ABSTRACT_OBJECTIVE = {
 
 def compute_spec(arrays, behavior, meta):
     root = arrays["root_link_pos_w"]
-    height_gain = float((root[..., 2].max(axis=0) - root[..., 2].min(axis=0)).mean())
     waypoint = arrays["goal__complete_course__waypoint_index"]
-    waypoint_max = float(waypoint.max())
-    ordered_steps = float(np.mean((np.diff(waypoint, axis=0) > 0).sum(axis=0) >= 4))
+    valid = arrays.get("first_episode_valid_mask")
     left_contact = arrays.get("left_foot_contact")
     right_contact = arrays.get("right_foot_contact")
-    if left_contact is None or right_contact is None:
-        airborne_hops = 0.0
-    else:
-        flight = (left_contact < 0.5) & (right_contact < 0.5)
+    success = arrays["goal__complete_course__success"]
+    if valid is None or left_contact is None or right_contact is None:
+        return {"spec_score": 0.0}
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 25:
+            passed.append(False)
+            continue
+        lane_root = root[keep, env]
+        lane_waypoint = waypoint[keep, env]
+        flight = ((left_contact[keep, env] < 0.5)
+                  & (right_contact[keep, env] < 0.5))
         starts = flight[1:] & (~flight[:-1])
-        airborne_hops = float(np.mean(starts.sum(axis=0) >= 3))
-    completed = float(arrays["goal__complete_course__success"].mean())
-    physical = float(height_gain > 0.9)
-    final_motion = np.linalg.norm(np.diff(root[-25:], axis=0), axis=-1)
-    final_pause = float(final_motion.mean() < 0.01)
-    progress = float(np.clip(waypoint_max / 4.0, 0.0, 1.0))
+        final_motion = np.linalg.norm(np.diff(lane_root[-25:], axis=0), axis=-1)
+        passed.append(bool(
+            lane_root[:, 2].max() - lane_root[:, 2].min() > 0.9
+            and np.sum(np.diff(lane_waypoint) > 0) >= 4
+            and starts.sum() >= 3
+            and final_motion.mean() < 0.01
+            and np.mean(success[keep[-3:], env]) >= 1.0
+        ))
+    score = float(np.mean(passed))
     return {
-        "spec_score": float(
-            physical * airborne_hops * final_pause
-            * ordered_steps * progress * completed),
-        "physical_traversal": physical,
-        "airborne_hops": airborne_hops,
-        "final_stable_pause": final_pause,
-        "ordered_waypoint_steps": ordered_steps,
-        "waypoint_progress": progress,
-        "completion_gate": completed,
+        "spec_score": score,
+        "completion_gate": score,
     }
 '''
 
@@ -345,6 +565,470 @@ def test_prompt_native_traversal_composes_physics_and_world_without_reference(
     assert scores["prompt_competent"] > 0.9
 
 
+def test_abstract_jump_then_land_is_one_continuous_flight_bout() -> None:
+    """An explicit landing continues the preceding flight until touchdown.
+
+    A fabricated grounded frame at the phase boundary turns one jump into two
+    contact bouts and makes every honest exactly-once metric reject the validator's
+    own competent example.
+    """
+    goal = (
+        "navigate, jump exactly once, land, recover, and hold 100 "
+        "uninterrupted post-completion frames"
+    )
+    probe = _abstract_objective_probe(
+        ["move_forward", "jump", "land", "recover", "dwell"],
+        behavior_goal=goal,
+    )
+    assert probe is not None
+
+    flight = (
+        (probe["left_foot_contact"][:, 0] < 0.5)
+        & (probe["right_foot_contact"][:, 0] < 0.5)
+    )
+    changes = np.diff(np.pad(flight.astype(np.int8), (1, 1)))
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+
+    assert len(starts) == len(ends) == 1
+    assert ends[0] - starts[0] >= 3
+    assert not flight[-35:].any()
+    assert np.ptp(probe["root_link_pos_w"][flight, 0, 0]) == pytest.approx(0.0)
+
+    root_xy = probe["root_link_pos_w"][:, 0, :2]
+    horizontal_speed = np.linalg.norm(np.diff(root_xy, axis=0), axis=1) / 0.02
+    assert np.all(horizontal_speed[-100:] < 0.12)
+    assert np.all(probe["left_foot_contact"][-100:, 0] > 0.5)
+    assert np.all(probe["right_foot_contact"][-100:, 0] > 0.5)
+    assert np.max(np.abs(probe["joint_vel"][-100:, 0])) < 1e-9
+
+
+def test_competent_route_truth_precedes_post_route_jump() -> None:
+    """Catalog progress and physical skill phases must share one timeline."""
+    program = ["move_forward", "jump", "land", "recover", "dwell"]
+    goal = (
+        "navigate, jump exactly once, land, recover, and hold 100 "
+        "uninterrupted post-completion frames"
+    )
+    probe = _abstract_objective_probe(
+        program,
+        behavior_goal=goal,
+    )
+    assert probe is not None
+    probe_steps = probe["root_link_pos_w"].shape[0]
+    route_window = _abstract_route_window(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    assert route_window is not None
+    route_start, route_completion = route_window
+
+    draft = author_environment(
+        "Build a slalom around four boxes with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    arrays = catalog_fixture_arrays(
+        catalog,
+        time_steps=probe_steps,
+        num_envs=2,
+        case="competent",
+        competent_route_start_step=route_start,
+        competent_route_completion_step=route_completion,
+    )
+    waypoint_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_state"
+    )
+    waypoint_distance_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_distance"
+    )
+    waypoint = arrays[waypoint_spec.name][:, 0]
+    waypoint_distance = arrays[waypoint_distance_spec.name][:, 0]
+    terminal_index = int(waypoint_spec.source["waypoint_count"])
+    terminal_frame = int(np.flatnonzero(waypoint >= terminal_index)[0])
+
+    flight = (
+        (probe["left_foot_contact"][:, 0] < 0.5)
+        & (probe["right_foot_contact"][:, 0] < 0.5)
+    )
+    flight_start = int(np.flatnonzero(flight)[0])
+
+    assert np.all(waypoint[:route_start] == 0)
+    assert np.all(waypoint_distance[:route_start] > 0.9)
+    assert terminal_frame == route_completion
+    assert terminal_frame < flight_start
+    assert np.all(waypoint_distance[route_completion:] == 0.0)
+
+
+def test_traveling_hop_route_advances_once_per_flight_landing_cycle() -> None:
+    """The competent catalog truth must interleave rails with physical hops."""
+    goal = (
+        "Move forward and perform four distinct support-cycle hops over four "
+        "low rails, landing after each, then recover upright and hold with "
+        "horizontal, angular, joint velocity, upright, and default-pose quiet "
+        "for 100 uninterrupted frames."
+    )
+    program = _abstract_objective_program(goal)
+    probe = _abstract_objective_probe(program, behavior_goal=goal)
+    assert probe is not None
+    probe_steps = probe["root_link_pos_w"].shape[0]
+    route_window = _abstract_route_window(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    route_advances = _abstract_traveling_jump_route_schedule(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    assert route_window is not None
+    assert route_advances is not None
+    assert len(route_advances) == 4
+
+    draft = author_environment(goal, robot_capability_id="unitree_g1:base")
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    arrays = catalog_fixture_arrays(
+        catalog,
+        time_steps=probe_steps,
+        num_envs=2,
+        case="competent",
+        competent_route_start_step=route_window[0],
+        competent_route_completion_step=route_window[1],
+        competent_route_advance_steps=route_advances,
+    )
+    waypoint_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_state"
+    )
+    waypoint = arrays[waypoint_spec.name][:, 0]
+    advances = np.flatnonzero(np.diff(waypoint) > 0) + 1
+    assert advances.tolist() == [*route_advances, route_window[1]]
+
+    flight = (
+        (probe["left_foot_contact"][:, 0] < 0.5)
+        & (probe["right_foot_contact"][:, 0] < 0.5)
+    )
+    assert all(not flight[step] for step in route_advances)
+    assert all(flight[step - 1] for step in route_advances)
+    assert not flight[route_window[1]]
+
+    route_specs = sorted(
+        (
+            spec for spec in catalog.channels
+            if spec.producer == "region_relative"
+            and "sequence_index" in spec.source
+        ),
+        key=lambda spec: spec.source["sequence_index"],
+    )
+    observed_advances = [
+        int(np.argmin(np.linalg.norm(arrays[spec.name][:, 0], axis=-1)))
+        for spec in route_specs
+    ]
+    assert observed_advances == [*route_advances, route_window[1]]
+
+
+def test_route_first_hop_adversary_preserves_complete_distinct_route() -> None:
+    """The decoupled negative must fail only hop/route alignment."""
+    goal = (
+        "Move forward and perform four distinct support-cycle hops over four "
+        "low rails, landing after each, then recover upright and hold with "
+        "horizontal, angular, joint velocity, upright, and default-pose quiet "
+        "for 100 uninterrupted frames."
+    )
+    program = _abstract_objective_program(goal)
+    competent = _abstract_objective_probe(program, behavior_goal=goal)
+    assert competent is not None
+    probe_steps = competent["root_link_pos_w"].shape[0]
+    route_window = _abstract_route_window(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    route_advances = _abstract_traveling_jump_route_schedule(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    clean, bounds = _abstract_phase_bounds(
+        program, probe_steps=probe_steps, final_hold_steps=100,
+    )
+    assert route_window is not None
+    assert route_advances is not None
+    first_hop = int(bounds[clean.index("jump_off")])
+    route_first, shifted_hop = _route_first_stationary_hops_probe(
+        competent,
+        route_start_step=route_window[0],
+        hop_start_step=first_hop,
+        route_end_step=route_window[1],
+    )
+
+    draft = author_environment(goal, robot_capability_id="unitree_g1:base")
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    route_first.update(catalog_fixture_arrays(
+        catalog,
+        time_steps=route_first["root_link_pos_w"].shape[0],
+        num_envs=route_first["root_link_pos_w"].shape[1],
+        case="competent",
+        competent_route_start_step=route_window[0],
+        competent_route_completion_step=shifted_hop - 1,
+        competent_route_advance_steps=route_advances,
+    ))
+
+    competent_root = competent["root_link_pos_w"][:, 0]
+    route_first_root = route_first["root_link_pos_w"][:, 0]
+    assert route_first_root.shape[0] > competent_root.shape[0]
+    assert np.linalg.norm(
+        route_first_root[-1, :2] - route_first_root[route_window[0], :2]
+    ) == pytest.approx(np.linalg.norm(
+        competent_root[-1, :2] - competent_root[route_window[0], :2]
+    ))
+
+    flight = (
+        (route_first["left_foot_contact"][:, 0] < 0.5)
+        & (route_first["right_foot_contact"][:, 0] < 0.5)
+    )
+    flight_changes = np.diff(np.pad(flight.astype(np.int8), (1, 1)))
+    flight_starts = np.flatnonzero(flight_changes == 1)
+    assert flight_starts.size == 4
+    assert flight_starts[0] >= shifted_hop
+    assert np.allclose(
+        route_first_root[shifted_hop:, :2],
+        route_first_root[shifted_hop, :2],
+    )
+
+    waypoint_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_state"
+    )
+    waypoint = route_first[waypoint_spec.name][:, 0]
+    waypoint_advances = np.flatnonzero(np.diff(waypoint) > 0) + 1
+    assert waypoint_advances.tolist() == [
+        *route_advances, shifted_hop - 1,
+    ]
+    assert waypoint_advances[-1] < flight_starts[0]
+
+    route_specs = sorted(
+        (
+            spec for spec in catalog.channels
+            if spec.producer == "region_relative"
+            and "sequence_index" in spec.source
+        ),
+        key=lambda spec: spec.source["sequence_index"],
+    )
+    region_minima = [
+        int(np.argmin(np.linalg.norm(
+            route_first[spec.name][:, 0], axis=-1,
+        )))
+        for spec in route_specs
+    ]
+    assert region_minima == [*route_advances, shifted_hop - 1]
+    assert len(set(region_minima)) == len(region_minima)
+
+
+def test_traveling_hop_schedule_does_not_reclassify_other_route_modes() -> None:
+    assert _abstract_traveling_jump_route_schedule(
+        ["move_forward", "jump_off", "land", "recover", "dwell"],
+        probe_steps=180,
+    ) is None
+    assert _abstract_traveling_jump_route_schedule(
+        [
+            "move_forward",
+            "jump", "land",
+            "jump", "land",
+            "jump", "land",
+        ],
+        probe_steps=180,
+    ) is None
+    assert _abstract_traveling_jump_route_schedule(
+        ["move_forward", "recover", "dwell"], probe_steps=180,
+    ) is None
+
+
+def test_traveling_hop_metric_self_calibrates_and_rejects_route_first_hops(
+    tmp_path: Path,
+) -> None:
+    goal = (
+        "Move forward and perform four distinct support-cycle hops over four "
+        "low rails, landing after each, then recover upright and hold with "
+        "horizontal, angular, joint velocity, upright, and default-pose quiet "
+        "for 100 uninterrupted frames."
+    )
+    draft = author_environment(goal, robot_capability_id="unitree_g1:base")
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        spec.name for spec in catalog.channels
+        if spec.producer == "success_hold"
+    )
+    waypoint_spec = next(
+        spec for spec in catalog.channels if spec.producer == "waypoint_state"
+    )
+    forbidden_names = [
+        spec.name for spec in catalog.channels
+        if spec.producer == "contact_pair"
+        and spec.source.get("group") == "forbidden"
+    ]
+    forbidden_expr = " or ".join(
+        f'bool(np.any(arrays["{name}"][keep, env]))'
+        for name in forbidden_names
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": [
+    "move_forward",
+    "jump_off", "land", "jump_off", "land",
+    "jump_off", "land", "jump_off", "land",
+    "recover", "dwell",
+]}}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays["first_episode_valid_mask"]
+    root = arrays["root_link_pos_w"]
+    angular = arrays["root_link_ang_vel_b"]
+    joint_vel = arrays["joint_vel"]
+    gravity = arrays["projected_gravity_b"]
+    default_pose = arrays["default_pose_rms"]
+    left_contact = arrays.get("left_foot_contact")
+    right_contact = arrays.get("right_foot_contact")
+    waypoint = arrays["{waypoint_spec.name}"]
+    success = arrays["{success_name}"]
+    if left_contact is None or right_contact is None:
+        return {{"spec_score": 0.0, "completion_gate": 0.0}}
+    dt = float(behavior.get("step_dt", 0.02) or 0.02)
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 120:
+            passed.append(False)
+            continue
+        flight = ((left_contact[keep, env] < 0.5)
+                  & (right_contact[keep, env] < 0.5))
+        changes = np.diff(np.pad(flight.astype(np.int8), (1, 1)))
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1)
+        lane_waypoint = waypoint[keep, env]
+        advances = np.flatnonzero(np.diff(lane_waypoint) > 0) + 1
+        maneuver_advances = advances[lane_waypoint[advances] < 5]
+        aligned = bool(
+            starts.size == 4
+            and ends.size == 4
+            and maneuver_advances.size == 4
+            and all(
+                maneuver_advances[index] == ends[index]
+                for index in range(4)
+            )
+        )
+        tail = keep[-100:]
+        tail_root = root[tail, env]
+        horizontal_speed = (
+            np.linalg.norm(np.diff(tail_root[:, :2], axis=0), axis=-1) / dt
+        )
+        terminal_quiet = bool(
+            np.all(horizontal_speed < 0.12)
+            and np.all(np.abs(angular[tail, env]) < 0.12)
+            and np.all(np.abs(joint_vel[tail, env]) < 0.12)
+            and np.all(default_pose[tail, env] < 0.12)
+            and np.all(-gravity[tail, env, 2] > 0.95)
+        )
+        forbidden = {forbidden_expr}
+        passed.append(bool(
+            aligned
+            and not forbidden
+            and lane_waypoint[-1] >= 5
+            and np.all(success[tail, env])
+            and terminal_quiet
+        ))
+    score = float(np.mean(passed))
+    return {{"spec_score": score, "completion_gate": score}}
+'''
+    path = _write_metric(tmp_path, source, "traveling_hops.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=goal,
+        channel_catalog=catalog,
+    )
+
+    assert result["archetype_scores"]["catalog_competent"] == pytest.approx(1.0)
+    assert result["archetype_scores"][
+        "catalog_route_first_stationary_hops"
+    ] == pytest.approx(0.0)
+    assert result["gates"]["traveling_hop_route_alignment"]
+    assert result["ok"], result["reasons"]
+
+
+def test_route_first_then_stationary_hops_fails_alignment_gate(
+    tmp_path: Path,
+) -> None:
+    goal = (
+        "Move forward and perform four distinct support-cycle hops over four "
+        "low rails, landing after each, then recover upright and hold still "
+        "for 100 uninterrupted frames."
+    )
+    draft = author_environment(goal, robot_capability_id="unitree_g1:base")
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        spec.name for spec in catalog.channels
+        if spec.producer == "success_hold"
+    )
+    waypoint_name = next(
+        spec.name for spec in catalog.channels
+        if spec.producer == "waypoint_state"
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": [
+    "move_forward",
+    "jump_off", "land", "jump_off", "land",
+    "jump_off", "land", "jump_off", "land",
+    "recover", "dwell",
+]}}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays["first_episode_valid_mask"]
+    left = arrays.get("left_foot_contact")
+    right = arrays.get("right_foot_contact")
+    waypoint = arrays["{waypoint_name}"]
+    success = arrays["{success_name}"]
+    if left is None or right is None:
+        return {{"spec_score": 0.0}}
+    passed = []
+    for env in range(valid.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        flight = ((left[keep, env] < 0.5) & (right[keep, env] < 0.5))
+        starts = np.sum(flight[1:] & ~flight[:-1])
+        passed.append(bool(
+            starts == 4
+            and waypoint[keep[-1], env] >= 5
+            and np.all(success[keep[-3:], env])
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "route_first_hops.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=goal,
+        channel_catalog=catalog,
+    )
+
+    assert result["archetype_scores"]["catalog_competent"] == pytest.approx(1.0)
+    assert result["archetype_scores"][
+        "catalog_route_first_stationary_hops"
+    ] == pytest.approx(1.0)
+    assert not result["gates"]["traveling_hop_route_alignment"]
+    assert any(
+        "otherwise-valid stationary hop cycles" in reason
+        for reason in result["reasons"]
+    )
+
+
+def test_abstract_route_window_abstains_after_extension_boundary() -> None:
+    """Flat phase programs must not guess route ownership when ordering is mixed."""
+    staged = _abstract_route_window(
+        ["climb", "dwell", "climb", "dwell", "jump_off", "land"],
+        probe_steps=180,
+    )
+    assert staged is not None
+
+    ambiguous = _abstract_route_window(
+        ["jump_off", "land", "move_forward", "recover"],
+        probe_steps=180,
+    )
+    assert ambiguous is None
+
+
 def test_prompt_native_planar_route_composes_motion_with_world_state(
     tmp_path: Path,
 ) -> None:
@@ -366,21 +1050,30 @@ ABSTRACT_OBJECTIVE = {{"phases": ["move_forward", "recover", "dwell"]}}
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
     success = arrays.get("{success_name}")
-    if root is None or success is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if root is None or success is None or valid is None:
         return {{"spec_score": 0.0}}
-    dx = root[-1, :, 0] - root[0, :, 0]
     dt = float(behavior.get("step_dt", 0.02) or 0.02)
-    speed = np.linalg.norm(
-        np.diff(root, axis=0)[..., :2], axis=-1) / dt
-    quiet = speed < 0.12
-    run = np.zeros(root.shape[1])
-    best = np.zeros(root.shape[1])
-    for t in range(quiet.shape[0]):
-        run = np.where(quiet[t], run + 1.0, 0.0)
-        best = np.maximum(best, run)
-    physical = (dx > 0.5) & (best >= round(2.0 / dt))
-    completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
-    return {{"spec_score": float(np.mean(physical & completed))}}
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < round(2.0 / dt) + 1:
+            passed.append(False)
+            continue
+        lane_root = root[keep, env]
+        speed = np.linalg.norm(np.diff(lane_root, axis=0)[..., :2], axis=-1) / dt
+        quiet = speed < 0.12
+        run = 0
+        best = 0
+        for is_quiet in quiet:
+            run = run + 1 if is_quiet else 0
+            best = max(best, run)
+        passed.append(bool(
+            lane_root[-1, 0] - lane_root[0, 0] > 0.5
+            and best >= round(2.0 / dt)
+            and np.mean(success[keep[-3:], env]) >= 1.0
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
 '''
     path = _write_metric(tmp_path, source, "planar_route.py")
 
@@ -404,6 +1097,188 @@ def compute_spec(arrays, behavior, meta):
     assert scores["prompt_competent"] > 0.9
     assert scores["catalog_interrupted_hold"] == pytest.approx(0.0)
     assert result["gates"]["continuous_hold_interruption"]
+    assert result["gates"]["temporal_validity_channel"]
+    assert result["gates"]["temporal_invalid_support"]
+    assert scores["temporal_invalid_support"] == pytest.approx(0.0)
+
+
+def test_temporal_metric_rejects_reset_flight_outside_official_support(
+    tmp_path: Path,
+) -> None:
+    """Reset both-air frames plus an invalid sequence cannot establish flight.
+
+    The validator's adversarial rollout places reset-like bilateral flight and
+    the otherwise competent route in the invalid prefix, followed by only a
+    short valid post-route state. Reading the mask as a no-op is rejected.
+    """
+    draft = author_environment(
+        "Build a slalom with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": ["move_forward", "jump", "land", "dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    root = arrays["root_link_pos_w"]
+    left = arrays["left_foot_contact"]
+    right = arrays["right_foot_contact"]
+    success = arrays["{success_name}"]
+    valid = arrays.get("first_episode_valid_mask")
+    if valid is None:
+        return {{"spec_score": 0.0}}
+    flight = (left < 0.5) & (right < 0.5)
+    starts = flight[1:] & (~flight[:-1])
+    speed = np.linalg.norm(np.diff(root, axis=0)[..., :2], axis=-1) / 0.02
+    route = root[-1, :, 0] - root[0, :, 0] > 0.5
+    held = np.all(speed[-100:] < 0.12, axis=0)
+    completed = success[-1] > 0.5
+    passed = route & (starts.sum(axis=0) >= 1) & held & completed
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "ignores_validity.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Run through the ordered route, then jump and land, then hold "
+            "still for 100 uninterrupted frames"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["gates"]["temporal_validity_channel"]
+    assert not result["gates"]["temporal_invalid_support"]
+    assert result["archetype_scores"]["temporal_invalid_support"] > 0.9
+    assert any(
+        "reset-like bilateral-flight prefix" in reason
+        for reason in result["reasons"]
+    )
+
+
+def test_terminal_quiet_rejects_gravity_derivative_and_role_subset(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Walk to a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+ABSTRACT_OBJECTIVE = {{"phases": ["dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays.get("first_episode_valid_mask")
+    joint_vel = arrays["joint_vel"]
+    gravity = arrays["projected_gravity_b"]
+    recorded_angular = arrays.get("root_link_ang_vel_b")
+    success = arrays["{success_name}"]
+    if valid is None or recorded_angular is None:
+        return {{"spec_score": 0.0}}
+    roles = (meta or {{}}).get("joint_roles", {{}})
+    knees = [roles[name] for name in REQUIRED_JOINT_ROLES if name in roles]
+    passed = []
+    for env in range(joint_vel.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 100 or not knees:
+            passed.append(False)
+            continue
+        lane_joint = joint_vel[keep, env]
+        derived_angular = np.linalg.norm(
+            np.diff(gravity[keep, env], axis=0), axis=-1) / 0.02
+        passed.append(bool(
+            np.all(np.abs(lane_joint[-100:, knees]) < 0.12)
+            and np.all(derived_angular[-99:] < 0.12)
+            and success[keep[-1], env] > 0.5
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "narrow_quiet.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Hold 100 uninterrupted frames of base angular velocity and "
+            "whole-body joint velocity quiet"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["gates"]["recorded_base_angular_channel"]
+    assert result["gates"]["whole_body_joint_velocity_channel"]
+    assert not result["gates"]["recorded_base_angular_violation"]
+    assert not result["gates"]["whole_body_joint_velocity_violation"]
+    assert result["archetype_scores"]["recorded_base_angular_violation"] > 0.9
+    assert result["archetype_scores"]["whole_body_joint_velocity_violation"] > 0.9
+
+
+def test_terminal_quiet_accepts_recorded_base_angular_and_all_joints(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Walk to a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": ["dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    valid = arrays.get("first_episode_valid_mask")
+    joint_vel = arrays["joint_vel"]
+    angular = arrays.get("root_link_ang_vel_b")
+    success = arrays["{success_name}"]
+    if valid is None or angular is None:
+        return {{"spec_score": 0.0}}
+    passed = []
+    for env in range(joint_vel.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 100:
+            passed.append(False)
+            continue
+        passed.append(bool(
+            np.all(np.abs(joint_vel[keep[-100:], env, :]) < 0.12)
+            and np.all(np.linalg.norm(angular[keep[-100:], env], axis=-1) < 0.12)
+            and success[keep[-1], env] > 0.5
+        ))
+    return {{"spec_score": float(np.mean(passed))}}
+'''
+    path = _write_metric(tmp_path, source, "whole_body_quiet.py")
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Hold 100 uninterrupted frames of base angular velocity and "
+            "whole-body joint velocity quiet"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["gates"]["temporal_invalid_support"]
+    assert result["gates"]["recorded_base_angular_violation"]
+    assert result["gates"]["whole_body_joint_velocity_violation"]
+    assert result["archetype_scores"]["temporal_invalid_support"] == pytest.approx(0.0)
+    assert result["archetype_scores"]["recorded_base_angular_violation"] == pytest.approx(0.0)
+    assert result["archetype_scores"]["whole_body_joint_velocity_violation"] == pytest.approx(0.0)
 
 
 def test_continuous_hold_rejects_quiet_sample_fraction_proxy(
@@ -431,10 +1306,12 @@ def compute_spec(arrays, behavior, meta):
     dt = float(behavior.get("step_dt", 0.02) or 0.02)
     speed = np.linalg.norm(
         np.diff(root, axis=0)[..., :2], axis=-1) / dt
-    quiet_fraction = np.mean(speed[-100:] < 0.12, axis=0)
+    padded = np.pad(speed, ((2, 2), (0, 0)), mode="edge")
+    smoothed_speed = sum(padded[i:i + speed.shape[0]] for i in range(5)) / 5.0
+    quiet_fraction = np.mean(smoothed_speed[-90:] < 0.12, axis=0)
     dx = root[-1, :, 0] - root[0, :, 0]
     completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
-    physical = (dx > 0.5) & (quiet_fraction > 0.9)
+    physical = (dx > 0.5) & (quiet_fraction > 0.99)
     return {{"spec_score": float(np.mean(physical & completed))}}
 '''
     path = _write_metric(tmp_path, source, "fraction_hold.py")
@@ -444,7 +1321,7 @@ def compute_spec(arrays, behavior, meta):
         path,
         behavior_goal=(
             "Run through the ordered slalom, enter the finish, then remain "
-            "upright and still continuously for at least 2 seconds"
+            "upright and still for 100 uninterrupted frames"
         ),
         channel_catalog=catalog,
     )
@@ -452,7 +1329,37 @@ def compute_spec(arrays, behavior, meta):
     assert not result["ok"]
     assert not result["gates"]["continuous_hold_interruption"]
     assert result["archetype_scores"]["catalog_interrupted_hold"] > 0.9
-    assert any("[continuous-hold]" in reason for reason in result["reasons"])
+    hold_reason = next(
+        reason for reason in result["reasons"]
+        if "[continuous-hold]" in reason
+    )
+    assert "at least 100 consecutive raw-frame samples" in hold_reason
+    assert "smoothing, capping" in hold_reason
+
+
+def test_catalog_literal_access_allows_guards_but_rejects_aliases() -> None:
+    from sculptor.eval.metric_validate import _catalog_array_access_violations
+
+    guarded = '''\
+def compute_spec(arrays, behavior, meta):
+    if arrays is None:
+        return {"spec_score": 0.0}
+    if not isinstance(arrays, dict):
+        return {"spec_score": 0.0}
+    root = arrays.get("root_link_pos_w")
+    return {"spec_score": 0.0 if root is None else 1.0}
+'''
+    aliased = '''\
+def compute_spec(arrays, behavior, meta):
+    local_arrays = arrays
+    root = local_arrays.get("root_link_pos_w")
+    return {"spec_score": 0.0 if root is None else 1.0}
+'''
+
+    assert _catalog_array_access_violations(guarded) == []
+    violations = _catalog_array_access_violations(aliased)
+    assert len(violations) == 1
+    assert "line 2" in violations[0]
 
 
 def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_path):
@@ -481,6 +1388,72 @@ def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_pat
         metric_path, rollout, channel_catalog=catalog)
     assert mismatch["spec_score"] == 0.0
     assert "hash mismatch" in mismatch["error"]
+
+
+@pytest.mark.parametrize(
+    ("right_foot_overrides", "expected_landing", "expected_retained"),
+    [
+        ({}, 1.0, 1.0),
+        ({4: 0.36}, 0.0, 0.0),
+        ({7: 0.36}, 1.0, 0.0),
+    ],
+)
+def test_world_foot_channels_prove_landing_and_veto_later_region_exit(
+    tmp_path: Path,
+    right_foot_overrides: dict[int, float],
+    expected_landing: float,
+    expected_retained: float,
+) -> None:
+    catalog = _catalog()
+    metric_path = _write_metric(
+        tmp_path, FOOT_REGION_RETENTION_METRIC, "foot_retention.py")
+    rollout = tmp_path / "rollout"
+    rollout.mkdir()
+    time_steps = 9
+    arrays = catalog_fixture_arrays(
+        catalog, time_steps=time_steps, num_envs=1, case="competent")
+
+    root = np.zeros((time_steps, 1, 3), dtype=np.float32)
+    root[..., 0] = 10.0  # replicated-environment world offset
+    root[..., 2] = 0.8
+    finish_relative = np.zeros((time_steps, 1, 3), dtype=np.float32)
+    left = root.copy()
+    right = root.copy()
+    left[..., 0] += 0.10
+    right[..., 0] -= 0.10
+    for frame, offset in right_foot_overrides.items():
+        right[frame, 0, 0] = root[frame, 0, 0] + offset
+    left_contact = np.ones((time_steps, 1), dtype=np.float32)
+    right_contact = np.ones((time_steps, 1), dtype=np.float32)
+    left_contact[2:4] = 0.0
+    right_contact[2:4] = 0.0
+
+    arrays.update({
+        "first_episode_valid_mask": np.ones(
+            (time_steps, 1), dtype=bool),
+        "root_link_pos_w": root,
+        "region__goal_mouth__relative": finish_relative,
+        "left_foot_pos_w": left,
+        "right_foot_pos_w": right,
+        "left_foot_contact": left_contact,
+        "right_foot_contact": right_contact,
+    })
+    np.savez(
+        rollout / "trajectory.npz",
+        **arrays,
+        channel_catalog_hash=np.asarray(catalog.catalog_hash),
+    )
+
+    result = compute_generated_metric(
+        metric_path,
+        rollout,
+        behavior={"step_dt": 0.02},
+        channel_catalog=catalog,
+    )
+
+    assert result["landing_feet_inside_frac"] == expected_landing
+    assert result["post_landing_retained_frac"] == expected_retained
+    assert result["spec_score"] == min(expected_landing, expected_retained)
 
 
 @dataclass

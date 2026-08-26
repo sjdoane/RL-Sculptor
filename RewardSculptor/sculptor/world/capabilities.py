@@ -7,11 +7,13 @@ JSON without adding task-specific branches to the compiler.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import importlib
 import importlib.metadata
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -29,6 +31,34 @@ class RobotGeometry:
     reach_radius_m: float
     max_step_height_m: float
     max_gap_m: float
+
+
+@dataclass(frozen=True)
+class ActuatorProfile:
+    """Versioned actuator physics composed into an admitted robot asset."""
+
+    profile_id: str
+    model: str
+    velocity_limits_rad_s: tuple[tuple[str, float], ...]
+
+    def __post_init__(self) -> None:
+        raw = self.velocity_limits_rad_s
+        items = raw.items() if isinstance(raw, dict) else raw
+        normalized = tuple(sorted(
+            (str(pattern), float(limit)) for pattern, limit in items
+        ))
+        if (
+            not self.profile_id
+            or not self.model
+            or not normalized
+            or len({pattern for pattern, _ in normalized}) != len(normalized)
+            or any(
+                not pattern or not math.isfinite(limit) or limit <= 0.0
+                for pattern, limit in normalized
+            )
+        ):
+            raise CapabilityError("actuator profile is malformed")
+        object.__setattr__(self, "velocity_limits_rad_s", normalized)
 
 
 @dataclass(frozen=True)
@@ -50,6 +80,7 @@ class RobotCapability:
     contact_capacity: int = 24
     augmentation: str | None = None
     asset_factory: str | None = None
+    actuator_profile: ActuatorProfile | None = None
 
     def resolve_role(self, role: str) -> tuple[str, ...]:
         names = self.body_roles.get(role, ())
@@ -103,11 +134,112 @@ class RobotCapability:
             k: list(v) for k, v in self.reward_state_schema.items()}
         data["reward_state_sources"] = dict(self.reward_state_sources)
         data["reward_info_keys"] = list(self.reward_info_keys)
+        if self.actuator_profile is not None:
+            data["actuator_profile"]["velocity_limits_rad_s"] = dict(
+                self.actuator_profile.velocity_limits_rad_s
+            )
         return data
 
 
-def build_robot_entity_cfg(capability: RobotCapability) -> Any:
-    """Instantiate the robot asset declared by a capability descriptor."""
+def actuator_velocity_limit(
+    actuator_cfg: Any, profile: ActuatorProfile,
+) -> float | None:
+    """Resolve one declared no-load speed without guessing joint semantics."""
+    patterns = getattr(actuator_cfg, "target_names_expr", None) or ()
+    profile_limits = dict(profile.velocity_limits_rad_s)
+    limits = [
+        profile_limits[pattern]
+        for pattern in patterns
+        if pattern in profile_limits
+    ]
+    return min(limits) if limits else None
+
+
+def apply_actuator_profile(
+    entity_cfg: Any,
+    profile: ActuatorProfile | None,
+    *,
+    strict: bool = True,
+) -> tuple[Any, int, tuple[Any, ...]]:
+    """Return an owned entity with its descriptor-pinned actuator physics.
+
+    MjLab robot factories currently return distinct ``EntityCfg`` wrappers
+    around shared articulation constants.  Copy-on-write here is therefore a
+    provenance boundary: callers can never mutate the installed factory or a
+    second world while preparing one runtime scene.
+    """
+    owned = copy.deepcopy(entity_cfg)
+    if profile is None:
+        return owned, 0, ()
+    if profile.model != "dc_motor_back_emf":
+        raise CapabilityError(
+            f"unsupported actuator profile model {profile.model!r}"
+        )
+    try:
+        from mjlab.actuator import (
+            BuiltinPositionActuatorCfg,
+            DcMotorActuatorCfg,
+        )
+    except Exception as exc:
+        raise CapabilityError(
+            f"actuator profile {profile.profile_id!r} requires MjLab "
+            "DcMotorActuatorCfg"
+        ) from exc
+
+    articulation = getattr(owned, "articulation", None)
+    actuators = list(
+        getattr(articulation, "actuators", None) or ()
+    ) if articulation is not None else []
+    if not actuators:
+        if strict:
+            raise CapabilityError(
+                f"actuator profile {profile.profile_id!r} has no articulation "
+                "actuators to compose"
+            )
+        return owned, 0, ()
+
+    transformed: list[Any] = []
+    unresolved: list[Any] = []
+    swapped = 0
+    for actuator in actuators:
+        velocity_limit = actuator_velocity_limit(actuator, profile)
+        effort_limit = getattr(actuator, "effort_limit", None)
+        if isinstance(actuator, BuiltinPositionActuatorCfg):
+            if velocity_limit is None or not effort_limit:
+                unresolved.append(
+                    getattr(actuator, "target_names_expr", "?")
+                )
+                transformed.append(actuator)
+                continue
+            extra: dict[str, Any] = {}
+            for field_name in ("viscous_damping", "frictionloss"):
+                value = getattr(actuator, field_name, None)
+                if value is not None:
+                    extra[field_name] = value
+            transformed.append(DcMotorActuatorCfg(
+                target_names_expr=actuator.target_names_expr,
+                stiffness=actuator.stiffness,
+                damping=actuator.damping,
+                effort_limit=float(effort_limit),
+                armature=actuator.armature,
+                velocity_limit=float(velocity_limit),
+                saturation_effort=float(effort_limit),
+                **extra,
+            ))
+            swapped += 1
+        else:
+            transformed.append(actuator)
+    if strict and unresolved:
+        raise CapabilityError(
+            f"actuator profile {profile.profile_id!r} does not cover "
+            f"actuator groups {unresolved}"
+        )
+    articulation.actuators = tuple(transformed)
+    return owned, swapped, tuple(unresolved)
+
+
+def build_base_robot_entity_cfg(capability: RobotCapability) -> Any:
+    """Instantiate an owned copy of the installed, uncomposed robot asset."""
     target = capability.asset_factory
     if not target or ":" not in target:
         raise CapabilityError(
@@ -125,7 +257,61 @@ def build_robot_entity_cfg(capability: RobotCapability) -> Any:
         raise CapabilityError(
             f"{capability.capability_id}: asset_factory {target!r} did not "
             "return an EntityCfg")
-    return cfg
+    return copy.deepcopy(cfg)
+
+
+def build_robot_entity_cfg(capability: RobotCapability) -> Any:
+    """Instantiate one owned, fully composed robot capability asset."""
+    return apply_actuator_profile(
+        build_base_robot_entity_cfg(capability),
+        capability.actuator_profile,
+        strict=True,
+    )[0]
+
+
+G1_DC_MOTOR_PROFILE = ActuatorProfile(
+    profile_id="unitree_g1_dc_motor_back_emf_v1",
+    model="dc_motor_back_emf",
+    velocity_limits_rad_s={
+        ".*_knee_joint": 20.0,
+        ".*_hip_roll_joint": 20.0,
+        ".*_hip_pitch_joint": 32.0,
+        ".*_hip_yaw_joint": 32.0,
+        "waist_yaw_joint": 32.0,
+        ".*_elbow_joint": 37.0,
+        ".*_shoulder_pitch_joint": 37.0,
+        ".*_shoulder_roll_joint": 37.0,
+        ".*_shoulder_yaw_joint": 37.0,
+        ".*_wrist_roll_joint": 37.0,
+        ".*_wrist_pitch_joint": 22.0,
+        ".*_wrist_yaw_joint": 22.0,
+        ".*_ankle_pitch_joint": 37.0,
+        ".*_ankle_roll_joint": 37.0,
+        "waist_pitch_joint": 37.0,
+        "waist_roll_joint": 37.0,
+    },
+)
+
+
+GO1_DC_MOTOR_PROFILE = ActuatorProfile(
+    profile_id="unitree_go1_dc_motor_back_emf_v1",
+    model="dc_motor_back_emf",
+    velocity_limits_rad_s={
+        ".*_hip_joint": 30.1,
+        ".*_thigh_joint": 30.1,
+        ".*_calf_joint": 20.06,
+    },
+)
+
+
+LEGACY_UNITREE_DC_MOTOR_PROFILE = ActuatorProfile(
+    profile_id="unitree_legacy_dc_motor_back_emf_v1",
+    model="dc_motor_back_emf",
+    velocity_limits_rad_s={
+        **dict(G1_DC_MOTOR_PROFILE.velocity_limits_rad_s),
+        **dict(GO1_DC_MOTOR_PROFILE.velocity_limits_rad_s),
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -231,6 +417,7 @@ def _builtin_robots() -> dict[str, RobotCapability]:
             "left_foot_height", "right_foot_height",
             "base_horizontal_speed",
         ),
+        actuator_profile=G1_DC_MOTOR_PROFILE,
     )
     go1 = RobotCapability(
         capability_id="unitree_go1:base", asset_id="unitree_go1",
@@ -259,6 +446,7 @@ def _builtin_robots() -> dict[str, RobotCapability]:
             "base_ang_vel_b": (3,), "projected_gravity_b": (3,),
             "actuator_force": (12,), "command_vel": (3,),
         },
+        actuator_profile=GO1_DC_MOTOR_PROFILE,
     )
     yam = RobotCapability(
         capability_id="yam:parallel_gripper", asset_id="yam",
@@ -303,8 +491,15 @@ def _builtin_robots() -> dict[str, RobotCapability]:
 def _load_robot_file(path: Path) -> RobotCapability:
     data = json.loads(path.read_text(encoding="utf-8"))
     geometry = RobotGeometry(**data.pop("geometry"))
+    actuator_profile_data = data.pop("actuator_profile", None)
+    actuator_profile = (
+        ActuatorProfile(**actuator_profile_data)
+        if isinstance(actuator_profile_data, dict)
+        else None
+    )
     return RobotCapability(
         geometry=geometry,
+        actuator_profile=actuator_profile,
         body_roles={k: tuple(v) for k, v in data.pop("body_roles").items()},
         site_roles={k: tuple(v) for k, v in
                     data.pop("site_roles", {}).items()},

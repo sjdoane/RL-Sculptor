@@ -29,6 +29,7 @@ import type {
   RobotStateResponse,
   SystemGpuResponse,
   SystemKgStatsResponse,
+  StageReferenceAttachmentReceipt,
   TechniqueSummary,
 } from "./types";
 
@@ -235,6 +236,26 @@ export async function healStubTitles(
   );
 }
 
+/** POST /projects/{slug}/kg/index-fulltext — indexes every Paper's stored body
+ *  for lexical retrieval. Paper search ranks on title+abstract only, so a paper
+ *  whose body answers a question but whose abstract never names the topic is
+ *  otherwise unfindable. Local and fast (no network, no LLM). */
+export interface IndexFullTextResponse {
+  indexed: number;
+  missing: number;
+  skipped: number;
+}
+
+export async function indexFullText(
+  projectSlug: string,
+): Promise<IndexFullTextResponse> {
+  return handle<IndexFullTextResponse>(
+    await fetch(`/api/projects/${projectSlug}/kg/index-fulltext`, {
+      method: "POST",
+    }),
+  );
+}
+
 /** §Ship-8: per-project settings (config.toml [iteration] block).
  *  §Ship-9a: adds early_stop_enabled + early_stop_patience. */
 export interface IterationSettings {
@@ -279,6 +300,49 @@ export async function patchProjectSettings(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }),
+  );
+}
+
+/** The project's env spec: what the sculpt loop trains under. */
+export interface EnvSpecInfo {
+  active: boolean;
+  current: { meta?: Record<string, unknown>; shared?: Record<string, unknown>;
+             train?: Record<string, unknown> } | null;
+  versions: string[];
+  /** Train keys the backend will accept an edit for. Rendered from here
+   *  rather than hardcoded, so the UI can't drift from the validator. */
+  editable_train_keys: string[];
+}
+
+export interface EnvSpecTrainEditResult {
+  applied: string[];
+  /** `[parameter, reason]` — surfaced, never swallowed. */
+  rejected: string[][];
+  new_version: string | null;
+  current: EnvSpecInfo["current"];
+}
+
+export async function getProjectEnvSpec(
+  projectSlug: string,
+): Promise<EnvSpecInfo> {
+  return handle<EnvSpecInfo>(
+    await fetch(`/api/projects/${projectSlug}/env-spec`),
+  );
+}
+
+/** PUT .../env-spec/train — change the knobs the loop trains under.
+ *  Partial success is normal: a rejected edit comes back with its reason
+ *  while the valid ones still land. */
+export async function editProjectEnvSpecTrain(
+  projectSlug: string,
+  edits: Array<{ parameter: string; new_value: unknown; rationale?: string }>,
+): Promise<EnvSpecTrainEditResult> {
+  return handle<EnvSpecTrainEditResult>(
+    await fetch(`/api/projects/${projectSlug}/env-spec/train`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ edits }),
     }),
   );
 }
@@ -744,8 +808,13 @@ export function clipUrl(
   return `/api/projects/${slug}/runs/${runId}/clips/iter_${iterIndex}.mp4`;
 }
 
-// ── Policies (trained checkpoints + deployment-bundle export) ─────────
-import type { PolicySummary } from "./types";
+// ── Policies + reusable starting skills ──────────────────────────────
+import type {
+  PolicyRecoverySnapshot,
+  PolicySummary,
+  StartingSkillReceipt,
+  StartingSkillsResponse,
+} from "./types";
 
 /** Disk-backed list of exportable trained iterations. Pass `runId` only
  *  for mission stage runs (their iters live in the stage's own tree). */
@@ -758,13 +827,64 @@ export async function listPolicies(
   );
 }
 
-/** Download URL for a policy deployment bundle (zip: checkpoint + ONNX/
- *  TorchScript + reward/env-spec/config snapshots + DEPLOY.md). */
+/** List server-attested periodic PPO saves from interrupted project runs.
+ * The response deliberately contains opaque ids and immutable digests, never
+ * a client-selectable path. These rows are unevaluated recovery inputs. */
+export async function listPolicyRecoverySnapshots(
+  slug: string,
+): Promise<PolicyRecoverySnapshot[]> {
+  return handle<PolicyRecoverySnapshot[]>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/policies/recovery-snapshots`,
+    ),
+  );
+}
+
+/** Download URL for a deployment-qualified policy archive. The backend
+ * rejects this route unless every deployment authority passed. */
 export function policyExportUrl(
   slug: string, iterIndex: number, runId?: string,
 ): string {
   const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
   return `/api/projects/${slug}/policies/${iterIndex}/export${q}`;
+}
+
+/** Neutral raw reproducibility download. Its manifest always discloses the
+ * qualification status; downloadability itself makes no deployment claim. */
+export function policyReproducibilityUrl(
+  slug: string, iterIndex: number, runId?: string,
+): string {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return `/api/projects/${slug}/policies/${iterIndex}/reproducibility${q}`;
+}
+
+/** List portable starting skills with a compatibility + trust receipt for
+ * this exact project. Compatibility is project-relative, so this intentionally
+ * lives below `/projects/{slug}` rather than in a context-free global list. */
+export async function listStartingSkills(
+  slug: string,
+): Promise<StartingSkillsResponse> {
+  return handle<StartingSkillsResponse>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/starting-skills`),
+  );
+}
+
+/** Quarantine and validate a data-only RewardSculptor `.rskill`. Deployment
+ * ZIPs and raw/executable checkpoint formats are intentionally a separate
+ * artifact class and are rejected. The backend returns the immutable
+ * admission receipt; no bundled world is activated as a side effect. */
+export async function uploadStartingSkill(
+  slug: string,
+  bundle: File,
+): Promise<StartingSkillReceipt> {
+  const body = new FormData();
+  body.append("bundle", bundle, bundle.name);
+  return handle<StartingSkillReceipt>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/starting-skills`, {
+      method: "POST",
+      body,
+    }),
+  );
 }
 
 // ── Missions (Ship 18a) ──────────────────────────────────────────────
@@ -1192,10 +1312,276 @@ export async function searchReferences(
 
 /** GET /references (no q) — the slim index listing. Used for the
  *  picker's empty-query state ("browse everything"). */
-export async function listReferences(opts?: { robot?: string }): Promise<RefIndexRow[]> {
+export async function listReferences(
+  opts?: { robot?: string; q?: string; k?: number },
+): Promise<RefIndexRow[]> {
   const u = new URL("/api/references", window.location.origin);
   u.searchParams.set("robot", opts?.robot ?? "g1");
+  // `q` switches the endpoint from the slim index listing to the retrieval
+  // search — same shape back, so callers that only list are unaffected.
+  if (opts?.q?.trim()) u.searchParams.set("q", opts.q.trim());
+  if (opts?.k) u.searchParams.set("k", String(opts.k));
   return handle<RefIndexRow[]>(await fetch(u.pathname + u.search));
+}
+
+export type BrowseReferencesResult = {
+  rows: (RefIndexRow & { composed?: boolean })[];
+  total: number;
+  offset: number;
+  limit: number;
+  robot: string;
+  facets: {
+    tiers: Record<string, number>;
+    labels: Record<string, number>;
+    composed: number;
+    total: number;
+  };
+};
+
+/** GET /references/browse — the paginated, faceted library view.
+ *
+ *  Distinct from `listReferences` on purpose. That one defaults to `k=10`
+ *  against a ~6000-clip library, which made the library look like ten
+ *  alphabetically-first clips and left a freshly composed motion findable
+ *  only by typing its own id back into a semantic search box. This returns a
+ *  total, a stable page boundary, and puts composites first. */
+export async function browseReferences(opts?: {
+  robot?: string;
+  q?: string;
+  label?: string;
+  tier?: string;
+  composed?: boolean;
+  minDurationS?: number;
+  maxDurationS?: number;
+  sort?: "recent" | "duration" | "name";
+  limit?: number;
+  offset?: number;
+}): Promise<BrowseReferencesResult> {
+  const u = new URL("/api/references/browse", window.location.origin);
+  u.searchParams.set("robot", opts?.robot ?? "g1");
+  if (opts?.q?.trim()) u.searchParams.set("q", opts.q.trim());
+  if (opts?.label) u.searchParams.set("label", opts.label);
+  if (opts?.tier) u.searchParams.set("tier", opts.tier);
+  if (opts?.composed !== undefined)
+    u.searchParams.set("composed", String(opts.composed));
+  if (opts?.minDurationS !== undefined)
+    u.searchParams.set("min_duration_s", String(opts.minDurationS));
+  if (opts?.maxDurationS !== undefined)
+    u.searchParams.set("max_duration_s", String(opts.maxDurationS));
+  if (opts?.sort) u.searchParams.set("sort", opts.sort);
+  u.searchParams.set("limit", String(opts?.limit ?? 50));
+  u.searchParams.set("offset", String(opts?.offset ?? 0));
+  return handle<BrowseReferencesResult>(await fetch(u.pathname + u.search));
+}
+
+/** What the user is building, carried across the steps that build it.
+ *
+ *  Compose → per-mode reward → run were three disconnected screens: the
+ *  composed clip id lived only in whichever dialog had just produced it, so
+ *  the same id had to be re-found by hand in a ~6000-clip library twice.
+ *  Intent, not configuration — every step still reads the authoritative
+ *  artifact for truth. */
+export type BehaviorDraft = {
+  behavior_goal?: string;
+  reference_clip_id?: string;
+  reference_robot?: string;
+  mode_reward_filename?: string;
+};
+
+/** `null` clears a field; an omitted field is left alone. The two are
+ *  distinct, which is why this is not just `Partial<BehaviorDraft>`. */
+export type BehaviorDraftPatch = {
+  [K in keyof BehaviorDraft]?: string | null;
+};
+
+export async function getBehaviorDraft(slug: string): Promise<BehaviorDraft> {
+  return handle<BehaviorDraft>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/behavior-draft`),
+  );
+}
+
+/** Merge, not replace — each step knows only its own field. Send `null` to
+ *  clear one. */
+export async function patchBehaviorDraft(
+  slug: string,
+  patch: BehaviorDraftPatch,
+): Promise<BehaviorDraft> {
+  return handle<BehaviorDraft>(
+    await fetch(`/api/projects/${encodeURIComponent(slug)}/behavior-draft`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  );
+}
+
+export type ModeDurationQa = {
+  schema: "mode-duration-qa-v1";
+  accumulation: "raw_per_step_not_duration_normalized";
+  episode_duration_s: number;
+  modes: {
+    name: string;
+    duration_s: number;
+    episode_share: number;
+    ratio_to_median: number;
+  }[];
+  warnings: {
+    code: "long_window_raw_per_step_accumulation";
+    mode: string;
+    duration_s: number;
+    episode_share: number;
+    ratio_to_median: number;
+  }[];
+};
+
+export type ModeRewardFile = {
+  filename: string;
+  path: string;
+  clip_id: string;
+  reference_robot: string;
+  execution_context_digest: string;
+  /** Normalized behavior goal immutably pinned when this scaffold was made. */
+  authoring_goal?: string;
+  /** Digest of the pinned authoring goal. Empty on legacy/unverifiable files. */
+  authoring_intent_sha256?: string;
+  /** Exact digest verification result. Missing/false must fail closed in UI. */
+  authoring_intent_valid?: boolean;
+  /** Human-readable reason this file cannot be authored or promoted. */
+  context_blocker?: string | null;
+  context_current: boolean;
+  tracking_enabled: boolean;
+  mtime: number;
+  /** sha256 of the file, to match against the promoted version's
+   *  `source_sha256`. Filenames cannot answer it: authoring chains to a new
+   *  name every call. */
+  digest: string;
+  modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
+  unauthored: string[];
+  /** Derived from immutable execution windows. Optional for older servers. */
+  duration_qa?: ModeDurationQa;
+};
+
+/** The per-mode reward selected by current.py, if that exact version is one.
+ *
+ *  `mode_reward_v<n>.py` is not a version — `promote` copies it to `v<n>.py`
+ *  and repoints `current.py`. Until then the authored bodies are inert, and
+ *  nothing on screen distinguished "four modes authored" from "four modes
+ *  will train". */
+export type PromotedModeReward = {
+  version: number;
+  filename: string;
+  clip_id: string;
+  reference_robot: string;
+  execution_context_digest: string;
+  authoring_goal?: string;
+  authoring_intent_sha256?: string;
+  authoring_intent_valid?: boolean;
+  context_blocker?: string | null;
+  context_current: boolean;
+  /** True only when selection_current pins the same reward path and digest. */
+  selection_current: boolean;
+  promotion_blocker: string | null;
+  tracking_enabled: boolean;
+  /** The mode-reward file this version was promoted from, and its exact bytes.
+   *  `""` for a version promoted before these were recorded — which reads as
+   *  "matches nothing", so the UI offers to promote again rather than claiming
+   *  a stale reward is what trains. */
+  source_sha256: string;
+  source_filename: string;
+  modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
+  unauthored: string[];
+  duration_qa?: ModeDurationQa;
+};
+
+export type ModeRewardsResult = {
+  mode_rewards: ModeRewardFile[];
+  promoted: PromotedModeReward | null;
+};
+
+/** GET /projects/{slug}/mode-rewards — the mode-reward files already on disk.
+ *
+ *  The read side that makes per-mode authoring resumable. Without it, all
+ *  authoring progress lived in one component's `useState`: a page reload
+ *  showed a panel whose only button was "Scaffold reward", which overwrote
+ *  the very bodies the reload had hidden. */
+export async function listModeRewards(
+  slug: string,
+): Promise<ModeRewardsResult> {
+  const d = await handle<Partial<ModeRewardsResult>>(
+    await fetch(`/api/projects/${slug}/mode-rewards`),
+  );
+  return { mode_rewards: d.mode_rewards ?? [], promoted: d.promoted ?? null };
+}
+
+export type ModeEvidenceStatus = {
+  schema: number;
+  created_at: number;
+  recorded: boolean;
+  receipt_sha256: string;
+  trust_status: "observe_only" | "trusted";
+  evidence_status: "absent" | "available";
+  fitness_or_selection_authority: boolean;
+  training_consumer_active: boolean;
+  blockers: string[];
+  next_action: string;
+  authority: {
+    clip_id: string;
+    reference_robot: string;
+    clip_sha256: string;
+    reward_sha256: string;
+    graph_sha256: string;
+    execution_manifest_sha256: string;
+    context_sha256: string;
+    selection: { present: boolean; valid: boolean; tuple_hash?: string };
+  };
+  gauntlet: {
+    mode_order: string[];
+    have: {
+      scores: boolean;
+      transitions: boolean;
+      validation: boolean;
+      calibration: boolean;
+    };
+  };
+};
+
+function modeEvidenceUrl(
+  slug: string,
+  clipId: string,
+  robot: string,
+  suffix = "",
+): string {
+  const u = new URL(
+    `/api/projects/${encodeURIComponent(slug)}/mode-evidence${suffix}`,
+    window.location.origin,
+  );
+  u.searchParams.set("clip_id", clipId);
+  u.searchParams.set("robot", robot);
+  return u.pathname + u.search;
+}
+
+/** Exact-context status for independent per-mode objective evidence. */
+export async function getModeEvidence(
+  slug: string,
+  clipId: string,
+  robot: string,
+): Promise<ModeEvidenceStatus> {
+  return handle<ModeEvidenceStatus>(
+    await fetch(modeEvidenceUrl(slug, clipId, robot)),
+  );
+}
+
+/** Persist the current absence/readiness finding as an immutable receipt. */
+export async function recordModeEvidenceReceipt(
+  slug: string,
+  clipId: string,
+  robot: string,
+): Promise<ModeEvidenceStatus> {
+  return handle<ModeEvidenceStatus>(
+    await fetch(modeEvidenceUrl(slug, clipId, robot, "/receipt"), {
+      method: "POST",
+    }),
+  );
 }
 
 /** POST /references/compose — build ONE novel clip out of spans of several
@@ -1206,11 +1592,13 @@ export async function listReferences(opts?: { robot?: string }): Promise<RefInde
  *  tracking run on it. */
 export async function composeReference(body: {
   clip_id: string;
-  robot?: string;
+  robot: string;
   segments: ComposeSegment[];
   text?: string;
   labels?: string[];
   blend_s?: number;
+  /** Resample every phase to this rate. Omitted means the first phase's fps. */
+  target_fps?: number;
   strict?: boolean;
 }): Promise<ComposeResult> {
   return handle<ComposeResult>(
@@ -1222,26 +1610,38 @@ export async function composeReference(body: {
   );
 }
 
-export async function getReference(clipId: string): Promise<RefDetail> {
+export async function getReference(
+  robot: string, clipId: string,
+): Promise<RefDetail> {
   return handle<RefDetail>(
-    await fetch(`/api/references/${encodeURIComponent(clipId)}`),
+    await fetch(
+      `/api/references/${encodeURIComponent(clipId)}?robot=${encodeURIComponent(robot)}`,
+    ),
   );
 }
 
 /** Preview keyframe-strip PNG URL. No existence check here — the
  *  backend 404s cleanly when a clip has no preview.png; callers should
  *  hide the <img> on error (see ReferencePickerDialog). */
-export function getReferencePreviewUrl(clipId: string): string {
-  return `/api/references/${encodeURIComponent(clipId)}/preview`;
+export function getReferencePreviewUrl(robot: string, clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/preview?robot=${encodeURIComponent(robot)}`;
+}
+
+/** GET /references/{clip_id}/file/clip.npz — the clip's raw motion arrays.
+ *  A plain href rather than a fetch: this is a file download, and letting
+ *  the browser stream it avoids buffering a multi-MB npz in JS. */
+export function getReferenceClipUrl(robot: string, clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/file/clip.npz?robot=${encodeURIComponent(robot)}`;
 }
 
 /** POST .../stages/{stage}/reference body {clip_id} — attach a
  *  reference clip to a stage. 409 if mission-scoped jobs are live (same
- *  guard family as regenerateStageMetric). Returns the updated mission. */
+ *  guard family as regenerateStageMetric). Returns the exact Tier-D
+ *  attachment receipt; callers invalidate and refetch the mission. */
 export async function attachStageReference(
   slug: string, missionSlug: string, stageName: string, clipId: string,
-): Promise<MissionDetail> {
-  return handle<MissionDetail>(
+): Promise<StageReferenceAttachmentReceipt> {
+  return handle<StageReferenceAttachmentReceipt>(
     await fetch(
       `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
       {
@@ -1256,8 +1656,8 @@ export async function attachStageReference(
 /** DELETE .../stages/{stage}/reference — detach. Same 409 guard. */
 export async function detachStageReference(
   slug: string, missionSlug: string, stageName: string,
-): Promise<MissionDetail> {
-  return handle<MissionDetail>(
+): Promise<void> {
+  return handle<void>(
     await fetch(
       `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
       { method: "DELETE" },
@@ -1365,5 +1765,151 @@ export async function previewWorldDraft(
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(120_000),
     }),
+  );
+}
+
+// ── per-mode reward authoring (OGMP modes of a composed reference) ──────
+export type ReferenceMode = {
+  name: string;
+  frame_range: [number, number];
+  start_s: number;
+  end_s: number;
+  source_clip_id: string | null;
+  reference_clip_id: string | null;
+  reward_terms: string[];
+  success_predicate: string | null;
+};
+
+export type ReferenceModeGraph = {
+  clip_id: string;
+  fps: number;
+  capability: {
+    kind: "phase_window_reference_scaffold";
+    paper_alignment: "ogmp_inspired";
+    dispatch_authority: "episode_time_window";
+    reference_generator: "fixed_composed_clip";
+    runtime_transition_guards: boolean;
+    policy_mode_conditioning: boolean;
+    rho_bounded_exploration: boolean;
+    closed_loop_receding_horizon_oracle: boolean;
+    preference_conditioning: boolean;
+    implementation_status: Record<
+      string,
+      "implemented" | "metadata_only" | "unsupported"
+    >;
+    summary: string;
+  };
+  modes: ReferenceMode[];
+  transitions: {
+    from_mode: string;
+    to_mode: string;
+    guard_kind: string;
+    at_phase: number | null;
+    expression: string | null;
+  }[];
+};
+
+export type ModeRewardResult = {
+  path: string;
+  filename: string;
+  clip_id: string;
+  /** Exact robot namespace paired with clip_id; missing legacy values block. */
+  reference_robot?: string;
+  execution_context_digest: string;
+  authoring_goal?: string;
+  authoring_intent_sha256?: string;
+  authoring_intent_valid?: boolean;
+  /** Supplied by the authoritative list response after scaffold/author. */
+  context_blocker?: string | null;
+  /** Supplied by the authoritative list response after scaffold/author. */
+  context_current?: boolean;
+  tracking: boolean;
+  modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
+  unauthored: string[];
+  duration_qa?: ModeDurationQa;
+};
+
+/** GET /references/{clip_id}/modes — the hybrid automaton a composed clip's
+ *  own provenance implies. 422 when the clip is not a composite: there is
+ *  then one mode and no transition to derive, which is a real answer rather
+ *  than an error to paper over. */
+export async function getReferenceModes(
+  clipId: string,
+  robot: string,
+): Promise<ReferenceModeGraph> {
+  const u = new URL(
+    `/api/references/${encodeURIComponent(clipId)}/modes`,
+    window.location.origin,
+  );
+  u.searchParams.set("robot", robot);
+  return handle<ReferenceModeGraph>(await fetch(u.pathname + u.search));
+}
+
+/** POST .../mode-reward — write a per-mode reward scaffold into the project.
+ *  Every mode starts as a stub paying nothing; the point of the scaffold is
+ *  the gating, which is generated from the automaton rather than authored. */
+export async function scaffoldModeReward(
+  slug: string,
+  clipId: string,
+  body: { robot: string; goal?: string; tracking?: boolean; filename?: string; overwrite?: boolean },
+): Promise<ModeRewardResult> {
+  return handle<ModeRewardResult>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/references/${encodeURIComponent(clipId)}/mode-reward`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clip_id: clipId, ...body }),
+      },
+    ),
+  );
+}
+
+/** POST .../mode-reward/author — Claude writes ONE mode's reward bodies.
+ *  Returns a job; poll `getJob`. One mode per call so a bad edit is scoped
+ *  to one window rather than the whole behavior. */
+export async function authorModeReward(
+  slug: string,
+  clipId: string,
+  body: { mode: string; robot: string; filename?: string; out_filename?: string; goal?: string; mode_goal?: string },
+): Promise<JobSummary> {
+  return handle<JobSummary>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/references/${encodeURIComponent(clipId)}/mode-reward/author`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clip_id: clipId, ...body }),
+      },
+    ),
+  );
+}
+
+export type ModePromoteResult = {
+  version: number;
+  filename: string;
+  path: string;
+  clip_id: string;
+  unauthored: string[];
+  source_filename: string;
+};
+
+/** POST .../mode-reward/promote — put the authored reward into the project's
+ *  reward version chain. Without this a run trains whatever `current.py`
+ *  pointed at before: `mode_reward_v<n>.py` is not a version. */
+export async function promoteModeReward(
+  slug: string,
+  clipId: string,
+  body: { filename: string; allow_unauthored?: boolean },
+): Promise<ModePromoteResult> {
+  return handle<ModePromoteResult>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/references/${encodeURIComponent(clipId)}/mode-reward/promote`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   );
 }

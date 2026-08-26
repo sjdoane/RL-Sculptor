@@ -88,6 +88,9 @@ class ProjectSummary(BaseModel):
     # dashboard uses).
     adapter_class: Optional[str] = None
     library_slug: Optional[str] = None
+    # Exact namespace for reference clips and portable policy contracts. This
+    # is not inferred from ``library_slug`` or the adapter task id.
+    reference_robot: Optional[str] = None
     num_envs: Optional[int] = None
     device: Optional[str] = None
     primary_metric: Optional[float] = None
@@ -104,6 +107,7 @@ class ProjectDetail(ProjectSummary):
     # after cross-referencing metadata.json's robot_source.
     ready_to_train: bool = True
     library_slug: Optional[str] = None
+    reference_robot: Optional[str] = None
     # M5: true when the user created a project with a coming-soon
     # adapter (Isaac Lab / MJX / RLlib). UI disables the Train button
     # with a tooltip pointing at the adoption guide.
@@ -164,8 +168,9 @@ class EnvSpecInfo(BaseModel):
     """§env generalization: the project's environment-adaptation spec —
     the per-project, goal-conditioned env config the sculpt loop trains
     under and whose train section the diagnoser iterates between
-    iterations. Read-only surface; the spec is generated and iterated
-    by the loop itself (env_spec_updated events carry the changes)."""
+    iterations. Generated and iterated by the loop itself
+    (env_spec_updated events carry the changes); the train section is
+    additionally editable by hand via PUT .../env-spec/train."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -175,6 +180,46 @@ class EnvSpecInfo(BaseModel):
     current: Optional[dict] = None
     #: All version names on disk, numerically sorted ("v0", "v1", ...).
     versions: list[str] = []
+    #: Train-section keys a human or the diagnoser may change, so the UI
+    #: can render exactly the editable set instead of hardcoding it.
+    editable_train_keys: list[str] = []
+
+
+class EnvSpecTrainEdit(BaseModel):
+    """One train-section change, shaped like a diagnoser edit so both go
+    through `sculptor.env_spec.apply_env_edits` and get the same bounds
+    and shape validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Must be in `ITERABLE_TRAIN_KEYS`; anything else is rejected.
+    parameter: str
+    #: The replacement value. Scalars, [lo, hi] ranges and booleans are
+    #: all valid depending on the key.
+    new_value: Any
+    #: Why — persisted with the version so a later reader knows.
+    rationale: str = ""
+
+
+class EnvSpecTrainEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    edits: list[EnvSpecTrainEdit]
+
+
+class EnvSpecTrainEditResult(BaseModel):
+    """Partial success is normal: each edit is validated against the spec
+    resulting from the ones before it, so a bad edit is reported and the
+    rest still land."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    applied: list[str] = []
+    #: `[parameter, reason]` pairs — always shown, never swallowed.
+    rejected: list[list[str]] = []
+    #: The version written, or None when no edit was valid.
+    new_version: Optional[str] = None
+    current: Optional[dict] = None
 
 
 class ProblemDetail(BaseModel):

@@ -75,7 +75,8 @@ REQUIRED_JOINT_ROLES = ["left_hip_pitch","right_hip_pitch","left_shoulder_pitch"
 def compute_spec(arrays, behavior, meta):
     try:
         pg=arrays.get("projected_gravity_b"); jp=arrays.get("joint_pos"); jv=arrays.get("joint_vel")
-        if pg is None or jp is None or jv is None: return {"spec_score":0.0}
+        valid=arrays.get("first_episode_valid_mask")
+        if pg is None or jp is None or jv is None or valid is None: return {"spec_score":0.0}
         roles=(meta or {}).get("joint_roles",{}) or {}
         need=["left_hip_pitch","right_hip_pitch","left_shoulder_pitch","right_shoulder_pitch"]
         if not all(r in roles for r in need): return {"spec_score":0.0}
@@ -83,15 +84,19 @@ def compute_spec(arrays, behavior, meta):
         gx=pg[...,0]; gz=pg[...,2]
         hip=0.5*(jp[...,lhp]+jp[...,rhp]); shv=0.5*(jv[...,lsp]+jv[...,rsp]); sh=0.5*(jp[...,lsp]+jp[...,rsp])
         E=pg.shape[1]
-        bent=np.zeros(E,bool); rec=np.zeros(E,bool); waved=np.zeros(E,bool)
+        bent=np.zeros(E,bool); rec=np.zeros(E,bool); waved=np.zeros(E,bool); bend_depth=np.zeros(E)
         for e in range(E):
-            be=(gx[:,e]>0.4)&(np.abs(hip[:,e])>0.5)
+            keep=np.flatnonzero(valid[:,e])
+            if keep.size<4: continue
+            egx=gx[keep,e]; egz=gz[keep,e]; ehip=hip[keep,e]; esh=sh[keep,e]; eshv=shv[keep,e]
+            bend_depth[e]=float(np.max(egx))
+            be=(egx>0.4)&(np.abs(ehip)>0.5)
             if not be.any(): continue
             tb=int(np.argmax(be)); bent[e]=True
-            ue=(gz[tb+1:,e]<-0.9)&(np.abs(hip[tb+1:,e])<0.35)
+            ue=(egz[tb+1:]<-0.9)&(np.abs(ehip[tb+1:])<0.35)
             if not ue.any(): continue
             tu=tb+1+int(np.argmax(ue)); rec[e]=True
-            seg=sh[tu:,e]; vseg=shv[tu:,e]
+            seg=esh[tu:]; vseg=eshv[tu:]
             if seg.size<4: continue
             if float(np.max(seg)-np.min(seg))>0.7:
                 sign=np.sign(np.where(np.abs(vseg)>0.6,vseg,0)); sc=0; last=0
@@ -101,7 +106,7 @@ def compute_spec(arrays, behavior, meta):
                         last=s
                 if sc>=2: waved[e]=True
         gate=float((bent&rec&waved).mean())
-        c_bend=float(np.mean(1.0-np.exp(-np.maximum(np.max(gx,axis=0)-0.35,0.0)/0.3)))
+        c_bend=float(np.mean(1.0-np.exp(-np.maximum(bend_depth-0.35,0.0)/0.3)))
         c_wave=1.0 if waved.any() else 0.0
         return {"spec_score":float(np.clip(gate*min(c_bend,c_wave),0,1))}
     except Exception as ex:
@@ -229,17 +234,25 @@ THREE_VEC_SLICE = '''import numpy as np
 REQUIRED_JOINT_ROLES=["left_hip_pitch","right_hip_pitch","left_knee","right_knee"]
 def compute_spec(arrays,behavior,meta):
     jp=arrays.get("joint_pos"); root=arrays.get("root_link_pos_w"); pg=arrays.get("projected_gravity_b")
-    if jp is None or root is None or pg is None: return {"spec_score":0.0}
+    valid=arrays.get("first_episode_valid_mask")
+    if jp is None or root is None or pg is None or valid is None: return {"spec_score":0.0}
     roles=(meta or {}).get("joint_roles",{}) or {}
     idx=[roles[r] for r in ("left_hip_pitch","right_hip_pitch","left_knee","right_knee") if r in roles]
     if not idx: return {"spec_score":0.0}
     z=root[:, :, 2]; gz=pg[:, :, 2]                  # explicit-slice 3-vector axis reads (LEGIT)
-    drop=float(np.mean(z[:5].mean(axis=0)-z.min(axis=0)))
-    ret=float(np.mean(np.abs(z[-5:].mean(axis=0)-z[:5].mean(axis=0))))
-    rom=float(np.mean(np.max(jp[...,idx],axis=0)-np.min(jp[...,idx],axis=0)))
-    up=float(np.mean(gz[:5].mean(axis=0)<-0.85))
-    gate=(1.0 if drop>0.2 else 0.0)*(1.0 if ret<0.08 else 0.0)*(1.0 if up>0.7 else 0.0)
-    return {"spec_score":float(np.clip(gate*np.clip(rom/1.2,0,1),0,1))}
+    scores=[]
+    for e in range(root.shape[1]):
+        keep=np.flatnonzero(valid[:,e])
+        if keep.size<5:
+            scores.append(0.0); continue
+        ez=z[keep,e]; egz=gz[keep,e]; ejp=jp[keep,e]
+        drop=float(ez[:5].mean()-ez.min())
+        ret=float(np.abs(ez[-5:].mean()-ez[:5].mean()))
+        rom=float(np.mean(np.max(ejp[:,idx],axis=0)-np.min(ejp[:,idx],axis=0)))
+        up=float(egz[:5].mean()<-0.85)
+        gate=(1.0 if drop>0.2 else 0.0)*(1.0 if ret<0.08 else 0.0)*(1.0 if up>0.7 else 0.0)
+        scores.append(float(np.clip(gate*np.clip(rom/1.2,0,1),0,1)))
+    return {"spec_score":float(np.mean(scores))}
 '''
 
 JOINT_COL_SLICE = '''import numpy as np
@@ -465,17 +478,26 @@ DIP_OR_WALK = '''import numpy as np
 REQUIRED_JOINT_ROLES = ["left_hip_pitch", "right_hip_pitch"]
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w"); pg = arrays.get("projected_gravity_b")
-    if root is None or pg is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if root is None or pg is None or valid is None:
         return {"spec_score": 0.0}
-    z = root[..., 2]
-    drop = float(np.mean(z[:5].mean(0) - z.min(0)))
-    ret = float(np.mean(np.abs(z[-5:].mean(0) - z[:5].mean(0))))
-    up = float(np.mean(pg[:5, ..., 2].mean(0) < -0.85))
-    dip = (1.0 if (drop > 0.2 and ret < 0.08 and up > 0.7) else 0.0) * float(np.clip(drop / 0.35, 0, 1))
-    disp = float(np.linalg.norm(root[-1, :, :2].mean(0) - root[0, :, :2].mean(0)))
-    standing = float(np.mean(z.mean(0) > 0.65))
-    walk = (1.0 if standing > 0.7 else 0.0) * float(1 - np.exp(-disp / 1.0))
-    return {"spec_score": float(np.clip(max(dip, walk), 0, 1))}
+    scores = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 5:
+            scores.append(0.0)
+            continue
+        lane_root = root[keep, env]
+        z = lane_root[:, 2]
+        drop = float(z[:5].mean() - z.min())
+        ret = float(np.abs(z[-5:].mean() - z[:5].mean()))
+        up = float(pg[keep[:5], env, 2].mean() < -0.85)
+        dip = (1.0 if (drop > 0.2 and ret < 0.08 and up > 0.7) else 0.0) * float(np.clip(drop / 0.35, 0, 1))
+        disp = float(np.linalg.norm(lane_root[-1, :2] - lane_root[0, :2]))
+        standing = float(z.mean() > 0.65)
+        walk = (1.0 if standing > 0.7 else 0.0) * float(1 - np.exp(-disp / 1.0))
+        scores.append(float(np.clip(max(dip, walk), 0, 1)))
+    return {"spec_score": float(np.mean(scores))}
 '''
 
 

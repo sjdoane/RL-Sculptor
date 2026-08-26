@@ -111,6 +111,11 @@ def test_library_pick_updates_config_and_sidecar(
     assert r.status_code == 200
     assert r.json()["env_id"] == "Hopper-v4"
 
+    project = client.get(f"/projects/{slug}")
+    assert project.status_code == 200
+    assert project.json()["library_slug"] == "hopper"
+    assert project.json()["reference_robot"] == "hopper"
+
 
 def test_library_pick_all_supported_names(client: TestClient) -> None:
     mapping = {
@@ -280,7 +285,7 @@ def test_mesh_zip_rejects_path_traversal(client: TestClient) -> None:
         },
     )
     assert r.status_code == 400, r.text
-    assert r.json()["type"] == "/problems/zip-path-traversal"
+    assert r.json()["type"] == "/problems/unsafe-archive"
 
 
 # ── GET /preview ──────────────────────────────────────────────────────

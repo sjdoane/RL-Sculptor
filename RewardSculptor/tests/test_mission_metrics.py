@@ -278,6 +278,10 @@ def _write_fixture_clip(tmp_path: Path, robot: str, clip_id: str) -> Path:
 
     root = tmp_path / "refs_root"
     clip = make_procedural_jump_clip()
+    # Tier-D certification is intentionally closed to legacy clips whose
+    # root-height convention must be guessed.  The procedural fixture is in
+    # world coordinates, so persist that fact explicitly.
+    clip["root_frame"] = "absolute"
     clip_path = library.clip_dir(robot, clip_id, root=root) / library.CLIP_FILENAME
     save_clip(clip_path, clip)
     content_sha = library.content_sha256(clip_path.read_bytes())
@@ -1294,7 +1298,21 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
     verify_tierd_certificate — with no explicit tier ever passed by
     mission_metrics.py."""
     from sculptor.refs import library
-    from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
+    from sculptor.reference import load_clip
+    from sculptor.refs.track import (
+        RUNNER_RUNTIME_ARTIFACT_SCHEMA,
+        _score_tierd_rollout_artifact,
+        bind_tierd_runtime_artifacts,
+        build_tierd_execution_contract,
+        build_tierd_reference_clock,
+        downsample_phase_targets,
+        projected_gravity_from_quat,
+        update_provenance_tier_d,
+    )
+    from sculptor.runtime_inputs import environment_artifacts_for_phase
+    from sculptor.policy_contract import (
+        condition_policy_contract_on_reference_clock,
+    )
 
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
@@ -1305,13 +1323,246 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
     rollout_path = (
         library.clip_dir("g1", "getup_demo_clip", root=root)
         / "tierD_rollout.npz")
-    rollout_path.write_bytes(b"a real tracking rollout for the wiring test")
-    errs = TrackingErrors(
-        mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
-        duration_coverage=1.0, common_joint_names=[], n_common_joints=0)
+    clip_path = (
+        library.clip_dir("g1", "getup_demo_clip", root=root)
+        / library.CLIP_FILENAME
+    )
+    clip = load_clip(clip_path)
+    joints = [str(name) for name in clip["joint_names"]]
+    donor = root / "tier_d_donor"
+    donor.mkdir(parents=True, exist_ok=True)
+    donor_config = donor / "config.toml"
+    donor_config.write_text(
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { task_id = "Mjlab-Velocity-Flat-Unitree-G1" }\n',
+        encoding="utf-8",
+    )
+    base_policy_contract = {
+        "schema": 2,
+        "identity": {
+            "adapter_class": "sculptor.adapters.mjlab.MjlabAdapter",
+            "task_id": "Mjlab-Velocity-Flat-Unitree-G1",
+        },
+        "joints": {"ordered_names": joints},
+        "observations": {
+            "ordered_terms": [
+                {"name": "base", "source": "base", "shape": [1]},
+            ],
+            "shape": [1],
+            "critic_ordered_terms": [
+                {"name": "base", "source": "base", "shape": [1]},
+            ],
+            "critic_shape": [1],
+        },
+        "actions": {
+            "ordered_names": joints,
+            "term_names": ["joint_position"],
+            "shape": [len(joints)],
+        },
+        "timing": {
+            "sim_timestep_s": 0.005,
+            "decimation": 4,
+            "control_dt_s": 0.02,
+        },
+        "versions": {
+            "torch": "2.7",
+            "mjlab": "0.3.1",
+            "rsl_rl": "3.1.0",
+            "adapter": "0.7.0",
+        },
+        "policy": {
+            "normalizer": {
+                "present": False,
+                "actor_present": False,
+                "critic_present": False,
+                "actor_shape": None,
+                "critic_shape": None,
+            },
+        },
+    }
+    reference_clock = build_tierd_reference_clock(
+        clip, clip_id="getup_demo_clip", robot="g1",
+    )
+    policy_contract = condition_policy_contract_on_reference_clock(
+        base_policy_contract, reference_clock,
+    )
+    execution_contract = build_tierd_execution_contract(
+        donor_project=donor,
+        certification_config_path=donor_config,
+        clip_id="getup_demo_clip",
+        robot="g1",
+        clip=clip,
+        policy_contract=policy_contract,
+        reference_clock=reference_clock,
+    )
+    reward_sha = "a" * 64
+    checkpoint_sha = "b" * 64
+    train_environment = environment_artifacts_for_phase(
+        execution_contract["environment_artifacts"], "train",
+    )
+    policy_contract_sha = execution_contract["donor"][
+        "policy_contract_sha256"
+    ]
+    execution_contract = bind_tierd_runtime_artifacts(
+        execution_contract,
+        requested_reward_module_sha256=reward_sha,
+        train_receipts=[{
+            "iteration": 1,
+            "schema": RUNNER_RUNTIME_ARTIFACT_SCHEMA,
+            "phase": "train",
+            "reward_module_sha256": reward_sha,
+            "requested_max_iterations": 2000,
+            "requested_seed": 0,
+            "requested_num_envs": 64,
+            "seed_application": {
+                "schema": "reward-sculptor-seed-application-v1",
+                "applied_seed": 0,
+                "python_random": True,
+                "numpy_global": True,
+                "torch_global": True,
+                "env_cfg": True,
+                "rl_cfg": True,
+            },
+            "environment_artifacts": train_environment,
+            "env_spec_application": {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "train",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            },
+            "input_checkpoint_requested_sha256": None,
+            "input_checkpoint_loaded_sha256": None,
+            "input_checkpoint_load_completed": False,
+            "output_checkpoint_sha256": checkpoint_sha,
+            "output_policy_contract_sha256": policy_contract_sha,
+            "output_policy_contract_sidecar_sha256": "c" * 64,
+        }],
+        final_checkpoint_sha256=checkpoint_sha,
+        requested_steps_per_iteration=2000,
+        requested_seed=0,
+        requested_num_envs=64,
+    )
+
+    # A Tier-D certificate now derives its errors from the exact retained,
+    # self-describing rollout.  Build a truthful one-lane post-step artifact
+    # instead of injecting caller-authored error numbers.
+    import numpy as np
+
+    dt = float(execution_contract["execution_boundary"]["timing"][
+        "control_dt_s"
+    ])
+    duration_s = float(execution_contract["reference"][
+        "playback_duration_s"
+    ])
+    n_steps = int(round(duration_s / dt)) + 1
+    joint_pos = downsample_phase_targets(clip["joint_pos"], n=n_steps)
+    root_z = downsample_phase_targets(clip["root_pos_z"], n=n_steps)
+    root_pos = np.zeros((n_steps, 1, 3), dtype=np.float32)
+    root_pos[:, 0, 2] = root_z
+    rollout_requirements = execution_contract["runtime_artifacts"][
+        "rollout_requirements"
+    ]
+    metadata = {
+        "schema": "reward-sculptor-trajectory-v1",
+        "layout": ["time", "environment", "feature"],
+        "ordered_joint_names": joints,
+        "control_dt_s": dt,
+        "root_link_pos_w_frame": "world",
+        "first_episode_lane": 0,
+        "valid_mask": {
+            "key": "first_episode_valid_mask",
+            "semantics": "true_prefix_before_first_done",
+            "invalid_state": "frozen_last_valid_sample",
+            "state_samples": "post_step_after_valid_transition",
+        },
+        "runtime_artifacts": {
+            "schema": RUNNER_RUNTIME_ARTIFACT_SCHEMA,
+            "phase": "rollout",
+            "reward_module_sha256": reward_sha,
+            "checkpoint_sha256": checkpoint_sha,
+            "checkpoint_load_completed": True,
+            "environment_artifacts": rollout_requirements[
+                "environment_artifacts"
+            ],
+            "requested_seed": rollout_requirements["requested_seed"],
+            "applied_seed": rollout_requirements["requested_seed"],
+            "seed_application": {
+                "schema": "reward-sculptor-seed-application-v1",
+                "applied_seed": rollout_requirements["requested_seed"],
+                "python_random": True,
+                "numpy_global": True,
+                "torch_global": True,
+                "env_cfg": True,
+                "rl_cfg": False,
+            },
+            "env_spec_application": {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "rollout",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            },
+            "eval_reset_application": {
+                "schema": "reward-sculptor-eval-reset-application-v1",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            },
+            "requested_n_episodes": rollout_requirements[
+                "requested_n_episodes"
+            ],
+            "configured_n_episodes": rollout_requirements[
+                "requested_n_episodes"
+            ],
+            "requested_max_episode_steps": rollout_requirements[
+                "requested_max_episode_steps"
+            ],
+            "configured_max_episode_steps": rollout_requirements[
+                "requested_max_episode_steps"
+            ],
+            "requested_task_id": rollout_requirements[
+                "requested_task_id"
+            ],
+            "configured_task_id": rollout_requirements[
+                "requested_task_id"
+            ],
+            "configured_num_envs": 1,
+            "completed_first_episodes": 0,
+        },
+    }
+    payload = {
+        "joint_pos": joint_pos[:, None, :].astype(np.float32),
+        "root_link_pos_w": root_pos,
+        "first_episode_valid_mask": np.ones((n_steps, 1), dtype=bool),
+        "trajectory_contract_json": np.asarray(json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"),
+        )),
+    }
+    if clip.get("root_quat_wxyz") is not None:
+        payload["projected_gravity_b"] = downsample_phase_targets(
+            projected_gravity_from_quat(clip["root_quat_wxyz"]), n=n_steps,
+        )[:, None, :].astype(np.float32)
+    np.savez_compressed(rollout_path, **payload)
+    rollout_sha = library.content_sha256(rollout_path.read_bytes())
+    content_addressed_rollout = rollout_path.with_name(
+        f"tierD_rollout_{rollout_sha}.npz"
+    )
+    rollout_path.rename(content_addressed_rollout)
+    rollout_path = content_addressed_rollout
+    errs = _score_tierd_rollout_artifact(
+        rollout_path,
+        clip=clip,
+        execution_contract=execution_contract,
+    )
     update_provenance_tier_d(
         robot="g1", clip_id="getup_demo_clip", errors=errs, iterations=1,
-        rollout_path=rollout_path, root=root)
+        rollout_path=rollout_path,
+        execution_contract=execution_contract,
+        root=root)
 
     def fake_gen(goal, out_dir, **kw):
         out_dir = Path(out_dir)

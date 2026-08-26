@@ -33,7 +33,6 @@ commit.
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import math
@@ -279,6 +278,56 @@ def _find_latest_reward_version(rewards_dir: Path) -> tuple[int, Path]:
 
 
 _ITERATION_COMPLETE_MARKER = "iteration_complete.json"
+_ITERATION_CHECKPOINT_NAMES = frozenset({"checkpoint.pt", "checkpoint.zip"})
+_REQUIRED_PHASE_MANIFESTS = (
+    "train_request_manifest.json",
+    "train_input_manifest.json",
+    "train_completion_manifest.json",
+    "rollout/rollout_input_manifest.json",
+    "rollout/rollout_completion_manifest.json",
+)
+_OPTIONAL_PHASE_MANIFESTS = (
+    "evaluation_plan.json",
+    "evaluation_results.json",
+)
+
+
+def _is_canonical_iteration_checkpoint(
+    iter_dir: Path, checkpoint_path: Path
+) -> bool:
+    """Return whether the checkpoint is a plain canonical file in iter_dir."""
+    iter_dir = Path(iter_dir)
+    checkpoint_path = Path(checkpoint_path)
+    try:
+        if checkpoint_path.is_symlink():
+            return False
+        resolved = checkpoint_path.resolve(strict=True)
+        return (
+            resolved.parent == iter_dir.resolve(strict=True)
+            and resolved.name in _ITERATION_CHECKPOINT_NAMES
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _checkpoint_sha256_and_size(checkpoint_path: Path) -> tuple[str, int]:
+    """Return a byte-exact receipt for one plain, non-empty checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
+        raise ValueError(
+            "iteration completion requires a regular checkpoint file"
+        )
+    digest = hashlib.sha256()
+    byte_count = 0
+    with checkpoint_path.open("rb") as checkpoint_handle:
+        for chunk in iter(lambda: checkpoint_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            byte_count += len(chunk)
+    if byte_count <= 0:
+        raise ValueError(
+            "iteration completion requires a non-empty checkpoint file"
+        )
+    return digest.hexdigest(), byte_count
 
 
 def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
@@ -287,17 +336,13 @@ def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
     A mere file is not enough: corrupt, copied, or wrong-index markers must
     preserve same-iteration crash recovery rather than silently skipping work.
     """
-    marker = iter_dir / _ITERATION_COMPLETE_MARKER
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and payload.get("schema") == 1
-        and type(payload.get("iter")) is int
-        and payload.get("iter") == iter_index
-        and payload.get("state") == "completed"
+    from sculptor.run_manifests import verify_iteration_completion_marker
+
+    receipt = verify_iteration_completion_marker(iter_dir)
+    return bool(
+        isinstance(receipt, dict)
+        and receipt.get("schema") == 3
+        and receipt.get("iter_index") == iter_index
     )
 
 
@@ -330,23 +375,58 @@ def _write_iteration_completion_marker(
     reward_version_before: int,
     reward_version_after: int | None,
     world_selection_hash: str | None,
-) -> None:
-    """Atomically make a completed iteration distinguishable from a crash."""
+) -> dict[str, Any]:
+    """Atomically attest the checkpoint and exact phase-manifest bytes."""
     from sculptor.run_context import write_json_atomic
 
-    write_json_atomic(
-        iter_dir / _ITERATION_COMPLETE_MARKER,
-        {
-            "schema": 1,
-            "state": "completed",
-            "iter": int(iter_index),
-            "completed_at": _utc_now_iso(),
-            "checkpoint": str(checkpoint_path),
-            "reward_version_before": int(reward_version_before),
-            "reward_version_after": reward_version_after,
-            "world_selection_hash": world_selection_hash,
-        },
+    checkpoint_path = Path(checkpoint_path)
+    if not _is_canonical_iteration_checkpoint(iter_dir, checkpoint_path):
+        raise ValueError(
+            "iteration completion checkpoint must be checkpoint.pt or "
+            "checkpoint.zip inside the exact iteration directory"
+        )
+    checkpoint_sha256, checkpoint_bytes = _checkpoint_sha256_and_size(
+        checkpoint_path
     )
+
+    phase_manifests: dict[str, dict[str, Any]] = {}
+    manifest_names = list(_REQUIRED_PHASE_MANIFESTS) + [
+        relative
+        for relative in _OPTIONAL_PHASE_MANIFESTS
+        if (iter_dir / relative).is_file()
+    ]
+    for relative in manifest_names:
+        manifest_path = iter_dir / relative
+        try:
+            resolved_manifest = manifest_path.resolve(strict=True)
+            resolved_manifest.relative_to(iter_dir.resolve(strict=True))
+            manifest_sha256, manifest_bytes = _checkpoint_sha256_and_size(
+                resolved_manifest
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"iteration completion requires exact {relative}: {exc}"
+            ) from exc
+        phase_manifests[relative] = {
+            "sha256": manifest_sha256,
+            "bytes": manifest_bytes,
+        }
+
+    payload = {
+        "schema": 3,
+        "state": "completed",
+        "iter": int(iter_index),
+        "completed_at": _utc_now_iso(),
+        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_bytes": checkpoint_bytes,
+        "reward_version_before": int(reward_version_before),
+        "reward_version_after": reward_version_after,
+        "world_selection_hash": world_selection_hash,
+        "phase_manifests": phase_manifests,
+    }
+    write_json_atomic(iter_dir / _ITERATION_COMPLETE_MARKER, payload)
+    return payload
 
 
 def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
@@ -388,7 +468,13 @@ def _ensure_current_py(rewards_dir: Path) -> Path:
     """Make sure rewards/current.py exists and re-exports the latest v<n>.py."""
     current = rewards_dir / "current.py"
     _, latest = _find_latest_reward_version(rewards_dir)
-    if not current.is_file():
+    selected = _current_reward_target(rewards_dir)
+    if selected is not None:
+        # Upgrade legacy core/UI selectors before every launch so the runner
+        # sees the complete reference-clock surface and an immutable digest
+        # receipt. The selected v<n>.py bytes remain the sole authority.
+        _write_current_reexport(rewards_dir, selected)
+    elif not current.is_file():
         _write_current_reexport(rewards_dir, latest)
     return current
 
@@ -410,6 +496,81 @@ def _pin_authored_selection(adapter: Any, project: Path) -> str | None:
         raise ValueError(f"immutable authored selection missing: {pinned}")
     adapter.world_selection_path = str(pinned.resolve())
     return selection.tuple_hash
+
+
+def _verify_requested_authored_selection(
+    project: Path,
+    *,
+    selection_path: Path | str | None,
+    expected_selection_sha256: str | None,
+    expected_tuple_hash: str | None,
+) -> dict[str, Any] | None:
+    """Fail closed on the exact immutable authored-world launch input."""
+    supplied = (
+        selection_path is not None,
+        expected_selection_sha256 is not None,
+        expected_tuple_hash is not None,
+    )
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise ValueError(
+            "world selection path, selection SHA-256, and tuple hash must be "
+            "supplied together"
+        )
+
+    def _valid_sha(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    if not _valid_sha(expected_selection_sha256):
+        raise ValueError("expected world selection SHA-256 is invalid")
+    if not _valid_sha(expected_tuple_hash):
+        raise ValueError("expected world tuple hash is invalid")
+
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    project = Path(project).expanduser().resolve()
+    store = WorldArtifactStore(project)
+    resolved = Path(str(selection_path)).expanduser().resolve(strict=True)
+    if resolved.parent != store.env_dir or not re.fullmatch(
+        r"selection_v([1-9][0-9]*)\.json",
+        resolved.name,
+    ):
+        raise ValueError(
+            "requested world selection must be an immutable project-local "
+            "selection_vN.json"
+        )
+    actual_selection_sha256 = file_sha256(resolved)
+    if actual_selection_sha256 != expected_selection_sha256:
+        raise ValueError(
+            "requested world selection bytes changed after launch admission"
+        )
+    selection = store.read_selection(resolved)
+    if selection is None:
+        raise ValueError("requested immutable world selection is missing")
+    if selection.tuple_hash != expected_tuple_hash:
+        raise ValueError(
+            "requested world tuple differs from launch admission"
+        )
+    version = int(resolved.stem.removeprefix("selection_v"))
+    if selection.selection_version != version:
+        raise ValueError(
+            "requested world selection version differs from its filename"
+        )
+    if file_sha256(resolved) != expected_selection_sha256:
+        raise ValueError(
+            "requested world selection changed during core verification"
+        )
+    return {
+        "selection_version": version,
+        "selection_path": str(resolved),
+        "selection_sha256": actual_selection_sha256,
+        "tuple_hash": selection.tuple_hash,
+    }
 
 
 def _promote_iteration_selection(
@@ -456,6 +617,62 @@ def _promote_iteration_selection(
     pinned = store.env_dir / f"selection_v{promoted.selection_version}.json"
     adapter.world_selection_path = str(pinned.resolve())
     return promoted.tuple_hash, pinned
+
+
+#: A per-mode module always defines both; a flat tracking reward never does.
+_MODE_REWARD_MARKERS = ("MODE_ORDER", "MODE_WINDOWS_S")
+
+
+def _promoted_mode_reward(
+    rewards_dir: Path,
+) -> Optional[tuple[int, Path, dict[str, Any]]]:
+    """Resolve the phase reward that ``current.py`` actually promotes.
+
+    A reward version is not promoted merely because it has the largest
+    integer suffix.  Keep-best and explicit recovery are allowed to point
+    ``current.py`` at an older version, so using the directory maximum here
+    can bind a run to source that will not execute.  An absent or
+    unrecognisable ``current.py`` therefore means "no promoted mode reward";
+    this provenance-sensitive path deliberately has no latest-version
+    fallback.
+
+    `promote_mode_reward` and `_prepare_reference_guided_run` are two separate
+    reward installers and both finish by repointing `current.py`. Promoting an
+    authored per-mode reward and then launching with `--reference-clip` for
+    that SAME clip used to build a flat tracking reward as the next version and
+    silently drop every authored mode: the bodies stayed on disk as
+    `mode_reward_v<n>.py`, `current.py` moved off them, and nothing in the
+    event stream said the modes were no longer being trained.
+
+    Read, never import: a per-mode module builds numpy tables at import time,
+    and the scaffold records its clip in `REWARD_SPEC["reference_clip_id"]`
+    precisely so this question is answerable from the source text.
+    """
+    target = _current_reward_target(rewards_dir)
+    if target is None:
+        return None
+    match = re.fullmatch(r"v(\d+)", target.stem)
+    if match is None:
+        return None
+    try:
+        source = target.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not all(marker in source for marker in _MODE_REWARD_MARKERS):
+        return None
+    from sculptor.mode_rewards import reward_spec_from_source
+
+    spec = reward_spec_from_source(source)
+    value = spec.get("reference_clip_id")
+    if not isinstance(value, str) or not value:
+        return None
+    return int(match.group(1)), target.resolve(), spec
+
+
+def _promoted_mode_reward_spec(rewards_dir: Path) -> Optional[dict[str, Any]]:
+    """Data-only spec for the reward that ``current.py`` actually selects."""
+    resolved = _promoted_mode_reward(rewards_dir)
+    return resolved[2] if resolved is not None else None
 
 
 def _prepare_reference_guided_run(
@@ -505,6 +722,107 @@ def _prepare_reference_guided_run(
         behavior_goal=behavior_goal,
     )
     cache_path = project / "reports" / "reference_motion_current.json"
+    # An authored per-mode reward for THIS clip is already a reference-guided
+    # reward — it carries the same tracking backbone plus the authored mode
+    # windows on top. Rebuilding the flat one here would be a strict downgrade
+    # that also discarded the authored work, so bind what is promoted instead
+    # of replacing it. The selection is still re-promoted so the pinned tuple
+    # names the reward that actually trains.
+    promoted_reward = _promoted_mode_reward(rewards_dir)
+    promoted_spec = promoted_reward[2] if promoted_reward else None
+    promoted_clip = (
+        promoted_spec.get("reference_clip_id") if promoted_spec else None
+    )
+    if promoted_clip is not None and promoted_clip == clip_id:
+        from sculptor.mode_rewards import (
+            MODE_BINDING_CONTEXT_REFS,
+            mode_reward_binding_errors,
+        )
+        from sculptor.modes import modes_from_composition
+
+        context_refs = {
+            kind: ref.sha256
+            for kind, ref in selection.refs.items()
+            if kind in MODE_BINDING_CONTEXT_REFS
+            and isinstance(ref.sha256, str)
+        }
+        assert promoted_reward is not None
+        promoted_n, promoted_path, _ = promoted_reward
+        selected_reward_ref = selection.refs.get("reward")
+        if selected_reward_ref is None:
+            raise ValueError(
+                "promoted phase reward cannot be reused because the pinned "
+                "selection has no reward ref"
+            )
+        selected_reward_path = Path(selected_reward_ref.path)
+        if not selected_reward_path.is_absolute():
+            selected_reward_path = project / selected_reward_path
+        selected_reward_path = selected_reward_path.resolve()
+        selected_reward_sha = str(selected_reward_ref.sha256 or "")
+        promoted_reward_sha = file_sha256(promoted_path)
+        if (
+            selected_reward_path != promoted_path
+            or selected_reward_sha != promoted_reward_sha
+        ):
+            raise ValueError(
+                "promoted phase reward cannot be reused because current.py "
+                "and the pinned selection reward ref disagree; restore or "
+                "promote one exact reward tuple before launch"
+            )
+        # The reward is not allowed to attest its own graph. Derive the graph
+        # again from the exact clip bytes resolved above, then validate both
+        # the manifest schedule and its binding against that independent
+        # object before any adapter can allocate a training process.
+        canonical_graph = modes_from_composition(_clip, clip_id=clip_id)
+        binding_errors = mode_reward_binding_errors(
+            promoted_spec,
+            clip_id=clip_id,
+            robot=robot,
+            clip_sha256=clip_sha256,
+            context_refs=context_refs,
+            graph=canonical_graph,
+            reward_source=promoted_path.read_text(encoding="utf-8"),
+        )
+        if binding_errors:
+            raise ValueError(
+                "promoted phase reward cannot be reused because its exact "
+                "mode binding is stale or incomplete; regenerate and "
+                "re-author it before launch:\n  - "
+                + "\n  - ".join(binding_errors)
+            )
+        tuple_hash, pinned = _promote_iteration_selection(
+            adapter,
+            project,
+            reward_path=promoted_path,
+            env_spec_version=(selection.refs["env_spec"].version
+                              if selection.refs.get("env_spec") else "v0"),
+            base_selection=selection_path,
+        )
+        result = {
+            "schema": 1,
+            "input_hash": input_hash,
+            "clip_id": clip_id,
+            "robot": robot,
+            "clip_sha256": clip_sha256,
+            "reference_target_sha256": None,
+            "phase_mode": "per_mode",
+            "phase_duration_s": None,
+            "task_residual_authored": True,
+            "reward_version": f"v{promoted_n}",
+            "reward_path": str(promoted_path),
+            "reward_sha256": promoted_reward_sha,
+            "selection_path": (str(pinned.resolve()) if pinned
+                               else str(selection_path)),
+            "tuple_hash": tuple_hash or selection.tuple_hash,
+            "source": "promoted_mode_reward",
+        }
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        _emit_event({"type": "reference_motion_reused", **result})
+        return result
+
     selected_reward_ref = selection.refs.get("reward")
     selected_reward_path: Optional[Path] = None
     if selected_reward_ref is not None:
@@ -703,7 +1021,8 @@ def _dry_run_diagnose(
         behavior = _load_json_if_present(iter_dir / "behavior.json")
     evidence = (
         f"Dry-run stub diagnosis. "
-        f"mean_return={metrics.get('metrics', {}).get('mean_return', 'n/a')}, "
+        "environment_default_return="
+        f"{metrics.get('metrics', {}).get('mean_return', 'n/a')}, "
         f"behavior={behavior!r}."
     )
     return Diagnosis(
@@ -1208,13 +1527,17 @@ def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
     init_policy_path: Optional[Path] = None,
+    init_policy_mode: str = "actor_critic",
+    warm_start_explicit: bool = False,
+    pre_train_event: Optional[dict[str, Any]] = None,
+    manifest_context: Optional[dict[str, Any]] = None,
 ):
-    """Skip `adapter.train` when `iter_dir/checkpoint.pt` is already on
-    disk and loads successfully — the expensive phase (≥ 22 min for
-    mjlab) is idempotent given the same reward and seed, so reusing a
-    prior run's artifact saves all that wall-clock when any downstream
-    phase (rollout, diagnose, edit) failed on the previous attempt.
-    Returns a `TrainResult`-compatible object either way.
+    """Resume training only from an exact immutable input receipt.
+
+    A parseable checkpoint by itself is not evidence that it belongs to the
+    requested reward, world, seed, initialization, adapter, or training plan.
+    The input and completion manifests close that relabeling path while keeping
+    exact crash recovery cheap and CPU-only.
 
     §Ship 15: `init_policy_path` is an optional path to a pre-trained
     rsl_rl checkpoint. When set AND the adapter's `train` signature
@@ -1226,11 +1549,67 @@ def _train_or_resume(
     from prior partial attempt" rather than the two silently collapsing.
     """
     from sculptor.adapters.base import TrainResult
+    from sculptor.run_manifests import (
+        build_completion_manifest,
+        build_train_input_manifest,
+        completion_manifest_matches,
+        file_identity,
+        file_identity_matches,
+        input_manifest_matches,
+        manifest_sha256,
+        read_json_object,
+        write_json_atomic,
+    )
+
+    input_manifest = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iter_index,
+        reward_module_path=reward_module_path,
+        steps=steps,
+        seed=seed,
+        init_policy_path=init_policy_path,
+        init_policy_mode=init_policy_mode,
+        context=manifest_context,
+    )
+    request_manifest_path = iter_dir / "train_request_manifest.json"
+    input_manifest_path = iter_dir / "train_input_manifest.json"
+    completion_manifest_path = iter_dir / "train_completion_manifest.json"
+    exact_request = input_manifest_matches(
+        request_manifest_path, input_manifest
+    )
+    effective_manifest = read_json_object(input_manifest_path)
+    effective_initialization = (
+        effective_manifest.get("effective_initialization")
+        if isinstance(effective_manifest, dict)
+        else None
+    )
+    effective_policy = (
+        effective_initialization.get("policy")
+        if isinstance(effective_initialization, dict)
+        else None
+    )
+    effective_manifest_valid = bool(
+        isinstance(effective_manifest, dict)
+        and effective_manifest.get("request_manifest_sha256")
+        == manifest_sha256(input_manifest)
+        and (
+            effective_policy is None
+            or file_identity_matches(effective_policy)
+        )
+    )
 
     # Most adapters save to `checkpoint.pt`; gym_sb3 uses `checkpoint.zip`.
     # Apply the same integrity rule used by cross-iteration resume discovery.
     ckpt = _valid_promoted_policy(iter_dir)
-    if ckpt is not None:
+    exact_completion = bool(
+        ckpt is not None
+        and exact_request
+        and effective_manifest_valid
+        and completion_manifest_matches(
+            completion_manifest_path, effective_manifest, [ckpt]
+        )
+    )
+    if ckpt is not None and exact_completion:
         # Assemble best-effort metrics from prior metrics.json.
         metrics: dict[str, float] = {}
         try:
@@ -1242,8 +1621,9 @@ def _train_or_resume(
         _emit_event({
             "type": "phase_skipped",
             "iter": iter_index, "phase": "train",
-            "reason": "checkpoint already on disk",
+            "reason": "exact input and completion manifests matched",
             "checkpoint": str(ckpt),
+            "input_manifest_sha256": manifest_sha256(effective_manifest),
         })
         # §Ship 15: caller requested warm-start, but iter's own
         # checkpoint already exists on disk — resume path wins.
@@ -1262,13 +1642,54 @@ def _train_or_resume(
             component_means={},
             logs_path=iter_dir / "logs",
         )
+    if ckpt is not None:
+        _emit_event({
+            "type": "phase_resume_rejected",
+            "iter": iter_index,
+            "phase": "train",
+            "reason": (
+                "input_manifest_mismatch"
+                if not exact_request or not effective_manifest_valid
+                else "completion_manifest_mismatch"
+            ),
+            "checkpoint": str(ckpt),
+            "requested_input_manifest_sha256": manifest_sha256(input_manifest),
+        })
 
     # Fresh/recovered training run — no promoted checkpoint or all promoted
     # candidates corrupt. Prefer this iter's newest valid intermediate policy
     # over a previous-iter warm start: it was trained under the exact current
     # reward/seed/world tuple and is strictly closer to the interrupted phase.
-    partial_policy = _latest_valid_partial_policy(iter_dir)
-    if partial_policy is not None:
+    #
+    # Exception: a warm start the caller NAMED outranks the partial. Recovery
+    # assumes the partial and the request are the same intent — true when a
+    # crashed iteration is resumed, false when someone stopped a run precisely
+    # because its policy was going wrong and picked a different one to restart
+    # from. Silently reinstating the rejected policy there makes the UI's
+    # "Warm-start checkpoint" field look broken, which is what happened on
+    # platform-ascent-showcase. `warm_start_explicit` is only ever set for the
+    # first iteration of a run, so mid-run crash recovery is unaffected.
+    partial_policy = (
+        _latest_valid_partial_policy(iter_dir) if exact_request else None
+    )
+    if not exact_request:
+        stale_partial = _latest_valid_partial_policy(iter_dir)
+        if stale_partial is not None:
+            _emit_event({
+                "type": "partial_train_ignored",
+                "iter": iter_index,
+                "checkpoint": str(stale_partial),
+                "reason": "input_manifest_mismatch",
+            })
+    if partial_policy is not None and warm_start_explicit:
+        _emit_event({
+            "type": "partial_train_ignored",
+            "iter": iter_index,
+            "checkpoint": str(partial_policy),
+            "reason": "explicit_warm_start_wins",
+            "warm_start": str(init_policy_path),
+        })
+    elif partial_policy is not None:
         superseded = init_policy_path
         init_policy_path = partial_policy
         _emit_event({
@@ -1298,6 +1719,7 @@ def _train_or_resume(
     # Accept either an explicit named param OR a VAR_KEYWORD param —
     # the former is the preferred contract, the latter is "adapter
     # MIGHT support it, let's try and let the adapter decide."
+    effective_init_forwarded = False
     if init_policy_path is not None:
         import inspect
         sig = inspect.signature(adapter.train)
@@ -1308,6 +1730,9 @@ def _train_or_resume(
         )
         if has_explicit or has_var_kwarg:
             train_kwargs["init_policy_path"] = init_policy_path
+            effective_init_forwarded = True
+            if "init_policy_mode" in sig.parameters or has_var_kwarg:
+                train_kwargs["init_policy_mode"] = init_policy_mode
         else:
             _emit_event({
                 "type": "warm_start_skipped",
@@ -1316,7 +1741,41 @@ def _train_or_resume(
                 "source": str(init_policy_path),
                 "adapter": type(adapter).__name__,
             })
-    return adapter.train(**train_kwargs)
+    if pre_train_event is not None:
+        _emit_event(dict(pre_train_event))
+    # First write wins only for an exact resume. A changed request replaces the
+    # stale input receipt before work begins; the old completion receipt can no
+    # longer match it if this attempt is interrupted.
+    effective_manifest = {
+        **input_manifest,
+        "request_manifest_sha256": manifest_sha256(input_manifest),
+        "effective_initialization": {
+            "mode": init_policy_mode if effective_init_forwarded else None,
+            "policy": (
+                file_identity(init_policy_path)
+                if effective_init_forwarded and init_policy_path is not None
+                else None
+            ),
+            "forwarded_to_adapter": effective_init_forwarded,
+        },
+    }
+    write_json_atomic(request_manifest_path, input_manifest)
+    write_json_atomic(input_manifest_path, effective_manifest)
+    result = adapter.train(**train_kwargs)
+    result_checkpoint = getattr(result, "checkpoint_path", None)
+    if result_checkpoint is not None and Path(result_checkpoint).is_file():
+        completion = build_completion_manifest(
+            effective_manifest, [Path(result_checkpoint)]
+        )
+        write_json_atomic(completion_manifest_path, completion)
+        _emit_event({
+            "type": "phase_manifest_completed",
+            "iter": iter_index,
+            "phase": "train",
+            "input_manifest_sha256": manifest_sha256(effective_manifest),
+            "checkpoint_sha256": completion["outputs"][0]["sha256"],
+        })
+    return result
 
 
 def _rollout_or_resume(
@@ -1330,32 +1789,87 @@ def _rollout_or_resume(
     render_height: int | None = None,
     render_env_index: int | None = None,
     seed: int | None = None,
+    reward_module_path: Path | None = None,
+    manifest_context: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Skip `adapter.rollout` when the three artifacts it produces
-    (`rollout.mp4` + `trajectory.npz` + `behavior.json`) are ALL on
-    disk. Partial rollouts re-run cleanly; we don't try to merge.
+    """Resume rollout only when exact inputs and output bytes match.
 
     §Ship-7: video knobs (max_episode_steps / playback_speed / etc.)
     are threaded through adapter.rollout; adapters that don't support
     them (gym_sb3) silently ignore via `**kwargs`.
     """
+    from sculptor.run_manifests import (
+        build_completion_manifest,
+        build_rollout_input_manifest,
+        completion_manifest_matches,
+        input_manifest_matches,
+        manifest_sha256,
+        write_json_atomic,
+    )
+
     required = (
         rollout_dir / "rollout.mp4",
         rollout_dir / "trajectory.npz",
         rollout_dir / "behavior.json",
     )
-    if all(p.is_file() and p.stat().st_size > 0 for p in required):
+    input_manifest = build_rollout_input_manifest(
+        adapter=adapter,
+        iteration=iter_index,
+        checkpoint_path=checkpoint_path,
+        reward_module_path=reward_module_path,
+        n_episodes=n_episodes,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        playback_speed=playback_speed,
+        render_every=render_every,
+        fps=fps,
+        render_width=render_width,
+        render_height=render_height,
+        render_env_index=render_env_index,
+        context=manifest_context,
+    )
+    input_manifest_path = rollout_dir / "rollout_input_manifest.json"
+    completion_manifest_path = rollout_dir / "rollout_completion_manifest.json"
+    outputs_present = all(
+        p.is_file() and p.stat().st_size > 0 for p in required
+    )
+    exact_input = input_manifest_matches(input_manifest_path, input_manifest)
+    exact_completion = bool(
+        outputs_present
+        and exact_input
+        and completion_manifest_matches(
+            completion_manifest_path, input_manifest, required
+        )
+    )
+    if exact_completion:
         _emit_event({
             "type": "phase_skipped",
             "iter": iter_index, "phase": "rollout",
-            "reason": "rollout artifacts already on disk",
+            "reason": "exact input and completion manifests matched",
+            "input_manifest_sha256": manifest_sha256(input_manifest),
         })
         return
+    if outputs_present:
+        _emit_event({
+            "type": "phase_resume_rejected",
+            "iter": iter_index,
+            "phase": "rollout",
+            "reason": (
+                "input_manifest_mismatch"
+                if not exact_input
+                else "completion_manifest_mismatch"
+            ),
+            "requested_input_manifest_sha256": manifest_sha256(input_manifest),
+        })
     # Pass video knobs only to adapters that declare them — older
     # adapter.rollout signatures (gym_sb3) don't accept the new kwargs
     # and would TypeError. Introspect once.
     import inspect
     sig = inspect.signature(adapter.rollout)
+    has_var_kwarg = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in sig.parameters.values()
+    )
     extra: dict[str, Any] = {}
     for name, value in (
         ("max_episode_steps", max_episode_steps),
@@ -1365,18 +1879,364 @@ def _rollout_or_resume(
         ("render_width", render_width),
         ("render_height", render_height),
         ("render_env_index", render_env_index),
-        # §Selection statistics: distinct eval seeds per repeat rollout —
-        # adapters that don't declare `seed` (gym_sb3) silently skip it.
+        # §Selection statistics: distinct eval seeds per repeat rollout.
+        # A requested seed fails closed below if the adapter cannot install it.
         ("seed", seed),
+        ("reward_module_path", reward_module_path),
     ):
-        if value is not None and name in sig.parameters:
+        if value is None:
+            continue
+        if name in sig.parameters or has_var_kwarg:
             extra[name] = value
+        elif name == "seed":
+            raise ValueError(
+                "adapter cannot install the requested rollout seed; "
+                "evaluation seed evidence would be false"
+            )
+    # Do not let an adapter that only rewrites a subset accidentally produce a
+    # completion receipt over a mixture of old and new rollout artifacts.
+    for stale_output in (*required, completion_manifest_path):
+        try:
+            if stale_output.is_file() or stale_output.is_symlink():
+                stale_output.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot clear stale rollout artifact {stale_output}: {exc}"
+            ) from exc
+    write_json_atomic(input_manifest_path, input_manifest)
     adapter.rollout(
         checkpoint_path=checkpoint_path,
         output_dir=rollout_dir,
         n_episodes=n_episodes,
         **extra,
     )
+    if all(p.is_file() and p.stat().st_size > 0 for p in required):
+        completion = build_completion_manifest(input_manifest, required)
+        write_json_atomic(completion_manifest_path, completion)
+        _emit_event({
+            "type": "phase_manifest_completed",
+            "iter": iter_index,
+            "phase": "rollout",
+            "input_manifest_sha256": manifest_sha256(input_manifest),
+            "output_sha256": [
+                item["sha256"] for item in completion["outputs"]
+            ],
+        })
+
+
+def _persist_mode_diagnostics(
+    *,
+    project: Path,
+    iter_index: int,
+    iter_dir: Path,
+    rollout_dir: Path,
+    reward_path: Path,
+    selection_path: Path | None,
+) -> dict[str, Any] | None:
+    """Persist exact, diagnostic-only phase evidence for a mode reward.
+
+    Flat rewards take the no-op path. Once a promoted reward declares mode
+    windows, however, missing/stale graph, manifest, reference, selection, or
+    rollout evidence is a hard integrity error: continuing would attach a
+    plausible-looking ``mode_metrics.json`` to semantics the run did not use.
+    The resulting record is never read by fitness or selection.
+    """
+    reward_path = Path(reward_path).resolve()
+    source = reward_path.read_text(encoding="utf-8")
+    if not all(marker in source for marker in _MODE_REWARD_MARKERS):
+        return None
+
+    from sculptor.eval.mode_metrics import build_mode_diagnostics
+    from sculptor.mode_rewards import (
+        MODE_BINDING_CONTEXT_REFS,
+        mode_reward_binding_errors,
+        reward_spec_from_source,
+    )
+    from sculptor.modes import mode_graph_sha256, modes_from_composition
+    from sculptor.reference_run import load_exact_reference_motion
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    spec = reward_spec_from_source(source)
+    manifest = spec.get("mode_execution_manifest")
+    binding = spec.get("mode_binding")
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            "promoted phase reward is missing mode_execution_manifest; "
+            "refusing to create mode diagnostics"
+        )
+    if not isinstance(binding, dict):
+        raise ValueError(
+            "promoted phase reward is missing mode_binding; refusing to "
+            "create mode diagnostics"
+        )
+    clip_id = str(spec.get("reference_clip_id") or "")
+    robot = str(spec.get("reference_robot") or binding.get("robot") or "")
+    if not clip_id or not robot:
+        raise ValueError(
+            "promoted phase reward does not identify its exact reference "
+            "clip and robot"
+        )
+    if binding.get("clip_id") != clip_id or binding.get("robot") != robot:
+        raise ValueError(
+            "promoted phase reward reference identity disagrees with its "
+            "mode_binding"
+        )
+
+    clip, _reference_provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot=robot,
+    )
+    graph = modes_from_composition(clip, clip_id=clip_id)
+
+    if selection_path is None:
+        raise ValueError(
+            "phase diagnostics require the immutable artifact selection used "
+            "by rollout"
+        )
+    selection_path = Path(selection_path).resolve()
+    selection = WorldArtifactStore(project).read_selection(selection_path)
+    if selection is None:
+        raise ValueError(
+            f"phase diagnostics selection is missing: {selection_path}"
+        )
+    selected_reward = selection.refs.get("reward")
+    reward_sha256 = file_sha256(reward_path)
+    if selected_reward is None or selected_reward.sha256 != reward_sha256:
+        raise ValueError(
+            "phase diagnostics reward does not match the pinned artifact tuple"
+        )
+    context_refs = {
+        kind: ref.sha256
+        for kind, ref in selection.refs.items()
+        if kind in MODE_BINDING_CONTEXT_REFS
+    }
+    binding_errors = mode_reward_binding_errors(
+        spec,
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha256,
+        context_refs=context_refs,
+        graph_sha256=mode_graph_sha256(graph),
+        graph=graph,
+        reward_source=source,
+    )
+    if binding_errors:
+        raise ValueError(
+            "phase diagnostics cannot attest a stale mode binding:\n  - "
+            + "\n  - ".join(binding_errors)
+        )
+
+    tuple_snapshot = iter_dir / "artifact_tuple.json"
+    if not tuple_snapshot.is_file():
+        raise ValueError(
+            "phase diagnostics require iter artifact_tuple.json"
+        )
+    try:
+        snapshot_data = json.loads(
+            tuple_snapshot.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"iter artifact_tuple.json is unreadable: {exc}"
+        ) from exc
+    selected_data = selection.to_dict()
+    if (
+        not isinstance(snapshot_data, dict)
+        or snapshot_data.get("tuple_hash") != selection.tuple_hash
+        or snapshot_data.get("refs") != selected_data.get("refs")
+    ):
+        raise ValueError(
+            "iter artifact_tuple.json does not name the same immutable refs "
+            "as the pinned selection"
+        )
+
+    trajectory_path = rollout_dir / "trajectory.npz"
+    behavior_path = rollout_dir / "behavior.json"
+    if not trajectory_path.is_file() or not behavior_path.is_file():
+        raise ValueError(
+            "official phase diagnostics require trajectory.npz and "
+            "behavior.json"
+        )
+    try:
+        behavior = json.loads(behavior_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"rollout behavior.json is unreadable: {exc}") from exc
+    if not isinstance(behavior, dict):
+        raise ValueError("rollout behavior.json must contain an object")
+
+    import numpy as np
+
+    with np.load(trajectory_path, allow_pickle=False) as archive:
+        if "first_episode_valid_mask" not in archive.files:
+            raise ValueError(
+                "trajectory is missing first_episode_valid_mask"
+            )
+        valid_mask = np.asarray(archive["first_episode_valid_mask"])
+        if valid_mask.ndim != 2:
+            raise ValueError(
+                "first_episode_valid_mask must have shape (T, E)"
+            )
+        rollout_frames = int(valid_mask.shape[0])
+        arrays: dict[str, np.ndarray] = {}
+        for name in archive.files:
+            array = np.asarray(archive[name])
+            if array.ndim >= 1 and int(array.shape[0]) == rollout_frames:
+                arrays[name] = array
+
+    record = build_mode_diagnostics(
+        graph,
+        execution_manifest=manifest,
+        mode_binding=binding,
+        arrays=arrays,
+        behavior=behavior,
+        provenance={
+            "iter": int(iter_index),
+            "reward_path": str(reward_path),
+            "reward_sha256": reward_sha256,
+            "trajectory_path": str(trajectory_path.resolve()),
+            "trajectory_sha256": file_sha256(trajectory_path),
+            "behavior_path": str(behavior_path.resolve()),
+            "behavior_sha256": file_sha256(behavior_path),
+            "reference_clip_id": clip_id,
+            "reference_robot": robot,
+            "reference_clip_sha256": clip_sha256,
+            "artifact_tuple_path": str(tuple_snapshot.resolve()),
+            "artifact_tuple_sha256": file_sha256(tuple_snapshot),
+            "artifact_tuple_hash": selection.tuple_hash,
+        },
+    )
+    output = iter_dir / "mode_metrics.json"
+    temporary = iter_dir / ".mode_metrics.json.tmp"
+    temporary.write_text(
+        json.dumps(record, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    _emit_event({
+        "type": "mode_diagnostics_recorded",
+        "iter": int(iter_index),
+        "path": str(output.resolve()),
+        "diagnostic_digest": record["diagnostic_digest"],
+        "graph_sha256": record["graph_sha256"],
+        "execution_manifest_digest": record["execution_manifest_digest"],
+        "authority": "diagnostic_only",
+    })
+    return record
+
+
+def _validated_mode_execution_admission(
+    *,
+    project: Path,
+    reward_path: Path,
+    selection_path: Path | None,
+) -> dict[str, Any] | None:
+    """Re-derive and pin the exact mode executor just before adapter.train.
+
+    Flat rewards intentionally return ``None``. A source that declares mode
+    gating must prove its immutable reward, reference, graph, schedule, and
+    authored context against the iteration's just-pinned selection.
+    """
+    reward_path = Path(reward_path).resolve(strict=True)
+    if re.fullmatch(r"v[0-9]+\.py", reward_path.name) is None:
+        raise ValueError(
+            "mode execution admission requires an immutable v<n>.py reward"
+        )
+    source = reward_path.read_text(encoding="utf-8")
+    if not all(marker in source for marker in _MODE_REWARD_MARKERS):
+        return None
+    if selection_path is None:
+        raise ValueError(
+            "mode execution admission requires the immutable artifact tuple"
+        )
+
+    from sculptor.mode_rewards import (
+        MODE_BINDING_CONTEXT_REFS,
+        mode_execution_manifest_digest,
+        mode_reward_binding_errors,
+        reward_spec_from_source,
+    )
+    from sculptor.modes import mode_graph_sha256, modes_from_composition
+    from sculptor.reference_run import load_exact_reference_motion
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    spec = reward_spec_from_source(source)
+    manifest = spec.get("mode_execution_manifest")
+    binding = spec.get("mode_binding")
+    if not isinstance(manifest, dict) or not isinstance(binding, dict):
+        raise ValueError(
+            "mode execution admission requires exact manifest and binding"
+        )
+    clip_id = str(spec.get("reference_clip_id") or "")
+    robot = str(spec.get("reference_robot") or binding.get("robot") or "")
+    if (
+        not clip_id
+        or not robot
+        or binding.get("clip_id") != clip_id
+        or binding.get("robot") != robot
+    ):
+        raise ValueError(
+            "mode execution admission has no consistent robot/clip identity"
+        )
+
+    clip, _provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot=robot,
+    )
+    graph = modes_from_composition(clip, clip_id=clip_id)
+    graph_sha256 = mode_graph_sha256(graph)
+
+    selection_path = Path(selection_path).resolve(strict=True)
+    selection = WorldArtifactStore(project).read_selection(selection_path)
+    if selection is None:
+        raise ValueError(
+            "mode execution admission cannot read the pinned selection"
+        )
+    reward_sha256 = file_sha256(reward_path)
+    selected_reward = selection.refs.get("reward")
+    if selected_reward is None:
+        raise ValueError("pinned selection has no reward ref")
+    selected_reward_path = Path(selected_reward.path)
+    if not selected_reward_path.is_absolute():
+        selected_reward_path = Path(project) / selected_reward_path
+    if (
+        selected_reward_path.resolve() != reward_path
+        or selected_reward.sha256 != reward_sha256
+    ):
+        raise ValueError(
+            "mode execution reward differs from the pinned artifact tuple"
+        )
+    context_refs = {
+        kind: ref.sha256
+        for kind, ref in selection.refs.items()
+        if kind in MODE_BINDING_CONTEXT_REFS
+    }
+    errors = mode_reward_binding_errors(
+        spec,
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha256,
+        context_refs=context_refs,
+        graph_sha256=graph_sha256,
+        graph=graph,
+        reward_source=source,
+    )
+    if errors:
+        raise ValueError(
+            "mode execution admission rejected stale authority:\n  - "
+            + "\n  - ".join(errors)
+        )
+    return {
+        "type": "mode_execution_admitted",
+        "source": "sculpt_run_worker",
+        "reward_path": str(reward_path),
+        "reward_sha256": reward_sha256,
+        "robot": robot,
+        "clip_id": clip_id,
+        "clip_sha256": clip_sha256,
+        "graph_sha256": graph_sha256,
+        "execution_manifest_digest": mode_execution_manifest_digest(manifest),
+        "context_refs": context_refs,
+        "selection": selection_path.name,
+        "tuple_hash": selection.tuple_hash,
+    }
 
 
 def _collect_hack_replays(adapter, runs_dir: Path, iter_index: int,
@@ -1546,6 +2406,8 @@ def _run_one_iter(
     kg_store,
     seed: int,
     init_policy_path: Optional[Path] = None,
+    init_policy_mode: str = "actor_critic",
+    warm_start_explicit: bool = False,
     fitness_fn: Optional[Callable[[Path], float]] = None,
     prior_fitness: Optional[dict] = None,
     fitness_observe_only: bool = False,
@@ -1740,6 +2602,79 @@ def _run_one_iter(
             "selection": world_selection_path.name,
         })
 
+    mode_execution_event = (
+        _validated_mode_execution_admission(
+            project=project,
+            reward_path=Path(reward_path_trained),
+            selection_path=world_selection_path,
+        )
+        if not dry_run
+        else None
+    )
+
+    # Bind every mutable selector available at the outer-loop boundary before
+    # train/rollout so a later pointer move cannot relabel retained outputs.
+    from sculptor.run_manifests import file_identity
+
+    _env_snapshot = iter_dir / "env_spec.json"
+    _run_context_receipt = project / "reports" / "run_context.json"
+    _active_env_path = Path(_active_spec_path) if _active_spec_path else None
+    _run_context = _load_json_if_present(_run_context_receipt)
+    _stable_software_context = {
+        key: _run_context.get(key)
+        for key in (
+            "code_git",
+            "python",
+            "packages",
+            "prompts",
+            "warm_start_policy_contract",
+        )
+        if key in _run_context
+    } or None
+    phase_manifest_context: dict[str, Any] = {
+        "configuration": {
+            "file": file_identity(config_path),
+            "effective": cfg,
+        },
+        "observed_software_context": _stable_software_context,
+        "reward_target": file_identity(Path(reward_path_trained)),
+        "environment": {
+            "version": env_spec_trained,
+            "active": (
+                file_identity(_active_env_path)
+                if _active_env_path is not None and _active_env_path.is_file()
+                else None
+            ),
+            "snapshot": (
+                file_identity(_env_snapshot)
+                if _env_snapshot.is_file()
+                else None
+            ),
+        },
+        "artifact_selection": {
+            "tuple_hash": world_selection_hash,
+            "selection": (
+                file_identity(world_selection_path)
+                if world_selection_path is not None
+                else None
+            ),
+        },
+        "timing_and_runtime": {
+            key: iter_cfg.get(key)
+            for key in (
+                "max_episode_steps",
+                "playback_speed",
+                "render_every",
+                "rollout_fps",
+                "render_width",
+                "render_height",
+                "render_env_index",
+                "rollout_episodes",
+            )
+        },
+        "dry_run": bool(dry_run),
+    }
+
     # §2026-07-04: report the version that actually TRAINS this iter
     # (current.py's target / the revert base), not the disk maximum —
     # the two diverge at run boundaries after best-selection.
@@ -1768,7 +2703,6 @@ def _run_one_iter(
     # present (overnight reliability: if a prior run errored at any
     # post-train phase, `iter_<i>/checkpoint.pt` is still on disk and
     # represents ~22 min of GPU work we must not redo).
-    t0 = time.time()
     train_result = _train_or_resume(
         adapter=adapter,
         iter_index=iter_index,
@@ -1777,9 +2711,11 @@ def _run_one_iter(
         steps=steps,
         seed=seed,
         init_policy_path=init_policy_path,
+        init_policy_mode=init_policy_mode,
+        warm_start_explicit=warm_start_explicit,
+        pre_train_event=mode_execution_event,
+        manifest_context=phase_manifest_context,
     )
-    train_s = time.time() - t0
-
     # 2. Rollout — use the checkpoint path the adapter actually wrote.
     # Different adapters use different extensions: gym_sb3 writes
     # `checkpoint.zip` (SB3 convention), mjlab writes `checkpoint.pt`
@@ -1793,23 +2729,121 @@ def _run_one_iter(
         if train_result is not None and train_result.checkpoint_path is not None
         else iter_dir / "checkpoint.zip"
     )
-    _rollout_or_resume(
-        adapter=adapter,
+
+    # Objective-evaluation seeds are launch inputs, not incidental loop
+    # counters. Persist the complete requested set before the first rollout so
+    # a failed repeat remains visible and cannot be reported as a smaller K.
+    _eval_seeds = 1
+    if fitness_fn is not None:
+        try:
+            _eval_seeds = max(1, int(iter_cfg.get("eval_seeds", 1) or 1))
+        except Exception:  # noqa: BLE001 -- malformed config keeps one seed
+            _eval_seeds = 1
+    objective_eval_seeds = [
+        10_000 + iter_index * 100 + k for k in range(_eval_seeds)
+    ] if fitness_fn is not None else []
+    evaluation_plan: dict[str, Any] | None = None
+    if objective_eval_seeds:
+        from sculptor.run_manifests import write_json_atomic
+
+        evaluation_plan = {
+            "schema": 1,
+            "iteration": iter_index,
+            "authority": "precommitted_objective_evaluation_seeds",
+            "requested_count": len(objective_eval_seeds),
+            "requested_seeds": objective_eval_seeds,
+            "rollout_episodes_per_seed": int(
+                iter_cfg.get("rollout_episodes", 6)
+            ),
+        }
+        write_json_atomic(
+            iter_dir / "evaluation_plan.json", evaluation_plan
+        )
+        _emit_event({
+            "type": "evaluation_plan_bound",
+            "iter": iter_index,
+            **evaluation_plan,
+        })
+    try:
+        _rollout_or_resume(
+            adapter=adapter,
+            iter_index=iter_index,
+            rollout_dir=rollout_dir,
+            checkpoint_path=checkpoint_path,
+            n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+            reward_module_path=Path(reward_path_trained),
+            manifest_context=phase_manifest_context,
+            # §Ship-7: rollout video knobs — default None means runner defaults
+            # (500 steps, playback 1x, auto render_every + fps). Each key
+            # overrides independently when set in config.toml or passed via
+            # the `sculpt run` CLI flags.
+            max_episode_steps=iter_cfg.get("max_episode_steps"),
+            playback_speed=iter_cfg.get("playback_speed"),
+            render_every=iter_cfg.get("render_every"),
+            fps=iter_cfg.get("rollout_fps"),
+            render_width=iter_cfg.get("render_width"),
+            render_height=iter_cfg.get("render_height"),
+            render_env_index=iter_cfg.get("render_env_index"),
+            seed=(objective_eval_seeds[0] if objective_eval_seeds else None),
+        )
+    except Exception as exc:
+        if evaluation_plan is not None:
+            failed_results = [{
+                "seed": objective_eval_seeds[0],
+                "rollout": "rollout",
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }] + [
+                {
+                    "seed": requested_seed,
+                    "rollout": None,
+                    "status": "not_run",
+                    "error": "the required primary evaluation failed",
+                }
+                for requested_seed in objective_eval_seeds[1:]
+            ]
+            from sculptor.run_manifests import (
+                manifest_sha256,
+                write_json_atomic,
+            )
+
+            failed_receipt = {
+                "schema": 1,
+                "iteration": iter_index,
+                "plan": evaluation_plan,
+                "requested_count": len(objective_eval_seeds),
+                "completed_count": 0,
+                "complete": False,
+                "results": failed_results,
+            }
+            write_json_atomic(
+                iter_dir / "evaluation_results.json",
+                failed_receipt,
+            )
+            _emit_event({
+                "type": "evaluation_batch_completed",
+                "iter": iter_index,
+                "requested_count": len(objective_eval_seeds),
+                "completed_count": 0,
+                "complete": False,
+                "results": failed_results,
+                "evaluation_receipt_sha256": manifest_sha256(
+                    failed_receipt
+                ),
+            })
+        raise
+
+    # A promoted phase reward is not fully integrated until its official
+    # rollout is joined back to the exact graph/schedule it trained under.
+    # This record is diagnostic evidence only; no value from it enters
+    # fitness, keep-best, early-stop, or reward-edit authority.
+    _persist_mode_diagnostics(
+        project=project,
         iter_index=iter_index,
+        iter_dir=iter_dir,
         rollout_dir=rollout_dir,
-        checkpoint_path=checkpoint_path,
-        n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
-        # §Ship-7: rollout video knobs — default None means runner defaults
-        # (500 steps, playback 1x, auto render_every + fps). Each key
-        # overrides independently when set in config.toml or passed via
-        # the `sculpt run` CLI flags.
-        max_episode_steps=iter_cfg.get("max_episode_steps"),
-        playback_speed=iter_cfg.get("playback_speed"),
-        render_every=iter_cfg.get("render_every"),
-        fps=iter_cfg.get("rollout_fps"),
-        render_width=iter_cfg.get("render_width"),
-        render_height=iter_cfg.get("render_height"),
-        render_env_index=iter_cfg.get("render_env_index"),
+        reward_path=Path(reward_path_trained),
+        selection_path=world_selection_path,
     )
 
     # §Ship 33: objective task fitness on this rollout (ground truth,
@@ -1828,6 +2862,7 @@ def _run_one_iter(
     extra_eval_dirs: list[Path] = []
     fitness_per_seed: list[float] = []
     progress_per_seed: list[float] = []
+    evaluation_results: list[dict[str, Any]] = []
     if fitness_fn is not None:
         # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
         # fn) to get the FULL component breakdown in one compute; fall back to
@@ -1853,6 +2888,20 @@ def _run_one_iter(
                 f"{type(e).__name__}: {e} — treating as unavailable\n"
             )
             iter_fitness = None
+            evaluation_results.append({
+                "seed": objective_eval_seeds[0],
+                "rollout": "rollout",
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+            })
+        else:
+            evaluation_results.append({
+                "seed": objective_eval_seeds[0],
+                "rollout": "rollout",
+                "status": "succeeded",
+                "fitness": iter_fitness,
+                "progress": iter_progress,
+            })
         # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2): the keep-best
         # decision was previously made on ONE rollout batch — a noisy
         # scalar compared with strict `>`. With `eval_seeds = K > 1` in
@@ -1862,12 +2911,9 @@ def _run_one_iter(
         # the diagnoser's view (keyframes / video / components); extras
         # land in `rollout_eval_<k>/`. Each extra is best-effort: a failed
         # re-roll is skipped, never fatal. Requires the fitness fn's
-        # `detail_dir` accessor (spec + generated metrics both have it).
-        _eval_seeds = 1
-        try:
-            _eval_seeds = max(1, int(iter_cfg.get("eval_seeds", 1) or 1))
-        except Exception:  # noqa: BLE001 — a malformed knob keeps N=1
-            _eval_seeds = 1
+        # `detail_dir` accessor (spec + generated metrics both have it). Every
+        # precommitted seed is required: a failed repeat is recorded and then
+        # aborts this outer iteration below.
         detail_dir_fn = getattr(fitness_fn, "detail_dir", None)
         if (iter_fitness is not None and _eval_seeds > 1
                 and detail_dir_fn is not None):
@@ -1883,6 +2929,7 @@ def _run_one_iter(
                         rollout_dir=eval_dir,
                         checkpoint_path=checkpoint_path,
                         n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+                        reward_module_path=Path(reward_path_trained),
                         max_episode_steps=iter_cfg.get("max_episode_steps"),
                         playback_speed=iter_cfg.get("playback_speed"),
                         render_every=iter_cfg.get("render_every"),
@@ -1890,27 +2937,115 @@ def _run_one_iter(
                         # Deterministic, disjoint from training seeds
                         # (config seed + iter) and the fresh-eval band
                         # (90k+): reproducible re-rolls, distinct per k.
-                        seed=10_000 + iter_index * 100 + k,
+                        seed=objective_eval_seeds[k],
+                        manifest_context=phase_manifest_context,
                     )
                     d = detail_dir_fn(eval_dir) or {}
-                    fitness_per_seed.append(
-                        float(d.get("spec_score", 0.0) or 0.0))
+                    _seed_fitness = float(
+                        d.get("spec_score", 0.0) or 0.0
+                    )
+                    fitness_per_seed.append(_seed_fitness)
                     pr_k = d.get("progress_score")
-                    progress_per_seed.append(
+                    _seed_progress = (
                         min(1.0, max(0.0, float(pr_k)))
                         if (isinstance(pr_k, (int, float))
                             and not isinstance(pr_k, bool)
                             and math.isfinite(float(pr_k)))
-                        else 0.0)
+                        else 0.0
+                    )
+                    progress_per_seed.append(_seed_progress)
                     extra_eval_dirs.append(eval_dir)
-                except Exception as e:  # noqa: BLE001 — per-seed best-effort
+                    evaluation_results.append({
+                        "seed": objective_eval_seeds[k],
+                        "rollout": eval_dir.name,
+                        "status": "succeeded",
+                        "fitness": _seed_fitness,
+                        "progress": _seed_progress,
+                    })
+                except Exception as e:  # noqa: BLE001 - persist seed failure
                     sys.stderr.write(
                         f"[sculpt] iter {iter_index}: eval seed {k} "
                         f"skipped — {type(e).__name__}: {e}\n")
-            if len(fitness_per_seed) > 1:
+                    evaluation_results.append({
+                        "seed": objective_eval_seeds[k],
+                        "rollout": eval_dir.name,
+                        "status": "failed",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+            if len(evaluation_results) == _eval_seeds and all(
+                item["status"] == "succeeded" for item in evaluation_results
+            ):
                 iter_fitness = _median(fitness_per_seed)
                 if iter_progress is not None:
                     iter_progress = _median(progress_per_seed)
+            elif _eval_seeds > 1:
+                # An incomplete requested batch has no K-seed selection score.
+                # Preserve every per-seed result below, but do not silently use
+                # the median of survivors for diagnosis or keep-best.
+                iter_fitness = None
+                iter_progress = None
+
+        # Bare fitness functions cannot honor K>1 because they expose no
+        # rollout-directory evaluator. Record that contract failure explicitly.
+        if _eval_seeds > 1 and detail_dir_fn is None:
+            for k in range(1, _eval_seeds):
+                evaluation_results.append({
+                    "seed": objective_eval_seeds[k],
+                    "rollout": f"rollout_eval_{k}",
+                    "status": "failed",
+                    "error": "fitness function has no detail_dir evaluator",
+                })
+            iter_fitness = None
+            iter_progress = None
+
+        from sculptor.run_manifests import manifest_sha256, write_json_atomic
+
+        observed_eval_seeds = {
+            int(item["seed"]) for item in evaluation_results
+        }
+        for requested_seed in objective_eval_seeds:
+            if requested_seed not in observed_eval_seeds:
+                evaluation_results.append({
+                    "seed": requested_seed,
+                    "rollout": None,
+                    "status": "not_run",
+                    "error": "an earlier required evaluation failed",
+                })
+        completed_eval = sum(
+            item.get("status") == "succeeded" for item in evaluation_results
+        )
+        evaluation_receipt = {
+            "schema": 1,
+            "iteration": iter_index,
+            "plan": evaluation_plan,
+            "requested_count": _eval_seeds,
+            "completed_count": completed_eval,
+            "complete": (
+                len(evaluation_results) == _eval_seeds
+                and completed_eval == _eval_seeds
+            ),
+            "results": evaluation_results,
+        }
+        write_json_atomic(
+            iter_dir / "evaluation_results.json", evaluation_receipt
+        )
+        _emit_event({
+            "type": "evaluation_batch_completed",
+            "iter": iter_index,
+            "requested_count": _eval_seeds,
+            "completed_count": completed_eval,
+            "complete": evaluation_receipt["complete"],
+            "results": evaluation_results,
+            "evaluation_receipt_sha256": manifest_sha256(
+                evaluation_receipt
+            ),
+        })
+        if not evaluation_receipt["complete"]:
+            raise RuntimeError(
+                "objective evaluation incomplete "
+                f"({completed_eval}/{_eval_seeds} requested seeds "
+                "succeeded); the iteration was not completed"
+            )
         if iter_fitness is not None:
             pf = prior_fitness or {}
             best_so_far = pf.get("best_so_far")
@@ -1947,8 +3082,9 @@ def _run_one_iter(
                 "delta_vs_previous": progress["delta"],
                 "observe_only": bool(fitness_observe_only),
                 # §Selection statistics: null/absent when eval_seeds=1.
-                "eval_seeds": (len(fitness_per_seed)
-                               if len(fitness_per_seed) > 1 else None),
+                "eval_seeds_requested": _eval_seeds,
+                "eval_seeds_completed": completed_eval,
+                "eval_seeds": (_eval_seeds if _eval_seeds > 1 else None),
                 "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
                                      if len(fitness_per_seed) > 1 else None),
                 # §D24 (F4): the same physical sub-component breakdown the
@@ -2074,9 +3210,25 @@ def _run_one_iter(
                 "observe_only": bool(fitness_observe_only),
                 "eval_seeds": (len(fitness_per_seed)
                                if len(fitness_per_seed) > 1 else None),
+                "eval_seeds_requested": _eval_seeds,
+                "eval_seeds_completed": sum(
+                    item.get("status") == "succeeded"
+                    for item in evaluation_results
+                ),
+                "evaluation_complete": all(
+                    item.get("status") == "succeeded"
+                    for item in evaluation_results
+                ),
+                "evaluation_results": evaluation_results,
                 "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
                                      if len(fitness_per_seed) > 1 else None),
                 "components": fitness_components,
+                "metric": {
+                    "id": getattr(fitness_fn, "metric_id", None),
+                    "version": getattr(fitness_fn, "metric_version", None),
+                    "source": getattr(fitness_fn, "metric_source", None),
+                    "sha256": getattr(fitness_fn, "metric_sha256", None),
+                },
                 "source": "live",
                 "recorded_at": _utc_now_iso(),
             }
@@ -2450,21 +3602,7 @@ def _run_one_iter(
     if primary_metric is not None and isinstance(prev_metric, (int, float)):
         metric_delta = float(primary_metric) - float(prev_metric)
 
-    _emit_event({
-        "type": "iter_completed",
-        "iter": iter_index,
-        "failure_modes": list(diagnosis.failure_modes),
-        "edit_count": edit_count,
-        "primary_metric": primary_metric,
-        "metric_delta": metric_delta,
-        # §2026-07-04: the version that actually trained (mirrors
-        # iter_started) — not the disk maximum.
-        "reward_version_before": (
-            int(_m_trained.group(1)) if _m_trained else latest_n),
-        "reward_version_after": reward_version_after,
-        "paper_refs": sorted(set(applied_paper_refs)),
-    })
-    _write_iteration_completion_marker(
+    completion_payload = _write_iteration_completion_marker(
         iter_dir,
         iter_index=iter_index,
         checkpoint_path=checkpoint_path,
@@ -2474,10 +3612,42 @@ def _run_one_iter(
         reward_version_after=reward_version_after,
         world_selection_hash=world_selection_hash,
     )
+    completion_marker = iter_dir / _ITERATION_COMPLETE_MARKER
+    completion_marker_sha256, _ = _checkpoint_sha256_and_size(
+        completion_marker
+    )
+    _emit_event({
+        "type": "iter_completed",
+        "iter": iter_index,
+        "failure_modes": list(diagnosis.failure_modes),
+        "edit_count": edit_count,
+        "primary_metric": primary_metric,
+        "primary_metric_id": primary_key,
+        "primary_metric_semantics": (
+            "environment_default_return"
+            if primary_key == "mean_return"
+            else "adapter_declared_metric"
+        ),
+        "generated_reward_fitness": iter_fitness,
+        "metric_delta": metric_delta,
+        # §2026-07-04: the version that actually trained (mirrors
+        # iter_started) — not the disk maximum.
+        "reward_version_before": (
+            int(_m_trained.group(1)) if _m_trained else latest_n),
+        "reward_version_after": reward_version_after,
+        "paper_refs": sorted(set(applied_paper_refs)),
+        "iteration_completion": {
+            "marker": str(completion_marker.resolve()),
+            "marker_sha256": completion_marker_sha256,
+            "checkpoint_sha256": completion_payload["checkpoint_sha256"],
+            "phase_manifests": completion_payload["phase_manifests"],
+        },
+    })
     _emit_event({
         "type": "iteration_completion_marked",
         "iter": iter_index,
-        "marker": str(iter_dir / _ITERATION_COMPLETE_MARKER),
+        "marker": str(completion_marker),
+        "marker_sha256": completion_marker_sha256,
     })
 
     # §Ship 48: never-silent env-extension signal. The diagnoser flags edits
@@ -2667,6 +3837,7 @@ def sculpt_run(
     early_stop_enabled: Optional[bool] = None,
     early_stop_patience: Optional[int] = None,
     init_policy_path: Optional[Path | str] = None,
+    init_policy_mode: str = "actor_critic",
     per_iter_callback: Optional[Callable[["IterOutcome"], Optional[str]]] = None,
     fitness_fn: Optional[Callable[[Path], float]] = None,
     fitness_patience: int = 2,
@@ -2681,6 +3852,10 @@ def sculpt_run(
     feedback_poll_interval: float = 2.0,
     reference_clip_id: Optional[str] = None,
     reference_robot: Optional[str] = None,
+    expected_active_reference_reward_sha256: Optional[str] = None,
+    world_selection_path: Optional[Path | str] = None,
+    expected_world_selection_sha256: Optional[str] = None,
+    expected_world_tuple_hash: Optional[str] = None,
 ) -> SculptRunResult:
     """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
     artifacts are persisted. Returning `None` keeps the loop running;
@@ -2735,6 +3910,10 @@ def sculpt_run(
     # mis-validate as cwd (which may or may not be a file). Treat
     # empty / whitespace-only strings as None explicitly.
     init_ckpt: Optional[Path] = None
+    if init_policy_mode not in ("actor_only", "actor_critic"):
+        raise ValueError(
+            "init_policy_mode must be 'actor_only' or 'actor_critic'"
+        )
     if init_policy_path is not None:
         raw = str(init_policy_path).strip()
         if raw:
@@ -2744,6 +3923,11 @@ def sculpt_run(
                     f"init_policy_path not found: {init_ckpt}. "
                     "Pass a valid rsl_rl checkpoint or None."
                 )
+    # Whether the starting policy was NAMED by the caller (the UI's
+    # "Warm-start checkpoint" field) rather than inferred below. Only a
+    # named one outranks a partial left by an interrupted attempt — see
+    # `_train_or_resume`.
+    warm_start_explicit = init_ckpt is not None
 
     cfg = _parse_toml(config_path)
     # `--steps-per-iter` CLI override wins over the config.toml value.
@@ -2827,6 +4011,17 @@ def sculpt_run(
         raise FileNotFoundError(
             f"no rewards/ dir in {project} — run `sculpt init` first.")
 
+    # The UI admits a mutable current pointer, but launches the immutable
+    # selection_vN snapshot named at admission. Verify it before adapter load
+    # so a promotion in the subprocess-start gap cannot alter the experiment
+    # or trigger GPU allocation first.
+    requested_authored_world_receipt = _verify_requested_authored_selection(
+        project,
+        selection_path=world_selection_path,
+        expected_selection_sha256=expected_world_selection_sha256,
+        expected_tuple_hash=expected_world_tuple_hash,
+    )
+
     adapter = load_adapter(config_path)
     if num_envs is not None:
         if not hasattr(adapter, "num_envs"):
@@ -2848,13 +4043,40 @@ def sculpt_run(
             f"[sculpt] CLI override: device={device!r}",
             file=sys.stderr, flush=True,
         )
+    if requested_authored_world_receipt is not None:
+        adapter.world_selection_path = str(
+            requested_authored_world_receipt["selection_path"]
+        )
     authored_tuple_hash = _pin_authored_selection(adapter, project)
     if authored_tuple_hash:
+        pinned_path = Path(adapter.world_selection_path).resolve()
+        observed_authored_world_receipt = {
+            "selection_version": int(
+                pinned_path.stem.removeprefix("selection_v")
+            ),
+            "selection_path": str(pinned_path),
+            "selection_sha256": hashlib.sha256(
+                pinned_path.read_bytes()
+            ).hexdigest(),
+            "tuple_hash": authored_tuple_hash,
+        }
+        if (
+            requested_authored_world_receipt is not None
+            and observed_authored_world_receipt
+            != requested_authored_world_receipt
+        ):
+            raise ValueError(
+                "observed authored world differs from the requested launch pin"
+            )
         _emit_event({
             "type": "authored_world_pinned",
             "tuple_hash": authored_tuple_hash,
-            "selection": Path(adapter.world_selection_path).name,
+            "selection": pinned_path.name,
+            "requested_receipt": requested_authored_world_receipt,
+            "observed_receipt": observed_authored_world_receipt,
         })
+    else:
+        observed_authored_world_receipt = None
 
     # Resolve KG store once (shared across iterations). Skip entirely in
     # --no-kg to avoid side-effects on an absent/empty DB.
@@ -2863,12 +4085,69 @@ def sculpt_run(
         from sculptor.kg.store import SculptorKG
         kg_store = SculptorKG()
 
+    from sculptor.reference_authority import (
+        ActiveReferenceAuthorityError,
+        resolve_active_reference_authority,
+    )
+
+    try:
+        active_reference_authority = resolve_active_reference_authority(
+            rewards_dir,
+        )
+    except ActiveReferenceAuthorityError as exc:
+        raise ValueError(
+            f"active reward reference authority is invalid: {exc}"
+        ) from exc
+    if expected_active_reference_reward_sha256 is not None:
+        if (
+            active_reference_authority is None
+            or active_reference_authority.reward_sha256
+            != expected_active_reference_reward_sha256
+        ):
+            raise ValueError(
+                "active reference reward changed after launch admission"
+            )
+    if active_reference_authority is not None:
+        active_pair = (
+            active_reference_authority.reference_clip_id,
+            active_reference_authority.reference_robot,
+        )
+        requested_pair = (reference_clip_id, reference_robot)
+        if any(requested_pair) and requested_pair != active_pair:
+            raise ValueError(
+                "requested reference motion disagrees with the exact "
+                "reference embedded in the active reward"
+            )
+        reference_clip_id, reference_robot = active_pair
+        _emit_event({
+            "type": "active_reference_reward_attested",
+            "source": "sculpt_run_boundary",
+            **active_reference_authority.to_dict(),
+        })
+
     if bool(reference_clip_id) != bool(reference_robot):
         raise ValueError(
             "reference_clip_id and reference_robot must be supplied together"
         )
     reference_motion_context: Optional[dict[str, Any]] = None
+    reference_certificate: Any = None
     if reference_clip_id and reference_robot:
+        if not dry_run:
+            # Direct CLI/programmatic calls bypass the UI's queue admission.
+            # Re-derive Tier D here, immediately before reference-guided
+            # training setup, so no caller can promote a tier string or stale
+            # path into dynamics authority.
+            target_robot, reference_certificate = _admit_reference_motion_for_target(
+                project=project,
+                reference_robot=reference_robot,
+                reference_clip_id=reference_clip_id,
+            )
+            _emit_event(_reference_feasibility_admission_event(
+                certificate=reference_certificate,
+                reference_robot=reference_robot,
+                target_robot=target_robot,
+                reference_clip_id=reference_clip_id,
+            ))
         reference_motion_context = _prepare_reference_guided_run(
             adapter=adapter,
             project=project,
@@ -2879,6 +4158,36 @@ def sculpt_run(
             kg_store=kg_store,
             dry_run=dry_run,
         )
+        if not dry_run:
+            from sculptor.reference_run import (
+                require_exact_reference_tracking_backbone,
+            )
+            from sculptor.refs.track import require_tierd_runtime_reference
+
+            reward_path = Path(reference_motion_context["reward_path"])
+            reward_source = reward_path.read_text(encoding="utf-8")
+            runtime_clock = require_tierd_runtime_reference(
+                reference_certificate,
+                reward_source,
+            )
+            backbone_sha256 = require_exact_reference_tracking_backbone(
+                reward_source=reward_source,
+                clip_id=reference_clip_id,
+                robot=reference_robot,
+            )
+            _emit_event({
+                "type": "reference_runtime_schedule_admitted",
+                "source": "sculpt_run_boundary",
+                "reference_robot": reference_robot,
+                "reference_clip_id": reference_clip_id,
+                "reference_target_sha256": runtime_clock[
+                    "reference_target_sha256"
+                ],
+                "phase_mode": runtime_clock["phase_mode"],
+                "phase_duration_s": runtime_clock["phase_duration_s"],
+                "n_phase_targets": runtime_clock["n_phase_targets"],
+                "tracking_backbone_sha256": backbone_sha256,
+            })
 
     # Start iter index
     latest_n_before_loop, _ = _find_latest_reward_version(rewards_dir)
@@ -2945,6 +4254,10 @@ def sculpt_run(
         "dry_run": bool(dry_run),
         "behavior_goal": behavior_goal,
         "reference_motion": reference_motion_context,
+        "authored_world": {
+            "requested": requested_authored_world_receipt,
+            "observed": observed_authored_world_receipt,
+        },
         # §Ship 24 (R1): seed surfaced at run start so any result can
         # be tied back to its seed plan from the event stream alone.
         "base_seed": int(base_seed),
@@ -2967,6 +4280,10 @@ def sculpt_run(
         )
         if reference_motion_context is not None:
             _rc["reference_motion"] = reference_motion_context
+        _rc["authored_world"] = {
+            "requested": requested_authored_world_receipt,
+            "observed": observed_authored_world_receipt,
+        }
         _rc_path = write_run_context(paths["reports"], _rc)
         _emit_event({
             "type": "run_context_captured",
@@ -3026,6 +4343,8 @@ def sculpt_run(
                 no_kg=no_kg, dry_run=dry_run, kg_store=kg_store,
                 seed=base_seed + i,
                 init_policy_path=(init_ckpt if i == start_iter else None),
+                init_policy_mode=init_policy_mode,
+                warm_start_explicit=(warm_start_explicit and i == start_iter),
                 fitness_fn=fitness_fn,
                 prior_fitness=(
                     {"best_so_far": result.best_fitness,
@@ -3360,6 +4679,66 @@ def sculpt_run(
                 and _best_out.checkpoint_path is not None
                 and Path(_best_out.checkpoint_path).is_file()):
             _fresh_scores: list[float] = []
+            _fresh_seeds = [90_001 + 131 * _j for _j in range(_fresh_n)]
+            _fresh_results: list[dict[str, Any]] = []
+            from sculptor.run_manifests import file_identity, write_json_atomic
+
+            _fresh_plan = {
+                "schema": 1,
+                "iteration": int(result.best_fitness_iter),
+                "authority": "precommitted_fresh_evaluation_seeds",
+                "requested_count": _fresh_n,
+                "requested_seeds": _fresh_seeds,
+                "rollout_episodes_per_seed": int(
+                    (cfg.get("iteration") or {}).get("rollout_episodes", 6)
+                ),
+                "checkpoint": file_identity(_best_out.checkpoint_path),
+                "reward": (
+                    file_identity(_best_out.reward_path_trained)
+                    if _best_out.reward_path_trained is not None
+                    else None
+                ),
+            }
+            write_json_atomic(
+                _best_out.iter_dir / "fresh_evaluation_plan.json",
+                _fresh_plan,
+            )
+            _emit_event({
+                "type": "fresh_evaluation_plan_bound",
+                "iter": int(result.best_fitness_iter),
+                **_fresh_plan,
+            })
+            _fresh_run_context = _load_json_if_present(
+                project / "reports" / "run_context.json"
+            )
+            _fresh_software_context = {
+                key: _fresh_run_context.get(key)
+                for key in (
+                    "code_git",
+                    "python",
+                    "packages",
+                    "prompts",
+                    "warm_start_policy_contract",
+                )
+                if key in _fresh_run_context
+            } or None
+            _fresh_manifest_context = {
+                "configuration": {
+                    "file": file_identity(config_path),
+                    "effective": cfg,
+                },
+                "observed_software_context": _fresh_software_context,
+                "artifact_selection": {
+                    "tuple_hash": _best_out.world_selection_hash,
+                    "selection": (
+                        file_identity(_best_out.world_selection_path)
+                        if _best_out.world_selection_path is not None
+                        and Path(_best_out.world_selection_path).is_file()
+                        else None
+                    ),
+                },
+                "evaluation_role": "fresh_kept_policy",
+            }
             for _j in range(_fresh_n):
                 _fresh_dir = _best_out.iter_dir / f"rollout_fresh_{_j}"
                 try:
@@ -3371,18 +4750,63 @@ def sculpt_run(
                         checkpoint_path=Path(_best_out.checkpoint_path),
                         n_episodes=int((cfg.get("iteration") or {}).get(
                             "rollout_episodes", 6)),
+                        reward_module_path=(
+                            Path(_best_out.reward_path_trained)
+                            if _best_out.reward_path_trained is not None
+                            else None
+                        ),
                         # Disjoint from training seeds and the in-loop
                         # eval band (10k+): deterministic held-out seeds.
-                        seed=90_001 + 131 * _j,
+                        seed=_fresh_seeds[_j],
+                        manifest_context=_fresh_manifest_context,
                     )
                     _d = _detail_dir_fn(_fresh_dir) or {}
-                    _fresh_scores.append(
-                        float(_d.get("spec_score", 0.0) or 0.0))
+                    _fresh_score = float(
+                        _d.get("spec_score", 0.0) or 0.0
+                    )
+                    _fresh_scores.append(_fresh_score)
+                    _fresh_results.append({
+                        "seed": _fresh_seeds[_j],
+                        "rollout": _fresh_dir.name,
+                        "status": "succeeded",
+                        "fitness": _fresh_score,
+                    })
                 except Exception as e:  # noqa: BLE001 — per-seed best-effort
                     sys.stderr.write(
-                        f"[sculpt] fresh eval seed {_j} skipped — "
+                        f"[sculpt] fresh eval seed {_fresh_seeds[_j]} failed — "
                         f"{type(e).__name__}: {e}\n")
-            if _fresh_scores:
+                    _fresh_results.append({
+                        "seed": _fresh_seeds[_j],
+                        "rollout": _fresh_dir.name,
+                        "status": "failed",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+            _fresh_complete = (
+                len(_fresh_results) == _fresh_n
+                and all(
+                    item["status"] == "succeeded"
+                    for item in _fresh_results
+                )
+            )
+            _fresh_result_receipt = {
+                "schema": 1,
+                "iteration": int(result.best_fitness_iter),
+                "plan": _fresh_plan,
+                "requested_count": _fresh_n,
+                "completed_count": len(_fresh_scores),
+                "complete": _fresh_complete,
+                "results": _fresh_results,
+            }
+            write_json_atomic(
+                _best_out.iter_dir / "fresh_evaluation_results.json",
+                _fresh_result_receipt,
+            )
+            from sculptor.run_manifests import manifest_sha256
+
+            _fresh_result_sha256 = manifest_sha256(
+                _fresh_result_receipt
+            )
+            if _fresh_complete:
                 result.fresh_fitness_per_seed = _fresh_scores
                 result.best_fitness_fresh = _median(_fresh_scores)
                 _emit_event({
@@ -3390,10 +4814,20 @@ def sculpt_run(
                     "iter": int(result.best_fitness_iter),
                     "fitness_fresh": round(result.best_fitness_fresh, 5),
                     "per_seed": [round(v, 5) for v in _fresh_scores],
+                    "evaluation_receipt_sha256": _fresh_result_sha256,
                     # Side-by-side: the (max-statistic) selected value.
                     "selected_fitness": (
                         round(result.best_fitness, 5)
                         if result.best_fitness is not None else None),
+                })
+            else:
+                _emit_event({
+                    "type": "best_fresh_eval_incomplete",
+                    "iter": int(result.best_fitness_iter),
+                    "requested_count": _fresh_n,
+                    "completed_count": len(_fresh_scores),
+                    "results": _fresh_results,
+                    "evaluation_receipt_sha256": _fresh_result_sha256,
                 })
 
     # §Ship 37: persist run-learnings to the KG case-memory so future
@@ -4849,13 +6283,9 @@ def mission_run(
     """
     from filelock import FileLock, Timeout as _FileLockTimeout
 
-    from sculptor.mission import save_mission
     from sculptor.mission_runtime import (
-        CriterionEvalError,
         MissionResult,
         StageResult,
-        _build_criterion_namespace,
-        _evaluate_success_criterion,
     )
 
     if mission.mission_dir is None:
@@ -5445,47 +6875,81 @@ def _parent_env_component_terms(mission, stage) -> set[str]:
         return set()
 
 
-#: Reference-library robot slugs the on-disk library is keyed by
-#: (`sculptor.refs.library.clip_dir(robot, clip_id)`). Mirrors
-#: `mission_metrics._ROBOT_SLUGS` — kept as a small local copy rather
-#: than an import since `mission_metrics.py` is a metric-generation
-#: module or this one has no other dependency on, and the mapping is a
-#: single-source-of-truth-worthy but tiny (3-entry) constant.
-_STAGE_REFERENCE_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+def _project_robot_library_slug(project_root: Path) -> str:
+    """Compatibility wrapper for the shared policy/reference namespace."""
+    from sculptor.project_robot import resolve_project_reference_robot
+
+    return resolve_project_reference_robot(project_root)
+
+
+def _admit_reference_motion_for_target(
+    *,
+    project: Path,
+    reference_robot: str,
+    reference_clip_id: str,
+) -> tuple[str, Any]:
+    """Verify one direct-run reference against the live project boundary."""
+    from sculptor.refs.track import (
+        TierDAdmissionError,
+        require_tierd_admission,
+        require_tierd_target_compatibility,
+    )
+
+    target_robot = _project_robot_library_slug(project)
+    if reference_robot != target_robot:
+        raise TierDAdmissionError(
+            f"selected reference robot {reference_robot!r} does not match "
+            f"project robot {target_robot!r}"
+        )
+    certificate = require_tierd_target_compatibility(
+        require_tierd_admission(reference_robot, reference_clip_id),
+        project,
+        target_robot=target_robot,
+    )
+    return target_robot, certificate
+
+
+def _reference_feasibility_admission_event(
+    *,
+    certificate: Any,
+    reference_robot: str,
+    target_robot: str,
+    reference_clip_id: str,
+) -> dict[str, Any]:
+    """Build the complete, narrowly scoped worker evidence event."""
+    return {
+        "type": "reference_feasibility_admitted",
+        "source": "sculpt_run_worker",
+        "status": "tierd_verified",
+        "tier": "D",
+        "kinematic_only": False,
+        "training_authorized": True,
+        "reference_tracking_certificate_admitted": True,
+        "reference_robot": reference_robot,
+        "target_robot": target_robot,
+        "reference_clip_id": reference_clip_id,
+        "clip_sha256": certificate.clip_content_sha256,
+        "rollout_sha256": certificate.rollout_sha256,
+        "certificate_sha256": certificate.certificate_sha256,
+        "execution_contract_sha256": certificate.execution_contract_sha256,
+        "execution_boundary_sha256": certificate.execution_boundary_sha256,
+        "certification_scope": json.loads(json.dumps(
+            certificate.certification_scope,
+            allow_nan=False,
+        )),
+    }
 
 
 def _stage_reference_robot_slug(*, stage_dir: Path, project_root: Path) -> str:
-    """Resolve the bare robot slug (`"g1"`, `"go1"`, ...) the reference
-    library keys clips by, from the stage's (or the project's, as a
-    fallback for a not-yet-scaffolded stage) `[adapter].config.task_id`
-    — the same adapter/task_id-shaped string used everywhere else
-    (`"Mjlab-Velocity-Flat-Unitree-G1"`). Unknown/unreadable/absent
-    always falls back to `"g1"` (the only populated library robot as of
-    §R1_BUILD_SPEC — mirrors `sculptor.refs`'s own `robot: str = "g1"`
-    default throughout)."""
-    task_id = ""
-    for config_path in (stage_dir / "config.toml", project_root / "config.toml"):
-        if not config_path.is_file():
-            continue
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:  # pragma: no cover
-                import tomli as tomllib  # type: ignore[no-redef]
-            with config_path.open("rb") as f:
-                cfg = tomllib.load(f)
-            task_id = str(
-                ((cfg.get("adapter") or {}).get("config") or {})
-                .get("task_id", "") or "")
-        except Exception:  # noqa: BLE001 — best-effort resolution only
-            task_id = ""
-        if task_id:
-            break
-    hint = task_id.lower()
-    for slug in _STAGE_REFERENCE_ROBOT_SLUGS:
-        if slug in hint:
-            return slug
-    return "g1"
+    """Resolve the exact robot namespace for one mission stage.
+
+    ``stage_dir`` remains in the call signature for compatibility with the
+    stage orchestration code, but a copied task id is not a robot identity and
+    may not override project metadata. There is intentionally no populated-
+    library or ``g1`` fallback.
+    """
+    del stage_dir
+    return _project_robot_library_slug(project_root)
 
 
 def _resolve_stage_rsi_clip(
@@ -5616,6 +7080,54 @@ def _run_one_stage(
     )
 
     stage_dir = mission.stage_dir(stage.name)
+
+    def _readmit_stage_reference(boundary: str) -> None:
+        from sculptor.refs.track import (
+            require_stage_tierd_admission,
+            require_tierd_target_compatibility,
+        )
+
+        if not getattr(stage, "reference_clip_id", None):
+            return
+        project_root = mission_dir.parent.parent
+        active_robot = _stage_reference_robot_slug(
+            stage_dir=stage_dir,
+            project_root=project_root,
+        )
+        certificate = require_stage_tierd_admission(
+            stage, expected_robot=active_robot,
+        )
+        if certificate is not None:
+            certificate = require_tierd_target_compatibility(
+                certificate,
+                project_root,
+                target_robot=active_robot,
+            )
+            emit({
+                "type": "stage_reference_admitted",
+                "stage_name": stage.name,
+                "boundary": boundary,
+                "reference_robot": certificate.robot,
+                "reference_clip_id": certificate.clip_id,
+                "clip_sha256": certificate.clip_content_sha256,
+                "certificate_sha256": certificate.certificate_sha256,
+                "execution_contract_sha256": (
+                    certificate.execution_contract_sha256
+                ),
+                "execution_boundary_sha256": (
+                    certificate.execution_boundary_sha256
+                ),
+            })
+
+    try:
+        _readmit_stage_reference("stage_worker_entry")
+    except ValueError as exc:
+        return _fail_stage(
+            stage,
+            "reference_admission_failed",
+            str(exc),
+            emit,
+        )
     # §Ship 20 Goal #2: compute the effective max iterations BEFORE
     # emitting stage_started so the UI can render `iters X/effectiveY`
     # accurately when the user passed `iterations_override`. Without
@@ -5690,11 +7202,20 @@ def _run_one_stage(
     # before — Ship 16 behavior preserved.
     skill_ckpt: Optional[Path] = None
     if skill_library_handle is not None and stage.init_skill_id:
-        skill_ckpt = skill_library_handle.maybe_load_for_stage(stage, emit)
+        try:
+            skill_ckpt = skill_library_handle.maybe_load_for_stage(stage, emit)
+        except Exception as exc:  # explicit skill selection is authoritative
+            return _fail_stage(
+                stage,
+                "skill_warm_start_admission_failed",
+                f"{type(exc).__name__}: {exc}",
+                emit,
+            )
 
     if skill_ckpt is not None:
         warm_start_path: Optional[Path] = skill_ckpt
         warm_start_source = "skill_library"
+        warm_start_mode = "actor_only"
         warm_start_source_id: Optional[str] = stage.init_skill_id
         if parent_ckpt is not None:
             emit({
@@ -5707,10 +7228,12 @@ def _run_one_stage(
     elif parent_ckpt is not None:
         warm_start_path = parent_ckpt
         warm_start_source = "parent_stage"
+        warm_start_mode = "actor_critic"
         warm_start_source_id = stage.parent_stage
     else:
         warm_start_path = None
         warm_start_source = "none"
+        warm_start_mode = "actor_critic"
         warm_start_source_id = None
 
     emit({
@@ -5720,6 +7243,7 @@ def _run_one_stage(
         "source": warm_start_source,
         "source_id": warm_start_source_id,
         "checkpoint": str(warm_start_path) if warm_start_path else None,
+        "initialization_mode": warm_start_mode,
     })
 
     # 2. Scaffold stage dir idempotently. `stage_dir` was resolved
@@ -6418,6 +7942,7 @@ def _run_one_stage(
                     tracking_source = generate_tracking_residual_reward_source(
                         clip=tracking_clip,
                         clip_id=loaded_clip_id,
+                        robot=sig_robot,
                         version="v0",
                     )
                     latest_reward_file.write_text(
@@ -6485,12 +8010,6 @@ def _run_one_stage(
     # §Ship-19d: Goal A wraps each iter with a criterion-eval
     # callback; Goal B runs additional sculpt_run passes (resume
     # mode) when metric is still improving at end-of-budget.
-    from sculptor.mission_runtime import (
-        CriterionEvalError,
-        CriterionMissingKeyError,
-        _build_criterion_namespace,
-        _evaluate_success_criterion,
-    )
 
     # §Ship 20 Goal #2: re-use the value already computed for
     # stage_started's payload above. `max_iters` is the authoritative
@@ -6547,6 +8066,7 @@ def _run_one_stage(
     extensions_used = 0
     sculpt_result: Any = None
     try:
+        _readmit_stage_reference("before_initial_training")
         sculpt_result = sculpt_run(
             config_path=stage_dir / "config.toml",
             behavior_goal=stage.goal_text,
@@ -6562,6 +8082,7 @@ def _run_one_stage(
             render_height=render_height,
             rollout_episodes=rollout_episodes,
             init_policy_path=warm_start_path,
+            init_policy_mode=warm_start_mode,
             per_iter_callback=per_iter_cb,
             fitness_fn=fitness_fn,
             fitness_target=fitness_target,
@@ -6663,6 +8184,7 @@ def _run_one_stage(
             "reason": "metric_still_improving",
         })
         try:
+            _readmit_stage_reference("before_extension_training")
             sculpt_result = sculpt_run(
                 config_path=stage_dir / "config.toml",
                 behavior_goal=stage.goal_text,
@@ -7156,7 +8678,6 @@ def _maybe_redecompose_and_splice(
     """
     from sculptor.decompose import (
         DecompositionError,
-        StageTrainingFeedback,
         redecompose_stage,
     )
     from sculptor.mission import MissionValidationError, validate_mission

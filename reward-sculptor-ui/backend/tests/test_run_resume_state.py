@@ -1,6 +1,6 @@
 """Regression: a RESUMED run must not surface the PRIOR run's iterations as
 RUNNING (the long-standing "all previous iters show running at once" bug), and
-a stranded mid-loop iter must reconcile to completed.
+a stranded mid-loop iter must not be promoted to completed without proof.
 
 Root cause: the fs watcher emitted `iter_started` for every on-disk iter_<n>
 dir, but `iter_completed` only ever comes from the live subprocess stdout for
@@ -10,6 +10,7 @@ matching `completed` and hung "running" forever.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from backend.services.job_manager import Job
 from backend.services.run_manager import (
@@ -33,11 +34,13 @@ def _mk_iter(runs, n, *, complete: bool) -> None:
 def test_preseed_seeds_prior_state_without_emitting(tmp_path):
     """A project with a PRIOR run on disk: the pre-seed populates the dedup
     sets (so the watcher won't re-emit) and emits ZERO events."""
-    runs = tmp_path / "runs"; runs.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
     _mk_iter(runs, 0, complete=True)
     _mk_iter(runs, 1, complete=True)
     _mk_iter(runs, 2, complete=False)          # a half-finished prior iter
-    rewards = tmp_path / "rewards"; rewards.mkdir()
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
     for v in (0, 1, 2, 3):
         (rewards / f"v{v}.py").write_text("x = 1\n", encoding="utf-8")
 
@@ -56,10 +59,8 @@ def test_preseed_seeds_prior_state_without_emitting(tmp_path):
     assert job.events == []
 
 
-def test_iter_events_reconciles_stranded_running_iter(tmp_path):
-    """If a lower iter's `iter_completed` was lost (dropped stdout / crash),
-    the sequential loop having advanced past it means it is done — reconcile to
-    completed; only the highest-started iter stays running."""
+def test_iter_events_does_not_infer_completion_from_later_start(tmp_path):
+    """A later start is contradictory evidence, not prior completion proof."""
     job = Job(job_id="t2", kind="sculpt_run", project_slug="p", status="running")
     job.emit({"type": "iter_started", "iter": 9, "ts": "t9a"})
     job.emit({"type": "iter_completed", "iter": 9, "ts": "t9b"})
@@ -69,8 +70,39 @@ def test_iter_events_reconciles_stranded_running_iter(tmp_path):
 
     by = {it["iter_index"]: it for it in build_iterations_summary(job)}
     assert by[9]["status"] == "completed"
-    assert by[10]["status"] == "completed"   # reconciled — loop advanced past it
+    assert by[10]["status"] == "errored"
     assert by[11]["status"] == "running"     # current iter, genuinely running
+
+
+def test_iter_events_accepts_reverified_schema3_receipt(
+    tmp_path, monkeypatch,
+):
+    from backend.services import iteration_completion
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    job = Job(
+        job_id="t-receipt",
+        kind="sculpt_run",
+        project_slug="p",
+        status="running",
+        params={"log_file": str(runs / "_run_t-receipt.log")},
+    )
+    job.emit({"type": "iter_started", "iter": 10, "ts": "t10"})
+    job.emit({"type": "iter_started", "iter": 11, "ts": "t11"})
+    monkeypatch.setattr(
+        iteration_completion,
+        "attested_completion_receipt",
+        lambda path: (
+            {"schema": 3, "iter_index": 10, "marker_sha256": "1" * 64}
+            if Path(path).name == "iter_10"
+            else None
+        ),
+    )
+
+    by = {it["iter_index"]: it for it in build_iterations_summary(job)}
+    assert by[10]["status"] == "completed"
+    assert by[11]["status"] == "running"
 
 
 def test_iter_events_keeps_sole_running_iter(tmp_path):

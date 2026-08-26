@@ -1,5 +1,11 @@
 # Meeting with Lokesh — Analysis & Future Directions
 
+> **Historical first-meeting synthesis.** The canonical living research brief
+> is now [`GUIDING_RESEARCH_CONTEXT.md`](GUIDING_RESEARCH_CONTEXT.md), which
+> reconciles this material with the second meeting, the public SONIC release,
+> the exact OGMP mechanisms, and the current code audit. Where the two differ,
+> the guiding brief is authoritative.
+
 *Produced by a multi-agent pass: 4 agents independently read the (rough) transcript and extracted Lokesh's takeaways + recommended directions; a compiler merged them into the master list below (agreement noted, e.g. 4/4); web-research validators checked each direction against the actual robotics literature; two critique agents assessed the meeting.*
 
 ---

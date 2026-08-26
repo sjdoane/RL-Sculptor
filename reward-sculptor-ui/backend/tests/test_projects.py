@@ -680,7 +680,12 @@ def test_env_spec_endpoint_inactive_then_active(
     # No env spec yet → inactive, no versions.
     r = client.get(f"/projects/{slug}/env-spec")
     assert r.status_code == 200, r.text
-    assert r.json() == {"active": False, "current": None, "versions": []}
+    body = r.json()
+    assert (body["active"], body["current"], body["versions"]) == (
+        False, None, [])
+    # The editable set is advertised even with no spec on disk, so the UI
+    # renders the same controls rather than hardcoding key names.
+    assert "entropy_coef_scale" in body["editable_train_keys"]
 
     # Materialize a spec the way the loop does (v<N>.json + current copy).
     env_dir = tmp_projects_root / slug / "env"
@@ -750,3 +755,117 @@ def test_store_get_rejects_malformed_slugs(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path / "projects")
     for bad in ("..", ".", "a/b", "a\\b", "A", "-x", "x-", ""):
         assert store.get(bad) is None, bad
+
+
+# ── PUT /projects/{slug}/env-spec/train ─────────────────────────────────
+def _project_with_env_spec(client: TestClient, root: Path,
+                           train: dict) -> str:
+    import json as _json
+
+    slug = client.post("/projects", json={"name": "EnvEdit"}).json()["slug"]
+    env_dir = root / slug / "env"
+    env_dir.mkdir()
+    spec = {"env_spec_version": 1,
+            "meta": {"version": "v0", "source": "generated"},
+            "shared": {}, "train": train}
+    (env_dir / "v0.json").write_text(_json.dumps(spec))
+    (env_dir / "current.json").write_text(_json.dumps(spec))
+    return slug
+
+
+def test_editing_a_train_knob_writes_a_new_version_and_repoints_current(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """The knob that decides whether a run can succeed, reachable by hand.
+
+    entropy_coef_scale at 3.0 triples PPO's entropy bonus; measured on
+    platform-ascent-showcase the action-noise std climbed all run and
+    mjlab's action_rate_l2 penalty overtook the task reward. Before this
+    route the only way to change it was to wait for the diagnoser.
+    """
+    slug = _project_with_env_spec(
+        client, tmp_projects_root, {"entropy_coef_scale": 3.0})
+
+    r = client.put(f"/projects/{slug}/env-spec/train", json={"edits": [
+        {"parameter": "entropy_coef_scale", "new_value": 1.0,
+         "rationale": "std ratchet"}]})
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["applied"] == ["entropy_coef_scale=1.0"]
+    assert body["rejected"] == []
+    assert body["new_version"] == "v1"
+    assert body["current"]["train"]["entropy_coef_scale"] == 1.0
+    # Persisted, and the GET agrees.
+    got = client.get(f"/projects/{slug}/env-spec").json()
+    assert got["versions"] == ["v0", "v1"]
+    assert got["current"]["train"]["entropy_coef_scale"] == 1.0
+    # A hand edit must not be recorded as the loop's own work.
+    assert got["current"]["meta"]["source"] == "user"
+    assert got["current"]["meta"]["parent"] == "v0"
+
+
+def test_an_out_of_bounds_edit_is_422_with_the_reason_and_changes_nothing(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _project_with_env_spec(
+        client, tmp_projects_root, {"entropy_coef_scale": 3.0})
+
+    r = client.put(f"/projects/{slug}/env-spec/train", json={"edits": [
+        {"parameter": "entropy_coef_scale", "new_value": 99.0}]})
+
+    assert r.status_code == 422, r.text
+    assert "entropy_coef_scale" in r.json()["detail"]
+    got = client.get(f"/projects/{slug}/env-spec").json()
+    assert got["versions"] == ["v0"], "a rejected edit writes no version"
+    assert got["current"]["train"]["entropy_coef_scale"] == 3.0
+
+
+def test_a_non_iterable_parameter_is_refused(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """The shared/eval section stays unreachable — train-only by design."""
+    slug = _project_with_env_spec(
+        client, tmp_projects_root, {"entropy_coef_scale": 3.0})
+
+    r = client.put(f"/projects/{slug}/env-spec/train", json={"edits": [
+        {"parameter": "episode_length_s", "new_value": 5.0}]})
+
+    assert r.status_code == 422, r.text
+    assert "episode_length_s" in r.json()["detail"]
+
+
+def test_a_bad_edit_does_not_take_the_good_ones_down_with_it(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _project_with_env_spec(
+        client, tmp_projects_root, {"entropy_coef_scale": 3.0})
+
+    r = client.put(f"/projects/{slug}/env-spec/train", json={"edits": [
+        {"parameter": "entropy_coef_scale", "new_value": 1.0},
+        {"parameter": "min_base_height_termination_m", "new_value": 99.0}]})
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["applied"] == ["entropy_coef_scale=1.0"]
+    assert [p for p, _ in body["rejected"]] == [
+        "min_base_height_termination_m"]
+    assert body["current"]["train"]["entropy_coef_scale"] == 1.0
+    assert "min_base_height_termination_m" not in body["current"]["train"]
+
+
+def test_editing_train_on_a_project_with_no_env_spec_is_422(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = client.post("/projects", json={"name": "NoSpec"}).json()["slug"]
+    r = client.put(f"/projects/{slug}/env-spec/train", json={"edits": [
+        {"parameter": "entropy_coef_scale", "new_value": 1.0}]})
+    assert r.status_code == 422, r.text
+
+
+def test_editing_train_on_an_unknown_project_is_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    r = client.put("/projects/nope/env-spec/train", json={"edits": [
+        {"parameter": "entropy_coef_scale", "new_value": 1.0}]})
+    assert r.status_code == 404

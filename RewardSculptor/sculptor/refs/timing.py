@@ -125,6 +125,36 @@ class SimTiming:
 MJLAB_G1_VELOCITY = SimTiming(physics_dt=0.005, decimation=4)
 
 
+def timing_for_task(task_id: str) -> SimTiming | None:
+    """Resolve a task's REAL rates from its mjlab env cfg.
+
+    This is the authority, and it is not the MJCF. mjlab sets
+    `MujocoCfg.timestep` on the compiled model, so a robot XML that declares no
+    `<option timestep=...>` (the Unitree G1 declares none, and therefore
+    compiles at MuJoCo's 0.002 s default) still trains at whatever the task
+    says — 0.005 s for the G1 velocity task. Reading the XML and reporting that
+    as "the physics timestep" is off by 2.5x.
+
+    Returns None when mjlab is unavailable or the task does not declare both
+    rates; callers should treat that as "unknown", never as a default.
+    """
+    if not task_id:
+        return None
+    try:
+        from mjlab.tasks.registry import load_env_cfg
+
+        ec = load_env_cfg(task_id)
+        sim = getattr(ec, "sim", None)
+        mj = getattr(sim, "mujoco", None) if sim is not None else None
+        physics_dt = float(getattr(mj, "timestep", 0.0) or 0.0)
+        decimation = int(getattr(ec, "decimation", 0) or 0)
+    except Exception:  # noqa: BLE001 — mjlab missing or task unknown
+        return None
+    if physics_dt <= 0 or decimation < 1:
+        return None
+    return SimTiming(physics_dt=physics_dt, decimation=decimation)
+
+
 def validate_timing(
     timing: SimTiming,
     *,

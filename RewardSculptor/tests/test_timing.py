@@ -100,3 +100,25 @@ def test_to_dict_is_serialisable_for_a_run_record():
     d = MJLAB_G1_VELOCITY.to_dict()
     assert d["control_hz"] == 50.0 and d["physics_hz"] == 200.0
     assert d["decimation"] == 4
+
+# ── resolving a real task (the MJCF is NOT the authority) ───────────────
+def test_timing_for_task_reads_the_mjlab_config_not_the_robot_xml():
+    """The G1 XML declares no `<option timestep>`, so it compiles at MuJoCo's
+    0.002 s default — but training runs at the task's 0.005 s. Reading the XML
+    and calling it "the physics timestep" is off by 2.5x, which is exactly what
+    the Physics tab did."""
+    from sculptor.refs.timing import timing_for_task
+
+    t = timing_for_task("Mjlab-Velocity-Flat-Unitree-G1")
+    if t is None:                     # mjlab not installed in this env
+        return
+    assert t.physics_dt == 0.005 and t.decimation == 4
+    assert t.control_hz == 50.0
+    assert t.physics_dt != 0.002      # the value the MJCF compiles to
+
+
+def test_an_unresolvable_task_is_unknown_rather_than_defaulted():
+    from sculptor.refs.timing import timing_for_task
+
+    assert timing_for_task("") is None
+    assert timing_for_task("Definitely-Not-A-Task") is None

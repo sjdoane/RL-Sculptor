@@ -50,6 +50,21 @@ def _isolate_saved_root(
     monkeypatch.setenv("RS_SAVED_ROOT", str(tmp_path / "saved"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_knowledge_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-08-25 audit: two lineage tests built a `RunLineageSession` without
+    setting `RS_KG_PATH`, so full backend-suite runs wrote fixture nodes —
+    including the store's only TRACKS edge, with placeholder Tier-D hashes —
+    into the developer's real `~/.local/share/sculptor/kg/graph.db` (purged
+    the same day). KG isolation was previously opt-in via `tmp_projects_root`;
+    make it unconditional so no backend test can ever resolve the shared
+    default store. Tests that point `RS_KG_PATH` at a specific tmp file still
+    win: their own monkeypatch runs after this autouse fixture."""
+    monkeypatch.setenv("RS_KG_PATH", str(tmp_path / "kg-isolated.db"))
+
+
 @pytest.fixture
 def tmp_projects_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "projects"

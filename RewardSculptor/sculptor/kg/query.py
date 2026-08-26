@@ -743,6 +743,70 @@ def query_semantic(
             store.close()
 
 
+#: Reciprocal-rank-fusion damping. 60 is the value from the original RRF paper
+#: and needs no calibration against cosine similarity — which is the point:
+#: BM25 scores and dot products are not on a comparable scale, so fusing by
+#: RANK rather than by score avoids inventing a weight we cannot justify.
+_RRF_K = 60
+
+#: Lexical rank contributes at this fraction of a semantic rank. Full text is a
+#: RECALL supplement, not a co-equal ranker: at 1.0 a paper matching only a
+#: common word like "state" displaced good semantic hits on
+#: "oracle ansatz bounding permissible state". Below ~0.5 a body-only hit can
+#: no longer break into top_k at all, which defeats the purpose.
+_LEXICAL_WEIGHT = 0.5
+
+
+def _fuse_full_text(
+    store: SculptorKG,
+    text: str,
+    scored: list[tuple[float, Paper]],
+    candidates: list[Paper],
+    top_k: int,
+) -> list[PaperMatch] | None:
+    """Fuse semantic ranking with BM25 over paper bodies (RRF).
+
+    Returns None when there is nothing to fuse — no body index, or no lexical
+    hit — so the caller falls through to the pure-semantic result unchanged.
+    That "None means no-op" contract is what makes enabling this safe on a
+    graph whose bodies were never indexed.
+    """
+    hits = store.search_paper_fulltext(text, limit=max(top_k * 4, 20))
+    if not hits:
+        return None
+    # Only fuse papers that survived the tag/tier filters — full text must not
+    # smuggle a paper past an exact structured filter the caller asked for.
+    allowed = {p.id: p for p in candidates}
+    lex_rank = {
+        nid: i for i, (nid, _s) in enumerate(h for h in hits if h[0] in allowed)
+    }
+    if not lex_rank:
+        return None
+
+    sem_rank = {p.id: i for i, (_score, p) in enumerate(scored)}
+    sem_score = {p.id: s for s, p in scored}
+
+    fused: dict[str, float] = {}
+    for nid in set(sem_rank) | set(lex_rank):
+        total = 0.0
+        if nid in sem_rank:
+            total += 1.0 / (_RRF_K + sem_rank[nid] + 1)
+        if nid in lex_rank:
+            total += _LEXICAL_WEIGHT / (_RRF_K + lex_rank[nid] + 1)
+        fused[nid] = total
+
+    order = sorted(
+        fused, key=lambda nid: (-fused[nid], allowed[nid].arxiv_id))
+    out: list[PaperMatch] = []
+    for nid in order[:top_k]:
+        paper = allowed[nid]
+        # Report the semantic similarity when we have one so the number keeps
+        # its established meaning; body-only hits have no cosine score.
+        out.append(PaperMatch(
+            paper=paper, relevance_score=sem_score.get(nid, 0.0)))
+    return out
+
+
 def query_papers(
     text: str,
     top_k: int = 5,
@@ -752,6 +816,7 @@ def query_papers(
     store: SculptorKG | None = None,
     model_name: str = EMBEDDING_MODEL,
     min_similarity: float = 0.0,
+    full_text: bool = True,
 ) -> list[PaperMatch]:
     """Semantic Paper retrieval with exact structured campaign filters.
 
@@ -759,6 +824,12 @@ def query_papers(
     qualified-taxonomy normalization (`locomotion` matches
     `continuous_locomotion`). Tier is case-insensitive. Unlike Technique
     retrieval, this makes metadata-only A/B papers useful before extraction.
+
+    `full_text` adds a lexical recall pass over paper BODIES, fused with the
+    semantic ranking. Embeddings only see `title + abstract + rationale`
+    (`paper_embed_text`), so a paper that answers the question in section IV
+    but never says so in its abstract could not be retrieved at all. When the
+    body index is empty this is a no-op and the ranking is unchanged.
     """
     import numpy as np
 
@@ -789,6 +860,10 @@ def query_papers(
         ]
         scored = [row for row in scored if row[0] >= min_similarity]
         scored.sort(key=lambda row: (-row[0], row[1].arxiv_id))
+        if full_text:
+            fused = _fuse_full_text(store, text, scored, candidates, top_k)
+            if fused is not None:
+                return fused
         return [PaperMatch(paper=p, relevance_score=score)
                 for score, p in scored[:top_k]]
     finally:

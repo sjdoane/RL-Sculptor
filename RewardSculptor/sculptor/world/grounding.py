@@ -13,16 +13,18 @@ relevant Techniques, FailureModes, and Papers so that
   KG node IDs (the validator's contract), so any later reader can ask
   the graph exactly which prior art shaped this world.
 
-Failure policy: grounding is strictly best-effort. A missing store, an
-unavailable embedder, or any retrieval error degrades to *ungrounded
-authoring* with one warning — it must never block or fail the author.
-The deterministic offline author and all validation gates are upstream
-of and independent from anything returned here.
+Failure policy: semantic grounding is strictly best-effort. A missing store,
+an unavailable embedder, or any retrieval error degrades to *ungrounded
+authoring* with one warning. Explicit ``paper:<id>`` pins are different: they
+are user-authored provenance constraints, so every pin must resolve to a Paper
+node in the graph. Missing or unverifiable explicit pins fail clearly instead
+of being silently replaced by semantic retrieval results.
 """
 from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from typing import Any, Sequence
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,19 @@ _INTENT_PAPER_TAGS: dict[str, list[str]] = {
 }
 
 _GUIDANCE_MAX_CHARS = 280
+
+# Natural KG paper IDs are intentionally broader than arXiv's current numeric
+# format (the graph and fixtures also use stable local IDs). Stop at ordinary
+# prose punctuation while allowing the separators used by historical arXiv
+# IDs and graph-native aliases.
+_EXPLICIT_PAPER_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])paper:"
+    r"([A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?)"
+)
+
+
+class ExplicitGroundingError(ValueError):
+    """An explicit prompt citation could not be attested by the KG."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +92,16 @@ def _paper_tags_for_prompt(prompt: str) -> list[str] | None:
         return None
 
 
+def _explicit_paper_ids(prompt: str) -> tuple[str, ...]:
+    """Return explicit ``paper:<id>`` pins in first-mentioned order."""
+    out: list[str] = []
+    for match in _EXPLICIT_PAPER_RE.finditer(str(prompt or "")):
+        node_id = f"paper:{match.group(1)}"
+        if node_id not in out:
+            out.append(node_id)
+    return tuple(out)
+
+
 def gather_grounding(
     prompt: str,
     *,
@@ -86,12 +111,14 @@ def gather_grounding(
     top_k_papers: int = 3,
     min_similarity: float = DEFAULT_MIN_SIMILARITY,
 ) -> tuple[GroundingItem, ...]:
-    """Retrieve prompt-relevant KG nodes; empty tuple on any failure.
+    """Retrieve prompt-relevant KG nodes.
 
-    Never raises and never creates state beyond the store's own lazy
-    embedding maintenance. Authoring must behave identically (minus the
-    evidence block) when this returns ``()``.
+    Semantic retrieval remains fail-soft and creates no state beyond the
+    store's own lazy embedding maintenance. Explicit ``paper:<id>`` pins are
+    fail-closed because silently substituting a nearby paper would falsify the
+    authored provenance receipt.
     """
+    explicit_ids = _explicit_paper_ids(prompt)
     try:
         return _gather(
             prompt,
@@ -101,7 +128,14 @@ def gather_grounding(
             top_k_papers=top_k_papers,
             min_similarity=min_similarity,
         )
+    except ExplicitGroundingError:
+        raise
     except Exception as exc:  # noqa: BLE001 — grounding is best-effort by contract
+        if explicit_ids:
+            raise ExplicitGroundingError(
+                "explicit paper grounding could not be verified for "
+                f"{list(explicit_ids)}: {type(exc).__name__}: {exc}"
+            ) from exc
         log.warning(
             "world.grounding: KG grounding unavailable (%s: %s); "
             "authoring proceeds ungrounded",
@@ -120,7 +154,7 @@ def _gather(
     min_similarity: float,
 ) -> tuple[GroundingItem, ...]:
     from sculptor.kg import query as kg_query
-    from sculptor.kg.schema import FailureMode
+    from sculptor.kg.schema import FailureMode, Paper
     from sculptor.kg.store import SculptorKG
 
     prompt = str(prompt or "").strip()
@@ -131,56 +165,85 @@ def _gather(
     store = store or SculptorKG()
     items: list[GroundingItem] = []
     seen: set[str] = set()
+    explicit_ids = _explicit_paper_ids(prompt)
 
     def _add(item: GroundingItem) -> None:
         if item.node_id not in seen:
             seen.add(item.node_id)
             items.append(item)
 
-    try:
-        if top_k_techniques > 0:
-            for match in kg_query.query_semantic(
-                prompt, top_k_techniques, store=store,
-                min_similarity=min_similarity,
-            ):
-                _add(GroundingItem(
-                    node_id=match.technique.id,
-                    kind="technique",
-                    name=match.technique.name,
-                    guidance=_trim(match.description),
-                    citation=match.paper_citation,
-                    score=round(float(match.relevance_score), 4),
-                ))
+    def _paper_item(paper: Paper, *, score: float = 0.0) -> GroundingItem:
+        year = f" ({paper.year})" if paper.year else ""
+        return GroundingItem(
+            node_id=paper.id,
+            kind="paper",
+            name=paper.title,
+            guidance=_trim(paper.rationale or paper.abstract),
+            citation=f"{paper.title}{year}",
+            score=round(float(score), 4),
+        )
 
-        if top_k_failure_modes > 0:
-            for node_id in kg_query.resolve_failure_modes_semantic(
-                store, [prompt], top_k_per=top_k_failure_modes,
-            ):
-                node = store.get_node(node_id)
-                if isinstance(node, FailureMode):
+    try:
+        unresolved: list[str] = []
+        for node_id in explicit_ids:
+            node = store.get_node(node_id)
+            if not isinstance(node, Paper):
+                unresolved.append(node_id)
+                continue
+            _add(_paper_item(node))
+        if unresolved:
+            raise ExplicitGroundingError(
+                "explicit paper grounding did not resolve to Paper node(s): "
+                f"{unresolved}; add them to the shared/project KG or remove "
+                "the explicit pins"
+            )
+
+        try:
+            if top_k_techniques > 0:
+                for match in kg_query.query_semantic(
+                    prompt, top_k_techniques, store=store,
+                    min_similarity=min_similarity,
+                ):
                     _add(GroundingItem(
-                        node_id=node.id,
-                        kind="failure_mode",
-                        name=node.name,
-                        guidance=_trim(node.description),
+                        node_id=match.technique.id,
+                        kind="technique",
+                        name=match.technique.name,
+                        guidance=_trim(match.description),
+                        citation=match.paper_citation,
+                        score=round(float(match.relevance_score), 4),
                     ))
 
-        if top_k_papers > 0:
-            for match in kg_query.query_papers(
-                prompt, top_k_papers, store=store,
-                tags=_paper_tags_for_prompt(prompt) or None,
-                min_similarity=min_similarity,
-            ):
-                paper = match.paper
-                year = f" ({paper.year})" if paper.year else ""
-                _add(GroundingItem(
-                    node_id=paper.id,
-                    kind="paper",
-                    name=paper.title,
-                    guidance=_trim(paper.rationale or paper.abstract),
-                    citation=f"{paper.title}{year}",
-                    score=round(float(match.relevance_score), 4),
-                ))
+            if top_k_failure_modes > 0:
+                for node_id in kg_query.resolve_failure_modes_semantic(
+                    store, [prompt], top_k_per=top_k_failure_modes,
+                ):
+                    node = store.get_node(node_id)
+                    if isinstance(node, FailureMode):
+                        _add(GroundingItem(
+                            node_id=node.id,
+                            kind="failure_mode",
+                            name=node.name,
+                            guidance=_trim(node.description),
+                        ))
+
+            if top_k_papers > 0:
+                for match in kg_query.query_papers(
+                    prompt, top_k_papers, store=store,
+                    tags=_paper_tags_for_prompt(prompt) or None,
+                    min_similarity=min_similarity,
+                ):
+                    _add(_paper_item(
+                        match.paper, score=match.relevance_score))
+        except Exception as exc:  # noqa: BLE001 - semantic retrieval is fail-soft
+            if not explicit_ids:
+                raise
+            log.warning(
+                "world.grounding: semantic KG retrieval unavailable after "
+                "explicit paper pins were verified (%s: %s); preserving the "
+                "explicit grounding receipt",
+                type(exc).__name__,
+                exc,
+            )
     finally:
         if owns_store:
             store.close()

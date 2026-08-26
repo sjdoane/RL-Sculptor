@@ -66,7 +66,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.models.kg import JobDetail, JobSummary
+from backend.models.kg import JobDetail
 from backend.models.mission import (
     BackfillFitnessResponse,
     CreateMissionRequest,
@@ -87,6 +87,7 @@ from backend.models.project import ProblemDetail
 from backend.services import mission_store
 from backend.services.job_manager import JobManager
 from backend.services.mission_jobs import (
+    admit_mission_references_for_target,
     run_mission_decompose_job,
     run_mission_execute_job,
 )
@@ -360,6 +361,7 @@ def get_mission(
     responses={
         404: {"model": ProblemDetail},
         409: {"model": ProblemDetail},
+        412: {"model": ProblemDetail},
     },
 )
 def run_mission(
@@ -477,6 +479,31 @@ def run_mission(
                         missing_stages=missing,
                     )
 
+    # Re-read and re-verify immediately before enqueue.  Mission JSON carries
+    # an immutable Tier-D receipt, but the clip/certificate/rollout bytes can
+    # still drift after attachment; a launch may never inherit that stale
+    # approval.  The subprocess runner repeats this check before spawn.
+    from sculptor.mission import load_mission
+    from sculptor.refs.track import TierDAdmissionError
+
+    try:
+        mission_for_admission = load_mission(
+            mission_store.mission_json_path(project_dir, mission_slug)
+        )
+        _target_robot, _admitted, reference_target_receipt = (
+            admit_mission_references_for_target(
+                project_dir,
+                mission_for_admission,
+            )
+        )
+    except TierDAdmissionError as exc:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mission reference admission failed",
+            detail=str(exc),
+            type_="/problems/reference-feasibility",
+        )
+
     job = jobs.submit(
         kind="mission_execute",
         project_slug=slug,
@@ -488,8 +515,17 @@ def run_mission(
             # §Ship 21: pass JobManager so the streamer can register
             # per-stage child Jobs (mission_stage_run kind) on the fly.
             job_manager=jobs,
+            reference_target_receipt=reference_target_receipt,
         ),
-        params={"mission_slug": mission_slug, **run_kwargs},
+        params={
+            "mission_slug": mission_slug,
+            **run_kwargs,
+            **(
+                {"reference_target_receipt": reference_target_receipt}
+                if reference_target_receipt is not None
+                else {}
+            ),
+        },
     )
     return job.to_detail()
 

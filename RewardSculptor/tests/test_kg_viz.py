@@ -12,12 +12,21 @@ from pathlib import Path
 import pytest
 
 from sculptor.kg.schema import (
+    ArtifactAttestation,
     Edge,
     Environment,
     FailureMode,
+    ModeExecutionArtifact,
     Paper,
+    PolicyArtifact,
+    ReferenceMotion,
     Relation,
+    RobotEmbodiment,
+    SoftwareEnvironment,
     Technique,
+    TrainingIteration,
+    TrainingRun,
+    WorldArtifact,
     make_environment_id,
     make_failure_mode_id,
     make_paper_id,
@@ -137,3 +146,125 @@ def test_build_kg_html_tolerates_dangling_edge(tmp_path: Path):
     assert out.is_file() and out.stat().st_size > 1000
     assert res.n_nodes == 2
     assert res.n_edges == 1                          # the dangling edge was skipped
+
+
+def test_artifact_lineage_has_distinct_legend_details_and_edge_receipt(
+    tmp_path: Path,
+):
+    store = SculptorKG(tmp_path / "kg.db")
+    policy = PolicyArtifact(
+        id="policy:" + "a" * 64,
+        sha256="a" * 64,
+        artifact_format="safetensors",
+        size_bytes=1234,
+        tensor_inventory_digest="b" * 64,
+    )
+    motion = ReferenceMotion(
+        id="reference:g1:cartwheel:" + "c" * 64,
+        sha256="c" * 64,
+        fps=50.0,
+        frame_count=180,
+        joint_names=["left_hip_pitch", "right_hip_pitch"],
+    )
+    world = WorldArtifact(
+        id="world:" + "d" * 64,
+        sha256="d" * 64,
+        artifact_format="selection_manifest",
+    )
+    mode = ModeExecutionArtifact(
+        id="mode-execution:" + "e" * 64,
+        bundle_digest="e" * 64,
+        reward_sha256="f" * 64,
+        robot="g1",
+        clip_id="cartwheel-v3",
+        clip_sha256="c" * 64,
+        graph_sha256="1" * 64,
+        execution_manifest_digest="2" * 64,
+        selection_digest="3" * 64,
+        context_refs_digest="4" * 64,
+        context_refs={"world": "d" * 64},
+    )
+    attestation = ArtifactAttestation(
+        id="attestation:" + "5" * 64,
+        manifest_digest="5" * 64,
+        trust_status="validated",
+        source_format="portable_bundle_v1",
+        declared={"robot": "g1", "initialization_modes": ["actor_only"]},
+    )
+    robot = RobotEmbodiment(
+        id="robot:g1:" + "6" * 64,
+        slug="g1",
+        contract_digest="6" * 64,
+        joint_names=["left_hip_pitch", "right_hip_pitch"],
+        observation_contract={"policy": {"shape": [128]}},
+        action_contract={"shape": [29]},
+        control_dt_s=0.02,
+    )
+    software = SoftwareEnvironment(
+        id="software:" + "7" * 64,
+        lock_digest="7" * 64,
+        versions={"python": "3.11"},
+        code_commit="abc123def456",
+        code_dirty=False,
+        runtime={"adapter": "mjlab"},
+    )
+    run = TrainingRun(
+        id="training-run:g1-evolution:job-1",
+        project="g1-evolution",
+        run_id="job-1",
+        requested_initialization_mode="actor_critic",
+        observed_initialization_mode="actor_critic",
+        selection_digest="3" * 64,
+    )
+    iteration = TrainingIteration(
+        id="training-iteration:g1-evolution:job-1:0",
+        project="g1-evolution",
+        run_id="job-1",
+        iteration_index=0,
+    )
+    for node in (
+        policy, motion, world, mode, attestation, robot, software, run,
+        iteration,
+    ):
+        store.add_node(node)
+    store.add_edge(Edge(
+        src=run.id,
+        dst=policy.id,
+        relation=Relation.INITIALIZED_FROM,
+        data={
+            "authority": "worker_event",
+            "requested": {"roles": ["actor", "critic"]},
+            "observed": {
+                "roles": ["actor", "critic"],
+                "checkpoint_sha256": "a" * 64,
+            },
+        },
+    ))
+    store.add_edge(Edge(
+        src=run.id, dst=iteration.id, relation=Relation.HAS_ITERATION,
+        data={"iteration_index": 0},
+    ))
+
+    out = tmp_path / "lineage.html"
+    result = build_kg_html(store, out)
+    body = out.read_text(encoding="utf-8")
+
+    assert result.n_nodes == 9
+    for label in (
+        "Policy artifact", "Reference motion", "World artifact",
+        "Mode execution", "Artifact attestation", "Robot embodiment",
+        "Software environment", "Training run", "Training iteration",
+    ):
+        assert label in body
+    for detail in (
+        "tensor inventory digest", "ordered joints", "execution manifest",
+        "declared metadata", "contract digest", "requested initialization",
+    ):
+        assert detail in body
+    assert "structured receipt" in body
+    assert "authority" in body
+    assert "worker_event" in body
+    assert "requested" in body
+    assert "observed" in body
+    assert "checkpoint_sha256" in body
+    assert "a" * 64 in body

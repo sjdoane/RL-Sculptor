@@ -71,6 +71,79 @@ from sculptor.llm import log_llm_call, model_for
 
 MODEL_ID = model_for("edit")
 MAX_TOKENS = 16000
+
+#: Bytes-per-token for a generated reward module, MEASURED rather than
+#: assumed. A first pass used 3.5 (the usual figure for prose-like Python) and
+#: under-counted the live per-mode reward by 30%, so the raised ceiling was
+#: still only 1.12x the module and the response was truncated twice more.
+#: Counted with `messages.count_tokens` on the real file:
+#:
+#:   v1.py whole module     49,310 B -> 20,173 tok   2.44 B/tok
+#:   TARGET_JOINT_POS        8,326 B ->  5,540 tok   1.50 B/tok
+#:   TARGET_GRAVITY          1,194 B ->    675 tok   1.77 B/tok
+#:
+#: Dense float literals tokenize about half as well as code, so a module's
+#: ratio depends on how much inlined data it carries. 2.2 sits under the mixed
+#: case and near the data-heavy one; erring low errs toward a LARGER ceiling,
+#: which is the safe direction.
+_BYTES_PER_TOKEN = 2.2
+
+#: What a HUMAN may type into the Rewards-tab prompt box. Small on purpose:
+#: the bound is there to catch someone pasting a whole file into a steering
+#: prompt, not to constrain what the system composes for itself.
+USER_PROMPT_MAX_CHARS = 2000
+
+#: What a system-composed prompt may reach. `sculptor.mode_rewards` builds a
+#: per-mode authoring prompt out of the mode's window, its neighbours, the
+#: batched-half contract and — on a project with an authored world — the course
+#: geometry and the goal channels a term may read. That last part is what stops
+#: a mode being authored blind to the mission, and it does not fit in 2000
+#: chars. Still bounded: an unbounded prompt is a way to smuggle a whole module
+#: past the module-rewrite path.
+SYSTEM_PROMPT_MAX_CHARS = 8000
+
+#: Hard ceiling, so a pathological module cannot request an absurd budget.
+#: `claude-opus-5` accepts at least 96000 output tokens (probed); 64000 leaves
+#: margin without being a real constraint on any reward we generate.
+MAX_REWRITE_TOKENS = 64000
+
+#: A whole-module rewrite must be able to emit the WHOLE module plus its
+#: changes. `MAX_TOKENS` is a fine ceiling for a 500-line reward and a hard
+#: wall for a generated one: a per-mode reward over a 3-mode automaton is
+#: ~1000 lines / ~12.4k tokens, of which ~2.5k is inlined reference tables
+#: (TARGET_JOINT_POS alone is 8.3 KB) the editor has to restate verbatim. The
+#: first sculpt run over one died with `response was cut off at the 16000-token
+#: ceiling`, so the loop could train the reward but never evolve it.
+#:
+#: 2.0, not 1.6: the budget has to cover the whole module AND the adaptive
+#: thinking that precedes it, which is charged against the same ceiling. A
+#: 1.12x-of-module budget was measured truncating on both attempts.
+_REWRITE_HEADROOM = 2.0
+
+
+#: Per-request HTTP ceiling at `MAX_TOKENS`, and the seconds-per-token it
+#: implies. 240s for 16000 tokens is the calibrated pair (see the client
+#: construction in `apply_edits`); anything above that ceiling gets
+#: proportionally longer, floored at the original 240s so every existing call
+#: site keeps its tuned budget exactly.
+BASE_HTTP_TIMEOUT_S = 240.0
+
+
+def _rewrite_http_timeout_s(max_tokens: int | None) -> float:
+    """HTTP timeout that matches the output ceiling it has to carry."""
+    limit = int(max_tokens or MAX_TOKENS)
+    return max(BASE_HTTP_TIMEOUT_S, BASE_HTTP_TIMEOUT_S * limit / MAX_TOKENS)
+
+
+def _rewrite_token_ceiling(source: str) -> int:
+    """Output ceiling for rewriting `source` in full.
+
+    Scales with the module so large generated rewards stay editable, and never
+    returns less than `MAX_TOKENS` — small rewards keep their existing budget
+    byte-for-byte.
+    """
+    needed = int(len(source) / _BYTES_PER_TOKEN * _REWRITE_HEADROOM)
+    return min(MAX_REWRITE_TOKENS, max(MAX_TOKENS, needed))
 RETRY_REMINDER_PREFIX = (
     "Your previous response failed validation. Fix the following and return "
     "ONLY the complete new reward.py source as plain Python — no markdown "
@@ -115,6 +188,25 @@ class EditValidationError(Exception):
 # grounding ↔ references cross-check.
 _ARXIV_IN_TEXT_RE = re.compile(
     r"(?:arxiv:)?(\d{4}\.\d{4,5})", flags=re.IGNORECASE
+)
+
+# Explicit prompt pins are user-authored provenance constraints, not retrieval
+# hints.  Keep their first-mentioned order so a prompt that asks for an exact
+# receipt can make that order part of the validated artifact.
+_EXPLICIT_PAPER_PIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])paper:"
+    r"([A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?)"
+)
+_NO_ADDITIONAL_REFS_RE = re.compile(
+    r"\bno\s+(?:additional|other|extra)\s+"
+    r"(?:papers?|paper\s+ids?|references?|citations?)\b",
+    flags=re.IGNORECASE,
+)
+_EXACT_REFS_RE = re.compile(
+    r"\b(?:use|include|cite|list)\s+(?:exactly|only)\s+"
+    r"(?:these|the\s+following)\s+"
+    r"(?:papers?|paper\s+ids?|references?|citations?)\b",
+    flags=re.IGNORECASE,
 )
 
 
@@ -231,8 +323,14 @@ def _dummy_from_space(space) -> Any:
 
 def _build_dummy_inputs(
     contract, *, info_leading_batch: bool = True,
+    clock: "tuple[float, float] | None" = None,
 ) -> tuple[Any, Any, Any, dict]:
     """Synthesize dummy inputs matching the reward's expected shape.
+
+    `clock` is `(episode_length, step_dt)`, filled into the info dict when
+    the contract advertises those keys. Everything else is zeros, and a
+    zero clock puts a mode automaton at t=0 — i.e. always in its entry
+    mode. Callers that need to see another mode say so here.
 
     Two contract flavors:
       * gym-style — `observation_space_spec` is a `gym.spaces.Box` (or
@@ -287,20 +385,29 @@ def _build_dummy_inputs(
                 # but still expected scalar fields as one-element tensors.
                 shape = feature_shape or (1,)
             info[key] = torch.zeros(shape, dtype=torch.float32)
+        if clock is not None:
+            for key, value in zip(("episode_length", "step_dt"), clock):
+                if key in info:
+                    info[key] = torch.full_like(info[key], float(value))
         return state, action, next_state, info
     # Gym-style path unchanged (gym_sb3 uses numpy throughout).
     state = _dummy_from_space(contract.observation_space_spec)
     next_state = _dummy_from_space(contract.observation_space_spec)
     action = _dummy_from_space(contract.action_space_spec)
     info: dict[str, float] = {k: 0.0 for k in (contract.expected_info_keys or [])}
+    if clock is not None:
+        for key, value in zip(("episode_length", "step_dt"), clock):
+            if key in info:
+                info[key] = float(value)
     return state, action, next_state, info
 
 
 def _call_compute_reward(
     mod, contract, *, info_leading_batch: bool = True,
+    clock: "tuple[float, float] | None" = None,
 ) -> tuple[float, dict]:
     s, a, ns, info = _build_dummy_inputs(
-        contract, info_leading_batch=info_leading_batch)
+        contract, info_leading_batch=info_leading_batch, clock=clock)
     try:
         out = mod.compute_reward(s, a, ns, info)
     except Exception as e:  # noqa: BLE001 — module bug → retryable
@@ -749,6 +856,60 @@ def _call_compute_reward_batched(mod, contract) -> None:
             "inputs — bound the offending term (unguarded div/log/exp).")
 
 
+def _mode_probe_step_dt(current_module) -> float:
+    """The control period the probe should tell a mode reward it is running at.
+
+    Handed to the module rather than inferred from it, so both halves of the
+    usual `float(info["step_dt"]) or DEFAULT_STEP_DT` idiom agree on the clock.
+    Prefers the module's own declared default so the two never diverge.
+    """
+    dt = getattr(current_module, "DEFAULT_STEP_DT", None)
+    try:
+        dt = float(dt)
+    except (TypeError, ValueError):
+        dt = 0.0
+    return dt if dt > 0.0 else 0.02
+
+
+def _reward_mode_windows(current_module) -> dict[str, tuple[float, float]]:
+    """`{mode: (start_s, end_s)}` for a mode-automaton reward, else `{}`.
+
+    `REWARD_SPEC['mode_windows_s']` is the declared contract and wins; the
+    module-level `MODE_WINDOWS_S` is the fallback for a reward that only
+    carries the automaton in code.
+    """
+    spec = getattr(current_module, "REWARD_SPEC", {}) or {}
+    windows = spec.get("mode_windows_s") if isinstance(spec, dict) else None
+    if not windows:
+        windows = getattr(current_module, "MODE_WINDOWS_S", None)
+    if not isinstance(windows, dict):
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for name, span in windows.items():
+        try:
+            lo, hi = float(span[0]), float(span[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if hi > lo:
+            out[str(name)] = (lo, hi)
+    return out
+
+
+def _mode_probe_clocks(current_module) -> list[tuple[float, float]]:
+    """One `(episode_length, step_dt)` per mode window — each window's midpoint.
+
+    A mode automaton routes on elapsed episode time, so the zero-filled probe
+    in `_build_dummy_inputs` always lands in the entry mode. Without these,
+    every other mode's components stay invisible to the grounding check and
+    the diagnoser's edits to them are rejected as unknown terms.
+    """
+    windows = _reward_mode_windows(current_module)
+    if not windows:
+        return []
+    dt = _mode_probe_step_dt(current_module)
+    return [(((lo + hi) / 2.0) / dt, dt) for lo, hi in windows.values()]
+
+
 def _current_reward_component_keys(current_module, contract) -> set[str]:
     try:
         _, components = _call_compute_reward(current_module, contract)
@@ -767,7 +928,23 @@ def _current_reward_component_keys(current_module, contract) -> set[str]:
                 current_module, contract, info_leading_batch=False)
         except EditValidationError:
             raise exact_shape_error
-    return set(components.keys())
+    keys = set(components.keys())
+    # Walk the rest of the automaton. Best-effort: the probe above is the
+    # one that decides whether this module conforms to the contract, so a
+    # mode that trips on synthetic inputs costs its own term names and
+    # nothing else.
+    for clock in _mode_probe_clocks(current_module):
+        try:
+            _, extra = _call_compute_reward(current_module, contract,
+                                            clock=clock)
+        except EditValidationError:
+            continue
+        keys |= set(extra.keys())
+    # A `<mode>.<term>` component also grounds the bare `<term>`: that is
+    # how the diagnoser names a change meant for every mode at once ("applies
+    # to all four mode variants of goal_progress").
+    keys |= {k.split(".", 1)[1] for k in keys if "." in k}
+    return keys
 
 
 def _current_reward_hparam_keys(current_module) -> set[str]:
@@ -805,8 +982,11 @@ def _current_reward_references(current_module) -> list[dict]:
 
 _REFERENCE_KERNEL_FUNCTIONS = (
     "_scalar",
+    "reference_clock_scalar",
     "_phase_index_scalar",
     "_reference_tracking_numpy",
+    "reference_clock_batched",
+    "reference_target_index_batched",
     "_phase_index_batched",
     "_reference_tracking_batched",
     "compute_reward",
@@ -819,6 +999,121 @@ _REFERENCE_KERNEL_GLOBALS = {
 }
 
 
+#: Sentinel standing in for an elided immutable table. Parses as a plain
+#: Name load, so the redacted module is still valid Python for the model to
+#: read — it is never imported or executed in this form.
+_ELIDED_TABLE_SENTINEL = "_REFERENCE_TABLE_UNCHANGED"
+
+#: Only elide tables big enough to matter. Below this the sentinel costs more
+#: attention than the literal it replaces.
+_ELIDE_MIN_BYTES = 512
+
+#: `REFERENCE_*` is the flat tracking base's naming; a per-mode reward calls
+#: the same immutable arrays `TARGET_*` (see `mode_rewards._scaffold`). Both
+#: are dense float tables the editor may not change, so both get elided.
+_ELIDE_PREFIXES = ("REFERENCE_", "TARGET_")
+
+
+def _reference_table_blocks(
+    source: str, *, min_bytes: int = _ELIDE_MIN_BYTES,
+    prefixes: "tuple[str, ...]" = _ELIDE_PREFIXES,
+) -> "dict[str, tuple[int, int, str]]":
+    """Locate the large immutable table assignments in `source`.
+
+    Returns name -> (start_line, end_line, exact_text), 1-indexed inclusive.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    lines = source.splitlines(keepends=True)
+    found: dict[str, tuple[int, int, str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        end = getattr(node, "end_lineno", None)
+        if end is None:
+            continue
+        for name in names:
+            if not name.startswith(prefixes):
+                continue
+            text = "".join(lines[node.lineno - 1:end])
+            if len(text) >= min_bytes:
+                found[name] = (node.lineno, end, text)
+    return found
+
+
+def _elide_reference_tables(
+    source: str,
+) -> "tuple[str, dict[str, tuple[int, int, str]]]":
+    """Swap large immutable `REFERENCE_*` tables for a one-line sentinel.
+
+    The editor is contractually forbidden from changing these — both
+    `_reference_kernel_hash` and `REFERENCE_TARGET_SHA256` cover them — so
+    making a model retype ~10 KB of dense floats buys nothing and spends the
+    whole output budget doing it. A 6.92 s composed clip produced a 19752-byte
+    tracking base, 51 % of it float tables; the resulting 17956-token ceiling
+    truncated attempt 1, and the truncation reminder ("do not restate
+    unchanged code") then talked attempt 2 into dropping the kernel, so the
+    run died before iteration 1 with `immutable reference tracking kernel
+    changed`. Eliding removes both failure modes at once: the model cannot
+    corrupt what it never sees, and the module it must emit halves.
+    """
+    blocks = _reference_table_blocks(source)
+    if not blocks:
+        return source, {}
+    lines = source.splitlines(keepends=True)
+    # Replace bottom-up so earlier line numbers stay valid.
+    for name, (start, end, _text) in sorted(
+            blocks.items(), key=lambda kv: kv[1][0], reverse=True):
+        lines[start - 1:end] = [
+            f"{name} = {_ELIDED_TABLE_SENTINEL}  "
+            f"# elided verbatim — restored after the edit, do not reproduce\n"
+        ]
+    return "".join(lines), blocks
+
+
+def _restore_reference_tables(
+    source: str, blocks: "dict[str, tuple[int, int, str]]",
+) -> str:
+    """Splice the elided tables back into a model-emitted module.
+
+    Restores in place, so the parent's declaration order (tables before the
+    kernels that close over them) survives. A name the model dropped entirely
+    is left absent on purpose: `_reference_kernel_hash` already refuses that
+    module with a precise message, and silently re-appending would paper over
+    a real structural edit.
+    """
+    if not blocks:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    lines = source.splitlines(keepends=True)
+    targets: list[tuple[int, int, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        end = getattr(node, "end_lineno", None)
+        if end is None:
+            continue
+        for name in names:
+            if name in blocks:
+                targets.append((node.lineno, end, blocks[name][2]))
+    for start, end, text in sorted(targets, key=lambda t: t[0], reverse=True):
+        lines[start - 1:end] = [text if text.endswith("\n") else text + "\n"]
+    return "".join(lines)
+
+
 def _reference_tracking_contract(mod) -> "dict[str, Any] | None":
     spec = getattr(mod, "REWARD_SPEC", {}) or {}
     composition = spec.get("composition") if isinstance(spec, dict) else None
@@ -826,6 +1121,90 @@ def _reference_tracking_contract(mod) -> "dict[str, Any] | None":
             or composition.get("type") != "reference_tracking_residual"):
         return None
     return dict(composition)
+
+
+def _mode_reward_contract(mod) -> "dict[str, Any] | None":
+    """Capture the mode automaton a per-mode reward was scaffolded from.
+
+    Returns None for an ordinary flat reward, so nothing about the old
+    single-function path changes.
+
+    A promoted per-mode reward reaches `apply_edits` as plain source with
+    every reference-tracking guard switched off: its spec has no
+    `composition` key, its arrays are `TARGET_*` not `REFERENCE_*`, and its
+    kernels are named `_phase_index`/`_tracking`, none of which appear in
+    `_REFERENCE_KERNEL_FUNCTIONS`. So the diagnose-and-edit loop was free to
+    drop a mode, shift a window, or collapse the dispatch to one flat
+    function and still pass every gate — the mode whose terms stopped being
+    paid would simply never be paid again, silently. `mode_rewards.
+    validate_mode_reward_source` already catches exactly this; it was just
+    never wired into the editor.
+    """
+    order = getattr(mod, "MODE_ORDER", None)
+    windows = getattr(mod, "MODE_WINDOWS_S", None)
+    if not isinstance(order, list) or not order or not isinstance(windows, dict):
+        return None
+    parsed: dict[str, list[float]] = {}
+    for name, span in windows.items():
+        try:
+            lo, hi = span
+            parsed[str(name)] = [float(lo), float(hi)]
+        except (TypeError, ValueError):
+            return None
+    if not parsed:
+        return None
+    return {"order": [str(n) for n in order], "windows": parsed}
+
+
+def _validate_mode_reward_contract(*, mod, source: str,
+                                   parent: "dict[str, Any]") -> None:
+    """The mode automaton is structure, not tuning — an edit may not move it.
+
+    Deliberately narrow: it fixes the set of modes, their order and their
+    time windows, and requires the dispatch to still be there. Everything
+    inside a `_mode_*` body stays fully editable, which is the whole point
+    of running diagnose-and-edit on a per-mode reward.
+    """
+    child = _mode_reward_contract(mod)
+    if child is None:
+        raise EditValidationError(
+            "parent reward is per-mode (it defines MODE_ORDER and "
+            "MODE_WINDOWS_S) but the rewrite dropped them — the mode "
+            "dispatch is structure, not tuning. Emit the same modes, in the "
+            "same order, with the same windows, and edit only the "
+            "`_mode_*` bodies.")
+
+    if child["order"] != parent["order"]:
+        raise EditValidationError(
+            f"MODE_ORDER changed: expected {parent['order']} but got "
+            f"{child['order']}. Adding, removing or reordering a mode "
+            f"changes which slice of the motion each reward is paid for.")
+
+    for name, span in parent["windows"].items():
+        got = child["windows"].get(name)
+        if got is None:
+            raise EditValidationError(
+                f"MODE_WINDOWS_S lost mode {name!r}; its share of every "
+                f"episode would pay zero reward")
+        if abs(got[0] - span[0]) > 1e-9 or abs(got[1] - span[1]) > 1e-9:
+            raise EditValidationError(
+                f"MODE_WINDOWS_S[{name!r}] moved from {span} to {got}. The "
+                f"windows come from the composition seams; shifting them "
+                f"desynchronizes the reward from the reference clip.")
+
+    for fn in ("compute_reward", "compute_reward_batched"):
+        if not callable(getattr(mod, fn, None)):
+            raise EditValidationError(f"per-mode reward lost {fn}")
+    for table in ("_MODE_FNS", "_MODE_FNS_BATCHED"):
+        fns = getattr(mod, table, None)
+        if not isinstance(fns, dict):
+            raise EditValidationError(
+                f"per-mode reward lost its {table} dispatch table")
+        missing = [n for n in parent["order"] if n not in fns]
+        if missing:
+            raise EditValidationError(
+                f"{table} has no entry for mode(s) {missing} — those modes "
+                f"would raise at runtime or pay nothing")
 
 
 def _reference_kernel_hash(source: str) -> "str | None":
@@ -865,6 +1244,16 @@ def _reference_kernel_hash(source: str) -> "str | None":
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def reference_tracking_backbone_sha256(source: str) -> "str | None":
+    """Public, data-only digest of a flat reference-tracking authority.
+
+    Editing and launch admission intentionally share this exact derivation;
+    otherwise a reward could pass the parent/child editor check and later run
+    under a different interpretation of which globals/functions are frozen.
+    """
+    return _reference_kernel_hash(source)
+
+
 def _validate_reference_tracking_contract(
     *, mod, source: str, components: dict, parent: dict[str, Any],
     parent_kernel_hash: str,
@@ -878,6 +1267,8 @@ def _validate_reference_tracking_contract(
     for key in (
         "reference_clip_id", "reference_target_sha256", "phase_mode",
         "phase_duration_s", "root_height_frame",
+        "reference_target_identity_schema", "reference_target_sampling",
+        "terminal_hold",
     ):
         if child.get(key) != parent.get(key):
             raise EditValidationError(
@@ -922,24 +1313,28 @@ def _validate_reference_tracking_contract(
             "REFERENCE_TARGET_SHA256 changed or disappeared; preserve the "
             "attached motion targets exactly")
     try:
-        targets = {
-            "joint_pos": np.round(np.asarray(
-                mod.REFERENCE_JOINT_POS, dtype=np.float64), 5).tolist(),
-            "joint_vel": np.round(np.asarray(
-                mod.REFERENCE_JOINT_VEL, dtype=np.float64), 5).tolist(),
-            "root_z": np.round(np.asarray(
-                mod.REFERENCE_ROOT_Z, dtype=np.float64), 5).tolist(),
-            "gravity": (
-                np.round(np.asarray(
-                    mod.REFERENCE_GRAVITY, dtype=np.float64), 5).tolist()
-                if mod.REFERENCE_GRAVITY is not None else None),
-        }
+        from sculptor.reference_clock import reference_target_sha256
+        from sculptor.refs.track import reference_tracking_target_payload
+
+        targets = reference_tracking_target_payload(
+            joint_names=[str(name) for name in mod.REFERENCE_JOINT_NAMES],
+            target_joint_pos=np.asarray(
+                mod.REFERENCE_JOINT_POS, dtype=np.float64),
+            target_joint_vel=np.asarray(
+                mod.REFERENCE_JOINT_VEL, dtype=np.float64),
+            target_root_z=np.asarray(
+                mod.REFERENCE_ROOT_Z, dtype=np.float64),
+            target_gravity=(
+                np.asarray(mod.REFERENCE_GRAVITY, dtype=np.float64)
+                if mod.REFERENCE_GRAVITY is not None else None
+            ),
+            root_frame=str(mod.REFERENCE_ROOT_FRAME),
+            phase_mode=str(mod.REFERENCE_PHASE_MODE),
+        )
     except (AttributeError, TypeError, ValueError) as e:
         raise EditValidationError(
             f"reference target arrays changed or disappeared: {e}") from e
-    actual_hash = hashlib.sha256(json.dumps(
-        targets, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
+    actual_hash = reference_target_sha256(targets)
     if actual_hash != target_hash:
         raise EditValidationError(
             "reference target arrays no longer match REFERENCE_TARGET_SHA256")
@@ -951,6 +1346,55 @@ def _validate_reference_tracking_contract(
 
 
 # ── KG validation helpers ─────────────────────────────────────────────────
+def _explicit_paper_refs(prompt: str) -> tuple[str, ...]:
+    """Bare paper IDs explicitly pinned as ``paper:<id>`` in prompt order."""
+    refs: list[str] = []
+    for match in _EXPLICIT_PAPER_PIN_RE.finditer(str(prompt or "")):
+        arxiv_id = match.group(1)
+        if arxiv_id not in refs:
+            refs.append(arxiv_id)
+    return tuple(refs)
+
+
+def _prompt_requires_exact_paper_refs(prompt: str) -> bool:
+    """Whether the prompt explicitly forbids references beyond its pins."""
+    text = str(prompt or "")
+    return bool(
+        _NO_ADDITIONAL_REFS_RE.search(text)
+        or _EXACT_REFS_RE.search(text)
+    )
+
+
+def _attest_explicit_paper_refs(
+    arxiv_ids: Iterable[str], kg_store: SculptorKG,
+) -> dict[str, str]:
+    """Resolve explicit pins to exact Paper metadata, or fail closed."""
+    from sculptor.kg.schema import Paper
+
+    citations: dict[str, str] = {}
+    for arxiv_id in arxiv_ids:
+        node_id = make_paper_id(arxiv_id)
+        try:
+            node = kg_store.get_node(node_id)
+        except Exception as exc:  # noqa: BLE001 — explicit authority is hard
+            raise EditValidationError(
+                f"explicit paper pin {node_id!r} could not be verified "
+                f"against the KG: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(node, Paper):
+            raise EditValidationError(
+                f"explicit paper pin {node_id!r} does not resolve to a "
+                "Paper node in the KG"
+            )
+        if node.id != node_id or str(node.arxiv_id).strip() != arxiv_id:
+            raise EditValidationError(
+                f"explicit paper pin {node_id!r} disagrees with KG metadata "
+                f"(node.id={node.id!r}, arxiv_id={node.arxiv_id!r})"
+            )
+        citations[arxiv_id] = cite(arxiv_id, store=kg_store)
+    return citations
+
+
 def _missing_paper_ids(arxiv_ids: Iterable[str], kg_store: SculptorKG) -> list[str]:
     missing: list[str] = []
     for aid in arxiv_ids:
@@ -1115,11 +1559,16 @@ def _build_user_prompt(
     citation_map: dict[str, str],
     applicable_edits: list[ProposedEdit],
     deferred_edits: list[ProposedEdit],
+    elided_table_names: "Iterable[str] | None" = None,
+    parent_modes: "dict[str, Any] | None" = None,
     training_feedback: dict | None = None,
     metric_observables: "frozenset[str] | None" = None,
     screen: Any = None,
     case_context: str = "",
     reference_signature: dict | None = None,
+    explicit_paper_refs: tuple[str, ...] = (),
+    explicit_paper_citations: dict[str, str] | None = None,
+    exact_paper_refs: bool = False,
 ) -> str:
     edits_json = [
         {
@@ -1225,6 +1674,53 @@ def _build_user_prompt(
             screen if screen is not None else partition_gate.ScreenResult(),
         )
 
+    # The immutable reference tables are shown as one-line sentinels so the
+    # whole output budget goes to the residual instead of retyping dense
+    # floats. Say so explicitly — a model that "helpfully" reconstructs them
+    # would be overwritten anyway, but it would waste the ceiling doing it.
+    elided_block = ""
+    if elided_table_names:
+        names = ", ".join(sorted(elided_table_names))
+        elided_block = (
+            "# ELIDED_IMMUTABLE_TABLES\n"
+            f"These assignments are shown as `NAME = {_ELIDED_TABLE_SENTINEL}` "
+            "instead of their real values: "
+            f"{names}.\n"
+            "Reproduce each line EXACTLY as shown, sentinel and all. Their real "
+            "contents are spliced back in verbatim after you answer, and they "
+            "are hash-checked — you cannot change them, and any attempt to "
+            "write them out costs output budget you need for the residual.\n\n"
+        )
+
+    # A per-mode reward is an automaton, not one function. Nothing in this
+    # prompt used to say so, and `expected_components` is None on every
+    # adapter, so a rewrite that collapsed the dispatch passed every gate.
+    modes_block = ""
+    if parent_modes:
+        rows = "\n".join(
+            f"  - {name}: {parent_modes['windows'][name][0]:.2f}"
+            f"–{parent_modes['windows'][name][1]:.2f} s"
+            for name in parent_modes["order"]
+            if name in parent_modes["windows"])
+        modes_block = (
+            "# PER_MODE_STRUCTURE (FROZEN)\n"
+            "This reward is split into OGMP-inspired phase windows derived "
+            "from the seams of a fixed composed reference motion. This is a "
+            "time-windowed reward scaffold, not the paper's closed-loop "
+            "oracle or mode-conditioned policy:\n"
+            f"{rows}\n"
+            "`MODE_ORDER`, `MODE_WINDOWS_S`, `_mode_masks`, `_MODE_FNS`, "
+            "`_MODE_FNS_BATCHED` and both `compute_reward*` dispatchers are "
+            "STRUCTURE: emit them back unchanged. Adding, removing, renaming "
+            "or reordering a mode, or moving a window, is rejected — it would "
+            "desynchronize the reward from the reference clip and silently "
+            "stop paying some slice of every episode.\n"
+            "Make your changes INSIDE the `_mode_*` bodies. That is where all "
+            "the tuning lives, and each body is paid only during its own "
+            "window, so a fix aimed at one phase belongs in that phase's "
+            "function and nowhere else.\n\n"
+        )
+
     # §2026-07-03 case-memory upgrade: the REWRITER is where "don't repeat
     # the same reward mistake" actually lands — the diagnoser proposes,
     # but the rewriter picks formulas + magnitudes. Same block the
@@ -1243,6 +1739,29 @@ def _build_user_prompt(
         rendered = render_reference_signature_block(reference_signature)
         if rendered:
             reference_block = f"{rendered}\n\n"
+
+    explicit_papers_block = ""
+    if explicit_paper_refs:
+        exact_rule = (
+            "REWARD_SPEC.references must contain EXACTLY these arxiv_id "
+            "values in this order, with no additional entries."
+            if exact_paper_refs else
+            "Other KG-attested references are allowed, but each pinned "
+            "arxiv_id must appear exactly once."
+        )
+        explicit_papers_block = (
+            "# EXPLICIT_PAPER_PINS (HARD VALIDATION)\n"
+            "These are user-authored provenance constraints, not semantic "
+            "retrieval suggestions.\n"
+            f"ordered_arxiv_ids: {json.dumps(list(explicit_paper_refs))}\n"
+            "locally_attested_citations: "
+            f"{json.dumps(explicit_paper_citations or {}, sort_keys=True)}\n"
+            f"{exact_rule}\n"
+            "Use each locally attested citation verbatim. Also mention every "
+            "pinned ID as `arXiv:<id>` in at least one string value of "
+            "REWARD_SPEC.grounding. Missing, substituted, reordered (when "
+            "exact), or ungrounded pins fail validation and trigger repair.\n\n"
+        )
 
     return (
         f"# NEW_VERSION\n{new_version}\n\n"
@@ -1274,6 +1793,9 @@ def _build_user_prompt(
         f"{json.dumps(citation_map, indent=2, sort_keys=True)}\n\n"
         f"# PREVIOUS_REFERENCES (preserve entries whose term still exists)\n"
         f"{json.dumps(current_references, indent=2, sort_keys=True, default=str)}\n\n"
+        f"{explicit_papers_block}"
+        f"{modes_block}"
+        f"{elided_block}"
         f"# CURRENT_REWARD_SOURCE\n```python\n{current_source}\n```\n\n"
         f"Emit the new reward module source now."
     )
@@ -1300,16 +1822,20 @@ def _call_llm(
     *,
     on_event=None,
     attempt: int = 1,
+    max_tokens: int | None = None,
 ) -> str:
+    """One rewrite call. `max_tokens` overrides `MAX_TOKENS` for callers whose
+    module is long enough that the default truncates — see `apply_edits`."""
     if on_event is not None:
         on_event({
             "type": "log_line",
             "text": f"[edit] LLM request start (attempt {attempt}, "
                     f"user_prompt_chars={len(user_content)})",
         })
+    limit = int(max_tokens or MAX_TOKENS)
     resp = client.messages.create(
         model=MODEL_ID,
-        max_tokens=MAX_TOKENS,
+        max_tokens=limit,
         thinking={"type": "adaptive"},
         cache_control={"type": "ephemeral"},
         system=system_prompt,
@@ -1326,6 +1852,23 @@ def _call_llm(
         meta={"attempt": attempt})
     if not chunks:
         raise EditValidationError("LLM returned no text blocks")
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        # Say so, rather than letting the half-written module surface as a
+        # baffling `SyntaxError: '(' was never closed`. Raised inside the
+        # repair-retry loop's `try`, so the reminder reaches the next attempt.
+        # NB: this reminder must never suggest OMITTING code. It used to end
+        # "do not restate unchanged code you could have left alone", which on a
+        # reference-tracking module is a direct instruction to violate the
+        # immutable-kernel contract — attempt 2 obeyed it and died with
+        # "immutable reference tracking kernel changed". Budget is recovered by
+        # eliding the tables before the call, not by dropping code after it.
+        raise EditValidationError(
+            f"response was cut off at the {limit}-token ceiling — the module "
+            f"is incomplete, not wrong. Emit the SAME module again, complete, "
+            f"but more concisely: drop commentary and shorten docstrings. "
+            f"Every function, constant and table the parent defined must still "
+            f"be present; omitting or abbreviating any of them fails "
+            f"validation just as hard as truncation did.")
     out = _strip_markdown_fence("".join(chunks))
     if on_event is not None:
         on_event({
@@ -1343,10 +1886,14 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hparams: "dict[str, Any] | None" = None,
                    parent_tracking: "dict[str, Any] | None" = None,
                    parent_tracking_kernel_hash: "str | None" = None,
+                   parent_modes: "dict[str, Any] | None" = None,
                    metric_observables: "frozenset[str] | None" = None,
                    replay_inputs=None,
                    replay_parent: "dict | None" = None,
                    hack_replays: "list[dict] | None" = None,
+                   explicit_paper_refs: tuple[str, ...] = (),
+                   explicit_paper_citations: "dict[str, str] | None" = None,
+                   exact_paper_refs: bool = False,
                    promote: bool = True) -> Any:
     """Write source, import, validate, return the imported module.
 
@@ -1464,6 +2011,13 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                 parent_kernel_hash=parent_tracking_kernel_hash,
             )
 
+        # A promoted per-mode reward is an automaton, not one function. The
+        # set of modes, their order and their windows come from the
+        # composition seams and are structure the editor may not move.
+        if parent_modes is not None:
+            _validate_mode_reward_contract(
+                mod=mod, source=new_source, parent=parent_modes)
+
         # References shape + every arxiv_id present in KG.
         refs = spec.get("references", None)
         if not isinstance(refs, list):
@@ -1484,6 +2038,39 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                 f"REWARD_SPEC.references cite arxiv_ids not in KG: "
                 f"{missing_refs}")
 
+        # Prompt-authored paper pins are authority, not retrieval hints. The
+        # ordinary KG check above only proves that whatever the model chose
+        # exists; it cannot detect omission or substitution of a requested
+        # paper. Enforce the locally-attested receipt here so the existing
+        # repair loop can correct the model instead of committing false
+        # provenance.
+        if explicit_paper_refs:
+            expected_ids = list(explicit_paper_refs)
+            if exact_paper_refs and ref_ids != expected_ids:
+                raise EditValidationError(
+                    "explicit paper pins require REWARD_SPEC.references "
+                    f"arxiv_id order exactly {expected_ids}, got {ref_ids}"
+                )
+            counts = {aid: ref_ids.count(aid) for aid in expected_ids}
+            bad_counts = {aid: count for aid, count in counts.items()
+                          if count != 1}
+            if bad_counts:
+                raise EditValidationError(
+                    "explicit paper pins must each appear exactly once in "
+                    f"REWARD_SPEC.references; counts={bad_counts}"
+                )
+            canonical = explicit_paper_citations or {}
+            for aid in expected_ids:
+                entry = next(r for r in refs if str(r["arxiv_id"]) == aid)
+                expected_citation = canonical.get(aid)
+                if (expected_citation is not None
+                        and entry.get("citation") != expected_citation):
+                    raise EditValidationError(
+                        f"explicit paper pin {aid!r} must use the locally "
+                        f"attested citation {expected_citation!r}; got "
+                        f"{entry.get('citation')!r}"
+                    )
+
         # Grounding ↔ references cross-check.
         grounding = spec.get("grounding") or {}
         if isinstance(grounding, dict):
@@ -1501,6 +2088,19 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                     f"a full reference entry for each, or remove the arxiv_id "
                     f"from grounding (physics first-principles text is OK)."
                 )
+            missing_grounding_pins = sorted(
+                set(explicit_paper_refs) - grounding_ids)
+            if missing_grounding_pins:
+                raise EditValidationError(
+                    "explicit paper pins are missing from structured "
+                    "REWARD_SPEC.grounding string values: "
+                    f"{missing_grounding_pins}; mention each as arXiv:<id>"
+                )
+        elif explicit_paper_refs:
+            raise EditValidationError(
+                "explicit paper pins require REWARD_SPEC.grounding to be a "
+                "dict whose string values mention every pinned arXiv ID"
+            )
 
         # §Ship 54-pre (#12) shaping↔metric partition gate — the ONE HARD gate.
         # Runs ONLY when an objective metric is steering the run; compares the
@@ -1563,6 +2163,9 @@ def apply_edits(
     replay_inputs=None,
     hack_replays: "list[dict] | None" = None,
     n_candidates: int = 1,
+    max_tokens: int | None = None,
+    explicit_paper_refs: tuple[str, ...] = (),
+    exact_paper_refs: bool = False,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
@@ -1612,6 +2215,9 @@ def apply_edits(
     owns_store = kg_store is None
     kg_store = kg_store or SculptorKG()
     try:
+        explicit_paper_refs = tuple(explicit_paper_refs or ())
+        explicit_paper_citations = _attest_explicit_paper_refs(
+            explicit_paper_refs, kg_store)
         current_module = _load_reward_module(current_reward_path)
         current_source = current_reward_path.read_text(encoding="utf-8")
         current_version = _current_reward_version(current_module)
@@ -1620,6 +2226,29 @@ def apply_edits(
         parent_tracking_kernel_hash = (
             _reference_kernel_hash(current_source)
             if parent_tracking is not None else None)
+        parent_modes = _mode_reward_contract(current_module)
+        # A reference-tracking or per-mode parent carries immutable float
+        # tables the model must not touch. Show it a redacted module and splice
+        # them back after (see `_elide_reference_tables`); every hash below
+        # still covers the FULL parent, so nothing about the contract is
+        # weakened.
+        prompt_source, elided_tables = (
+            _elide_reference_tables(current_source)
+            if (parent_tracking is not None or parent_modes is not None)
+            else (current_source, {}))
+        if elided_tables and on_event is not None:
+            on_event({
+                "type": "log_line",
+                "text": (
+                    f"[edit] eliding {len(elided_tables)} immutable reference "
+                    f"table(s) from the rewrite "
+                    f"({len(current_source)}→{len(prompt_source)} bytes); "
+                    f"restored verbatim before validation"),
+            })
+        # The model has to emit this whole module back, so the ceiling has to
+        # fit what it actually emits — the redacted module. An explicit caller
+        # value still wins.
+        max_tokens = max_tokens or _rewrite_token_ceiling(prompt_source)
         parent_hash = hashlib.sha256(
             current_source.encode("utf-8")).hexdigest()[:16]
         # §Ship 54-pre (#12): parent hparam VALUES for the post-LLM partition
@@ -1720,9 +2349,16 @@ def apply_edits(
         # backoff envelope tight enough for a user-facing workflow
         # (was 6 — 10+ min backoff is fine for CLI batch, not for a
         # UI Rewards-tab button).
+        #
+        # The 240s figure is calibrated against MAX_TOKENS. Raising the
+        # ceiling for a large module without raising this just relocates the
+        # failure from "response was cut off" to APITimeoutError — measured,
+        # not predicted: the first replay of the per-mode edit at a 22,541
+        # ceiling died on the 240s wall. Scale them together.
         if client is None:
             import anthropic
-            client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+            client = anthropic.Anthropic(
+                max_retries=2, timeout=_rewrite_http_timeout_s(max_tokens))
 
         # §7.2: load Eureka-format reward trajectory if present so the
         # rewrite prompt shows the SAME per-component data the diagnoser
@@ -1779,7 +2415,9 @@ def apply_edits(
 
         # Build prompt.
         user_prompt = _build_user_prompt(
-            current_source=current_source,
+            current_source=prompt_source,
+            elided_table_names=sorted(elided_tables),
+            parent_modes=parent_modes,
             current_version=current_version,
             current_references=current_references,
             new_version=new_iter_id,
@@ -1794,6 +2432,9 @@ def apply_edits(
             screen=plan.screen,
             case_context=case_context,
             reference_signature=reference_signature,
+            explicit_paper_refs=explicit_paper_refs,
+            explicit_paper_citations=explicit_paper_citations,
+            exact_paper_refs=exact_paper_refs,
         )
         if on_event is not None:
             on_event({
@@ -1820,10 +2461,11 @@ def apply_edits(
                 rec: dict[str, Any] = {"index": ci, "valid": False,
                                        "hack_margin": None}
                 try:
-                    cand_source = _call_llm(
+                    cand_source = _restore_reference_tables(_call_llm(
                         client, _EDIT_SYSTEM, framed_prompt,
                         on_event=on_event, attempt=1,
-                    )
+                        max_tokens=max_tokens,
+                    ), elided_tables)
                     rec["source"] = cand_source
                     rec["source_sha256"] = hashlib.sha256(
                         cand_source.encode("utf-8")).hexdigest()[:16]
@@ -1833,11 +2475,15 @@ def apply_edits(
                         new_version=new_iter_id, write_to=target_path,
                         parent_hparams=gate_parent_hparams,
                         parent_tracking=parent_tracking,
+                        parent_modes=parent_modes,
                         parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                         metric_observables=metric_observables,
                         replay_inputs=replay_inputs,
                         replay_parent=replay_parent,
                         hack_replays=hack_replays,
+                        explicit_paper_refs=explicit_paper_refs,
+                        explicit_paper_citations=explicit_paper_citations,
+                        exact_paper_refs=exact_paper_refs,
                         promote=False,
                     )
                     rec["valid"] = True
@@ -1869,11 +2515,15 @@ def apply_edits(
                     write_to=target_path,
                     parent_hparams=gate_parent_hparams,
                     parent_tracking=parent_tracking,
+                    parent_modes=parent_modes,
                     parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                     metric_observables=metric_observables,
                     replay_inputs=replay_inputs,
                     replay_parent=replay_parent,
                     hack_replays=hack_replays,
+                    explicit_paper_refs=explicit_paper_refs,
+                    explicit_paper_citations=explicit_paper_citations,
+                    exact_paper_refs=exact_paper_refs,
                 )
                 winner_promoted = True
                 if on_event is not None:
@@ -1907,21 +2557,26 @@ def apply_edits(
                     + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
                     + str(raise_after_retry)
                 )
-                new_source = _call_llm(
+                new_source = _restore_reference_tables(_call_llm(
                     client, _EDIT_SYSTEM, retry_user,
                     on_event=on_event, attempt=2,
-                )
+                    max_tokens=max_tokens,
+                ), elided_tables)
                 _post_validate(
                     new_source, contract=reward_contract, kg_store=kg_store,
                     parent_hash=parent_hash, new_version=new_iter_id,
                     write_to=target_path,
                     parent_hparams=gate_parent_hparams,
                     parent_tracking=parent_tracking,
+                    parent_modes=parent_modes,
                     parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                     metric_observables=metric_observables,
                     replay_inputs=replay_inputs,
                     replay_parent=replay_parent,
                     hack_replays=hack_replays,
+                    explicit_paper_refs=explicit_paper_refs,
+                    explicit_paper_citations=explicit_paper_citations,
+                    exact_paper_refs=exact_paper_refs,
                 )
                 winner_promoted = True
 
@@ -1940,10 +2595,11 @@ def apply_edits(
             attempt_prompt = user_prompt
             for attempt in range(1, max_retries + 2):
                 try:
-                    new_source = _call_llm(
+                    new_source = _restore_reference_tables(_call_llm(
                         client, _EDIT_SYSTEM, attempt_prompt,
                         on_event=on_event, attempt=attempt,
-                    )
+                        max_tokens=max_tokens,
+                    ), elided_tables)
                     if on_event is not None:
                         on_event({
                             "type": "log_line",
@@ -1955,11 +2611,15 @@ def apply_edits(
                         write_to=target_path,
                         parent_hparams=gate_parent_hparams,
                         parent_tracking=parent_tracking,
+                        parent_modes=parent_modes,
                         parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                         metric_observables=metric_observables,
                         replay_inputs=replay_inputs,
                         replay_parent=replay_parent,
                         hack_replays=hack_replays,
+                        explicit_paper_refs=explicit_paper_refs,
+                        explicit_paper_citations=explicit_paper_citations,
+                        exact_paper_refs=exact_paper_refs,
                     )
                     last_err = None
                     break
@@ -2016,6 +2676,8 @@ def apply_prompt_edit(
     kg_store: "SculptorKG | None" = None,
     client=None,
     on_event=None,
+    max_tokens: int | None = None,
+    max_prompt_chars: int = USER_PROMPT_MAX_CHARS,
 ) -> Path:
     """One-shot reward rewrite from a user's natural-language prompt.
 
@@ -2039,10 +2701,15 @@ def apply_prompt_edit(
         raise EditValidationError(
             "prompt must be at least 3 characters"
         )
-    if len(user_prompt) > 2000:
+    limit = min(int(max_prompt_chars), SYSTEM_PROMPT_MAX_CHARS)
+    if len(user_prompt) > limit:
         raise EditValidationError(
-            f"prompt must be ≤ 2000 chars (got {len(user_prompt)})"
+            f"prompt must be ≤ {limit} chars (got {len(user_prompt)})"
         )
+
+    explicit_refs = _explicit_paper_refs(user_prompt)
+    exact_refs = bool(
+        explicit_refs and _prompt_requires_exact_paper_refs(user_prompt))
 
     # Always consult the KG — users editing reward functions through
     # the Rewards-tab prompt have historically bypassed literature
@@ -2101,12 +2768,17 @@ def apply_prompt_edit(
     # in the emitted REWARD_SPEC despite the grounding dict being rich.
     # Issue B from Test 1 (2026-04-22). `source_paper_ids` items are in
     # `make_paper_id()` form (`paper:<arxiv_id>`) — strip the prefix.
-    prompt_paper_refs: list[str] = sorted({
+    semantic_paper_refs: list[str] = sorted({
         pid[len("paper:"):]
         for match in lit_context
         for pid in (match.source_paper_ids or [])
         if pid.startswith("paper:")
     })
+    prompt_paper_refs = list(explicit_refs)
+    if not exact_refs:
+        prompt_paper_refs.extend(
+            aid for aid in semantic_paper_refs
+            if aid not in prompt_paper_refs)
 
     synthetic = Diagnosis(
         failure_modes=[],
@@ -2132,6 +2804,12 @@ def apply_prompt_edit(
         iter_dir=None,
         behavior_goal=user_prompt,
     )
+    explicit_kwargs: dict[str, Any] = {}
+    if explicit_refs:
+        explicit_kwargs = {
+            "explicit_paper_refs": explicit_refs,
+            "exact_paper_refs": exact_refs,
+        }
     return apply_edits(
         current_reward_path=current_reward_path,
         diagnosis=synthetic,
@@ -2140,6 +2818,8 @@ def apply_prompt_edit(
         kg_store=kg_store,
         client=client,
         on_event=on_event,
+        max_tokens=max_tokens,
+        **explicit_kwargs,
     )
 
 
@@ -2237,6 +2917,16 @@ def _write_current_reexport(rewards_dir: Path, latest: Path) -> None:
     inside `env.load_managers()`. Scalar-only adapters (gym_sb3) don't
     look for it, so the `hasattr` guard keeps both worlds working.
     """
+    latest = Path(latest).resolve()
+    rewards_dir = Path(rewards_dir).resolve()
+    if (
+        latest.parent != rewards_dir
+        or re.fullmatch(r"v\d+\.py", latest.name) is None
+        or not latest.is_file()
+        or latest.is_symlink()
+    ):
+        raise ValueError("current.py target must be a regular sibling v<n>.py")
+    selected_sha256 = hashlib.sha256(latest.read_bytes()).hexdigest()
     current = rewards_dir / "current.py"
     src = f'''"""Auto-generated by sculptor.edit. Re-exports the latest reward.
 
@@ -2245,6 +2935,12 @@ Latest: {latest.name}
 
 import importlib.util
 from pathlib import Path
+
+SCULPTOR_REWARD_SELECTOR = {{
+    "schema": 1,
+    "filename": {latest.name!r},
+    "sha256": {selected_sha256!r},
+}}
 
 _HERE = Path(__file__).resolve().parent
 _LATEST = _HERE / {latest.name!r}
@@ -2266,6 +2962,14 @@ __all__ = ["compute_reward", "REWARD_SPEC"]
 if hasattr(_mod, "compute_reward_batched"):
     compute_reward_batched = _mod.compute_reward_batched
     __all__.append("compute_reward_batched")
+
+# A reference-conditioned policy reads these exact functions from the module
+# passed to the runner. Keep the mutable selector as a transparent adapter to
+# the immutable selected module; the functions retain that module's globals.
+for _name in ("reference_clock_batched", "reference_target_index_batched"):
+    if hasattr(_mod, _name):
+        globals()[_name] = getattr(_mod, _name)
+        __all__.append(_name)
 '''
     # ``current.py`` is a mutable convenience pointer (the promoted world
     # selection remains authoritative), but readers still must never observe a

@@ -46,7 +46,11 @@ Hard rules (a violation means your output is thrown away):
 - also allowed: `beam`, `wall`, `stairs`, `stepping_stones`.
 Give a robot a lead-in (`start_offset_m` ≥ 0.6) before the first platform.
 
-**Objects** (`shared.objects`) — `{shape, fixed, nominal}`. Shapes & their required nominal:
+**Objects** (`shared.objects`) — `{shape, fixed, route_semantics?, nominal}`.
+`route_semantics` is data-only command geometry: `avoid_around` asks the route
+controller for planar clearance; `traverse_over` preserves a straight crossing
+command while contact predicates remain unchanged. Omission retains the legacy
+`avoid_around` behavior. Shapes & their required nominal:
 - sphere:   `radius_m`                          (a ball)
 - box:      `size_m: [x,y,z]`
 - cylinder / capsule: `radius_m, height_m`
@@ -77,11 +81,12 @@ of course heights/gaps so the policy sees a distribution of layouts, not one fro
       "shared": {
         "control_mode": "waypoint_following" | "object_manipulation" | "velocity",
         "goal": { ...see below... },
+        "event_sequence": { ...optional admitted one-shot program below... },
         "observations": {"height_scan": true, ...},
         "contacts": {"desired": [["robot:<role>","object:<name>"]]},
         "termination": {"fall": "enabled"|"disabled"}
       },
-      "train": {"goal_sampling": [ ... ]}
+      "train": {"goal_sampling": [ ... ], "event_phase_sampling": { ... }}
     }
 
 Goal forms:
@@ -91,6 +96,46 @@ Goal forms:
   "subject":"<object>","region":"<zone>","success":{"predicate":"inside","hold_s":0.25,"tolerance_m":0.0}}`
 - go to a region: `{"id":"reach_region","type":"robot_to_region","region":"<zone>",
   "success":{"predicate":"inside","hold_s":0.25}}`
+
+For a request that explicitly adds **one bilateral jump after a waypoint route,
+then a quiet hold**, emit the only implemented event automaton exactly. Do not
+use this block for ordinary routes, repeated jumps, predicate branches, or a
+robot whose capability cannot resolve both declared support roles:
+
+    "event_sequence": {
+      "id": "route_jump_hold",
+      "phases": [
+        {"id":"route", "until":{"event":"goal_complete"}},
+        {"id":"jump", "until":{
+          "event":"bilateral_support_cycle",
+          "support_contacts":[
+            ["robot:left_foot", "world:terrain"],
+            ["robot:right_foot", "world:terrain"]
+          ],
+          "min_air_time_s":0.06,
+          "min_height_delta_m":0.18
+        }},
+        {"id":"hold", "terminal":true, "minimum_hold_s":2.0}
+      ]
+    }
+
+The base `waypoint_sequence.success.hold_s` should be `0.0` for this compound
+program: raw route completion enters JUMP; HOLD has its own declared duration.
+Budget the episode for the complete sequence rather than reusing the route-only
+horizon; for the four-box showcase, set `termination.episode_length_s` to at
+least `24.0` so traversal, the jump cycle, and the two-second proof hold all fit.
+Put the training-only curriculum separately under `task_spec.train`:
+
+    "event_phase_sampling":{"route":0.5,"jump":0.4,"hold":0.1}
+
+Evaluation never samples these starts: it always begins in ROUTE and consumes
+the same immutable shared event sequence. `bilateral_support_cycle` means
+support must be observed first, followed by continuous simultaneous loss of
+both declared contacts for `min_air_time_s`, followed by bilateral support.
+The JUMP-to-HOLD landing also requires the maximum root-height increase from
+the final bilateral-support height immediately before that same continuous
+flight to reach `min_height_delta_m`; a supported stand-up, shallow foot
+shuffle, or evidence spliced across separate hops is not success.
 
 ## Worked example — "push a ball into a soccer goal" (gripper/arm robot)
 

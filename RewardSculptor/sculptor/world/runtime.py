@@ -313,6 +313,73 @@ class WorldChannelRuntime:
             array = np.any(array > 0, axis=tuple(range(1, array.ndim)))
         return array.astype(bool, copy=False)
 
+    def _event_command_value(
+        self, source: Mapping[str, Any], attribute: str,
+    ) -> np.ndarray:
+        """Consume reward-time truth, or current command truth in evaluation.
+
+        Training installs :class:`TorchWorldRewardRuntime`, which publishes an
+        exact pre-transition reward snapshot for the recorder.  Deterministic
+        evaluation does not instantiate that reward runtime, but the authored
+        command term remains the authority for the same event state.  Fall
+        back to its read-only tensors only when no snapshot exists at all; a
+        present but incomplete snapshot still fails closed rather than mixing
+        values from two simulator times.
+        """
+        event_id = str(source.get("event_sequence", ""))
+        snapshots = getattr(
+            self.env, "_sculptor_event_reward_snapshot", None)
+        snapshot = snapshots.get(event_id) \
+            if isinstance(snapshots, Mapping) else None
+        if isinstance(snapshot, Mapping):
+            value = snapshot.get(attribute)
+        else:
+            value = self._event_command_attribute(event_id, attribute)
+        array = _to_numpy(value)
+        if array.shape == (self.num_envs,):
+            return array
+        raise WorldRuntimeError(
+            f"event reward-time snapshot {event_id!r}/{attribute} is absent")
+
+    def _event_command_attribute(self, event_id: str, attribute: str) -> Any:
+        """Read one event value without advancing the command automaton."""
+        manager = getattr(self.env, "command_manager", None)
+        if manager is None:
+            raise WorldRuntimeError(
+                "event evaluation channel requires a command manager")
+        for name in tuple(getattr(manager, "active_terms", ()) or ()):
+            try:
+                term = manager.get_term(name)
+            except (AttributeError, KeyError, RuntimeError):
+                continue
+            if str(getattr(term, "event_sequence_id", "")) != event_id:
+                continue
+            support_prefix = "event_support_contact_"
+            if attribute.startswith(support_prefix):
+                try:
+                    index = int(attribute.removeprefix(support_prefix))
+                except ValueError as exc:
+                    raise WorldRuntimeError(
+                        f"event support-contact attribute {attribute!r} is invalid"
+                    ) from exc
+                contacts = _to_numpy(
+                    getattr(term, "event_support_contacts", None))
+                if (
+                    contacts.ndim != 2
+                    or contacts.shape[0] != self.num_envs
+                    or index < 0
+                    or index >= contacts.shape[1]
+                ):
+                    raise WorldRuntimeError(
+                        "event command support contacts have an invalid shape")
+                return contacts[:, index]
+            value = getattr(term, attribute, None)
+            if value is None:
+                raise WorldRuntimeError(
+                    f"event command {event_id!r}/{attribute} is absent")
+            return value
+        raise WorldRuntimeError(f"event command {event_id!r} is not active")
+
     def _configuration_error(self) -> np.ndarray:
         target = self.goal.get("target")
         if isinstance(target, Mapping):
@@ -362,14 +429,55 @@ class WorldChannelRuntime:
             return self._configuration_error() <= threshold
         raise WorldRuntimeError(f"unsupported goal type {goal_type!r}")
 
+    def _inside_terminal_waypoint(self) -> np.ndarray:
+        if self._waypoints.size == 0:
+            raise WorldRuntimeError(
+                "event sequence requires a resolved terminal waypoint"
+            )
+        position = self._local_position(self._robot_position())
+        distance = np.linalg.norm(
+            position[..., :2] - self._waypoints[-1, :2], axis=-1
+        )
+        tolerance = max(0.0, self._goal_tolerance()) or 0.25
+        return (
+            (distance <= tolerance)
+            & self._fixed_geometry_aligned()
+        )
+
     def _update_success(self) -> np.ndarray:
         predicate = self._base_predicate().astype(bool, copy=False)
         self._last_predicate = predicate
+        event_sequence = self.task.get("event_sequence")
+        if isinstance(event_sequence, Mapping):
+            phase = self._event_command_value(
+                {"event_sequence": str(event_sequence["id"])},
+                "event_phase",
+            ).astype(np.int32, copy=False)
+            violation = self._event_command_value(
+                {"event_sequence": str(event_sequence["id"])},
+                "event_sequence_violation",
+            ).astype(bool, copy=False)
+            # Raw route completion remains separately observable through the
+            # waypoint predicate/index.  Declared task success, however, is
+            # the complete event program: only HOLD may accrue its duration.
+            predicate = (
+                predicate
+                & (phase == 2)
+                & ~violation
+                & self._inside_terminal_waypoint()
+            )
+            hold_s = float(
+                event_sequence["phases"][2]["minimum_hold_s"]
+            )
+        else:
+            hold_s = float(self.goal.get("success", {}).get("hold_s", 0.0))
         self._hold_elapsed = np.where(
             predicate, self._hold_elapsed + self.step_dt, 0.0).astype(
                 np.float32, copy=False)
-        hold_s = float(self.goal.get("success", {}).get("hold_s", 0.0))
-        return predicate & (self._hold_elapsed + 1e-7 >= hold_s)
+        temporal_epsilon = max(1e-7, self.step_dt * 1e-3)
+        return predicate & (
+            self._hold_elapsed + temporal_epsilon >= hold_s
+        )
 
     def _produce(
         self, spec: ChannelSpec, *, success: np.ndarray,
@@ -406,6 +514,22 @@ class WorldChannelRuntime:
             value = self._waypoint_index
         elif producer == "configuration_error":
             value = self._configuration_error()
+        elif producer == "event_phase_state":
+            value = self._event_command_value(
+                source, "event_phase")
+        elif producer == "event_phase_height_delta":
+            value = self._event_command_value(
+                source, "event_phase_height_delta")
+        elif producer == "event_phase_vertical_velocity":
+            value = self._event_command_value(
+                source, "event_phase_vertical_velocity")
+        elif producer == "event_sequence_violation":
+            value = self._event_command_value(
+                source, "event_sequence_violation")
+        elif producer == "event_support_contact":
+            index = int(source["support_index"])
+            value = self._event_command_value(
+                source, f"event_support_contact_{index}")
         else:
             raise WorldRuntimeError(
                 f"channel {spec.name!r} declares unsupported producer {producer!r}")
@@ -423,18 +547,51 @@ class WorldChannelRuntime:
         return array
 
     def sample(self) -> RuntimeSnapshot:
-        self._update_waypoints()
-        success = self._update_success()
-        values = {
-            spec.name: self._produce(spec, success=success)
-            for spec in self.catalog.channels
-        }
-        # This is the actual metric firewall.  Reward code is never handed
-        # metric_only arrays, even though the recorder persists all channels.
-        reward_names = self.catalog.names(reward=True)
-        reward_info = {name: value for name, value in values.items()
-                       if name in reward_names}
-        return RuntimeSnapshot(channels=values, reward_info=reward_info)
+        try:
+            self._update_waypoints()
+            success = self._update_success()
+            values = {
+                spec.name: self._produce(spec, success=success)
+                for spec in self.catalog.channels
+            }
+            # This is the actual metric firewall.  Reward code is never handed
+            # metric_only arrays, even though the recorder persists all channels.
+            reward_names = self.catalog.names(reward=True)
+            reward_info = {name: value for name, value in values.items()
+                           if name in reward_names}
+            # Persist raw event phase and violation truth in ``channels``, but
+            # never expose terminal HOLD credit to generated reward after the
+            # one-shot sequence has been invalidated.  ``-1`` is deliberately
+            # outside the admitted 0..phase_count-1 state space, so invalid
+            # rows cannot fall back to farming ROUTE or JUMP shaping either.
+            for spec in self.catalog.channels:
+                if spec.name not in reward_info or spec.producer not in {
+                    "event_phase_state",
+                    "event_phase_height_delta",
+                    "event_phase_vertical_velocity",
+                }:
+                    continue
+                violation = self._event_command_value(
+                    spec.source, "event_sequence_violation",
+                ).astype(bool, copy=False)
+                if spec.producer == "event_phase_state":
+                    reward_info[spec.name] = np.where(
+                        violation,
+                        np.asarray(-1, dtype=reward_info[spec.name].dtype),
+                        reward_info[spec.name],
+                    )
+                else:
+                    reward_info[spec.name] = np.where(
+                        violation,
+                        np.asarray(0, dtype=reward_info[spec.name].dtype),
+                        reward_info[spec.name],
+                    )
+            return RuntimeSnapshot(channels=values, reward_info=reward_info)
+        finally:
+            if isinstance(self.task.get("event_sequence"), Mapping):
+                # One reward-time snapshot proves exactly one persisted row.
+                # Reuse would silently shift transition boundaries.
+                self.env._sculptor_event_reward_snapshot = None
 
 
 class TorchWorldRewardRuntime:
@@ -597,6 +754,103 @@ class TorchWorldRewardRuntime:
             found = self.torch.any(found > 0, dim=tuple(range(1, found.ndim)))
         return found.bool()
 
+    def _event_command_value(
+        self, source: Mapping[str, Any], attribute: str,
+    ) -> Any:
+        event_id = str(source.get("event_sequence", ""))
+        snapshots = getattr(
+            self.env, "_sculptor_event_reward_snapshot", None)
+        snapshot = snapshots.get(event_id) \
+            if isinstance(snapshots, Mapping) else None
+        if not isinstance(snapshot, Mapping):
+            snapshot = self._event_reward_snapshot(event_id)
+        return snapshot[attribute]
+
+    def _event_reward_snapshot(self, event_id: str) -> dict[str, Any]:
+        """Capture current physics without advancing the phase automaton."""
+        manager = getattr(self.env, "command_manager", None)
+        if manager is None:
+            raise WorldRuntimeError(
+                "event reward channel requires a command manager")
+        for name in tuple(getattr(manager, "active_terms", ()) or ()):
+            try:
+                term = manager.get_term(name)
+            except (AttributeError, KeyError, RuntimeError):
+                continue
+            if str(getattr(term, "event_sequence_id", "")) != event_id:
+                continue
+            phase = getattr(term, "event_phase", None)
+            anchor = getattr(term, "_event_takeoff_height_anchor", None)
+            if not self.torch.is_tensor(phase) or tuple(phase.shape) != (
+                    int(self.env.num_envs),):
+                raise WorldRuntimeError(
+                    "event command phase has an invalid shape")
+            robot = _scene_item(self.scene, "robot")
+            root_pos = robot.data.root_link_pos_w
+            root_vel = getattr(robot.data, "root_link_lin_vel_w", None)
+            if (
+                not self.torch.is_tensor(anchor)
+                or tuple(anchor.shape) != (int(self.env.num_envs),)
+                or not self.torch.is_tensor(root_vel)
+                or tuple(root_vel.shape) != (int(self.env.num_envs), 3)
+            ):
+                raise WorldRuntimeError(
+                    "event reward snapshot requires phase anchor and "
+                    "world-frame root velocity")
+            height_delta = self.torch.where(
+                self.torch.isfinite(anchor) & (phase > 0),
+                root_pos[:, 2] - anchor,
+                self.torch.zeros_like(anchor),
+            )
+            violation = getattr(term, "event_sequence_violation", None)
+            support_contacts = getattr(term, "event_support_contacts", None)
+            if (
+                not self.torch.is_tensor(violation)
+                or tuple(violation.shape) != (int(self.env.num_envs),)
+            ):
+                raise WorldRuntimeError(
+                    "event reward snapshot requires a violation latch")
+            if (
+                not self.torch.is_tensor(support_contacts)
+                or tuple(support_contacts.shape)
+                != (int(self.env.num_envs), 2)
+            ):
+                raise WorldRuntimeError(
+                    "event reward snapshot requires two support contacts")
+            valid_progress = ~violation.to(dtype=self.torch.bool)
+            reward_height_delta = self.torch.where(
+                valid_progress,
+                height_delta,
+                self.torch.zeros_like(height_delta),
+            )
+            reward_vertical_velocity = self.torch.where(
+                valid_progress,
+                root_vel[:, 2],
+                self.torch.zeros_like(root_vel[:, 2]),
+            )
+            return {
+                "event_phase": phase.detach().clone(),
+                "event_reward_phase": self.torch.where(
+                    valid_progress,
+                    phase,
+                    self.torch.full_like(phase, -1),
+                ).detach().clone(),
+                "event_phase_height_delta": height_delta.detach().clone(),
+                "event_reward_phase_height_delta": (
+                    reward_height_delta.detach().clone()),
+                "event_phase_vertical_velocity": (
+                    root_vel[:, 2].detach().clone()),
+                "event_reward_phase_vertical_velocity": (
+                    reward_vertical_velocity.detach().clone()),
+                "event_sequence_violation": violation.detach().clone(),
+                "event_support_contact_0": (
+                    support_contacts[:, 0].detach().clone()),
+                "event_support_contact_1": (
+                    support_contacts[:, 1].detach().clone()),
+            }
+        raise WorldRuntimeError(
+            f"event command {event_id!r} is not active")
+
     def _configuration_error(self) -> Any:
         target = self.goal.get("target")
         if isinstance(target, Mapping):
@@ -611,6 +865,18 @@ class TorchWorldRewardRuntime:
 
     def sample(self) -> dict[str, Any]:
         values: dict[str, Any] = {}
+        event_ids = {
+            str(spec.source.get("event_sequence", ""))
+            for spec in self.specs
+            if spec.producer.startswith("event_phase_")
+        }
+        event_snapshots = {
+            event_id: self._event_reward_snapshot(event_id)
+            for event_id in event_ids
+            if event_id
+        }
+        if event_snapshots:
+            self.env._sculptor_event_reward_snapshot = event_snapshots
         waypoint_distance = None
         if any(spec.producer == "waypoint_distance" for spec in self.specs):
             waypoint_distance = self._waypoint_distance()
@@ -653,6 +919,24 @@ class TorchWorldRewardRuntime:
                 value = waypoint_distance
             elif producer == "configuration_error":
                 value = self._configuration_error()
+            elif producer == "event_phase_state":
+                value = self._event_command_value(
+                    source, "event_reward_phase")
+            elif producer == "event_phase_height_delta":
+                value = self._event_command_value(
+                    source, "event_reward_phase_height_delta")
+            elif producer == "event_phase_vertical_velocity":
+                value = self._event_command_value(
+                    source, "event_reward_phase_vertical_velocity")
+            elif producer == "event_sequence_violation":
+                # Violation truth is held out from rewards, but retaining this
+                # branch keeps the runtime exhaustive if access policy changes.
+                value = self._event_command_value(
+                    source, "event_sequence_violation")
+            elif producer == "event_support_contact":
+                index = int(source["support_index"])
+                value = self._event_command_value(
+                    source, f"event_support_contact_{index}")
             else:
                 # Every predicate/success/index producer is metric_only.  If
                 # a future catalog marks one reward-visible, fail closed.

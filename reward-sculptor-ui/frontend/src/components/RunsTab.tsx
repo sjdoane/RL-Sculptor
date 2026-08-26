@@ -26,6 +26,7 @@ import { qk } from "@/lib/queryKeys";
 import {
   formatContradictionTooltip, formatIterMetrics, naturalnessChipText, selectionLabel, selectionSentence,
 } from "@/lib/selection";
+import { isDeployablePolicy } from "@/lib/policyEvidence";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative, sanitizeConsoleText } from "@/lib/utils";
 import type {
@@ -33,6 +34,7 @@ import type {
   IterEventSummary,
   MissionDetail,
   MissionSummary,
+  PolicySummary,
   ProjectDetail,
   RunDetail,
   RunEvent,
@@ -45,6 +47,9 @@ import type {
   StageObjectiveMetric,
   StageSelectionCandidate,
   StageSelectionReport,
+  StartingPolicyInitializationAuthority,
+  StartingPolicyInitializationReceipt,
+  TierDCertificationScope,
 } from "@/lib/types";
 
 // ── benign-error display mapping ────────────────────────────────────────
@@ -63,9 +68,111 @@ interface RunDisplayStatus {
   icon: string;
 }
 
+const POST_TRAINING_ROLLOUT_FAILED = "post_training_rollout_failed" as const;
+
+export function PolicyAvailabilityCard({
+  iteration,
+  evaluated,
+  exportHref,
+}: {
+  iteration: number;
+  evaluated: boolean;
+  exportHref: string | null;
+}) {
+  if (!evaluated) {
+    return (
+      <div
+        className="rs-card rs-card-pad"
+        role="status"
+        aria-label={`Iteration ${iteration} preserved unevaluated checkpoint`}
+      >
+        <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+          <Icon name="alert-triangle" size={15} />Preserved unevaluated checkpoint
+        </div>
+        <p className="rs-sub" style={{ margin: "0 0 8px", fontSize: 12, lineHeight: 1.5 }}>
+          Iteration {iteration} has checkpoint bytes, but no server-validated
+          completion and evaluation receipt. It is a recovery input, not a
+          deployable policy.
+        </p>
+        <p className="rs-sub" style={{ margin: 0, fontSize: 11.5, lineHeight: 1.5 }}>
+          To continue, use New run → Project policy → Interrupted or unevaluated after
+          the server lists an attested recovery input.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+        <Icon name="package" size={15} />Deploy this policy
+      </div>
+      <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
+        Download iter {iteration}&apos;s evaluated checkpoint bundled with its reward,
+        env spec, and policy network.
+      </p>
+      {exportHref && (
+        <a
+          href={exportHref}
+          download
+          className="rs-btn rs-btn-primary rs-btn-sm"
+        >
+          <Icon name="download" size={14} />Export policy bundle
+        </a>
+      )}
+    </div>
+  );
+}
+
+export function EvaluationFailureNotice({
+  classification,
+  error,
+}: {
+  classification: ErrorClassification;
+  error: string;
+}) {
+  return (
+    <div
+      className="rs-banner warn"
+      role="alert"
+      style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}
+    >
+      <div className="rs-flex rs-gap-8">
+        <Icon name="alert-triangle" size={17} />
+        <span className="rs-grow">
+          <b>{classification.title?.trim() || "Training completed; rollout evaluation failed"}</b>
+        </span>
+      </div>
+      {classification.detail && (
+        <p style={{ margin: 0, fontSize: 12.5 }}>{classification.detail}</p>
+      )}
+      <p style={{ margin: 0, fontSize: 12.5 }}>
+        The checkpoint was preserved, but rollout evidence was not completed. It is
+        a recovery input, not deployment evidence.
+      </p>
+      <p style={{ margin: 0, fontSize: 11.5 }}>
+        Continue only through New run → Project policy → Interrupted or unevaluated
+        after the server lists an attested recovery input.
+      </p>
+      <details>
+        <summary style={{ cursor: "pointer", fontSize: 11.5 }}>Worker detail</summary>
+        <pre className="mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 10, margin: "6px 0 0", opacity: 0.9 }}>
+          {error}
+        </pre>
+      </details>
+    </div>
+  );
+}
+
 /** Maps a run's raw status/error to a display descriptor for badges,
  *  falling back to the shared STATUS_META lookup for everything else. */
-function runDisplayStatus(run: Pick<RunSummary, "status" | "error">): RunDisplayStatus {
+function runDisplayStatus(run: Pick<
+  RunSummary,
+  "status" | "error" | "error_classification"
+>): RunDisplayStatus {
+  if (run.error_classification?.kind === POST_TRAINING_ROLLOUT_FAILED) {
+    return { label: "Evaluation failed", cls: "amber", icon: "alert-triangle" };
+  }
   if (run.error === CRITERION_NOT_MET_ERROR) {
     return { label: "Criterion not met", cls: "amber", icon: "alert-circle" };
   }
@@ -78,9 +185,13 @@ function runDisplayStatus(run: Pick<RunSummary, "status" | "error">): RunDisplay
 
 /** Badge variant that honors the benign-error remap above; otherwise
  *  identical to <Badge status={run.status} />. */
-function RunStatusBadge({
+export function RunStatusBadge({
   run, big, label,
-}: { run: Pick<RunSummary, "status" | "error">; big?: boolean; label?: string }) {
+}: {
+  run: Pick<RunSummary, "status" | "error" | "error_classification">;
+  big?: boolean;
+  label?: string;
+}) {
   const d = runDisplayStatus(run);
   return (
     <span className={"rs-badge " + d.cls + (big ? " big" : "")}>
@@ -466,6 +577,7 @@ function RunRow({
   // over stage_index+1 — falls back while the mission-detail label map is
   // still loading (or for disk-reconstructed rows with no stage_index).
   const numberLabel = displayLabel ?? (typeof r.stage_index === "number" ? String(r.stage_index + 1) : null);
+  const displayStatus = runDisplayStatus(r);
   return (
     <button className={"rs-runrow" + (selected ? " on" : "") + (stageContext ? " rs-stage" : "")} onClick={onSelect}>
       <RunStatusBadge run={r} label="" />
@@ -487,7 +599,11 @@ function RunRow({
           : r.primary_metric_history}
         w={46}
         h={20}
-        color={r.status === "errored" ? "var(--st-rose)" : r.status === "running" ? "var(--st-amber)" : "var(--st-emerald)"}
+        color={displayStatus.cls === "rose"
+          ? "var(--st-rose)"
+          : displayStatus.cls === "amber"
+            ? "var(--st-amber)"
+            : "var(--st-emerald)"}
       />
     </button>
   );
@@ -913,7 +1029,7 @@ function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery
               <ReferenceCertificationRow
                 key={reference.clip_id}
                 reference={reference}
-                indexRow={refIndex.data?.find((r) => r.clip_id === reference.clip_id) ?? null}
+                indexRow={refIndex.data?.rows.find((r) => r.clip_id === reference.clip_id) ?? null}
               />
             ))}
           </div>
@@ -1405,6 +1521,7 @@ function ProjectDiskDetailPane({
   slug, summary,
 }: { slug: string; summary: RunSummary | null }) {
   const iters = useProjectIterations(slug);
+  const policies = usePolicies(slug);
   const rows = iters.data ?? [];
 
   const [picked, setPicked] = useState<number | null>(null);
@@ -1416,6 +1533,11 @@ function ProjectDiskDetailPane({
   }, [rows]);
   const activeIter = picked ?? defaultIter;
   const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+  const activePolicy = (policies.data ?? []).find(
+    (policy) => policy.iter_index === activeIter,
+  ) ?? null;
+  const activePolicyDeployable = activePolicy !== null
+    && isDeployablePolicy(activePolicy);
 
   return (
     <div className="rs-runs-detail">
@@ -1488,22 +1610,13 @@ function ProjectDiskDetailPane({
 
       <div className="rs-extra-col">
         {activeIter != null && activeRow?.has_checkpoint && (
-          <div className="rs-card rs-card-pad">
-            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
-              <Icon name="package" size={15} />Deploy this policy
-            </div>
-            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
-              Download iter {activeIter}'s checkpoint bundled with its
-              reward, env spec, and an ONNX/TorchScript policy network.
-            </p>
-            <a
-              href={policyExportUrl(slug, activeIter)}
-              download
-              className="rs-btn rs-btn-primary rs-btn-sm"
-            >
-              <Icon name="download" size={14} />Export policy bundle
-            </a>
-          </div>
+          <PolicyAvailabilityCard
+            iteration={activeIter}
+            evaluated={activePolicyDeployable}
+            exportHref={activePolicyDeployable
+              ? policyExportUrl(slug, activeIter)
+              : null}
+          />
         )}
         <StageRewardsCard slug={slug} stage={null} />
       </div>
@@ -1610,6 +1723,43 @@ function LiveRunDetailPane({
     return { awaiting: aw, awaitingIter: awIter, mode: m };
   }, [events.events, run.data?.mode]);
 
+  // Requested intent and backend path resolution are useful diagnostics, but
+  // neither proves that the runner consumed those bytes. Only the dedicated
+  // nested receipt, emitted after exact load/reuse verification, earns
+  // "Initialized from" in the UI.
+  const startingPolicy = useMemo(
+    () => deriveStartingPolicyState(events.events),
+    [events.events],
+  );
+
+  const referenceAdmission = useMemo(
+    () => deriveReferenceAdmissionState(events.events),
+    [events.events],
+  );
+
+  // The most recent `learning_vitals`, plus where the run's exploration
+  // noise started and whether it is ratcheting. Neither simpler signal
+  // works on its own: the failed run's penalty exceeded its reward at its
+  // BEST iteration, and the healthy run's noise still rose 0.91 -> 1.24
+  // while its return climbed to its best. Only noise rising WHILE return
+  // falls tells the two apart.
+  const vitals = useMemo(() => {
+    const all: LearningVitals[] = [];
+    for (const ev of events.events) {
+      if ((ev as { type?: string }).type === "learning_vitals") {
+        all.push(ev as unknown as LearningVitals);
+      }
+    }
+    const last = all[all.length - 1];
+    if (last === undefined) return null;
+    const first = all.find((v) => typeof v.action_std === "number") ?? null;
+    return {
+      v: last,
+      stdAtStart: first?.action_std ?? null,
+      ratcheting: isRatcheting(all),
+    };
+  }, [events.events]);
+
   // §Ship 43: launch-time objective-metric generation as run-phase 0. Fold the
   // metric_generation_* events into a single phase view (progress while running;
   // accepted / rejected-with-reasons outcome — never silent).
@@ -1668,23 +1818,36 @@ function LiveRunDetailPane({
   const liveStageLabel = mission?.stages.find((s) => s.name === stageName)?.display_label ?? null;
 
   const mergedIters = useMergedIterations(iters, events.events);
+  const evaluationFailedAfterCheckpoint =
+    run.data?.error_classification?.kind === POST_TRAINING_ROLLOUT_FAILED;
+  const evaluationFailedIteration = evaluationFailedAfterCheckpoint
+    ? [...mergedIters]
+      .reverse()
+      .find((iter) => iter.status === "errored")?.iter_index
+        ?? mergedIters[mergedIters.length - 1]?.iter_index
+        ?? null
+    : null;
 
-  // Exportable trained checkpoints (disk-backed). Stage runs export from
-  // their own runs tree; plain sculpt runs share the project tree.
+  // Disk-backed checkpoints. Only entries with retained evaluation evidence
+  // are deployable; the rest remain recovery inputs.
   const policies = usePolicies(slug, isStageRun ? { runId } : undefined);
   const exportRunId = isStageRun ? runId : undefined;
-  const exportableIters = useMemo(
-    () => new Set((policies.data ?? []).map((p) => p.iter_index)),
+  const deployableIters = useMemo(
+    () => new Set(
+      (policies.data ?? [])
+        .filter(isDeployablePolicy)
+        .map((policy) => policy.iter_index),
+    ),
     [policies.data],
   );
   // Latest exportable iter OF THIS RUN — iter dirs accumulate across runs
   // in the project tree, so intersect with the run's own iterations.
-  const latestExportable = useMemo(() => {
+  const latestRunPolicy = useMemo<PolicySummary | null>(() => {
     const runIters = new Set(mergedIters.map((it) => it.iter_index));
-    let best: number | null = null;
+    let best: PolicySummary | null = null;
     for (const p of policies.data ?? []) {
-      if (runIters.has(p.iter_index) && (best === null || p.iter_index > best)) {
-        best = p.iter_index;
+      if (runIters.has(p.iter_index) && (best === null || p.iter_index > best.iter_index)) {
+        best = p;
       }
     }
     return best;
@@ -1709,7 +1872,12 @@ function LiveRunDetailPane({
           <EmptyState icon="clock" title="Not started" sub="This run is queued. Iterations appear once training begins." />
         </div>
       ) : (
-        <IterationTimeline iters={mergedIters} selected={selectedIter} onSelect={setSelectedIter} />
+        <IterationTimeline
+          iters={mergedIters}
+          selected={selectedIter}
+          onSelect={setSelectedIter}
+          evaluationFailedIteration={evaluationFailedIteration}
+        />
       )}
 
       <div className="rs-mid-col">
@@ -1741,6 +1909,14 @@ function LiveRunDetailPane({
             });
           }}
         />
+        {run.data?.authored_world_execution_receipt && (
+          <AuthoredWorldExecutionCard
+            receipt={run.data.authored_world_execution_receipt}
+          />
+        )}
+        {startingPolicy && <StartingPolicyCard {...startingPolicy} />}
+        {referenceAdmission && <ReferenceAdmissionCard {...referenceAdmission} />}
+        {vitals && <LearningVitalsStrip {...vitals} />}
         {isActive && awaiting && run.data && (
           <FeedbackPanel
             iterIndex={awaitingIter}
@@ -1802,33 +1978,25 @@ function LiveRunDetailPane({
           )}
         </div>
         {stageRewardsScope && <StageRewardsCard slug={slug} stage={stageRewardsScope} />}
-        {!isActive && latestExportable !== null && (
-          <div className="rs-card rs-card-pad">
-            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
-              <Icon name="package" size={15} />Deploy this policy
-            </div>
-            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
-              Download iter {latestExportable}'s checkpoint bundled with its
-              reward, env spec, and an ONNX/TorchScript policy network.
-            </p>
-            <a
-              href={policyExportUrl(slug, latestExportable, exportRunId)}
-              download
-              className="rs-btn rs-btn-primary rs-btn-sm"
-            >
-              <Icon name="download" size={14} />Export policy bundle
-            </a>
-          </div>
+        {!isActive && latestRunPolicy !== null && (
+          <PolicyAvailabilityCard
+            iteration={latestRunPolicy.iter_index}
+            evaluated={isDeployablePolicy(latestRunPolicy)}
+            exportHref={isDeployablePolicy(latestRunPolicy)
+              ? policyExportUrl(slug, latestRunPolicy.iter_index, exportRunId)
+              : null}
+          />
         )}
         {isActive && <RunGpuCard />}
         {selectedIter !== null && (
           <IterationDetailCard
             iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null}
             exportHref={
-              selectedIter !== null && exportableIters.has(selectedIter)
+              selectedIter !== null && deployableIters.has(selectedIter)
                 ? policyExportUrl(slug, selectedIter, exportRunId)
                 : null
             }
+            evaluationFailed={selectedIter === evaluationFailedIteration}
           />
         )}
       </div>
@@ -1942,8 +2110,697 @@ function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePendi
   );
 }
 
+/** One `learning_vitals` event — rsl_rl's own per-iteration numbers. */
+interface LearningVitals {
+  rl_iter: number;
+  rl_total: number;
+  mean_reward: number | null;
+  mean_ep_len: number | null;
+  action_std: number | null;
+  top_reward?: { term: string; value: number };
+  top_penalty?: { term: string; value: number };
+}
+
+/** Is exploration noise running away with the run?
+ *
+ * Rising noise is NOT by itself a problem: a healthy 1500-iteration run here
+ * went 0.91 → 1.25 and finished at its best return. What went wrong looked
+ * different — noise still climbing while returns fell, 0.91 → 1.37 as the
+ * return dropped from 358 to 38. So the signal is the conjunction, compared
+ * across two halves of a recent window rather than against any fixed level.
+ *
+ * Deliberately conservative: silence on a struggling-but-recovering run costs
+ * nothing, while crying wolf on a healthy one would make the whole strip
+ * ignorable.
+ */
+function isRatcheting(all: LearningVitals[]): boolean {
+  const WINDOW = 120;              // ~8% of a default 1500-iteration run
+  const pts = all.filter((v) => typeof v.action_std === "number"
+                             && typeof v.mean_reward === "number");
+  if (pts.length < WINDOW) return false;
+  const tail = pts.slice(-WINDOW);
+  const half = Math.floor(WINDOW / 2);
+  const mean = (xs: LearningVitals[], k: "action_std" | "mean_reward") =>
+    xs.reduce((s, x) => s + (x[k] as number), 0) / xs.length;
+  const older = tail.slice(0, half);
+  const newer = tail.slice(half);
+  const stdUp = mean(newer, "action_std") > mean(older, "action_std") * 1.05;
+  const returnDown = mean(newer, "mean_reward") < mean(older, "mean_reward") * 0.8;
+  return stdUp && returnDown;
+}
+
+// Is training going anywhere? The progress bar answers "how far", never
+// "how well". Shows what the policy is paid most for and what it is charged
+// most for — the pair that decides whether attempting the task beats standing
+// still — plus the exploration noise, whose upward drift is what turns the
+// second into the first.
+function LearningVitalsStrip({ v, stdAtStart, ratcheting }: {
+  v: LearningVitals; stdAtStart: number | null; ratcheting: boolean;
+}) {
+  const num = (x: number | null | undefined, digits = 1) =>
+    typeof x === "number" ? x.toFixed(digits) : "—";
+  const pays = v.top_reward;
+  const costs = v.top_penalty;
+  const stat = (label: string, value: string) => (
+    <span className="rs-flex rs-gap-6" style={{ alignItems: "baseline" }}>
+      <span className="rs-eyebrow">{label}</span>
+      <span className="mono" style={{ fontSize: 12 }}>{value}</span>
+    </span>
+  );
+  return (
+    <div className="rs-card" style={{ margin: "0 16px 12px" }}>
+      <div className="rs-flex rs-gap-12" style={{ flexWrap: "wrap", alignItems: "baseline" }}>
+        {stat("iter", `${v.rl_iter}/${v.rl_total}`)}
+        {stat("return", num(v.mean_reward))}
+        {stat("episode", `${num(v.mean_ep_len)} steps`)}
+        {stat("action noise", num(v.action_std, 2)
+          + (stdAtStart != null ? ` (from ${num(stdAtStart, 2)})` : ""))}
+      </div>
+      {pays && costs && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>
+          Pays most: <code className="mono">{pays.term}</code> {num(pays.value, 2)}
+          {" · "}Costs most: <code className="mono">{costs.term}</code> {num(costs.value, 2)}
+        </div>
+      )}
+      {ratcheting && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6, color: "var(--st-amber)" }}>
+          Exploration noise is still climbing while the return falls. The
+          action-rate penalty grows with the square of that noise, so it will
+          keep eating into the return. Lower{" "}
+          <code className="mono">entropy_coef_scale</code> in project settings
+          and restart from a checkpoint taken before the climb.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A checkpoint path, or null when the field carries something else. Event
+ * envelope provenance historically collided with a payload's `source`, so
+ * provisional events never treat a bare value like `stdout` as a path. */
+function asPath(v: unknown): string | null {
+  return typeof v === "string" && (v.includes("/") || v.includes("\\"))
+    ? v
+    : null;
+}
+
+/** `.../runs/iter_4/logs/model_450.pt` → `iter_4/logs/model_450.pt`. */
+function shortCkpt(path: string): string {
+  const parts = path.replaceAll("\\", "/").split("/");
+  const at = parts.findIndex((part) => /^iter_\d+$/.test(part));
+  return (at >= 0 ? parts.slice(at) : parts.slice(-2)).join("/") || path;
+}
+
+function rolesForMode(mode: string): string[] {
+  if (mode === "reference_only") return [];
+  return mode === "actor_only" ? ["actor"] : ["actor", "critic"];
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isAuthority(value: unknown): value is StartingPolicyInitializationAuthority {
+  if (value == null || typeof value !== "object") return false;
+  const authority = value as Partial<StartingPolicyInitializationAuthority>;
+  return typeof authority.initialization_mode === "string"
+    && isStringArray(authority.roles);
+}
+
+function canonicalStructuredValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalStructuredValue);
+  if (value != null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalStructuredValue(item)]),
+    );
+  }
+  return value;
+}
+
+function exactStructuredMatch(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalStructuredValue(left))
+    === JSON.stringify(canonicalStructuredValue(right));
+}
+
+function parseVerifiedInitializationReceipt(
+  value: unknown,
+): StartingPolicyInitializationReceipt | null {
+  if (value == null || typeof value !== "object") return null;
+  const receipt = value as Partial<StartingPolicyInitializationReceipt>;
+  if (
+    receipt.schema !== 1
+    || !isAuthority(receipt.requested)
+    || !isAuthority(receipt.resolved)
+    || !isAuthority(receipt.observed)
+  ) return null;
+  const requested = receipt.requested;
+  const resolved = receipt.resolved;
+  const observed = receipt.observed;
+  const checkpointSha = resolved.checkpoint_sha256;
+  const loadedSha = observed.loaded_checkpoint_sha256;
+  const adapted = observed.adapted === true;
+  const observedMigration = observed.policy_contract_migration;
+  const resolvedMigration = resolved.policy_contract_migration;
+  if (
+    requested.initialization_mode !== resolved.initialization_mode
+    || requested.initialization_mode !== observed.initialization_mode
+    || requested.roles.join("\u0000") !== resolved.roles.join("\u0000")
+    || requested.roles.join("\u0000") !== observed.roles.join("\u0000")
+    || !isStringArray(observed.load_cfg_keys)
+    || requested.roles.join("\u0000") !== observed.load_cfg_keys.join("\u0000")
+    || typeof checkpointSha !== "string"
+    || !/^[a-f0-9]{64}$/.test(checkpointSha)
+    || typeof loadedSha !== "string"
+    || !/^[a-f0-9]{64}$/.test(loadedSha)
+    || observed.source_sha256 !== checkpointSha
+    || (!adapted && loadedSha !== checkpointSha)
+    || (
+      adapted
+      && (
+        observedMigration == null
+        || resolvedMigration == null
+        || observedMigration.optimizer_resume !== false
+        || !exactStructuredMatch(observedMigration, resolvedMigration)
+        || typeof resolved.target_policy_contract_sha256 !== "string"
+        || observed.effective_policy_contract_sha256
+          !== resolved.target_policy_contract_sha256
+      )
+    )
+  ) return null;
+  return receipt as StartingPolicyInitializationReceipt;
+}
+
+export interface StartingPolicyState {
+  requested: StartingPolicyInitializationAuthority | null;
+  resolved: StartingPolicyInitializationAuthority | null;
+  observed: StartingPolicyInitializationAuthority | null;
+  verified: boolean;
+  invalidVerificationReceipt: boolean;
+  ignoredPartial: string | null;
+  noise: { before: number; after: number; ceiling: number } | null;
+  /** A reference-only import is a starting-motion choice, not a policy
+   * initialization request. Keep its explicit disclosure out of the
+   * Requested/Resolved/Observed weight-verification vocabulary. */
+  referenceOnly: boolean;
+}
+
+/** Derive the three policy authorities without upgrading a path resolution or
+ * raw worker log into proof of initialization. */
+export function deriveStartingPolicyState(
+  events: RunEvent[],
+): StartingPolicyState | null {
+  let requested: StartingPolicyInitializationAuthority | null = null;
+  let resolved: StartingPolicyInitializationAuthority | null = null;
+  let observed: StartingPolicyInitializationAuthority | null = null;
+  let invalidVerificationReceipt = false;
+  let ignoredPartial: string | null = null;
+  let noise: StartingPolicyState["noise"] = null;
+  let referenceOnly = false;
+  for (const event of events) {
+    const e = event as RunEvent & Record<string, unknown>;
+    if (e.type === "starting_skill_resolved" && typeof e.starting_skill_id === "string") {
+      const mode = typeof e.initialization_mode === "string"
+        ? e.initialization_mode
+        : "unknown";
+      const roles = rolesForMode(mode);
+      referenceOnly = mode === "reference_only";
+      requested = {
+        kind: "starting_skill",
+        id: e.starting_skill_id,
+        initialization_mode: mode,
+        roles,
+        manifest_digest: typeof e.manifest_digest === "string" ? e.manifest_digest : null,
+        trust_status: typeof e.trust_status === "string" ? e.trust_status : null,
+      };
+      resolved = {
+        initialization_mode: mode,
+        roles,
+        checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+          ? e.checkpoint_sha256
+          : null,
+      };
+    } else if (e.type === "warm_start_checkpoint_resolved") {
+      referenceOnly = false;
+      const roles = ["actor", "critic"];
+      requested = {
+        kind: "project_iteration",
+        id: typeof e.iteration === "number" ? String(e.iteration) : null,
+        initialization_mode: "actor_critic",
+        roles,
+        trust_status: "verified_local",
+      };
+      resolved = {
+        initialization_mode: "actor_critic",
+        roles,
+        checkpoint: asPath(e.checkpoint),
+        checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+          ? e.checkpoint_sha256
+          : null,
+      };
+    } else if (e.type === "resume_warm_start_resolved") {
+      const path = asPath(e.source);
+      if (path) {
+        referenceOnly = false;
+        requested = {
+          kind: "automatic_resume",
+          id: null,
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+        };
+        resolved = {
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+          checkpoint: path,
+          checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+            ? e.checkpoint_sha256
+            : null,
+        };
+      }
+    } else if (e.type === "partial_train_recovered") {
+      const path = asPath(e.checkpoint);
+      if (path) {
+        referenceOnly = false;
+        requested = {
+          kind: "interrupted_snapshot",
+          id: null,
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+        };
+        resolved = {
+          initialization_mode: "actor_critic",
+          roles: ["actor", "critic"],
+          checkpoint: path,
+          checkpoint_sha256: typeof e.checkpoint_sha256 === "string"
+            ? e.checkpoint_sha256
+            : null,
+        };
+      }
+    } else if (e.type === "partial_train_ignored") {
+      ignoredPartial = asPath(e.checkpoint);
+    } else if (e.type === "starting_policy_initialization_verified") {
+      const receipt = parseVerifiedInitializationReceipt(e.receipt);
+      if (receipt) {
+        referenceOnly = false;
+        requested = receipt.requested;
+        resolved = receipt.resolved;
+        observed = receipt.observed;
+      } else {
+        invalidVerificationReceipt = true;
+      }
+    } else if (
+      e.type === "warm_start_noise_clamped"
+      && typeof e.std_before === "number"
+      && typeof e.std_after === "number"
+    ) {
+      noise = {
+        before: e.std_before,
+        after: e.std_after,
+        ceiling: typeof e.ceiling === "number" ? e.ceiling : 1,
+      };
+    }
+  }
+  if (
+    !requested && !resolved && !observed && !invalidVerificationReceipt
+    && !ignoredPartial && !noise
+  ) return null;
+  return {
+    requested,
+    resolved,
+    observed,
+    verified: observed != null,
+    invalidVerificationReceipt,
+    ignoredPartial,
+    noise,
+    referenceOnly,
+  };
+}
+
+function authorityIdentity(authority: StartingPolicyInitializationAuthority): string {
+  if (authority.kind === "starting_skill") return `portable skill ${authority.id ?? "unknown"}`;
+  if (authority.kind === "project_iteration") return `project iteration ${authority.id ?? "unknown"}`;
+  if (authority.kind === "interrupted_snapshot") return `interrupted snapshot ${authority.id ?? "unknown"}`;
+  return (authority.kind ?? "policy source").replaceAll("_", " ");
+}
+
+export function StartingPolicyCard({
+  requested,
+  resolved,
+  observed,
+  verified,
+  invalidVerificationReceipt,
+  ignoredPartial,
+  noise,
+  referenceOnly,
+}: StartingPolicyState) {
+  if (referenceOnly) {
+    return (
+      <div className="rs-card" style={{ margin: "0 16px 12px" }}>
+        <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 7 }}>
+          <Icon name="activity" size={15} color="var(--rs-muted)" />
+          <span className="rs-eyebrow">Reference-only starting point</span>
+        </div>
+        <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+          No actor or critic weights were requested, resolved, or loaded from
+          this import. Its motion is admitted separately by the reference
+          receipt below; the run initializes a fresh policy.
+        </div>
+      </div>
+    );
+  }
+  const identity = requested ? authorityIdentity(requested) : "policy source";
+  return (
+    <div className="rs-card" style={{ margin: "0 16px 12px" }}>
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 7 }}>
+        <Icon name={verified ? "shield-check" : "activity"} size={15} color={verified ? "var(--st-emerald)" : "var(--rs-muted)"} />
+        <span className="rs-eyebrow">{verified ? "Initialized from" : "Starting policy verification"}</span>
+        <span style={{ fontSize: 12, fontWeight: 650 }}>{identity}</span>
+      </div>
+      <div style={{ display: "grid", gap: 5, fontSize: 11, lineHeight: 1.45 }}>
+        <div>
+          <strong>Requested:</strong>{" "}
+          {requested
+            ? <>
+                {authorityIdentity(requested)} · {requested.initialization_mode.replaceAll("_", " ")} · roles {requested.roles.join(" + ")}
+                {requested.manifest_digest && <> · manifest <code className="mono">{requested.manifest_digest.slice(0, 12)}…</code></>}
+              </>
+            : "No requested authority was recorded."}
+        </div>
+        <div>
+          <strong>Resolved:</strong>{" "}
+          {resolved
+            ? <>
+                {resolved.checkpoint && <code className="mono">{shortCkpt(resolved.checkpoint)}</code>}
+                {resolved.checkpoint_sha256 && <> · sha256 <code className="mono">{resolved.checkpoint_sha256.slice(0, 12)}…</code></>}
+                {!resolved.checkpoint && !resolved.checkpoint_sha256 && "No exact checkpoint receipt yet."}
+              </>
+            : "Waiting for backend path and digest resolution."}
+        </div>
+        <div style={{ color: verified ? "var(--st-emerald)" : "var(--rs-muted)" }}>
+          <strong>Observed:</strong>{" "}
+          {observed
+            ? <>
+                exact backend-verified {observed.load_cfg_keys?.join(" + ")} load
+                {observed.loaded_checkpoint && <> from <code className="mono">{shortCkpt(observed.loaded_checkpoint)}</code></>}
+                {observed.loaded_checkpoint_sha256 && <> · sha256 <code className="mono">{observed.loaded_checkpoint_sha256.slice(0, 12)}…</code></>}
+                {observed.adapted && " · exact admitted interface migration applied"}
+                {observed.reuse_kind && <> · {observed.reuse_kind.replaceAll("_", " ")}</>}
+              </>
+            : invalidVerificationReceipt
+              ? "A malformed initialization receipt was rejected; initialization is not proven."
+              : "Not verified. A resolved path or raw warm-start log does not prove that the weights loaded."}
+        </div>
+      </div>
+      {ignoredPartial && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>
+          An interrupted attempt left <code className="mono">{shortCkpt(ignoredPartial)}</code> on
+          disk. It was explicitly ignored.
+        </div>
+      )}
+      {noise && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>
+          Carried action-noise std {noise.before.toFixed(2)}, above this task's fresh-init{" "}
+          {noise.ceiling.toFixed(2)} — clamped to {noise.after.toFixed(2)}. Inherited noise is
+          paid every step through the action-rate penalty, so it is bounded rather than compounded
+          across runs.
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function AuthoredWorldExecutionCard({
+  receipt,
+}: {
+  receipt: NonNullable<RunDetail["authored_world_execution_receipt"]>;
+}) {
+  const requested = receipt.requested;
+  const observed = receipt.observed;
+  const verified = observed != null && exactStructuredMatch(requested, observed);
+  const mismatch = observed != null && !verified;
+  return (
+    <div
+      className="rs-card"
+      role="status"
+      aria-label="Authored world execution receipt"
+      style={{
+        margin: "0 16px 12px",
+        border: `1px solid ${verified
+          ? "var(--st-emerald)"
+          : mismatch
+            ? "var(--st-rose)"
+            : "var(--hairline)"}`,
+      }}
+    >
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 7 }}>
+        <Icon
+          name={verified ? "shield-check" : mismatch ? "alert-triangle" : "globe"}
+          size={15}
+          color={verified ? "var(--st-emerald)" : mismatch ? "var(--st-rose)" : "var(--rs-muted)"}
+        />
+        <span className="rs-eyebrow">{verified ? "Executes in" : "Training environment verification"}</span>
+        <span style={{ fontSize: 12, fontWeight: 650 }}>
+          authored selection v{requested.selection_version}
+        </span>
+      </div>
+      <div style={{ display: "grid", gap: 5, fontSize: 11, lineHeight: 1.5 }}>
+        <div>
+          <strong>Requested:</strong> tuple <code className="mono">{requested.tuple_hash}</code>
+          {" · "}selection <code className="mono">{requested.selection_sha256}</code>
+          {" · "}<code className="mono">{requested.selection_path}</code>
+        </div>
+        <div style={{ color: verified ? "var(--st-emerald)" : mismatch ? "var(--st-rose)" : "var(--rs-muted)" }}>
+          <strong>Observed:</strong>{" "}
+          {verified
+            ? <>worker pinned the exact requested tuple and selection bytes</>
+            : mismatch
+              ? <>worker receipt differs from the requested world; execution is not proven</>
+              : <>pending or unavailable; a requested world does not prove worker execution</>}
+          {observed && (
+            <>
+              {" · "}tuple <code className="mono">{observed.tuple_hash}</code>
+              {" · "}selection <code className="mono">{observed.selection_sha256}</code>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // §Ship 39 (H1): the inline feedback prompt shown when the loop is paused
 // awaiting the human's observation (manual mode).
+export interface ReferenceRuntimeScheduleObservation {
+  robot: string | null;
+  clipId: string | null;
+  targetSha256: string | null;
+  phaseMode: string | null;
+  phaseDurationS: number | null;
+  nPhaseTargets: number | null;
+  trackingBackboneSha256: string | null;
+}
+
+export interface ReferenceAdmissionState {
+  outcome: "admitted" | "failed";
+  tier: string;
+  status: string;
+  robot: string | null;
+  clipId: string | null;
+  clipSha256: string | null;
+  rolloutSha256: string | null;
+  certificateSha256: string | null;
+  executionContractSha256: string | null;
+  executionBoundarySha256: string | null;
+  trainingAuthorized: boolean;
+  certificationScope: TierDCertificationScope | null;
+  reason: string | null;
+  observedSchedule: ReferenceRuntimeScheduleObservation | null;
+  observedScheduleMatchesAdmission: boolean | null;
+  completionProofSha256: string | null;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function numberField(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Keep launch admission and worker observation as separate authorities. */
+export function deriveReferenceAdmissionState(
+  events: RunEvent[],
+): ReferenceAdmissionState | null {
+  let admission: Omit<ReferenceAdmissionState,
+    "observedSchedule" | "observedScheduleMatchesAdmission" | "completionProofSha256"
+  > | null = null;
+  let observedSchedule: ReferenceRuntimeScheduleObservation | null = null;
+  let completionProofSha256: string | null = null;
+  for (const event of events) {
+    const e = event as RunEvent & Record<string, unknown>;
+    if (e.type === "reference_feasibility_admitted") {
+      admission = {
+        outcome: "admitted",
+        tier: stringField(e.tier) ?? "unknown",
+        status: stringField(e.status) ?? "verified",
+        robot: stringField(e.reference_robot),
+        clipId: stringField(e.reference_clip_id),
+        clipSha256: stringField(e.clip_sha256),
+        rolloutSha256: stringField(e.rollout_sha256),
+        certificateSha256: stringField(e.certificate_sha256),
+        executionContractSha256: stringField(e.execution_contract_sha256),
+        executionBoundarySha256: stringField(e.execution_boundary_sha256),
+        trainingAuthorized: e.training_authorized === true,
+        certificationScope: (e.certification_scope ?? null) as TierDCertificationScope | null,
+        reason: stringField(e.reason),
+      };
+    } else if (e.type === "reference_feasibility_integrity_failed") {
+      admission = {
+        outcome: "failed",
+        tier: stringField(e.tier) ?? "unknown",
+        status: "integrity_failed",
+        robot: stringField(e.reference_robot),
+        clipId: stringField(e.reference_clip_id),
+        clipSha256: stringField(e.clip_sha256),
+        rolloutSha256: stringField(e.rollout_sha256),
+        certificateSha256: stringField(e.certificate_sha256),
+        executionContractSha256: stringField(e.execution_contract_sha256),
+        executionBoundarySha256: stringField(e.execution_boundary_sha256),
+        trainingAuthorized: false,
+        certificationScope: null,
+        reason: stringField(e.error) ?? stringField(e.reason)
+          ?? "reference feasibility integrity failed",
+      };
+    } else if (e.type === "reference_runtime_schedule_admitted") {
+      observedSchedule = {
+        robot: stringField(e.reference_robot),
+        clipId: stringField(e.reference_clip_id),
+        targetSha256: stringField(e.reference_target_sha256),
+        phaseMode: stringField(e.phase_mode),
+        phaseDurationS: numberField(e.phase_duration_s),
+        nPhaseTargets: numberField(e.n_phase_targets),
+        trackingBackboneSha256: stringField(e.tracking_backbone_sha256),
+      };
+    } else if (e.type === "run_lineage_proof_verified") {
+      const proof = e.proof;
+      if (proof != null && typeof proof === "object") {
+        const candidate = proof as Record<string, unknown>;
+        if (
+          candidate.schema === 1
+          && candidate.strict_reference_lineage === true
+          && candidate.authority === "reference_guided_completion_verified"
+          && typeof candidate.proof_sha256 === "string"
+          && /^[a-f0-9]{64}$/.test(candidate.proof_sha256)
+        ) {
+          completionProofSha256 = candidate.proof_sha256;
+        }
+      }
+    }
+  }
+  if (!admission) return null;
+  const observedScheduleMatchesAdmission = observedSchedule == null
+    ? null
+    : observedSchedule.robot === admission.robot
+      && observedSchedule.clipId === admission.clipId;
+  return {
+    ...admission,
+    observedSchedule,
+    observedScheduleMatchesAdmission,
+    completionProofSha256,
+  };
+}
+
+export function ReferenceAdmissionCard({
+  outcome, tier, status, robot, clipId, clipSha256, rolloutSha256,
+  certificateSha256, executionContractSha256, executionBoundarySha256,
+  trainingAuthorized, certificationScope, reason, observedSchedule,
+  observedScheduleMatchesAdmission, completionProofSha256,
+}: ReferenceAdmissionState) {
+  const good = outcome === "admitted";
+  const isTrackingCertificate = good && tier === "D";
+  const readableScope = (value: string) => value.replaceAll("_", " ");
+  return (
+    <div
+      className="rs-card"
+      style={{
+        margin: "0 16px 12px",
+        border: `1px solid ${good ? "var(--st-emerald)" : "var(--st-rose)"}`,
+      }}
+    >
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
+        <Icon name={good ? "shield-check" : "alert-triangle"} size={15} color={good ? "var(--st-emerald)" : "var(--st-rose)"} />
+        <span className="rs-eyebrow">
+          {isTrackingCertificate ? "Reference launch admission" : "Reference admission"}
+        </span>
+        <span className={`rs-badge ${good ? "emerald" : "rose"}`}>Tier {tier}</span>
+        <span style={{ fontSize: 11.5, fontWeight: 650 }}>
+          {good
+            ? trainingAuthorized ? "launch authorized" : "inspection only · no policy output"
+            : "integrity check failed"}
+        </span>
+      </div>
+      <div style={{ display: "grid", gap: 5, fontSize: 11, lineHeight: 1.5 }}>
+        <div>
+          <strong>Requested:</strong>{" "}
+          {robot && clipId
+            ? <code className="mono">{robot}/{clipId}</code>
+            : "Reference identity was not recorded."}
+        </div>
+        <div>
+          <strong>Resolved admission:</strong> {status.replaceAll("_", " ")}
+          {clipSha256 && <> · clip <code className="mono">{clipSha256}</code></>}
+          {rolloutSha256 && <> · rollout <code className="mono">{rolloutSha256}</code></>}
+          {certificateSha256 && <> · certificate <code className="mono">{certificateSha256}</code></>}
+          {executionContractSha256 && <> · execution contract <code className="mono">{executionContractSha256}</code></>}
+          {executionBoundarySha256 && <> · execution boundary <code className="mono">{executionBoundarySha256}</code></>}
+          {reason && <> · {reason}</>}
+        </div>
+        <div style={{ color: observedScheduleMatchesAdmission === false ? "var(--st-rose)" : "var(--rs-muted)" }}>
+          <strong>Observed runtime:</strong>{" "}
+          {completionProofSha256
+            ? <>worker completion lineage verified · proof <code className="mono">{completionProofSha256}</code></>
+            : observedScheduleMatchesAdmission === false
+              ? "The worker schedule identity conflicts with this launch admission; runtime consumption is not proven."
+              : observedSchedule
+                ? <>
+                    worker admitted the exact schedule at the sculpt-run boundary
+                    {observedSchedule.targetSha256 && <> · target <code className="mono">{observedSchedule.targetSha256}</code></>}
+                    {observedSchedule.phaseMode && <> · {observedSchedule.phaseMode.replaceAll("_", " ")}</>}
+                    {observedSchedule.nPhaseTargets != null && <> · {observedSchedule.nPhaseTargets} targets</>}
+                    {observedSchedule.trackingBackboneSha256 && <> · backbone <code className="mono">{observedSchedule.trackingBackboneSha256}</code></>}
+                  </>
+                : "Pending or unavailable. Launch admission alone does not prove that the worker consumed the reference schedule."}
+        </div>
+      </div>
+      {isTrackingCertificate && certificationScope && (
+        <div
+          aria-label="Tier-D certification scope"
+          className="rs-sub"
+          style={{ fontSize: 11, lineHeight: 1.5, marginTop: 5 }}
+        >
+          <div>Claim: {certificationScope.claim}.</div>
+          <div>
+            Gated evidence: {certificationScope.gated_evidence.map(readableScope).join(", ")}.
+          </div>
+          <div>
+            Measured, not gated: {certificationScope.measured_only.map(readableScope).join(", ")}.
+          </div>
+          <div>
+            Not certified: {certificationScope.not_certified.map(readableScope).join(", ")}.
+          </div>
+        </div>
+      )}
+      {isTrackingCertificate && !certificationScope && (
+        <div className="rs-sub" style={{ fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
+          Certificate scope is missing from this event; do not interpret it as
+          contact, collision, or general dynamics evidence.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FeedbackPanel({ iterIndex, pending, onSubmit }: { iterIndex: number | null; pending: boolean; onSubmit: (text: string, goAuto: boolean) => void }) {
   const [text, setText] = useState("");
   return (
@@ -1999,12 +2856,25 @@ function RewardVersionTransition({
 }
 
 // ── iteration timeline ────────────────────────────────────────────────
-function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSummary[]; selected: number | null; onSelect: (n: number) => void }) {
+export function IterationTimeline({
+  iters,
+  selected,
+  onSelect,
+  evaluationFailedIteration = null,
+}: {
+  iters: IterEventSummary[];
+  selected: number | null;
+  onSelect: (n: number) => void;
+  evaluationFailedIteration?: number | null;
+}) {
   return (
     <div className="rs-iter-col">
       <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
       {iters.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>no iterations yet</p>}
-      {iters.map((it) => (
+      {iters.map((it) => {
+        const evaluationFailed = it.iter_index === evaluationFailedIteration;
+        const displayStatus = evaluationFailed ? "errored" as const : it.status;
+        return (
         <button
           key={it.iter_index}
           className={"rs-itercard" + (selected === it.iter_index ? " on" : "")}
@@ -2012,7 +2882,15 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
           onClick={() => onSelect(it.iter_index)}
         >
           <div className="rs-itercard-top">
-            <span className="it"><Badge status={it.status} label="" />iter {it.iter_index}</span>
+            <span className="it"><Badge status={displayStatus} label="" />iter {it.iter_index}</span>
+            {evaluationFailed && (
+              <span
+                className="rs-tag"
+                style={{ fontSize: 10, background: "var(--st-amber-bg)", color: "var(--st-amber-fg)" }}
+              >
+                evaluation failed
+              </span>
+            )}
             {/* §Ship 35: objective fitness is the PRIMARY metric (prominent,
                 violet); the reward metric is demoted to a small muted value.
                 Falls back to reward-as-primary on blind runs (no fitness). */}
@@ -2037,12 +2915,12 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
               )
             )}
           </div>
-          {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
+          {displayStatus === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
             <IterProgressBar rlIter={it.rl_iter ?? 0} rlTotal={it.rl_total} pct={it.pct ?? 0} etaS={it.eta_s ?? null} />
           )}
           {(it.reward_version_before !== null || it.reward_version_after !== null) && (
             <div className="rs-flex-between" style={{ marginTop: 5 }}>
-              <RewardVersionTransition versionBefore={it.reward_version_before} versionAfter={it.reward_version_after} editCount={it.edit_count} failureModes={it.failure_modes} status={it.status} />
+              <RewardVersionTransition versionBefore={it.reward_version_before} versionAfter={it.reward_version_after} editCount={it.edit_count} failureModes={it.failure_modes} status={displayStatus} />
               {it.metric_delta !== null && <Delta value={it.metric_delta} />}
             </div>
           )}
@@ -2105,7 +2983,8 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
             </span>
           )}
         </button>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -2146,6 +3025,14 @@ function RunErrorCard({
       </div>
     );
   }
+  if (classification?.kind === POST_TRAINING_ROLLOUT_FAILED) {
+    return (
+      <EvaluationFailureNotice
+        classification={classification}
+        error={error}
+      />
+    );
+  }
 
   const onRegenerate = () => {
     regen.mutate(undefined, {
@@ -2173,11 +3060,21 @@ function RunErrorCard({
   );
 }
 
-function IterationDetailCard({ iter, exportHref }: { iter: IterEventSummary | null; exportHref: string | null }) {
+function IterationDetailCard({
+  iter,
+  exportHref,
+  evaluationFailed = false,
+}: {
+  iter: IterEventSummary | null;
+  exportHref: string | null;
+  evaluationFailed?: boolean;
+}) {
   if (!iter) return null;
   return (
     <div className="rs-card rs-card-pad">
-      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}><Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {iter.status}</div>
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}>
+        <Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {evaluationFailed ? "evaluation failed" : iter.status}
+      </div>
       <div className="rs-vgap-8">
         {exportHref && (
           <div>
@@ -2209,6 +3106,22 @@ function IterationDetailCard({ iter, exportHref }: { iter: IterEventSummary | nu
               ))}
               {iter.env_spec_update.rejected.map((r, i) => (
                 <span key={`rej-${i}`} className="rs-tag mono" style={{ fontSize: 10, opacity: 0.55, textDecoration: "line-through" }} title={r.reason}>{r.parameter}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        {iter.edits_rejected && iter.edits_rejected.reasons.length > 0 && (
+          <div>
+            <div className="rs-eyebrow" style={{ marginBottom: 4 }}>
+              reward edits filtered ({iter.edits_rejected.count})
+            </div>
+            <div className="rs-vgap-8">
+              {iter.edits_rejected.reasons.map((r, i) => (
+                <div key={`er-${i}`} className="rs-sub mono"
+                     style={{ fontSize: 10, lineHeight: 1.5,
+                              color: "var(--st-amber)", wordBreak: "break-word" }}>
+                  {r}
+                </div>
               ))}
             </div>
           </div>
@@ -2259,6 +3172,9 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     best_fitness: winner.best_fitness ?? loser.best_fitness,
     progress: winner.progress ?? loser.progress,
     env_spec_update: winner.env_spec_update ?? loser.env_spec_update,
+    // `edits_rejected` arrives at pre-flight, well before `iter_completed`
+    // wins the slot — take whichever half actually saw it.
+    edits_rejected: winner.edits_rejected ?? loser.edits_rejected,
   };
 }
 
@@ -2444,6 +3360,14 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
       if (ev.type === "diagnosed") {
         slot.diagnosed = true;
         slot.failure_modes = Array.isArray(ev.failure_modes) ? (ev.failure_modes as string[]) : slot.failure_modes;
+      }
+      if (ev.type === "edits_rejected") {
+        const reasons = Array.isArray(ev.reasons)
+          ? (ev.reasons as unknown[]).map(String) : [];
+        slot.edits_rejected = {
+          count: typeof ev.count === "number" ? ev.count : reasons.length,
+          reasons,
+        };
       }
       if (ev.type === "edit_applied") {
         if (ev.reward_version_after !== undefined) slot.reward_version_after = Number(ev.reward_version_after);

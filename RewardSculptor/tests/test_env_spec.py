@@ -570,9 +570,25 @@ def test_apply_eval_reset_joint_target_length_mismatch_skips() -> None:
 
 def test_apply_eval_reset_removes_fell_over_termination() -> None:
     cfg = _fake_cfg_full()
-    _mjlab_runner._apply_eval_reset(
-        cfg, {"fell_over_termination": False})
+    receipt = _mjlab_runner._apply_eval_reset(
+        cfg, {"fell_over_termination": False}, strict=True)
     assert "fell_over" not in cfg.terminations
+    assert receipt["applied"] == ["fell_over_termination"]
+    assert receipt["dead"] == []
+    assert receipt["errors"] == []
+
+
+def test_apply_eval_reset_strict_accepts_fell_over_already_absent() -> None:
+    cfg = _fake_cfg_full()
+    cfg.terminations.pop("fell_over", None)
+
+    receipt = _mjlab_runner._apply_eval_reset(
+        cfg, {"fell_over_termination": False}, strict=True,
+    )
+
+    assert receipt["applied"] == ["fell_over_termination"]
+    assert receipt["dead"] == []
+    assert receipt["errors"] == []
 
 
 def test_apply_eval_reset_absent_payload_is_byte_identical_noop() -> None:
@@ -600,6 +616,64 @@ def test_apply_eval_reset_tolerates_partial_cfg() -> None:
     _mjlab_runner._apply_eval_reset(SimpleNamespace(), payload)
     _mjlab_runner._apply_eval_reset(
         SimpleNamespace(events={}, terminations={}), payload)
+
+
+def test_apply_eval_reset_strict_rejects_unapplied_fields() -> None:
+    payload = {
+        "reset_height_offset_m": -0.5,
+        "fell_over_termination": False,
+    }
+    with pytest.raises(RuntimeError, match="not applied exactly"):
+        _mjlab_runner._apply_eval_reset(
+            SimpleNamespace(), payload, strict=True,
+        )
+
+
+def test_load_explicit_eval_reset_fails_closed(tmp_path) -> None:
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unreadable/invalid"):
+        _mjlab_runner._load_explicit_eval_reset(str(malformed))
+
+    non_object = tmp_path / "list.json"
+    non_object.write_text("[]", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="must contain a JSON object"):
+        _mjlab_runner._load_explicit_eval_reset(str(non_object))
+
+
+def test_env_spec_application_receipt_distinguishes_applied_and_dead() -> None:
+    spec = {
+        "env_spec_version": 1,
+        "shared": {"episode_length_s": 7.0},
+    }
+    applied = _mjlab_runner._apply_env_spec(
+        _fake_cfg_full(), spec, train=False,
+    )
+    assert applied["phase"] == "rollout"
+    assert applied["requested"] == ["episode_length_s"]
+    assert applied["dead"] == []
+    assert applied["errors"] == []
+
+    dead = _mjlab_runner._apply_env_spec(
+        SimpleNamespace(), spec, train=False,
+    )
+    assert dead["requested"] == ["episode_length_s"]
+    assert dead["dead"] == ["episode_length_s"]
+
+
+@pytest.mark.parametrize("seed", [-1, 2**32])
+def test_runtime_seed_rejects_values_outside_shared_rng_domain(seed: int) -> None:
+    with pytest.raises(ValueError, match="0..4294967295"):
+        _mjlab_runner._apply_runtime_seed(seed)
+
+
+@pytest.mark.parametrize("seed", [0, 2**32 - 1])
+def test_runtime_seed_accepts_shared_rng_domain_boundaries(seed: int) -> None:
+    receipt = _mjlab_runner._apply_runtime_seed(seed)
+    assert receipt["applied_seed"] == seed
+    assert receipt["python_random"] is True
+    assert receipt["numpy_global"] is True
+    assert receipt["torch_global"] is True
 
 
 # ── Runner-side resolution ─────────────────────────────────────────────────
@@ -884,50 +958,35 @@ def test_rsi_trajectory_validates_and_is_not_iterable() -> None:
     assert "reset_joint_pos_trajectory" not in es.ITERABLE_TRAIN_KEYS
 
 
-def test_rsi_trajectory_wires_phase_reset_event() -> None:
+def test_rsi_trajectory_fails_closed_until_phase_is_synchronized() -> None:
     spec = {"env_spec_version": 1, "train": {
         "reset_joint_pos_trajectory": [[0.1, 0.2, 0.3], [0.2, 0.3, 0.4]],
         "reset_joint_vel_trajectory": [[0.0, 0.0, 0.0], [1.0, -1.0, 0.5]],
     }}
     assert es.validate_env_spec(spec) == []
     cfg = _fake_cfg_full()
-    _mjlab_runner._apply_env_spec(cfg, spec, train=True, task_id="")
-    ev = cfg.events["reset_robot_joints_to_reference"]
-    assert ev.mode == "reset"
-    assert "joint_pos_traj" in ev.params and "joint_vel_traj" in ev.params
+    with pytest.raises(RuntimeError, match="immutable per-environment phase"):
+        _mjlab_runner._apply_env_spec(cfg, spec, train=True, task_id="")
+    assert "reset_robot_joints_to_reference" not in cfg.events
     # rollout: reference reset is train-only
     cfg2 = _fake_cfg_full()
     _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
     assert "reset_robot_joints_to_reference" not in cfg2.events
 
 
-def test_phase_rsi_reset_samples_pos_and_vel_from_same_frame() -> None:
-    """Each env resets to a RANDOM reference frame, and its joint velocity comes
-    from that SAME frame (not the default zeros the single-target path uses)."""
+def test_phase_rsi_event_rejects_unsynchronized_trajectory() -> None:
     import torch
     from types import SimpleNamespace
 
     pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, -0.5, 0.5], [1.0, -1.0, 1.0]])
     vel = torch.tensor([[0.0, 0.0, 0.0], [2.0, -2.0, 1.0], [4.0, -4.0, 2.0]])
 
-    class _Asset:
-        data = SimpleNamespace(
-            default_joint_vel=torch.zeros(8, 3),
-            soft_joint_pos_limits=torch.tensor([[[-3.0, 3.0]] * 3] * 8))
-
-        def write_joint_state_to_sim(self, jp, jv, env_ids, joint_ids):
-            self.pos, self.vel = jp.clone(), jv.clone()
-
-    asset = _Asset()
-    env = SimpleNamespace(num_envs=8, device="cpu", scene={"robot": asset})
-    torch.manual_seed(3)
-    _mjlab_runner.reset_joints_to_reference(
-        env, None, joint_pos_traj=pos, joint_vel_traj=vel,
-        asset_cfg=SimpleNamespace(name="robot", joint_ids=slice(None)))
-    for r in range(8):
-        match = [k for k in range(3) if torch.allclose(asset.pos[r], pos[k], atol=1e-4)]
-        assert match, asset.pos[r].tolist()
-        assert torch.allclose(asset.vel[r], vel[match[0]], atol=1e-4)
+    with pytest.raises(RuntimeError, match="phase offset"):
+        _mjlab_runner.reset_joints_to_reference(
+            SimpleNamespace(), None,
+            joint_pos_traj=pos,
+            joint_vel_traj=vel,
+        )
 
 
 def test_pd_gains_dr_skipped_on_non_pd_robot() -> None:

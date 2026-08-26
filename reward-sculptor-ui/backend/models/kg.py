@@ -87,12 +87,41 @@ class PaperEntities(BaseModel):
     environments: list[KGEntitySummary] = []
 
 
+class ResearchCapabilitySummary(BaseModel):
+    """One reviewed paper mechanism with an explicit product-status edge.
+
+    ``parameters`` contains source-pinned scientific facts. It is not runtime
+    configuration, and ``unsupported`` must never be rendered as available.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    name: str
+    description: str = ""
+    scope: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    implementation_status: Literal[
+        "implemented", "metadata_only", "unsupported"
+    ]
+    status_definition: str
+    code_evidence: list[str] = Field(default_factory=list)
+    provenance: str
+    paper_role: str = ""
+    source_version: str = ""
+    source_locator: str = ""
+
+
 class PaperDetail(PaperSummary):
     abstract: str = ""
     conclusion_text: str = ""
+    rationale: str = ""
+    tags: list[str] = Field(default_factory=list)
+    source_url: str = ""
+    provenance: str = ""
     pdf_available: bool
     ingested_at: Optional[datetime] = None
     entities: PaperEntities
+    capabilities: list[ResearchCapabilitySummary] = Field(default_factory=list)
 
 
 class TechniqueSummary(BaseModel):
@@ -123,6 +152,11 @@ JobKind = Literal[
     # regenerate. In-process thread job (mirrors mission_decompose's
     # strategy — a handful of LLM calls, no subprocess needed).
     "mission_stage_metric_regen",
+    # Per-mode reward authoring over a composed reference's automaton: Claude
+    # writes ONE mode's two function bodies, the rest of the module is
+    # generated. One job per mode on purpose — see
+    # `sculptor.mode_rewards.author_mode`.
+    "mode_author",
 ]
 JobStatus = Literal["queued", "running", "completed", "errored", "stopped"]
 

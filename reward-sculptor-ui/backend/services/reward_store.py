@@ -141,51 +141,17 @@ def _compute_reward_signature_ok(source: str) -> Optional[str]:
     return "no module-level compute_reward function found"
 
 
-_TRACKING_IMMUTABLE_FUNCTIONS = {
-    "_scalar", "_phase_index_scalar", "_reference_tracking_numpy",
-    "_phase_index_batched", "_reference_tracking_batched",
-    "compute_reward", "compute_reward_batched",
-}
-_TRACKING_IMMUTABLE_GLOBALS = {
-    "_W_JOINT_POS", "_W_JOINT_VEL", "_W_ROOT", "_W_ORIENTATION",
-    "_TRACKING_WEIGHT", "_RESIDUAL_MAX", "_ALIVE_BONUS",
-}
-
-
 def _tracking_immutable_hash(source: str) -> Optional[str]:
-    """Hash tracking targets and composition without executing reward code."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return None
-    functions = {
-        node.name: node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    if not _TRACKING_IMMUTABLE_FUNCTIONS.issubset(functions):
-        return None
-    assignments: dict[str, ast.AST] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    assignments[target.id] = node
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            assignments[node.target.id] = node
-    names = sorted(
-        name for name in assignments
-        if name.startswith("REFERENCE_") or name in _TRACKING_IMMUTABLE_GLOBALS
-    )
-    if (not any(name.startswith("REFERENCE_") for name in names)
-            or not _TRACKING_IMMUTABLE_GLOBALS.issubset(names)):
-        return None
-    nodes = [functions[name] for name in sorted(_TRACKING_IMMUTABLE_FUNCTIONS)]
-    nodes.extend(assignments[name] for name in names)
-    payload = "\n".join(
-        ast.dump(node, annotate_fields=True, include_attributes=False)
-        for node in nodes
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Use the core's single data-only flat-runtime authority.
+
+    Manual UI edits and CLI/launch admission must freeze the exact same
+    functions and globals.  Keeping a second AST inventory here previously
+    let clock/index functions change while the UI still reported an unchanged
+    tracking backbone.
+    """
+    from sculptor.edit import reference_tracking_backbone_sha256
+
+    return reference_tracking_backbone_sha256(source)
 
 
 def _validate_manual_tracking_edit(
@@ -646,23 +612,7 @@ def apply_manual_edit(
 
 
 def _write_current_reexport(rewards_dir: Path, target: Path) -> None:
-    """Mirror of sculptor/edit.py's current.py pattern: importlib spec
-    by file path so there's no symlink, works cross-platform."""
-    relative = target.name  # same dir
-    content = (
-        '"""Auto-generated. Re-exports the latest reward version."""\n'
-        "from __future__ import annotations\n\n"
-        "import importlib.util\n"
-        "from pathlib import Path\n\n"
-        f"_TARGET = Path(__file__).resolve().parent / {relative!r}\n"
-        "_spec = importlib.util.spec_from_file_location("
-        '"_sculpt_current_reward", _TARGET)\n'
-        "_mod = importlib.util.module_from_spec(_spec)\n"
-        "assert _spec.loader is not None\n"
-        "_spec.loader.exec_module(_mod)\n\n"
-        "compute_reward = _mod.compute_reward\n"
-        "if hasattr(_mod, 'compute_reward_batched'):\n"
-        "    compute_reward_batched = _mod.compute_reward_batched\n"
-        "REWARD_SPEC = _mod.REWARD_SPEC\n"
-    )
-    (rewards_dir / "current.py").write_text(content, encoding="utf-8")
+    """Delegate to the one canonical selector implementation."""
+    from sculptor.edit import _write_current_reexport as write_current
+
+    write_current(rewards_dir, target)

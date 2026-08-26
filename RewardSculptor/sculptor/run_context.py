@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import platform
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 #: Bumped on shape changes so downstream analysis can dispatch.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 #: Packages whose versions matter for reproducing a run. Tolerant
 #: lookup — absent packages are simply omitted.
@@ -73,17 +74,92 @@ def _git_info(repo_dir: Path, must_track: Optional[Path] = None) -> dict[str, An
     installed into `.venv/` INSIDE an adopter's project repo would
     otherwise report the adopter's SHA as sculptor's code revision.
     """
-    def _run(*args: str) -> Optional[str]:
+    def _run_bytes(*args: str) -> Optional[bytes]:
         try:
             r = subprocess.run(
                 ["git", "-C", str(repo_dir), *args],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, timeout=10, check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return None
         if r.returncode != 0:
             return None
-        return r.stdout.strip()
+        return r.stdout
+
+    def _run(*args: str) -> Optional[str]:
+        raw = _run_bytes(*args)
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+
+    def _dirty_tree_sha256(repo_root: Path) -> tuple[str, int] | None:
+        """Hash the normalized HEAD diff and every untracked file byte.
+
+        ``git diff`` does not include untracked files, so a patch identity made
+        from it alone can silently collapse two materially different source
+        trees.  The length-delimited stream below covers both namespaces,
+        includes untracked file kinds/modes, and never follows an untracked
+        symlink outside the repository.  Git's textual patch uses LF; normalize
+        CRLF defensively so the same patch has one identity across launch hosts.
+        """
+        patch = _run_bytes(
+            "diff", "--binary", "--full-index", "--no-ext-diff", "--no-color",
+            "HEAD", "--",
+        )
+        raw_untracked = _run_bytes(
+            "ls-files", "--others", "--exclude-standard", "-z",
+        )
+        if patch is None or raw_untracked is None:
+            return None
+
+        digest = hashlib.sha256()
+        digest.update(b"reward-sculptor-worktree-v1\0")
+        normalized_patch = patch.replace(b"\r\n", b"\n")
+        digest.update(len(normalized_patch).to_bytes(8, "big"))
+        digest.update(normalized_patch)
+
+        names = sorted(name for name in raw_untracked.split(b"\0") if name)
+        root = repo_root.resolve()
+        for raw_name in names:
+            try:
+                name = os.fsdecode(raw_name)
+                path = root / name
+                relative = path.relative_to(root)
+                info = path.lstat()
+            except (OSError, ValueError):
+                return None
+            if relative.is_absolute() or ".." in relative.parts:
+                return None
+
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                kind = b"symlink"
+                try:
+                    content = os.fsencode(os.readlink(path))
+                except OSError:
+                    return None
+            elif stat.S_ISREG(info.st_mode):
+                kind = b"file"
+                try:
+                    content = path.read_bytes()
+                except OSError:
+                    return None
+            else:
+                # Repository identity must never depend on reading a socket,
+                # device, FIFO, or another unstable special file.
+                return None
+
+            digest.update(len(raw_name).to_bytes(8, "big"))
+            digest.update(raw_name)
+            digest.update(len(kind).to_bytes(2, "big"))
+            digest.update(kind)
+            digest.update(mode.to_bytes(4, "big"))
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        return digest.hexdigest(), len(names)
 
     sha = _run("rev-parse", "HEAD")
     if sha is None:
@@ -93,14 +169,28 @@ def _git_info(repo_dir: Path, must_track: Optional[Path] = None) -> dict[str, An
         if tracked is None:
             return {"available": False, "reason": "installed_outside_repo"}
     status = _run("status", "--porcelain")
-    return {
+    dirty = bool(status) if status is not None else None
+    result = {
         "available": True,
         "sha": sha,
         "branch": _run("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
         # None (not False) when `git status` itself failed — an unknown
         # dirty state must never be recorded as a definitive "clean".
-        "dirty": bool(status) if status is not None else None,
+        "dirty": dirty,
     }
+    if dirty:
+        raw_root = _run("rev-parse", "--show-toplevel")
+        identity = (
+            _dirty_tree_sha256(Path(raw_root)) if raw_root is not None else None
+        )
+        if identity is not None:
+            result["diff_sha256"], result["untracked_count"] = identity
+        else:
+            # Preserve the unknown state.  Lineage admission rejects dirty
+            # captures without this digest rather than deriving identity from
+            # volatile run-context bytes.
+            result["diff_sha256"] = None
+    return result
 
 
 def _code_repo_dir() -> Path:
@@ -170,6 +260,41 @@ def _sculptor_env() -> dict[str, Any]:
     }
 
 
+def _warm_start_policy_contract_receipt() -> dict[str, Any] | None:
+    """Capture the worker-admitted warm-start receipt, not just env names."""
+    raw = os.environ.get(
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+    )
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "warm-start policy-contract receipt is invalid JSON"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != 1
+        or not isinstance(payload.get("source"), dict)
+        or not isinstance(payload.get("target"), dict)
+        or not isinstance(payload.get("compatibility"), dict)
+    ):
+        raise ValueError(
+            "warm-start policy-contract receipt has an invalid structure"
+        )
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return {
+        "receipt": payload,
+        "receipt_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -221,6 +346,48 @@ def capture_run_context(
         "schema": SCHEMA_VERSION,
         "captured_at": _utc_now(),
         "behavior_goal": behavior_goal,
+        "starting_skill": (
+            {
+                "skill_id": os.environ.get("SCULPTOR_STARTING_SKILL_ID"),
+                "initialization_mode": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_INIT_MODE"
+                ),
+                "manifest_digest": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_MANIFEST_DIGEST"
+                ),
+                "compatibility_contract_digest": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_CONTRACT_DIGEST"
+                ),
+                "compatibility_contract_provenance_status": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_CONTRACT_PROVENANCE_STATUS"
+                ),
+                "compatibility_contract_provenance_digest": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_CONTRACT_PROVENANCE_DIGEST"
+                ),
+                "legacy_reconstructed_acknowledged": (
+                    os.environ.get(
+                        "SCULPTOR_STARTING_SKILL_LEGACY_ACKNOWLEDGED"
+                    ) == "1"
+                ),
+                "tensor_signature_sha256": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_TENSOR_SIGNATURE"
+                ),
+                "checkpoint_sha256": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"
+                ),
+                "reference_clip_id": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_REFERENCE_CLIP"
+                ),
+                "reference_sha256": os.environ.get(
+                    "SCULPTOR_STARTING_SKILL_REFERENCE_SHA256"
+                ),
+            }
+            if os.environ.get("SCULPTOR_STARTING_SKILL_ID")
+            else None
+        ),
+        "warm_start_policy_contract": (
+            _warm_start_policy_contract_receipt()
+        ),
         "code_git": _git_info(
             _code_repo_dir(), must_track=_code_repo_dir() / "__init__.py",
         ),

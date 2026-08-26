@@ -5,7 +5,7 @@
 #
 # Runtime cost:
 #   - ~2-5 min (arxiv PDF downloads; rate-limited).
-#   - ~2-5 min (Claude entity extraction; ~150K tokens for 46 papers).
+#   - ~2-5 min (Claude entity extraction; ~160K tokens for 48 papers).
 #   - Requires ANTHROPIC_API_KEY (auto-loaded from .env by sculptor).
 #
 # Output: overwrites examples/kg_preextracted.db on success.
@@ -35,6 +35,13 @@ SCULPTOR_KG_PATH="$STAGING" uv run python -m sculptor.kg.ingest "$SEEDS"
 # Extract: Claude-powered entity extraction over each paper.
 echo "[regen] extracting entities via Claude ..."
 SCULPTOR_KG_PATH="$STAGING" uv run sculpt kg extract --all
+
+# Deterministic reviewed claims do not depend on an LLM extraction. Re-run the
+# materializer explicitly so a future ingest refactor cannot silently omit the
+# source-pinned SONIC capability/status subgraph from fresh installations.
+echo "[regen] materializing reviewed SONIC capabilities ..."
+SCULPTOR_KG_PATH="$STAGING" uv run python -c \
+    'from sculptor.kg.sonic_capabilities import materialize_sonic_capability_map; from sculptor.kg.store import SculptorKG; store = SculptorKG(); materialize_sonic_capability_map(store); store.close()'
 
 # Stats: sanity-check the output.
 echo "[regen] final stats:"

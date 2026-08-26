@@ -176,11 +176,13 @@ def _build_eval_reset_block(eval_reset: dict[str, Any]) -> str:
 
 
 MODEL_ID = model_for("metric_gen")
-#: §truncation fix: adaptive THINKING shares this budget with the code output, and a
-#: hard metric's think can use 5-8k tokens — at the old 8000 cap that truncated the
-#: code (a confusing downstream "missing compute_spec"). 16000 leaves ample room for
-#: thinking AND a complete metric (observed ~7.3-7.5k total per generation).
-MAX_TOKENS = 16000
+#: Adaptive THINKING shares this budget with the code output.  World-grounded,
+#: compound objectives can legitimately need more than the old 16k ceiling before
+#: emitting any code, so keep enough headroom for both phases.  ``medium`` effort
+#: prevents best-of-N from spending the entire budget re-deriving the validator while
+#: preserving enough reasoning for an honest conjunctive metric.
+MAX_TOKENS = 32000
+GENERATION_EFFORT = "medium"
 #: §reviewer-truncation fix: the review call had the SAME class of bug MAX_TOKENS
 #: fixed for generation — adaptive THINKING shares the budget with the structured
 #: JSON verdict, and at the old 4000 cap a reviewer whose thinking ran long emitted a
@@ -282,6 +284,7 @@ def _review_one(
     client: Any, model: str, lens: str, goal: str, source: str,
     archetype_scores: dict, keyframes: Optional[list] = None,
     selectivity: Optional[dict] = None,
+    review_appendix: Optional[str] = None,
 ) -> dict[str, Any]:
     """One reviewer (model × lens). Returns
     `{model, lens, status: approved|veto|skip|error, reason, concerns, gaming_exploit}`.
@@ -291,7 +294,13 @@ def _review_one(
 
     `selectivity` (the validate selectivity-probe scores, present only on a NOVEL-goal
     vacuous pass) is surfaced so the reviewer sees the metric IS selective — otherwise
-    it sees an all-zero fixed battery and wrongly flags "can't confirm not near-constant"."""
+    it sees an all-zero fixed battery and wrongly flags "can't confirm not near-constant".
+
+    `review_appendix` (default None → BYTE-IDENTICAL) is an EXTRA system block appended
+    after the lens focus — the scope contract for a metric that grades only part of an
+    episode (`sculptor.eval.mode_metrics`). It layers on the shared rubric exactly like
+    a lens does, rather than forking `review_objective_metric.md`, so the hard-won
+    rejection causes stay in one file and cannot drift between the two callers."""
     is_vlm = lens == _VLM_LENS
     if is_vlm and not keyframes:
         return {"model": model, "lens": lens, "status": "skip",
@@ -302,6 +311,8 @@ def _review_one(
     system = [{"type": "text", "text": load_prompt("review_objective_metric"),
                "cache_control": {"type": "ephemeral"}},
               {"type": "text", "text": appendix}]
+    if review_appendix:
+        system.append({"type": "text", "text": review_appendix})
     pay: dict[str, Any] = {"behavior_goal": goal, "metric_source": source,
                            "archetype_scores": archetype_scores}
     if selectivity is not None:
@@ -372,6 +383,7 @@ def _review_metric_panel(
     client: Any, goal: str, source: str, archetype_scores: dict, *,
     reviewers: list[tuple[str, str]], keyframes: Optional[list] = None,
     selectivity: Optional[dict] = None,
+    review_appendix: Optional[str] = None,
 ) -> dict[str, Any]:
     """§Ship 55 (LAW 9): a diversified, blinded review PANEL. Each reviewer (model ×
     lens) votes; aggregation is asymmetric-veto with an ABSOLUTE quorum FLOOR:
@@ -388,7 +400,7 @@ def _review_metric_panel(
     in the sibling keys, never nested in `review`. Never-silent: a veto / quorum
     miss names the (model, lens, reason) in `review.concerns`."""
     panel = [_review_one(client, m, lens, goal, source, archetype_scores, keyframes,
-                         selectivity)
+                         selectivity, review_appendix)
              for (m, lens) in reviewers]
     eligible = [p for p in panel if p["status"] != "skip"]
     n_elig = len(eligible)
@@ -436,6 +448,7 @@ def _sample_source(client: Any, system_prompt: str, user_content: str,
         max_tokens=MAX_TOKENS,
         temperature=1.0,
         thinking={"type": "adaptive"},
+        output_config={"effort": GENERATION_EFFORT},
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )
@@ -644,8 +657,11 @@ def _best_of_n(
 def _review_metric(
     client: Any, model: str, goal: str, source: str,
     archetype_scores: dict, selectivity: Optional[dict] = None,
+    review_appendix: Optional[str] = None,
 ) -> dict[str, Any]:
     system_prompt = load_prompt("review_objective_metric")
+    if review_appendix:   # default None → BYTE-IDENTICAL (see `_review_one`)
+        system_prompt = system_prompt + "\n\n" + review_appendix
     pay: dict[str, Any] = {
         "behavior_goal": goal,
         "metric_source": source,
@@ -722,6 +738,8 @@ def generate_objective_metric(
     channel_catalog: (
         ChannelCatalog | Mapping[str, Any] | Path | str | None
     ) = None,
+    prompt_appendix: Optional[str] = None,
+    review_appendix: Optional[str] = None,
 ) -> dict[str, Any]:
     """Generate, validate, (regenerate on failure,) and review an objective
     metric for `behavior_goal`. Writes `metric.py` + `meta.json` to
@@ -762,6 +780,16 @@ def generate_objective_metric(
     extraction raised records `{"_error": ...}` instead of crashing the
     run).
 
+    §per-mode gauntlet: `prompt_appendix` / `review_appendix` (both optional,
+    default None → BYTE-IDENTICAL) append EXTRA system-prompt blocks to the
+    authoring and review calls respectively. Their one caller today is
+    `sculptor.eval.mode_metrics`, which uses them to add the mode-SCOPE
+    contract (`prompts/gen_mode_metric.md` + the graph-derived per-mode data)
+    for a metric that grades only one mode's slice of an episode. They ADD
+    obligations to the author/reviewer; they can neither remove a rule from
+    the shared rubric nor touch a validation gate, so a mode-scoped metric
+    still clears exactly the gates an episode-scoped one does.
+
     §D24 F2: `eval_reset` (optional — the stage's certified eval-reset
     preview, `mission_metrics._compute_eval_reset_preview`'s return
     value; default None → BYTE-IDENTICAL behavior) grounds authoring AND
@@ -795,6 +823,8 @@ def generate_objective_metric(
         # (the runtime resolution is then the backstop).
         robot_names = robot_joint_names(robot_hint)
         system_prompt = load_prompt("gen_objective_metric")
+        if prompt_appendix:   # additive-only; see the docstring
+            system_prompt = system_prompt + "\n\n" + prompt_appendix
         base_user = json.dumps(
             {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
             indent=2, default=str,
@@ -878,6 +908,7 @@ def generate_objective_metric(
         selected_candidate: Optional[int] = None
         ranked_valid: list[dict[str, Any]] = []
         passed = False
+        cumulative_validation_reasons: list[str] = []
 
         if n_candidates and n_candidates > 1:
             # §best-of-N: sample N candidates and select the most-discriminating valid one.
@@ -905,15 +936,24 @@ def generate_objective_metric(
                 _emit({"stage": "generating", "attempt": attempt + 1, "max": n_attempts,
                        "message": f"Generating candidate metric "
                                   f"(attempt {attempt + 1}/{n_attempts})…"})
-                user = base_user
-                # Feed back ANY prior failure's reasons (an earlier attempt OR, when
-                # best-of-N fell through, its aggregated candidate failures). Equivalent
-                # to `attempt > 0` for single-shot (validation is None at attempt 0).
+                # Preserve the whole repair contract across retries.  Feeding back
+                # only the immediately previous result lets a later candidate
+                # regress on an earlier gate as soon as that gate disappears from
+                # the latest reason list (for example, reintroducing a smoothed
+                # continuity proxy after fixing a catalog access).
                 if validation is not None and not validation.get("ok"):
+                    for reason in validation.get("reasons") or []:
+                        if reason not in cumulative_validation_reasons:
+                            cumulative_validation_reasons.append(reason)
+                user = base_user
+                # Feed back every failure observed so far (an earlier attempt OR,
+                # when best-of-N fell through, its aggregated candidate failures).
+                if cumulative_validation_reasons:
                     user = (
                         base_user
-                        + "\n\nThe previous attempt FAILED these validation gates:\n"
-                        + json.dumps(validation.get("reasons") or [], indent=2)
+                        + "\n\nPrior attempts FAILED these validation gates "
+                          "(cumulative; fix ALL of them):\n"
+                        + json.dumps(cumulative_validation_reasons, indent=2)
                         + "\nFix ALL of them. Output ONLY the corrected module."
                     )
                 try:
@@ -968,10 +1008,11 @@ def generate_objective_metric(
                 panel = _review_metric_panel(
                     client, behavior_goal, src, archetype_scores,
                     reviewers=reviewers, keyframes=review_keyframes,
-                    selectivity=selectivity)
+                    selectivity=selectivity, review_appendix=review_appendix)
                 return panel["review"], {k: v for k, v in panel.items() if k != "review"}
             return (_review_metric(client, model, behavior_goal, src, archetype_scores,
-                                   selectivity=selectivity), None)
+                                   selectivity=selectivity,
+                                   review_appendix=review_appendix), None)
 
         review_out: Optional[dict[str, Any]] = None
         review_panel: Optional[dict[str, Any]] = None

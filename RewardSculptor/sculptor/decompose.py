@@ -24,7 +24,6 @@ land in Ships 15-18.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -832,7 +831,14 @@ def _select_and_attach_span(stage: Stage, robot: str) -> None:
         )
 
 
-def _attach_stage_references(stages: list[Stage], robot: str) -> None:
+def _attach_stage_references(
+    stages: list[Stage],
+    robot: str,
+    *,
+    target_project: Optional[Path] = None,
+    target_robot: Optional[str] = None,
+    target_policy_contract: Optional[dict[str, Any]] = None,
+) -> None:
     """§REFERENCE_TRAJECTORY_PLAN §4/§7/§9: for each drafted stage, run
     refs retrieval against ITS OWN `goal_text` and attach the top match's
     fields (`reference_clip_id`/`tier`/`match_confidence`) ONLY when
@@ -847,7 +853,22 @@ def _attach_stage_references(stages: list[Stage], robot: str) -> None:
     Runs AFTER stages are drafted+parsed (so it sees the LLM's actual
     per-stage goal_text), mutates `stages` in place. Any retrieval
     failure for a stage (or globally, e.g. no library index) leaves that
-    stage's fields untouched — never raises."""
+    stage's fields untouched — never raises.
+
+    Retrieval is candidate discovery, not execution authority. If the caller
+    cannot supply the exact target project, robot, and policy contract, this
+    function deliberately leaves the candidates unattached. A later UI attach
+    can certify one against the then-current target. When a target is
+    available, every auto-attachment must pass the same target-specific
+    Tier-D comparison as manual attach and launch."""
+    if (
+        target_project is None
+        or not isinstance(target_robot, str)
+        or not target_robot.strip()
+        or target_policy_contract is None
+        or target_robot.strip() != robot
+    ):
+        return
     for stage in stages:
         try:
             from sculptor.refs import library, retrieve
@@ -871,9 +892,44 @@ def _attach_stage_references(stages: list[Stage], robot: str) -> None:
             is_clear_standout = True  # only one candidate at all — no competitor to beat
         if (confidence is not None and confidence >= REFERENCE_ATTACH_CONFIDENCE) or (
                 confidence is None and is_clear_standout):
-            stage.reference_clip_id = getattr(top, "clip_id", None)
-            stage.reference_tier = getattr(top, "tier", None)
+            clip_id = getattr(top, "clip_id", None)
+            if not clip_id:
+                continue
+            # Retrieval confidence selects a candidate; it does not prove the
+            # motion has compatible exact-schedule tracking evidence.
+            # Auto-attach only after the same narrow Tier-D admission used by
+            # manual attach and launch, and pin the exact bytes/certificate
+            # that earned that decision. Tier D does not certify contact,
+            # collision, or general dynamics feasibility.
+            try:
+                from sculptor.refs.track import (
+                    require_tierd_admission,
+                    require_tierd_target_compatibility,
+                )
+
+                certificate = require_tierd_admission(robot, clip_id)
+                certificate = require_tierd_target_compatibility(
+                    certificate,
+                    target_project,
+                    target_robot=target_robot.strip(),
+                    target_policy_contract=target_policy_contract,
+                )
+            except (OSError, ValueError):
+                continue
+            stage.reference_clip_id = clip_id
+            stage.reference_tier = "D"
             stage.reference_match_confidence = confidence
+            stage.reference_robot = robot
+            stage.reference_clip_sha256 = certificate.clip_content_sha256
+            stage.reference_certificate_sha256 = (
+                certificate.certificate_sha256
+            )
+            stage.reference_execution_contract_sha256 = (
+                certificate.execution_contract_sha256
+            )
+            stage.reference_execution_boundary_sha256 = (
+                certificate.execution_boundary_sha256
+            )
             # §D24 F1 item 4a: select the goal-aligned sub-span right
             # after attach — see `_select_and_attach_span`'s docstring.
             _select_and_attach_span(stage, robot)
@@ -890,6 +946,9 @@ def decompose_task(
     skill_library_handle: Any = None,
     robot_hint: Optional[str] = None,
     attach_references: bool = True,
+    target_project: Optional[Path] = None,
+    target_robot: Optional[str] = None,
+    target_policy_contract: Optional[dict[str, Any]] = None,
 ) -> Mission:
     """Ask Claude to decompose `goal` into a Mission curriculum.
 
@@ -931,7 +990,14 @@ def decompose_task(
         (`_attach_stage_references`). Set False to disable both (e.g. in
         tests, or when the caller wants a bare decomposition). A missing
         library index or any retrieval failure is always a no-op, never
-        an error, regardless of this flag.
+        an error, regardless of this flag. Auto-attachment additionally
+        requires ``target_project``, ``target_robot``, and
+        ``target_policy_contract``; without those, retrieval remains
+        candidate-only.
+    target_project / target_robot / target_policy_contract : exact current
+        training target used only for target-specific Tier-D auto-attachment.
+        These are deliberately explicit so a decomposer cannot infer
+        execution authority from a robot-looking task id or a global default.
 
     Returns
     -------
@@ -957,7 +1023,11 @@ def decompose_task(
     skill_context, available_skill_ids = _render_skill_library_context(
         skill_library_handle,
     )
-    robot = _reference_robot_slug(robot_hint)
+    robot = (
+        target_robot.strip()
+        if isinstance(target_robot, str) and target_robot.strip()
+        else _reference_robot_slug(robot_hint)
+    )
     reference_context = ""
     if attach_references:
         mission_matches = _retrieve_mission_references(goal, robot_hint)
@@ -974,7 +1044,13 @@ def decompose_task(
 
     stages = _stages_from_model(parsed.stages)
     if attach_references:
-        _attach_stage_references(stages, robot)
+        _attach_stage_references(
+            stages,
+            robot,
+            target_project=target_project,
+            target_robot=target_robot,
+            target_policy_contract=target_policy_contract,
+        )
     mission = Mission(
         goal=goal,
         stages=stages,
@@ -1284,7 +1360,6 @@ def redecompose_stage(
         failed_stage.name, suffix_len=len("__r1_") + 2,  # __r1_<digits>
     )
 
-    parent_chain = failed_stage.parent_stage
     expected_criterion = failed_stage.success_criterion.strip()
 
     for i, model_stage in enumerate(parsed.stages):
@@ -1398,6 +1473,17 @@ def redecompose_stage(
             reference_clip_id=failed_stage.reference_clip_id,
             reference_tier=failed_stage.reference_tier,
             reference_match_confidence=failed_stage.reference_match_confidence,
+            reference_robot=failed_stage.reference_robot,
+            reference_clip_sha256=failed_stage.reference_clip_sha256,
+            reference_certificate_sha256=(
+                failed_stage.reference_certificate_sha256
+            ),
+            reference_execution_contract_sha256=(
+                failed_stage.reference_execution_contract_sha256
+            ),
+            reference_execution_boundary_sha256=(
+                failed_stage.reference_execution_boundary_sha256
+            ),
             redecomposition_attempts=1,  # bound at one level
         ))
 

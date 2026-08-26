@@ -611,29 +611,3 @@ undergrad portfolio, and labs know it. The pitch is not "I solved
 reward design"; it is "I built the instrument, found the open problem
 everyone else routes around (evaluation trust), measured it, and my
 negative results are load-bearing."
-
----
-
-## 6. Is the novel claim actually novel?
-
-Covered in §4.3 — yes, with CARD / OMNI-EPIC / VLM-judge lines as the
-nearest neighbors to cite and differentiate. The differentiation
-sentence for a writeup: *prior work either assumes a ground-truth
-fitness (Eureka line), substitutes humans (REvolve, ICPL), or generates
-success checkers without validating them (OMNI-EPIC, 72.7% human
-agreement); we treat the evaluation metric itself as an untrusted
-artifact that must earn steering authority through adversarial
-validation.*
-
----
-
-## 7. The roadmap
-
-(filled after research workflow — ordered SHOULD / COULD / WON'T)
-
----
-
-## 8. What "research success" looks like
-
-(filled after research workflow — the paper skeleton, the experiments,
-the artifact list)

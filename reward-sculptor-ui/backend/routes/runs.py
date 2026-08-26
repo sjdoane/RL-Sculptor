@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -27,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from backend.models.mission import StageIterationSummary
 from backend.models.project import ProblemDetail
 from backend.models.run import (
+    ErrorClassification,
     IterEventSummary,
     RunControl,
     RunControlState,
@@ -44,19 +46,47 @@ from backend.routes.missions import (
     _extract_objective_fitness,
     _read_fitness_and_naturalness,
 )
-from backend.services import mission_store, world_store
+from backend.services import mission_store, sculptor_bridge, world_store
 from backend.services.job_manager import Job, JobManager
+from backend.services.iteration_completion import is_completed_iteration
+from backend.services.run_lifecycle import (
+    TERMINAL_RECEIPTS_DIR,
+    verify_terminal_run_receipt,
+)
 from backend.services.physical_scene_audit import (
     audit_physical_scene_alignment,
 )
 from backend.services.project_store import ProjectStore
+from backend.services.project_robot import resolve_project_reference_robot
 from backend.services.run_manager import (
+    _post_training_rollout_failure_evidence,
     build_iterations_summary,
     control_file_path,
     read_control_file,
+    resolve_starting_skill_target,
     resolve_warm_start_checkpoint,
     run_sculpt_job,
     write_control_file,
+)
+from backend.services.recovery_snapshots import resolve_recovery_snapshot
+from sculptor.skill_bundle import ImportTarget, compatibility_for
+from sculptor.skill_library import SkillLibrary, SkillLibraryError
+from sculptor.compatibility_provenance import (
+    CompatibilityProvenanceError,
+    build_launch_acknowledgement_receipt,
+)
+from sculptor.policy_contract import (
+    build_iteration_warm_start_contract_receipt,
+    build_recovery_snapshot_warm_start_contract_receipt,
+    build_skill_warm_start_contract_receipt,
+)
+from sculptor.reference_authority import (
+    ActiveReferenceAuthorityError,
+    resolve_active_reference_authority,
+)
+from sculptor.reference_run import (
+    ReferenceRunError,
+    resolve_reference_clock_for_run,
 )
 
 # Snake-case-ish segment guard for mission_slug / stage_name before they are
@@ -65,6 +95,9 @@ _SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 router = APIRouter(tags=["runs"])
+
+
+_MJLAB_ADAPTER = "sculptor.adapters.mjlab.MjlabAdapter"
 
 
 # ── DI ─────────────────────────────────────────────────────────────────
@@ -93,6 +126,136 @@ def _problem(
         status_code=status_code,
         content=body,
         media_type="application/problem+json",
+    )
+
+
+def _sha256_path(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _live_mjlab_launch_preflight_problem(
+    *,
+    project_dir: Path,
+    adapter_config: dict[str, Any],
+    body: RunParams,
+) -> JSONResponse | None:
+    """Return a fail-closed launch problem for an unready live mjlab run.
+
+    This boundary is deliberately called only for live runs.  In particular,
+    Tier-K reference inspection is a CPU/data-only contract check and must not
+    import torch, query CUDA, import a simulator, or allocate a device merely
+    because the project's configured adapter is mjlab.
+    """
+    try:
+        info = sculptor_bridge.gpu_info()
+    except Exception as exc:  # noqa: BLE001 - direct API must fail closed
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "GPU readiness could not be verified",
+            detail=f"{type(exc).__name__}: {exc}",
+            type_="/problems/gpu-preflight-unavailable",
+        )
+    if not bool(info.get("mjlab_available")):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab is unavailable",
+            detail=(
+                "live mjlab training requires the backend environment to "
+                "resolve the mjlab package before the run can be queued"
+            ),
+            type_="/problems/mjlab-missing",
+        )
+    if not bool(info.get("rsl_rl_available")):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "rsl_rl is unavailable",
+            detail=(
+                "live mjlab training requires the backend environment to "
+                "resolve the rsl_rl package before the run can be queued"
+            ),
+            type_="/problems/rsl-rl-missing",
+        )
+    if not bool(info.get("torch_available")) or not bool(
+        info.get("cuda_available")
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab requires an available CUDA runtime",
+            detail=(
+                "live mjlab training requires torch with CUDA available in "
+                "the backend environment"
+            ),
+            type_="/problems/gpu-required",
+        )
+
+    raw_device = body.device_override or adapter_config.get("device") or "cuda:0"
+    device = str(raw_device)
+    if device != "cuda" and not re.fullmatch(r"cuda:[0-9]+", device):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "live mjlab training requires a CUDA device",
+            detail=(
+                f"the effective device is {device!r}; choose cuda or cuda:N "
+                "before launching live training"
+            ),
+            type_="/problems/gpu-required",
+        )
+
+    raw_task_id = adapter_config.get("task_id")
+    if not isinstance(raw_task_id, str) or not raw_task_id.strip():
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab task configuration is unavailable",
+            detail="the project adapter has no non-empty task_id",
+            type_="/problems/mjlab-config",
+        )
+    raw_num_envs = (
+        body.num_envs_override
+        if body.num_envs_override is not None
+        else adapter_config.get("num_envs", 2048)
+    )
+    if type(raw_num_envs) is not int or raw_num_envs <= 0:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab environment count is unavailable",
+            detail=f"the effective num_envs value is invalid: {raw_num_envs!r}",
+            type_="/problems/mjlab-config",
+        )
+
+    try:
+        from backend.services.preflight import check_mjlab_preflight
+
+        result = check_mjlab_preflight(
+            task_id=raw_task_id,
+            num_envs=raw_num_envs,
+            device=device,
+            project_dir=project_dir,
+            min_gpu_memory_gb=0.0,
+        )
+    except Exception as exc:  # noqa: BLE001 - never queue on unknown readiness
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "GPU readiness could not be verified",
+            detail=f"{type(exc).__name__}: {exc}",
+            type_="/problems/gpu-preflight-unavailable",
+        )
+    if result.ok:
+        return None
+    return _problem(
+        status.HTTP_412_PRECONDITION_FAILED,
+        "device preflight failed",
+        detail=result.reason or "live mjlab device preflight did not pass",
+        type_=result.problem_type or "/problems/device-unavailable",
+        suggested_num_envs=result.suggested_num_envs,
+        free_vram_gb=round(result.free_vram_gb, 2),
+        total_vram_gb=round(result.total_vram_gb, 2),
+        estimated_required_gb=round(result.estimated_required_gb, 2),
+        device_index=result.device_index,
+        device_name=result.device_name,
     )
 
 
@@ -384,12 +547,56 @@ def _read_project_metric_history(project_dir: Path) -> list[Optional[float]]:
 
 
 def _iter_looks_completed(iter_dir: Path) -> bool:
-    """An iteration that finished training leaves `metrics.json` (and
-    usually a checkpoint). Either marker counts — older iters may have
-    one without the other."""
-    if (iter_dir / "metrics.json").is_file():
-        return True
-    return _find_stage_checkpoint(iter_dir) is not None
+    """Return the same server-validated completion truth used by policies."""
+    return is_completed_iteration(iter_dir)
+
+
+def _project_disk_evaluation_failure(
+    project_dir: Path, iteration: int,
+) -> dict[str, Any] | None:
+    """Return the latest durable rollout-failure proof for one iteration."""
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    runs_dir = project_dir / "runs"
+    for log_path in runs_dir.glob("_run_job_*.log"):
+        if log_path.is_symlink() or not log_path.is_file():
+            continue
+        evidence = _post_training_rollout_failure_evidence(
+            log_path, project_dir,
+        )
+        if evidence is None or evidence.get("iteration") != iteration:
+            continue
+        try:
+            modified_at = log_path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((modified_at, evidence))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _latest_verified_project_terminal_receipt(
+    project_dir: Path, project_slug: str,
+) -> dict[str, Any] | None:
+    """Return the newest fully reverified backend terminal receipt."""
+    receipts_dir = project_dir / "runs" / TERMINAL_RECEIPTS_DIR
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        return None
+    candidates: list[tuple[Any, dict[str, Any]]] = []
+    for path in receipts_dir.glob("*.json"):
+        receipt = verify_terminal_run_receipt(
+            project_dir, path, project_slug=project_slug,
+        )
+        if receipt is None:
+            continue
+        completed_at = _parse_iso_dt(receipt.get("completed_at"))
+        if completed_at is not None:
+            candidates.append((completed_at, receipt))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    return candidates[0][1]
 
 
 def _synthesize_project_disk_run_row(
@@ -406,11 +613,12 @@ def _synthesize_project_disk_run_row(
     job's row already reaches these artifacts, and there is no per-run
     partition on disk that would let us row-split honestly.
 
-    Status comes from the LAST iteration's disk state: a finished
-    marker (metrics.json / checkpoint) reads "completed"; a bare iter
-    dir means the process died mid-iteration → errored/"interrupted".
-    A run that ended between iterations is indistinguishable from a
-    clean finish on disk, so this is best-effort truth, not history.
+    A new run's durable backend terminal receipt is the primary restart
+    authority and is reverified against every bound schema-3 iteration. Legacy
+    trees may still read completed from their last iteration. A durable
+    post-training rollout failure reads "evaluation failed". Bare partial
+    directories do not fabricate an errored terminal run; they remain
+    discoverable through recovery-snapshot APIs.
     """
     if jobs.list(kind="sculpt_run", project_slug=project_slug):
         return None
@@ -418,14 +626,97 @@ def _synthesize_project_disk_run_row(
     if not pairs:
         return None
 
+    terminal_receipt = _latest_verified_project_terminal_receipt(
+        project_dir, project_slug,
+    )
     completed = sum(1 for _, d in pairs if _iter_looks_completed(d))
-    _, last_dir = pairs[-1]
-    if _iter_looks_completed(last_dir):
+    last_iteration, last_dir = pairs[-1]
+    evaluation_failure = _project_disk_evaluation_failure(
+        project_dir, last_iteration,
+    )
+    requested_count = 0
+    started_at = ended_at = None
+    metric_history = _read_project_metric_history(project_dir)
+    terminal_last_completed: int | None = None
+    has_later_iteration_evidence = False
+    if terminal_receipt is not None:
+        plan = terminal_receipt["lifecycle_proof"]["iteration_plan"]
+        requested = plan["requested"]
+        completed_plan = plan["completed"]
+        terminal_last_completed = completed_plan[-1]
+        has_later_iteration_evidence = (
+            last_iteration > terminal_last_completed
+        )
+        requested_count = len(requested)
+        completed = len(completed_plan)
+        metric_history = [
+            metric_history[index] if index < len(metric_history) else None
+            for index in completed_plan
+        ]
+        started_at = _parse_iso_dt(terminal_receipt.get("started_at"))
+        ended_at = _parse_iso_dt(terminal_receipt.get("completed_at"))
+
+    if terminal_receipt is not None and not has_later_iteration_evidence:
         run_status = "completed"
         error = None
-    else:
+        error_classification = None
+    elif evaluation_failure is not None:
         run_status = "errored"
-        error = "interrupted"
+        error = "Training checkpoint preserved; evaluation failed"
+        error_classification = ErrorClassification(
+            kind="post_training_rollout_failed",
+            title="Training checkpoint preserved; evaluation failed",
+            detail=(
+                "Training produced a preserved checkpoint, but rollout/"
+                "evaluation failed before completion evidence was written."
+            ),
+            suggestions=[
+                "Continue from the attested recovery snapshot after fixing "
+                "the evaluation failure.",
+            ],
+            problem_type="/problems/post-training-rollout-failed",
+            evidence=evaluation_failure,
+        )
+        if terminal_receipt is not None:
+            # The verified success receipt predates this failed attempt. Its
+            # completion timestamp must not mask the later terminal evidence.
+            ended_at = None
+    elif terminal_receipt is not None and has_later_iteration_evidence:
+        checkpoint = _find_stage_checkpoint(last_dir)
+        run_status = "errored"
+        error = "Newer iteration evidence lacks a verified terminal receipt"
+        error_classification = ErrorClassification(
+            kind="interrupted_recovery_available",
+            title=error,
+            detail=(
+                f"The newest verified run ended at iter_"
+                f"{terminal_last_completed}, but iter_{last_iteration} "
+                "contains later evidence without a durable verified run "
+                "completion receipt."
+            ),
+            suggestions=[
+                (
+                    "Continue from the preserved recovery snapshot after "
+                    "checking the interrupted run."
+                    if checkpoint is not None
+                    else "Inspect the later iteration artifacts before "
+                    "relaunching."
+                ),
+            ],
+            problem_type="/problems/run-terminal-receipt-unproven",
+            evidence={
+                "last_verified_iteration": terminal_last_completed,
+                "later_iteration": last_iteration,
+                "checkpoint_preserved": checkpoint is not None,
+            },
+        )
+        ended_at = None
+    elif _iter_looks_completed(last_dir):
+        run_status = "completed"
+        error = None
+        error_classification = None
+    else:
+        return None
 
     meta = _load_json_dict(project_dir / "metadata.json") or {}
     goal = str(meta.get("behavior_goal") or "")
@@ -435,27 +726,32 @@ def _synthesize_project_disk_run_row(
     # trained iteration", not one run's wall-clock duration.
     from datetime import datetime as _dt, timezone as _tz
 
-    started_at = ended_at = None
-    try:
-        mtimes = [d.stat().st_mtime for _, d in pairs]
-        started_at = _dt.fromtimestamp(min(mtimes), tz=_tz.utc)
-        ended_at = _dt.fromtimestamp(max(mtimes), tz=_tz.utc)
-    except OSError:
-        pass
+    if started_at is None or ended_at is None:
+        try:
+            mtimes = [d.stat().st_mtime for _, d in pairs]
+            started_at = started_at or _dt.fromtimestamp(
+                min(mtimes), tz=_tz.utc,
+            )
+            ended_at = ended_at or _dt.fromtimestamp(
+                max(mtimes), tz=_tz.utc,
+            )
+        except OSError:
+            pass
 
     return RunSummary(
         run_id=PROJECT_DISK_RUN_ID,
         project_slug=project_slug,
         status=run_status,  # type: ignore[arg-type]
         behavior_goal=goal,
-        iterations_requested=0,  # unknown across runs → UI shows "?"
+        iterations_requested=requested_count,
         iterations_completed=completed,
         current_iter_index=None,
-        primary_metric_history=_read_project_metric_history(project_dir),
+        primary_metric_history=metric_history,
         fitness_history=[],
         started_at=started_at,
         ended_at=ended_at,
         error=error,
+        error_classification=error_classification,
         kind="sculpt_run",
         parent_id=None,
         mission_slug=None,
@@ -517,21 +813,512 @@ def launch_run(
                 type_="/problems/no-api-key",
             )
 
+        if not (body.fitness_metric or "").strip() and not (
+            body.acknowledge_blind_fitness
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "objective fitness is required for live training",
+                detail=(
+                    "choose an objective fitness metric, or explicitly set "
+                    "acknowledge_blind_fitness=true for a deliberate blind "
+                    "ablation"
+                ),
+                type_="/problems/objective-fitness-required",
+            )
+
     project_dir = Path(detail.project_dir)
+    policy_sources = sum((
+        body.warm_start_iteration is not None,
+        body.warm_start_snapshot is not None,
+        body.starting_skill_id is not None,
+    ))
+    if policy_sources > 1:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "choose one starting policy source",
+            detail=(
+                "completed project checkpoints, interrupted PPO snapshots, "
+                "and shared/imported skills are distinct sources; choose "
+                "exactly one"
+            ),
+            type_="/problems/starting-skill",
+        )
+    if (
+        body.initialization_mode is not None
+        and body.starting_skill_id is None
+        and body.warm_start_snapshot is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "initialization mode has no starting skill",
+            detail="select a starting_skill_id or clear initialization_mode",
+            type_="/problems/starting-skill",
+        )
+    if (
+        body.warm_start_snapshot is not None
+        and body.initialization_mode not in {None, "actor_critic"}
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "interrupted snapshots require actor and critic initialization",
+            detail=(
+                "use initialization_mode=actor_critic (or omit the field); "
+                "optimizer state is never resumed"
+            ),
+            type_="/problems/recovery-snapshot-initialization-mode",
+        )
+    if (
+        body.acknowledge_legacy_reconstructed_initialization
+        and body.starting_skill_id is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "legacy reconstruction acknowledgement has no starting skill",
+            detail=(
+                "select the disclosed legacy-reconstructed policy, or clear "
+                "the acknowledgement"
+            ),
+            type_="/problems/starting-skill-provenance",
+        )
+    if (
+        body.expected_starting_skill_manifest_digest is not None
+        and body.starting_skill_id is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "starting-skill manifest pin has no skill",
+            detail=(
+                "expected_starting_skill_manifest_digest is only valid with "
+                "starting_skill_id"
+            ),
+            type_="/problems/starting-skill-stale",
+        )
+    if (
+        body.starting_skill_id is not None
+        and body.expected_starting_skill_manifest_digest is None
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "starting-skill manifest pin is required",
+            detail=(
+                "refresh the starting-point picker and submit the receipt's "
+                "manifest_digest with the selected skill"
+            ),
+            type_="/problems/starting-skill-stale",
+        )
+    if bool(body.reference_clip_id) != bool(body.reference_robot):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference motion is incomplete",
+            detail=(
+                "reference_clip_id and reference_robot must be supplied together"
+            ),
+            type_="/problems/reference-motion",
+        )
+
+    selected_skill = None
+    selected_snapshot_receipt: Optional[dict[str, Any]] = None
+    starting_skill_target_receipt: Optional[dict[str, Any]] = None
+    warm_start_policy_contract_receipt: dict[str, Any] | None = None
+    contract_provenance_launch_receipt: dict[str, Any] | None = None
+    selected_mode = (
+        "actor_critic"
+        if body.warm_start_snapshot is not None
+        else (body.initialization_mode or "actor_only")
+    )
+    resolved_reference_clip_id = body.reference_clip_id
+    resolved_reference_robot = body.reference_robot
+    reference_feasibility: Optional[dict[str, Any]] = None
+    reference_clock: dict[str, Any] | None = None
+    try:
+        active_reference = resolve_active_reference_authority(
+            project_dir / "rewards",
+        )
+    except ActiveReferenceAuthorityError as exc:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "active reward reference authority is invalid",
+            detail=str(exc),
+            type_="/problems/active-reference-authority",
+        )
+    active_reference_receipt = (
+        active_reference.to_dict() if active_reference is not None else None
+    )
+    if body.starting_skill_id is not None:
+        try:
+            resolve_project_reference_robot(project_dir)
+        except (OSError, TypeError, ValueError) as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "project robot identity is unresolved",
+                detail=str(exc),
+                type_="/problems/starting-skill-project-contract",
+                code="project_robot_unresolved",
+            )
+        library = SkillLibrary()
+        selected_skill = library.load(body.starting_skill_id)
+        if selected_skill is None:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill is unavailable",
+                detail=f"no skill record {body.starting_skill_id!r}",
+                type_="/problems/starting-skill",
+            )
+        if (
+            selected_skill.manifest_digest
+            != body.expected_starting_skill_manifest_digest
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill changed after selection",
+                detail=(
+                    "the selected skill's immutable manifest digest no longer "
+                    "matches the launch request; refresh the starting-point "
+                    "picker before launching"
+                ),
+                type_="/problems/starting-skill-stale",
+                expected_manifest_digest=(
+                    body.expected_starting_skill_manifest_digest
+                ),
+                actual_manifest_digest=selected_skill.manifest_digest,
+            )
+        try:
+            target_payload, starting_skill_target_receipt = (
+                resolve_starting_skill_target(
+                    project_dir,
+                    require_policy_contract=(selected_mode != "reference_only"),
+                )
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "project policy contract is unavailable",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/starting-skill-project-contract",
+            )
+        target = ImportTarget(
+            adapter_class=target_payload["adapter_class"],
+            task_id=target_payload["task_id"],
+            robot_slug=target_payload["robot_slug"],
+            compatibility_contract=target_payload["compatibility_contract"],
+        )
+        compatibility = compatibility_for(selected_skill, target)
+        if compatibility["reasons"]:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill is incompatible",
+                detail="; ".join(compatibility["reasons"]),
+                type_="/problems/starting-skill-incompatible",
+                compatibility=compatibility,
+            )
+        if selected_mode not in compatibility["allowed_initialization_modes"]:
+            selected_reasons = compatibility.get("mode_reasons", {}).get(
+                selected_mode, [],
+            )
+            reason_suffix = (
+                "; " + "; ".join(str(reason) for reason in selected_reasons)
+                if selected_reasons
+                else ""
+            )
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "initialization mode is not supported",
+                detail=(
+                    f"{selected_mode!r} is unavailable for this skill; choose "
+                    + ", ".join(compatibility["allowed_initialization_modes"])
+                    + reason_suffix
+                ),
+                type_="/problems/starting-skill-mode",
+                compatibility=compatibility,
+            )
+        if selected_mode != "reference_only":
+            try:
+                contract_provenance_launch_receipt = (
+                    build_launch_acknowledgement_receipt(
+                        status=(
+                            selected_skill.compatibility_contract_provenance_status
+                        ),
+                        provenance_digest=(
+                            selected_skill.compatibility_contract_provenance_digest
+                        ),
+                        acknowledged=bool(
+                            body.acknowledge_legacy_reconstructed_initialization
+                        ),
+                        initialization_mode=selected_mode,
+                    )
+                )
+            except CompatibilityProvenanceError as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting-skill provenance acknowledgement is required",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-provenance",
+                    provenance_status=(
+                        selected_skill.compatibility_contract_provenance_status
+                    ),
+                )
+            try:
+                library.checkpoint_path_for(selected_skill)
+                warm_start_policy_contract_receipt = (
+                    build_skill_warm_start_contract_receipt(
+                        skill_id=selected_skill.skill_id,
+                        manifest_digest=str(selected_skill.manifest_digest),
+                        checkpoint_sha256=selected_skill.checkpoint_sha256,
+                        tensor_signature_sha256=(
+                            selected_skill.tensor_signature_sha256
+                        ),
+                        source_contract=(
+                            selected_skill.compatibility_contract or {}
+                        ),
+                        target_contract=(
+                            target_payload["compatibility_contract"] or {}
+                        ),
+                        target_receipt=(
+                            starting_skill_target_receipt or {}
+                        ),
+                        initialization_mode=selected_mode,
+                    )
+                )
+            except SkillLibraryError as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill failed its integrity check",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-integrity",
+                )
+            except (TypeError, ValueError) as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill policy receipt is unavailable",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-project-contract",
+                )
+        elif body.acknowledge_legacy_reconstructed_initialization:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "legacy acknowledgement is not valid for reference-only mode",
+                detail=(
+                    "the acknowledgement applies only to actor/critic policy "
+                    "initialization from a reconstructed compatibility contract"
+                ),
+                type_="/problems/starting-skill-provenance",
+            )
+        if (
+            selected_mode == "reference_only"
+            and selected_skill.reference_clip_id
+            and selected_skill.reference_robot
+        ):
+            bundled_pair = (
+                selected_skill.reference_clip_id,
+                selected_skill.reference_robot,
+            )
+            explicit_pair = (body.reference_clip_id, body.reference_robot)
+            if all(explicit_pair) and explicit_pair != bundled_pair:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill and motion selection disagree",
+                    detail=(
+                        "clear the separately selected motion or select the "
+                        "same motion carried by the starting-skill manifest"
+                    ),
+                    type_="/problems/starting-skill-reference",
+                )
+            resolved_reference_clip_id, resolved_reference_robot = bundled_pair
+        elif selected_mode == "reference_only":
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "starting skill has no reference motion",
+                detail="reference_only requires a bundled reference clip",
+                type_="/problems/starting-skill-reference",
+            )
+    if active_reference is not None:
+        active_pair = (
+            active_reference.reference_clip_id,
+            active_reference.reference_robot,
+        )
+        selected_pair = (
+            resolved_reference_clip_id,
+            resolved_reference_robot,
+        )
+        if any(selected_pair) and selected_pair != active_pair:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "motion selection disagrees with the active reward",
+                detail=(
+                    "the exact reward selected by rewards/current.py embeds "
+                    f"{active_pair[1]}/{active_pair[0]}; select that motion "
+                    "or promote a reward built for the requested motion"
+                ),
+                type_="/problems/active-reference-authority",
+                active_reference=active_reference_receipt,
+            )
+        resolved_reference_clip_id, resolved_reference_robot = active_pair
+    selection_path = project_dir / "env" / "selection_current.json"
+    if resolved_reference_clip_id and resolved_reference_robot:
+        from sculptor.refs import library as reference_library
+
+        prequeue_ref_dir = reference_library.clip_dir(
+            resolved_reference_robot,
+            resolved_reference_clip_id,
+        )
+        if not (
+            (prequeue_ref_dir / reference_library.PROVENANCE_FILENAME).is_file()
+            and (prequeue_ref_dir / reference_library.CLIP_FILENAME).is_file()
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is unavailable",
+                detail=(
+                    "no complete reference clip "
+                    f"{resolved_reference_robot}/{resolved_reference_clip_id}"
+                ),
+                type_="/problems/reference-motion",
+            )
+        if not selection_path.is_file():
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "a reference motion needs an authored world",
+                detail=(
+                    "attaching a reference clip makes this a tracking-first "
+                    "run, and the generated tracking reward is bound to the "
+                    "authored world atomically — so the project needs a "
+                    "promoted world first. Author one from the World tab "
+                    "(the default flat scene still needs promoting), or "
+                    "launch without a motion prior."
+                ),
+                type_="/problems/reference-motion",
+            )
+        # Integrity precedes derived controller metadata. This keeps the
+        # authored tuple as the first scientific authority and avoids reporting
+        # a secondary clock error for a world that cannot launch at all.
+        try:
+            reference_world_report = world_store.training_preflight(project_dir)
+        except Exception as exc:  # noqa: BLE001 - fail closed before queueing
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world could not be verified",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/world-integrity",
+            )
+        if not isinstance(reference_world_report, dict) or not bool(
+            reference_world_report.get("ok")
+        ):
+            errors = (
+                reference_world_report.get("errors")
+                if isinstance(reference_world_report, dict)
+                else None
+            ) or ["unknown integrity error"]
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world integrity check failed",
+                detail="; ".join(str(error) for error in errors),
+                type_="/problems/world-integrity",
+            )
+        if reference_world_report.get("robot_matches_project") is False:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "training environment targets another robot",
+                detail=(
+                    f"the authored world targets "
+                    f"{reference_world_report.get('world_robot')!r}, but the "
+                    f"project targets "
+                    f"{reference_world_report.get('project_robot')!r}; "
+                    "re-author the world for the project robot before launching"
+                ),
+                type_="/problems/world-robot-mismatch",
+            )
+        try:
+            reference_clock = resolve_reference_clock_for_run(
+                project_dir,
+                clip_id=resolved_reference_clip_id,
+                robot=resolved_reference_robot,
+            )
+        except (OSError, TypeError, ValueError, ReferenceRunError) as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference clock is unavailable",
+                detail=str(exc),
+                type_="/problems/reference-clock",
+            )
+
+        # Starting-skill admission may have been evaluated before a bundled or
+        # active reward resolved the final reference pair. Rebuild the target
+        # contract with the exact clock now; this is the receipt the runner
+        # will attest and the only compatibility result allowed to launch.
+        if selected_skill is not None and selected_mode != "reference_only":
+            try:
+                target_payload, starting_skill_target_receipt = (
+                    resolve_starting_skill_target(
+                        project_dir,
+                        require_policy_contract=True,
+                        reference_clock=reference_clock,
+                    )
+                )
+                target = ImportTarget(
+                    adapter_class=target_payload["adapter_class"],
+                    task_id=target_payload["task_id"],
+                    robot_slug=target_payload["robot_slug"],
+                    compatibility_contract=target_payload[
+                        "compatibility_contract"
+                    ],
+                )
+                compatibility = compatibility_for(selected_skill, target)
+                if compatibility["reasons"]:
+                    raise ValueError("; ".join(compatibility["reasons"]))
+                if (
+                    selected_mode
+                    not in compatibility["allowed_initialization_modes"]
+                ):
+                    raise ValueError(
+                        f"{selected_mode!r} is unavailable for this skill"
+                    )
+                warm_start_policy_contract_receipt = (
+                    build_skill_warm_start_contract_receipt(
+                        skill_id=selected_skill.skill_id,
+                        manifest_digest=str(selected_skill.manifest_digest),
+                        checkpoint_sha256=selected_skill.checkpoint_sha256,
+                        tensor_signature_sha256=(
+                            selected_skill.tensor_signature_sha256
+                        ),
+                        source_contract=(
+                            selected_skill.compatibility_contract or {}
+                        ),
+                        target_contract=(
+                            target_payload["compatibility_contract"] or {}
+                        ),
+                        target_receipt=starting_skill_target_receipt,
+                        initialization_mode=selected_mode,
+                    )
+                )
+            except (SkillLibraryError, TypeError, ValueError) as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "starting skill is incompatible with reference phase",
+                    detail=str(exc),
+                    type_="/problems/starting-skill-project-contract",
+                )
     # A promoted authored world is part of the run's scientific input, not a
     # cosmetic preview. Verify the atomic tuple at the last responsible
     # moment so a stale browser or direct API client cannot start training on
     # tampered/drifted artifacts. Legacy projects without a selection keep
     # their existing default-scene behavior.
-    selection_path = project_dir / "env" / "selection_current.json"
+    authored_world_receipt: dict[str, Any] | None = None
     if selection_path.is_file():
         try:
-            world_report = world_store.validate(project_dir)
+            world_report = world_store.training_preflight(project_dir)
         except Exception as exc:  # noqa: BLE001 — fail closed before GPU work
             return _problem(
                 status.HTTP_412_PRECONDITION_FAILED,
                 "authored world could not be verified",
                 detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/world-integrity",
+            )
+        if not isinstance(world_report, dict):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world integrity check failed",
+                detail="authored world selection disappeared during preflight",
                 type_="/problems/world-integrity",
             )
         if not bool(world_report.get("ok")):
@@ -540,6 +1327,32 @@ def launch_run(
                 status.HTTP_412_PRECONDITION_FAILED,
                 "authored world integrity check failed",
                 detail="; ".join(str(error) for error in errors),
+                type_="/problems/world-integrity",
+            )
+        if world_report.get("robot_matches_project") is False:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "training environment targets another robot",
+                detail=(
+                    f"the authored world targets "
+                    f"{world_report.get('world_robot')!r}, but the project "
+                    f"targets {world_report.get('project_robot')!r}; "
+                    "re-author the world for the project robot before launching"
+                ),
+                type_="/problems/world-robot-mismatch",
+            )
+        try:
+            authored_world_receipt = (
+                world_store.immutable_training_receipt(
+                    project_dir,
+                    world_report,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - exact pin is mandatory
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world could not be pinned",
+                detail=f"{type(exc).__name__}: {exc}",
                 type_="/problems/world-integrity",
             )
     if body.warm_start_iteration is not None:
@@ -554,7 +1367,113 @@ def launch_run(
                 detail=f"{type(exc).__name__}: {exc}",
                 type_="/problems/warm-start",
             )
-    if bool(body.reference_clip_id) != bool(body.reference_robot):
+        if authored_world_receipt is not None:
+            try:
+                target_selection = Path(
+                    str(authored_world_receipt["selection_path"])
+                )
+                receipt_kwargs: dict[str, Any] = {
+                    "target_selection_path": target_selection,
+                }
+                if reference_clock is not None:
+                    receipt_kwargs["reference_clock"] = reference_clock
+                warm_start_policy_contract_receipt = (
+                    build_iteration_warm_start_contract_receipt(
+                        project_dir,
+                        int(body.warm_start_iteration),
+                        **receipt_kwargs,
+                    )
+                )
+            except Exception as exc:
+                return _problem(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "warm-start policy contract is unavailable",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    type_="/problems/warm-start-policy-contract",
+                )
+    if body.warm_start_snapshot is not None:
+        snapshot_ref = body.warm_start_snapshot
+        if not snapshot_ref.acknowledge_interrupted_snapshot:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "interrupted snapshot acknowledgement is required",
+                detail=(
+                    "confirm that this PPO save is unevaluated and may be "
+                    "worse than the run's starting policy"
+                ),
+                type_="/problems/recovery-snapshot-acknowledgement",
+            )
+        try:
+            _, selected_snapshot_receipt = resolve_recovery_snapshot(
+                project_dir,
+                snapshot_id=snapshot_ref.snapshot_id,
+                checkpoint_sha256=snapshot_ref.checkpoint_sha256,
+                receipt_digest=snapshot_ref.receipt_digest,
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "interrupted snapshot changed after selection",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/recovery-snapshot-stale",
+            )
+        provenance_status = selected_snapshot_receipt.get(
+            "provenance_status"
+        )
+        if (
+            provenance_status == "legacy_reconstructed"
+            and not snapshot_ref.acknowledge_legacy_reconstructed_snapshot
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "historical snapshot reconstruction acknowledgement is required",
+                detail=(
+                    "this worker predates origin-persisted snapshot receipts; "
+                    "confirm the disclosed log/selection reconstruction"
+                ),
+                type_="/problems/recovery-snapshot-provenance",
+            )
+        if (
+            provenance_status != "legacy_reconstructed"
+            and snapshot_ref.acknowledge_legacy_reconstructed_snapshot
+        ):
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "historical acknowledgement does not match this snapshot",
+                detail="refresh the interrupted-snapshot receipt",
+                type_="/problems/recovery-snapshot-provenance",
+            )
+        if authored_world_receipt is None:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world is required for interrupted snapshot transfer",
+                detail="re-admit the training world before launching",
+                type_="/problems/recovery-snapshot-policy-contract",
+            )
+        try:
+            target_selection = Path(
+                str(authored_world_receipt["selection_path"])
+            )
+            recovery_contract_kwargs: dict[str, Any] = {
+                "recovery_receipt": selected_snapshot_receipt,
+                "target_selection_path": target_selection,
+            }
+            if reference_clock is not None:
+                recovery_contract_kwargs["reference_clock"] = reference_clock
+            warm_start_policy_contract_receipt = (
+                build_recovery_snapshot_warm_start_contract_receipt(
+                    project_dir,
+                    **recovery_contract_kwargs,
+                )
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "interrupted snapshot policy contract is unavailable",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/recovery-snapshot-policy-contract",
+            )
+    if bool(resolved_reference_clip_id) != bool(resolved_reference_robot):
         return _problem(
             status.HTTP_412_PRECONDITION_FAILED,
             "reference motion is incomplete",
@@ -564,14 +1483,29 @@ def launch_run(
             ),
             type_="/problems/reference-motion",
         )
-    if body.reference_clip_id and body.reference_robot:
+    if (
+        resolved_reference_clip_id
+        and resolved_reference_robot
+        and body.no_kg
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference-guided runs require lineage",
+            detail=(
+                "reference-conditioned training cannot disable the KG because "
+                "its requested/observed runtime, initialization, world, and "
+                "output lineage must be proven before completion"
+            ),
+            type_="/problems/reference-lineage-required",
+        )
+    if resolved_reference_clip_id and resolved_reference_robot:
         # Resolve the exact (embodiment, clip) pair before queuing GPU work.
         # The index is a cache, so provenance + clip bytes remain the
         # authoritative existence check.
         from sculptor.refs import library as reference_library
 
         ref_dir = reference_library.clip_dir(
-            body.reference_robot, body.reference_clip_id,
+            resolved_reference_robot, resolved_reference_clip_id,
         )
         provenance_path = ref_dir / reference_library.PROVENANCE_FILENAME
         clip_path = ref_dir / reference_library.CLIP_FILENAME
@@ -581,11 +1515,169 @@ def launch_run(
                 "reference motion is unavailable",
                 detail=(
                     f"no complete reference clip "
-                    f"{body.reference_robot}/{body.reference_clip_id}"
+                    f"{resolved_reference_robot}/{resolved_reference_clip_id}"
                 ),
                 type_="/problems/reference-motion",
             )
+        # `_prepare_reference_guided_run` (sculptor/sculpt.py) hard-raises
+        # without an authoritative world selection, because the tracking
+        # reward has to be bound to the world atomically. That raise happens
+        # at subprocess start, so the run appeared to launch and then died
+        # with a ValueError in the log. Say it here, before the GPU is
+        # touched, and say what to do about it.
+        if not selection_path.is_file():
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "a reference motion needs an authored world",
+                detail=(
+                    "attaching a reference clip makes this a tracking-first "
+                    "run, and the generated tracking reward is bound to the "
+                    "authored world atomically — so the project needs a "
+                    "promoted world first. Author one from the World tab "
+                    "(the default flat scene still needs promoting), or "
+                    "launch without a motion prior."
+                ),
+                type_="/problems/reference-motion",
+            )
+        # Lokesh feasibility admission: a reference-backed TRAINING run is
+        # only scientifically meaningful after the exact clip has been
+        # physics-tracked successfully.  Never trust provenance.tier alone;
+        # the verifier re-hashes both clip and rollout artifacts.  Tier-K is
+        # still useful for an explicit inspect-only check, where the worker
+        # re-verifies the immutable reference contract and then returns before
+        # creating a sculpt subprocess.  It never trains, rolls out, or
+        # publishes a checkpoint; that weaker admission is recorded plainly.
+        from sculptor.refs.track import (
+            TierDAdmissionError,
+            require_tierd_admission,
+            require_tierd_target_compatibility,
+        )
+
+        try:
+            target_robot = resolve_project_reference_robot(project_dir)
+        except ValueError as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "project robot identity is unresolved",
+                detail=str(exc),
+                type_="/problems/reference-feasibility",
+            )
+        if resolved_reference_robot != target_robot:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is for a different robot",
+                detail=(
+                    f"selected reference robot {resolved_reference_robot!r} "
+                    f"does not match project robot {target_robot!r}"
+                ),
+                type_="/problems/reference-feasibility",
+            )
+        try:
+            certificate = require_tierd_admission(
+                resolved_reference_robot, resolved_reference_clip_id,
+            )
+            certificate = require_tierd_target_compatibility(
+                certificate,
+                project_dir,
+                target_robot=target_robot,
+            )
+            certificate_reason = None
+        except TierDAdmissionError as exc:
+            certificate = None
+            certificate_reason = str(exc)
+        if certificate is None and not body.dry_run:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is kinematic-only",
+                detail=(
+                    "live reference-backed training requires a verified "
+                    "Tier-D exact reference-tracking certificate for the clip "
+                    f"and rollout: {certificate_reason or 'not certified'}"
+                ),
+                type_="/problems/reference-feasibility",
+                reference_robot=resolved_reference_robot,
+                reference_clip_id=resolved_reference_clip_id,
+                required_tier="D",
+                admitted_tier="K",
+            )
+        if certificate is not None:
+            reference_feasibility = {
+                "status": "tierd_verified",
+                "tier": "D",
+                "clip_sha256": certificate.clip_content_sha256,
+                "rollout_sha256": certificate.rollout_sha256,
+                "certificate_sha256": certificate.certificate_sha256,
+                "execution_contract_sha256": (
+                    certificate.execution_contract_sha256
+                ),
+                "execution_boundary_sha256": (
+                    certificate.execution_boundary_sha256
+                ),
+                "target_robot": target_robot,
+                "tracked_at": certificate.tracked_at,
+            }
+        else:
+            reference_feasibility = {
+                "status": "kinematic_reference_inspection_only",
+                "tier": "K",
+                "clip_sha256": _sha256_path(clip_path),
+                "rollout_sha256": None,
+                "reason": certificate_reason,
+                "scope": "contract_and_reference_resolution",
+                "inspection_only": True,
+                "training_authorized": False,
+                "training_invoked": False,
+                "checkpoint_published": False,
+                "target_robot": target_robot,
+            }
+    if not body.dry_run and detail.adapter_class == _MJLAB_ADAPTER:
+        readiness_problem = _live_mjlab_launch_preflight_problem(
+            project_dir=project_dir,
+            adapter_config=detail.adapter_config,
+            body=body,
+        )
+        if readiness_problem is not None:
+            return readiness_problem
     run_params: dict[str, Any] = body.model_dump()
+    run_params["initialization_mode"] = (
+        selected_mode
+        if selected_skill is not None or selected_snapshot_receipt is not None
+        else None
+    )
+    run_params["reference_clip_id"] = resolved_reference_clip_id
+    run_params["reference_robot"] = resolved_reference_robot
+    run_params["reference_feasibility"] = reference_feasibility
+    run_params["reference_clock"] = reference_clock
+    run_params["active_reference_authority"] = active_reference_receipt
+    run_params["starting_skill_target_receipt"] = (
+        starting_skill_target_receipt
+    )
+    run_params["warm_start_policy_contract_receipt"] = (
+        warm_start_policy_contract_receipt
+    )
+    run_params["recovery_snapshot_receipt"] = selected_snapshot_receipt
+    run_params["compatibility_contract_provenance_receipt"] = (
+        contract_provenance_launch_receipt
+    )
+    # Pin the admitted world tuple separately from the request. The worker
+    # re-attests this receipt immediately before subprocess creation so a
+    # queued run cannot inherit a re-authored or deleted world silently.
+    run_params["authored_world_receipt"] = authored_world_receipt
+    run_params["objective_fitness_receipt"] = {
+        "requested_metric": body.fitness_metric,
+        "objective_requested": bool((body.fitness_metric or "").strip()),
+        "blind_ablation_acknowledged": bool(body.acknowledge_blind_fitness),
+        "dry_run": bool(body.dry_run),
+        "authorization": (
+            "dry_run"
+            if body.dry_run
+            else (
+                "objective_requested"
+                if (body.fitness_metric or "").strip()
+                else "blind_ablation_acknowledged"
+            )
+        ),
+    }
     job = jobs.submit(
         kind="sculpt_run",
         project_slug=slug,
@@ -695,6 +1787,30 @@ def get_run(
     return RunDetail(
         **summary.model_dump(),
         params=params,
+        reference_feasibility=(
+            dict(job.params["reference_feasibility"])
+            if isinstance(job.params.get("reference_feasibility"), dict)
+            else None
+        ),
+        objective_fitness_receipt=(
+            dict(job.params["objective_fitness_receipt"])
+            if isinstance(job.params.get("objective_fitness_receipt"), dict)
+            else None
+        ),
+        starting_skill_target_receipt=(
+            dict(job.params["starting_skill_target_receipt"])
+            if isinstance(
+                job.params.get("starting_skill_target_receipt"), dict,
+            )
+            else None
+        ),
+        authored_world_execution_receipt=(
+            dict(job.params["authored_world_execution_receipt"])
+            if isinstance(
+                job.params.get("authored_world_execution_receipt"), dict,
+            )
+            else None
+        ),
         iterations=iterations,
         stdout_tail=list(job.log_ring),
         total_event_count=len(job.events),

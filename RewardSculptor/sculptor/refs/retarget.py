@@ -301,7 +301,12 @@ def retarget_and_register(
 
     cid = clip_id or (library.slugify(source_path.stem) + f"--{robot}")
     library.validate_clip_id(cid)
-    sha = library.content_sha256(source_path.read_bytes())
+    source_sha = library.content_sha256(source_path.read_bytes())
+    d = library.clip_dir(robot, cid, root=root)
+    clip_path = save_clip(d / library.CLIP_FILENAME, clip)
+    artifact_sha = library.content_sha256(clip_path.read_bytes())
+    from sculptor.reference_clock import reference_playback_duration_s
+
     prov = library.make_provenance(
         clip_id=cid, robot=robot,
         source={
@@ -309,7 +314,8 @@ def retarget_and_register(
             "source_format": source_format,
         },
         license=license_, attribution=attribution,
-        content_sha256_=sha,
+        content_sha256_=artifact_sha,
+        source_content_sha256_=source_sha,
         retarget={
             "tool": "GMR", "version": result.get("tool_version") or tool_version_fallback,
             "gmr_robot": result["robot"], "source_format": source_format,
@@ -324,7 +330,9 @@ def retarget_and_register(
         labels=list(labels or []), text=text,
         qc={
             "n_frames": stats.get("n_frames"),
-            "duration_s": round(stats.get("n_frames", 0) / max(stats.get("fps", 1.0), 1e-6), 4),
+            "duration_s": round(reference_playback_duration_s(
+                frame_count=int(stats.get("n_frames", 0)),
+                fps=float(stats.get("fps", 0.0))), 4),
             # §library._index_row_from_provenance reads qc["root_z_range"]
             # (the index-row contract `ingest.py` also writes to) — this is
             # the POST-clamp range (what's actually on disk in clip.npz);
@@ -338,8 +346,6 @@ def retarget_and_register(
         },
     )
 
-    d = library.clip_dir(robot, cid, root=root)
-    save_clip(d / library.CLIP_FILENAME, clip)
     prov_path = library.write_provenance(robot, cid, prov, root=root)
     return library.LibraryClip(
         robot=robot, clip_id=cid, clip_path=d / library.CLIP_FILENAME,

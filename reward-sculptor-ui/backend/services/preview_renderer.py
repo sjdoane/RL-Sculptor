@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -51,6 +52,135 @@ class PreviewError(Exception):
     def __init__(self, message: str, *, kind: str = "unknown"):
         super().__init__(message)
         self.kind = kind
+
+
+_MODEL_PATH_ATTRIBUTES = {
+    "assetdir",
+    "file",
+    "filename",
+    "meshdir",
+    "texturedir",
+    "uri",
+}
+_FORBIDDEN_MODEL_ELEMENTS = {"extension", "include", "plugin"}
+
+
+def _xml_local_name(value: object) -> str:
+    return str(value).rsplit("}", 1)[-1].lower()
+
+
+def _confined_asset_path(
+    raw_value: str,
+    *,
+    source_file: Path,
+    asset_root: Path,
+) -> Path:
+    """Resolve an uploaded model dependency without escaping its upload root."""
+    value = raw_value.strip().replace("\\", "/")
+    if not value:
+        return source_file.parent
+
+    lowered = value.lower()
+    if (
+        value.startswith("/")
+        or ":" in value
+        or "://" in lowered
+        or lowered.startswith(("package://", "model://"))
+    ):
+        raise PreviewError(
+            f"external or absolute asset reference is not allowed: {raw_value!r}",
+            kind="unsafe_model",
+        )
+
+    relative = Path(value)
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise PreviewError(
+            f"asset reference must be a normalized child path: {raw_value!r}",
+            kind="unsafe_model",
+        )
+
+    root = asset_root.resolve()
+    resolved = (source_file.parent / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as e:
+        raise PreviewError(
+            f"asset reference escapes the uploaded model root: {raw_value!r}",
+            kind="unsafe_model",
+        ) from e
+    return resolved
+
+
+def validate_model_asset_confinement(
+    xml_path: Path,
+    *,
+    asset_root: Path | None = None,
+) -> None:
+    """Fail closed unless an uploaded XML model is self-contained data.
+
+    Includes and plugin declarations can cause MuJoCo to read or load content
+    beyond the admitted upload set, so uploads may use only direct, relative
+    asset references rooted beneath ``asset_root``.
+    """
+    if not xml_path.is_file():
+        raise PreviewError(
+            f"model file not found: {xml_path}", kind="model_missing"
+        )
+
+    root = (asset_root or xml_path.parent).resolve()
+    source = xml_path.resolve()
+    try:
+        source.relative_to(root)
+    except ValueError as e:
+        raise PreviewError(
+            "model file is outside the admitted upload root",
+            kind="unsafe_model",
+        ) from e
+
+    try:
+        xml_bytes = source.read_bytes()
+    except OSError as e:
+        raise PreviewError(
+            f"could not read uploaded model: {type(e).__name__}: {e}",
+            kind="unsafe_model",
+        ) from e
+
+    lowered = xml_bytes.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        raise PreviewError(
+            "DOCTYPE and entity declarations are not allowed in uploaded models",
+            kind="unsafe_model",
+        )
+
+    try:
+        document = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        # Let MuJoCo produce the detailed parser message on the normal path.
+        return
+
+    for element in document.iter():
+        tag = _xml_local_name(element.tag)
+        if tag in _FORBIDDEN_MODEL_ELEMENTS:
+            raise PreviewError(
+                f"<{tag}> is not allowed in uploaded models; upload one "
+                "self-contained model and data-only assets",
+                kind="unsafe_model",
+            )
+
+        for attribute, raw_value in element.attrib.items():
+            name = _xml_local_name(attribute)
+            value = str(raw_value).strip()
+            if name == "plugin" and value:
+                raise PreviewError(
+                    "plugin-backed model elements are not allowed in uploads",
+                    kind="unsafe_model",
+                )
+            if name in _MODEL_PATH_ATTRIBUTES and value:
+                _confined_asset_path(
+                    value,
+                    source_file=source,
+                    asset_root=root,
+                )
 
 
 # ── public API ────────────────────────────────────────────────────────
@@ -387,7 +517,11 @@ def _encode_png(frame: np.ndarray, path: Path) -> None:
 
 
 # ── MJCF / URDF parse validation (used by robot-upload route) ─────────
-def validate_model_file(xml_path: Path) -> dict[str, Any]:
+def validate_model_file(
+    xml_path: Path,
+    *,
+    asset_root: Path | None = None,
+) -> dict[str, Any]:
     """Verify the file is parseable by MuJoCo. Returns a small summary
     dict on success. Raises PreviewError(kind="parse" | "urdf_parse")
     with an actionable message on failure.
@@ -400,6 +534,8 @@ def validate_model_file(xml_path: Path) -> dict[str, Any]:
     If both fail, the error message names both attempts so the user
     can see which capability is missing.
     """
+    validate_model_asset_confinement(xml_path, asset_root=asset_root)
+
     try:
         import mujoco
     except Exception as e:  # noqa: BLE001

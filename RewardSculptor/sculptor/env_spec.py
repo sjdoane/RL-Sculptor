@@ -491,10 +491,16 @@ def repoint_env_current(env_dir: Path, version: str) -> Path:
     return env_dir / "current.json"
 
 
-def apply_env_edits(env_dir: Path, edits: list) -> dict:
-    """§env generalization 3/4: apply diagnoser-proposed TRAIN-section
-    edits to the project's active env spec — the environment counterpart
-    of reward apply_edits, with the same validation discipline.
+def apply_env_edits(env_dir: Path, edits: list, *,
+                    author: str = "diagnoser") -> dict:
+    """§env generalization 3/4: apply proposed TRAIN-section edits to the
+    project's active env spec — the environment counterpart of reward
+    apply_edits, with the same validation discipline.
+
+    `author` is recorded as the new version's `meta.source`. It defaults
+    to the sculpt loop's diagnoser, which is where these edits originated;
+    a hand edit from the UI passes its own so the version history says who
+    actually made the change rather than crediting the loop for it.
 
     Each edit is `{parameter, new_value, rationale}` (duck-typed:
     attributes or dict keys). Per-edit gates: parameter must be in
@@ -572,7 +578,7 @@ def apply_env_edits(env_dir: Path, edits: list) -> dict:
 
     if changed:
         meta = work.setdefault("meta", {})
-        meta["source"] = "diagnoser"
+        meta["source"] = author
         meta["parent"] = (spec.get("meta") or {}).get("version")
         meta["rationale"] = " | ".join(applied_rationales)[:1000]
         path = write_env_spec_version(env_dir, work)

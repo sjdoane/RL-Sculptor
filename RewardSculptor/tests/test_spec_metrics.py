@@ -646,6 +646,9 @@ def test_make_spec_fitness_fn_reads_rollout_score(tmp_path) -> None:
     from sculptor.eval.spec_metrics import make_spec_fitness_fn
 
     fn = make_spec_fitness_fn("cartpole_balance")
+    assert fn.metric_id == "cartpole_balance"
+    assert fn.metric_source == "built_in"
+    assert fn.metric_sha256
     rollout = tmp_path / "rollout"
     rollout.mkdir()
     (rollout / "behavior.json").write_text(

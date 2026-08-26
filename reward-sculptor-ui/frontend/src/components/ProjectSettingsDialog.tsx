@@ -8,6 +8,8 @@ import { Btn, Field, IconBtn, Modal } from "@/components/rs/primitives";
 import { useDeleteProject } from "@/hooks/useProjects";
 import {
   ApiError,
+  editProjectEnvSpecTrain,
+  getProjectEnvSpec,
   getProjectSettings,
   patchProjectSettings,
   type IterationSettings,
@@ -38,6 +40,7 @@ export function ProjectSettingsDialog({
         >
           <SummarySection project={project} />
           <IterationSettingsSection project={project} open={open} />
+          <EnvSpecTrainSection project={project} open={open} />
           <DangerZone project={project} onDeleted={() => setOpen(false)} />
         </Modal>
       )}
@@ -79,9 +82,22 @@ function IterationSettingsSection({
 
   // Local form state; seeded from the loaded iteration block.
   const [form, setForm] = useState<IterationSettings>({});
+  // Raw text for the comma-separated list fields. Parsing on every keystroke
+  // and re-joining for display would swallow the separator the instant you
+  // typed it, so what the user is typing is held verbatim here and parsed
+  // into an array only on the way into `form`.
+  const [listDraft, setListDraft] = useState<Record<string, string>>({});
   useEffect(() => {
     if (q.data) {
-      setForm(q.data.iteration ?? {});
+      const iteration = q.data.iteration ?? {};
+      setForm(iteration);
+      setListDraft(
+        Object.fromEntries(
+          Object.entries(iteration)
+            .filter(([, v]) => Array.isArray(v))
+            .map(([k, v]) => [k, (v as string[]).join(", ")]),
+        ),
+      );
     }
   }, [q.data]);
 
@@ -92,9 +108,11 @@ function IterationSettingsSection({
     | { key: keyof IterationSettings; label: string; type: "number"; step?: number; min?: number; max?: number; hint?: string }
     | { key: keyof IterationSettings; label: string; type: "bool"; hint?: string }
     | { key: keyof IterationSettings; label: string; type: "text"; hint?: string }
+    | { key: keyof IterationSettings; label: string; type: "list"; hint?: string }
   > = [
     { key: "steps_per_iter", label: "steps_per_iter (training)", type: "number", min: 100, max: 500_000, hint: "rsl_rl max_iterations for mjlab" },
     { key: "primary_metric", label: "primary_metric", type: "text", hint: "e.g. mean_return, max_episode_length" },
+    { key: "behavior_metrics", label: "behavior_metrics", type: "list", hint: "comma-separated; which behavior metrics each iteration computes (blank = adapter default)" },
     { key: "rollout_episodes", label: "rollout_episodes", type: "number", min: 1, max: 32, hint: "episodes captured per iter" },
     { key: "auto_adjust_physics", label: "auto_adjust_physics", type: "bool", hint: "§7.4 — suggest MJCF edit on severe realism verdict" },
     { key: "max_episode_steps", label: "max_episode_steps (rollout)", type: "number", min: 50, max: 5000, hint: "env steps per rollout episode" },
@@ -107,6 +125,12 @@ function IterationSettingsSection({
     { key: "fresh_eval_seeds", label: "fresh_eval_seeds", type: "number", min: 0, max: 10, hint: "end-of-run re-rolls of the kept best on held-out seeds (0 = off)" },
     { key: "hack_income_screen", label: "hack_income_screen", type: "bool", hint: "reject edits that make a caught exploit MORE profitable" },
   ];
+
+  const updateList = (key: keyof IterationSettings, raw: string) => {
+    setListDraft((d) => ({ ...d, [String(key)]: raw }));
+    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    setForm((prev) => ({ ...prev, [key]: parts.length > 0 ? parts : null }));
+  };
 
   const update = (key: keyof IterationSettings, raw: string | boolean) => {
     setForm((prev) => {
@@ -137,7 +161,14 @@ function IterationSettingsSection({
         <span className="rs-caption" style={{ margin: 0 }}>Iteration settings (config.toml)</span>
         {q.isLoading && <Icon name="loader" size={12} className="rs-spin" />}
       </div>
-      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>Persistent project defaults — used whenever a run omits the override.</p>
+      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>
+        Persistent project defaults — used whenever a run omits the override.
+        Note that New run → <strong>Advanced</strong> pre-fills its fields with
+        adapter defaults rather than leaving them blank, so in practice a
+        launch overrides most of these unless you clear the field. Same knobs,
+        different names: <code className="mono">steps_per_iter</code> here is
+        <code className="mono"> training_iterations</code> there.
+      </p>
       <div className="rs-row2">
         {fields.map((f) => (
           <Field key={String(f.key)} label={f.label} htmlFor={`set-${String(f.key)}`}>
@@ -161,6 +192,16 @@ function IterationSettingsSection({
                   <option value="false">false</option>
                 </select>
               </div>
+            ) : f.type === "list" ? (
+              <input
+                id={`set-${String(f.key)}`}
+                className="rs-input mono"
+                type="text"
+                value={listDraft[String(f.key)] ?? ""}
+                onChange={(e) => updateList(f.key, e.target.value)}
+                placeholder="(unset)"
+                disabled={mut.isPending || q.isLoading}
+              />
             ) : (
               <input
                 id={`set-${String(f.key)}`}
@@ -182,6 +223,258 @@ function IterationSettingsSection({
       <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 12 }}>
         <Btn kind="quiet" size="sm" onClick={() => setForm(loaded)} disabled={!dirty || mut.isPending}>Revert</Btn>
         <Btn kind="primary" size="sm" icon={mut.isPending ? "loader" : "check"} onClick={() => mut.mutate(form)} disabled={!dirty || mut.isPending}>Save</Btn>
+      </div>
+    </section>
+  );
+}
+
+/** Short, plain-language notes for the knobs whose effect is not obvious
+ *  from the name. Everything else is rendered generically — the editable
+ *  set comes from the backend so this list can lag without hiding a key. */
+const ENV_TRAIN_HINTS: Record<string, string> = {
+  friction_range:
+    "Train-only foot/ground friction randomization; evaluation remains at the " +
+    "nominal setting. Keep mild ranges near the model's nominal friction.",
+  entropy_coef_scale:
+    "Multiplies PPO's entropy bonus. Above 1 the policy's action-noise std " +
+    "climbs all run, and the action-rate penalty grows with the square of it " +
+    "— at 3.0 that penalty overtook the task reward and mean return fell from " +
+    "358 to 38. Raise it only for short explosive skills.",
+  min_base_height_termination_m:
+    "Ends the episode when the base drops below this world height. Pairs with " +
+    "RSI resets; too high and it kills legitimate crouches.",
+  fell_over_termination:
+    "Train-only. Turn off for a stage that RESETS in a fallen pose (get-up), " +
+    "or every episode ends at step 0.",
+  com_offset_m: "Per-link centre-of-mass jitter for sim2real. Keep small (0.02–0.05).",
+};
+
+/** The environment the loop trains under. Read-only until now: these decide
+ *  whether a run can succeed, and the only way to change one was to wait for
+ *  the diagnoser to try it between iterations. */
+export function EnvSpecTrainSection({
+  project, open,
+}: { project: ProjectDetail; open: boolean }) {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ["project-env-spec", project.slug],
+    queryFn: () => getProjectEnvSpec(project.slug),
+    enabled: open,
+  });
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [adding, setAdding] = useState(false);
+  const [newKey, setNewKey] = useState("");
+  const [newValue, setNewValue] = useState("");
+  const loaded = (q.data?.current?.train ?? {}) as Record<string, unknown>;
+
+  useEffect(() => {
+    if (q.data) {
+      setForm(Object.fromEntries(Object.entries(
+        (q.data.current?.train ?? {}) as Record<string, unknown>,
+      ).map(([k, v]) => [k, JSON.stringify(v)])));
+    }
+  }, [q.data]);
+
+  const mut = useMutation({
+    mutationFn: (edits: Array<{ parameter: string; new_value: unknown; rationale: string }>) =>
+      editProjectEnvSpecTrain(project.slug, edits),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["project-env-spec", project.slug] });
+      toast.success(`Saved as ${res.new_version}`, {
+        description: res.applied.join(", "),
+      });
+      // Partial success is a normal outcome here, so say what did not land.
+      for (const [param, reason] of res.rejected) {
+        toast.error(`${param} not applied`, { description: reason });
+      }
+    },
+    onError: (err) => {
+      const msg = err instanceof ApiError
+        ? err.problem.detail ?? err.problem.title
+        : (err as Error).message;
+      toast.error("Could not save environment settings", { description: msg });
+    },
+  });
+
+  // The backend owns the editable-key catalog. Existing values stay inline;
+  // unset values require an explicit add flow below.
+  const editableKeys = q.data?.editable_train_keys ?? [];
+  const keys = editableKeys.filter((k) => k in loaded);
+  const unsetKeys = editableKeys.filter((k) => !(k in loaded));
+  const edits = keys.flatMap((k) => {
+    const raw = form[k] ?? "";
+    if (raw === JSON.stringify(loaded[k])) return [];
+    try {
+      return [{ parameter: k, new_value: JSON.parse(raw),
+                rationale: "edited from project settings" }];
+    } catch {
+      return [];  // mid-typing / not valid JSON yet — not an edit
+    }
+  });
+  const malformed = keys.filter((k) => {
+    const raw = form[k] ?? "";
+    if (raw === JSON.stringify(loaded[k])) return false;
+    try { JSON.parse(raw); return false; } catch { return true; }
+  });
+  let parsedNewValue: { valid: true; value: unknown } | { valid: false } | null = null;
+  if (newValue.trim() !== "") {
+    try {
+      parsedNewValue = { valid: true, value: JSON.parse(newValue) };
+    } catch {
+      parsedNewValue = { valid: false };
+    }
+  }
+
+  const cancelAdd = () => {
+    setAdding(false);
+    setNewKey("");
+    setNewValue("");
+  };
+
+  const saveNewSetting = () => {
+    if (!newKey || !parsedNewValue?.valid) return;
+    mut.mutate(
+      [{
+        parameter: newKey,
+        new_value: parsedNewValue.value,
+        rationale: "added from project settings",
+      }],
+      { onSuccess: cancelAdd },
+    );
+  };
+
+  if (q.data && !q.data.active) return null;
+
+  return (
+    <section style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", background: "var(--surface-strong)", padding: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+        <span className="rs-caption" style={{ margin: 0 }}>
+          Environment the loop trains under
+          {q.data?.current?.meta && typeof (q.data.current.meta as { version?: string }).version === "string" && (
+            <> · <code className="mono">{(q.data.current.meta as { version: string }).version}</code></>
+          )}
+        </span>
+        {(q.isLoading || mut.isPending) && <Icon name="loader" size={12} className="rs-spin" />}
+      </div>
+      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>
+        Train-only knobs — resets, terminations and PPO exploration. Saving
+        writes a new spec version and repoints <code className="mono">current</code>;
+        the next run picks it up. Values are JSON, so a range is{" "}
+        <code className="mono">[0.0, 1.5]</code> and a switch is{" "}
+        <code className="mono">false</code>.
+      </p>
+      <div className="rs-row2">
+        {keys.map((k) => (
+          <Field key={k} label={k} htmlFor={`env-${k}`}>
+            <input
+              id={`env-${k}`}
+              className="rs-input mono"
+              value={form[k] ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, [k]: e.target.value }))}
+              disabled={mut.isPending || q.isLoading}
+            />
+            {ENV_TRAIN_HINTS[k] && <p className="rs-hintline">{ENV_TRAIN_HINTS[k]}</p>}
+          </Field>
+        ))}
+      </div>
+      {adding ? (
+        <div
+          style={{
+            border: "1px solid var(--hairline)",
+            borderRadius: "var(--radius-sm)",
+            marginTop: 12,
+            padding: 12,
+          }}
+        >
+          <p className="rs-caption" style={{ margin: "0 0 8px" }}>Add train setting</p>
+          <div className="rs-row2">
+            <Field label="Train setting" htmlFor="env-new-key">
+              <select
+                id="env-new-key"
+                className="rs-input mono"
+                value={newKey}
+                onChange={(e) => {
+                  setNewKey(e.target.value);
+                  setNewValue("");
+                }}
+                disabled={mut.isPending || q.isLoading}
+              >
+                <option value="" disabled>Select an unset setting</option>
+                {unsetKeys.map((k) => <option key={k} value={k}>{k}</option>)}
+              </select>
+              {newKey && ENV_TRAIN_HINTS[newKey] && (
+                <p className="rs-hintline">{ENV_TRAIN_HINTS[newKey]}</p>
+              )}
+            </Field>
+            <Field label="JSON value" htmlFor="env-new-value">
+              <input
+                id="env-new-value"
+                className="rs-input mono"
+                value={newValue}
+                onChange={(e) => setNewValue(e.target.value)}
+                placeholder="Enter a value, for example [0.8, 1.2]"
+                aria-invalid={parsedNewValue?.valid === false}
+                disabled={!newKey || mut.isPending || q.isLoading}
+              />
+              <p className="rs-hintline">
+                This is validated by the same bounds and whole-spec checks as automated edits.
+              </p>
+            </Field>
+          </div>
+          {parsedNewValue?.valid === false && (
+            <p
+              className="rs-hintline"
+              role="status"
+              aria-live="polite"
+              style={{ color: "var(--st-amber)", marginTop: 8 }}
+            >
+              Enter a valid JSON value before saving.
+            </p>
+          )}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 10 }}>
+            <Btn kind="quiet" size="sm" onClick={cancelAdd} disabled={mut.isPending}>
+              Cancel
+            </Btn>
+            <Btn
+              kind="primary"
+              size="sm"
+              icon={mut.isPending ? "loader" : "check"}
+              onClick={saveNewSetting}
+              disabled={!newKey || !parsedNewValue?.valid || mut.isPending}
+            >
+              Save setting
+            </Btn>
+          </div>
+        </div>
+      ) : unsetKeys.length > 0 ? (
+        <div style={{ paddingTop: 10 }}>
+          <Btn
+            kind="quiet"
+            size="sm"
+            icon="plus"
+            onClick={() => setAdding(true)}
+            disabled={mut.isPending || q.isLoading}
+          >
+            Add train setting
+          </Btn>
+        </div>
+      ) : null}
+      {malformed.length > 0 && (
+        <p className="rs-hintline" role="status" aria-live="polite" style={{ color: "var(--st-amber)", marginTop: 8 }}>
+          Not valid JSON yet: {malformed.join(", ")}
+        </p>
+      )}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 12 }}>
+        <Btn kind="quiet" size="sm" disabled={edits.length === 0 || mut.isPending}
+             onClick={() => setForm(Object.fromEntries(
+               Object.entries(loaded).map(([k, v]) => [k, JSON.stringify(v)])))}>
+          Revert
+        </Btn>
+        <Btn kind="primary" size="sm" icon={mut.isPending ? "loader" : "check"}
+             disabled={edits.length === 0 || mut.isPending}
+             onClick={() => mut.mutate(edits)}>
+          Save
+        </Btn>
       </div>
     </section>
   );

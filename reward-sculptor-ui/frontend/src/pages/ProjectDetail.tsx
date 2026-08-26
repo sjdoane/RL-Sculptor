@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, FactChip } from "@/components/rs/primitives";
+import { BehaviorFlow } from "@/components/BehaviorFlow";
 import { KnowledgeGraphTab } from "@/components/KnowledgeGraphTab";
 import { PhysicsTab } from "@/components/PhysicsTab";
 import { ProjectSettingsDialog } from "@/components/ProjectSettingsDialog";
@@ -14,12 +15,16 @@ import WorldTab, { courseBreakdownText } from "@/components/WorldTab";
 import { useLibraryRobot } from "@/hooks/useLibrary";
 import { useWorldSelection } from "@/hooks/useWorlds";
 import { usePhysics } from "@/hooks/usePhysics";
-import { usePolicies } from "@/hooks/usePolicies";
 import { useProject } from "@/hooks/useProjects";
-import { useRewards } from "@/hooks/useRewards";
 import { useRobot } from "@/hooks/useRobot";
+import { useHasActiveRun } from "@/hooks/useRuns";
+import { projectBadgeStatus } from "@/lib/projectStatus";
 import { formatRelative } from "@/lib/utils";
-import type { ProjectDetail as ProjectDetailShape, RobotStateResponse, SelectedStage } from "@/lib/types";
+import type {
+  ProjectDetail as ProjectDetailShape,
+  RobotStateResponse,
+  SelectedStage,
+} from "@/lib/types";
 
 const RunsTabLazy = lazy(() => import("@/components/RunsTab"));
 const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
@@ -37,6 +42,56 @@ const TABS = [
 ] as const;
 
 type TabValue = (typeof TABS)[number]["value"];
+
+export function ProjectTabList({
+  tab,
+  onSelect,
+}: {
+  tab: TabValue;
+  onSelect: (value: TabValue) => void;
+}) {
+  const moveFocus = (value: TabValue) => {
+    onSelect(value);
+    document.getElementById(`project-tab-${value}`)?.focus();
+  };
+  return (
+    <div
+      className="rs-tabs"
+      role="tablist"
+      aria-label="Project workspace"
+      aria-orientation="horizontal"
+    >
+      {TABS.map((item, index) => (
+        <button
+          key={item.value}
+          id={`project-tab-${item.value}`}
+          role="tab"
+          type="button"
+          aria-selected={tab === item.value}
+          aria-controls={`project-panel-${item.value}`}
+          tabIndex={tab === item.value ? 0 : -1}
+          className={"rs-tab" + (tab === item.value ? " on" : "")}
+          onClick={() => onSelect(item.value)}
+          onKeyDown={(event) => {
+            let nextIndex: number | null = null;
+            if (event.key === "ArrowRight") nextIndex = (index + 1) % TABS.length;
+            if (event.key === "ArrowLeft") {
+              nextIndex = (index - 1 + TABS.length) % TABS.length;
+            }
+            if (event.key === "Home") nextIndex = 0;
+            if (event.key === "End") nextIndex = TABS.length - 1;
+            if (nextIndex === null) return;
+            event.preventDefault();
+            moveFocus(TABS[nextIndex].value);
+          }}
+        >
+          <Icon name={item.icon} size={15} />
+          {item.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 // Old bookmark / in-app values from before the IA rename.
 const LEGACY_TABS: Record<string, TabValue> = {
@@ -170,6 +225,11 @@ export default function ProjectDetail() {
   }, [setSearchParams]);
   const p = project.data;
   const canRun = !!p && !p.adapter_unavailable && p.ready_to_train !== false;
+  // §Ship 37: the backend's derived `project.status` never reports "running"
+  // (see `hasActiveRun`), so this page showed "Draft" through an entire run.
+  // Overlay the live signal onto the badge; the other derived states —
+  // configured / ready / completed / errored — still come from the project.
+  const liveRun = useHasActiveRun(slug);
 
   return (
     <>
@@ -182,7 +242,7 @@ export default function ProjectDetail() {
           <span className="rs-phead-name" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {p?.display_name ?? slug}
           </span>
-          {p && <Badge status={p.status} big />}
+          {p && <Badge status={projectBadgeStatus(p.status, liveRun)} big />}
         </div>
         <div className="rs-phead-spacer" />
         {p && <ProjectSettingsDialog project={p} />}
@@ -209,25 +269,18 @@ export default function ProjectDetail() {
         <ScrollPad><p className="rs-sub">No project.</p></ScrollPad>
       ) : (
         <>
-          <div className="rs-tabs" role="tablist">
-            {TABS.map((t) => (
-              <button
-                key={t.value}
-                role="tab"
-                aria-selected={tab === t.value}
-                className={"rs-tab" + (tab === t.value ? " on" : "")}
-                onClick={() => setTab(t.value)}
-              >
-                <Icon name={t.icon} size={15} />
-                {t.label}
-              </button>
-            ))}
-          </div>
+          <ProjectTabList tab={tab} onSelect={setTab} />
 
-          {tab !== "training" && <FactsBand project={p} />}
-          {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
+          <div
+            id={`project-panel-${tab}`}
+            role="tabpanel"
+            aria-labelledby={`project-tab-${tab}`}
+            tabIndex={0}
+          >
+            {tab !== "training" && <FactsBand project={p} />}
+            {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
 
-          {tab === "overview" && (
+            {tab === "overview" && (
             <OverviewTab
               slug={slug!}
               project={p}
@@ -236,8 +289,8 @@ export default function ProjectDetail() {
               selectedStage={selectedStage}
               setSelectedStage={setSelectedStage}
             />
-          )}
-          {tab === "rewards" && (
+            )}
+            {tab === "rewards" && (
             <ScrollPad>
               <RewardsTab
                 slug={slug!}
@@ -246,8 +299,8 @@ export default function ProjectDetail() {
                 setSelectedStage={setSelectedStage}
               />
             </ScrollPad>
-          )}
-          {tab === "world" && (
+            )}
+            {tab === "world" && (
             <ScrollPad>
               <WorldTab
                 slug={slug!}
@@ -261,10 +314,10 @@ export default function ProjectDetail() {
                 ) : undefined}
               />
             </ScrollPad>
-          )}
-          {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
-          {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
-          {tab === "training" && (
+            )}
+            {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
+            {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
+            {tab === "training" && (
             <Suspense fallback={<TabFallback />}>
               <RunsTabLazy
                 slug={slug!}
@@ -274,8 +327,8 @@ export default function ProjectDetail() {
                 setSelectedStage={setSelectedStage}
               />
             </Suspense>
-          )}
-          {tab === "results" && (
+            )}
+            {tab === "results" && (
             <Suspense fallback={<TabFallback />}>
               <ReportsTabLazy
                 slug={slug!}
@@ -283,7 +336,8 @@ export default function ProjectDetail() {
                 setSelectedStage={setSelectedStage}
               />
             </Suspense>
-          )}
+            )}
+          </div>
         </>
       )}
     </>
@@ -313,6 +367,8 @@ function OverviewTab({
   setSelectedStage: (value: SelectedStage | null) => void;
 }) {
   const configured = isRobotConfigured(robot, project);
+  // §Ship 37: same overlay as the page header — see `hasActiveRun`.
+  const liveRun = useHasActiveRun(slug);
   const cfg = project.adapter_config || {};
   const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
   const numEnvs = typeof cfg.num_envs === "number" ? cfg.num_envs : null;
@@ -320,7 +376,10 @@ function OverviewTab({
   return (
     <div className="rs-scroll">
       <div className="rs-pad" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.6fr) minmax(300px,1fr)", gap: 22, alignItems: "start" }}>
-        <div className="rs-vgap-16">
+        {/* Anchored so the Behavior flow's first step can bring it into
+            view. Both cards live in the other column of this same screen, so
+            that step's button used to switch to the tab it was already on. */}
+        <div className="rs-vgap-16" id="robot-config">
           {configured ? (
             <RobotViewer slug={slug} selectedStage={selectedStage} setSelectedStage={setSelectedStage} />
           ) : (
@@ -333,7 +392,7 @@ function OverviewTab({
         </div>
 
         <div className="rs-vgap-16">
-          <WorkflowCard
+          <BehaviorFlow
             slug={slug}
             project={project}
             robotConfigured={configured}
@@ -342,7 +401,10 @@ function OverviewTab({
           <div className="rs-card">
             <div className="rs-card-head"><div className="rs-card-title"><Icon name="info" size={16} />Project facts</div></div>
             <div className="rs-kv">
-              <div className="k">status</div><div className="v"><Badge status={project.status} /></div>
+              <div className="k">status</div>
+              <div className="v">
+                <Badge status={projectBadgeStatus(project.status, liveRun)} />
+              </div>
               <div className="k">adapter</div><div className="v">{adapterShort(project.adapter_class)}</div>
               {humanizeSlug(project.library_slug) && (<><div className="k">robot</div><div className="v">{humanizeSlug(project.library_slug)}</div></>)}
               {(taskId || project.env_id) && (<><div className="k">task_id</div><div className="v">{taskId ?? project.env_id}</div></>)}
@@ -402,104 +464,6 @@ function AuthoredWorldCard({ slug, onGoTo }: { slug: string; onGoTo: (tab: TabVa
           Sculpt runs on this project train and evaluate inside this world
           (atomic selection <span className="mono">{s.selection.evaluation_lineage}</span>).
         </p>
-      </div>
-    </div>
-  );
-}
-
-// ── Getting-started workflow (first-time-user orientation) ────────────
-function WorkflowCard({
-  slug, project, robotConfigured, onGoTo,
-}: {
-  slug: string;
-  project: ProjectDetailShape;
-  robotConfigured: boolean;
-  onGoTo: (tab: TabValue) => void;
-}) {
-  const policies = usePolicies(slug);
-  const rewards = useRewards(slug);
-  const world = useWorldSelection(slug);
-  // Don't flash a wrong checklist while the queries settle (or mislead
-  // forever if one errors) — the card is orientation, not status-critical.
-  if (
-    policies.isLoading || rewards.isLoading || world.isLoading
-    || policies.error || rewards.error
-  ) {
-    return null;
-  }
-  const hasIters = project.n_iterations_completed > 0;
-  const hasPolicies = (policies.data?.length ?? 0) > 0;
-  const rewardShaped = (rewards.data?.length ?? 0) > 1 || hasIters;
-  const worldAuthored = !!world.data;
-  const steps: Array<{
-    label: string; done: boolean; tab: TabValue; hint: string;
-  }> = [
-    {
-      label: "Configure the robot", done: robotConfigured, tab: "overview",
-      hint: "Pick a library robot or upload a URDF/MJCF.",
-    },
-    {
-      label: "Author the world", done: worldAuthored, tab: "world",
-      hint: "Describe terrain, objects, task semantics, and train variations.",
-    },
-    {
-      label: "Shape the reward", done: rewardShaped, tab: "rewards",
-      hint: "Review the grounded starting reward — the sculptor iterates from here.",
-    },
-    {
-      label: "Train", done: hasIters, tab: "training",
-      hint: "Launch a run or decompose a goal into a mission.",
-    },
-    {
-      label: "Export the policy", done: hasPolicies && !!project.n_iterations_completed, tab: "results",
-      hint: "Download a deployment bundle for sim-to-real.",
-    },
-  ];
-  const next = steps.find((s) => !s.done);
-  // Everything done and exported → the checklist has served its purpose.
-  if (!next && hasPolicies) return null;
-  return (
-    <div className="rs-card">
-      <div className="rs-card-head">
-        <div className="rs-card-title"><Icon name="list" size={16} />Getting started</div>
-      </div>
-      <div className="rs-card-pad rs-vgap-8">
-        {steps.map((s, i) => {
-          const isNext = next === s;
-          return (
-            <button
-              key={s.label}
-              onClick={() => onGoTo(s.tab)}
-              className="rs-flex rs-gap-8"
-              style={{
-                background: "none", border: "none", padding: "4px 0",
-                cursor: "pointer", textAlign: "left", width: "100%",
-                alignItems: "flex-start", font: "inherit", color: "inherit",
-              }}
-              title={s.hint}
-            >
-              <Icon
-                name={s.done ? "check-circle" : "circle"}
-                size={15}
-                color={s.done ? "var(--st-emerald)" : isNext ? "var(--rs-primary)" : "var(--rs-muted)"}
-              />
-              <span style={{ minWidth: 0 }}>
-                <span style={{
-                  display: "block", fontSize: 13,
-                  fontWeight: isNext ? 600 : 400,
-                  color: s.done ? "var(--rs-muted)" : "var(--ink)",
-                }}>
-                  {i + 1}. {s.label}
-                </span>
-                {isNext && (
-                  <span className="rs-sub" style={{ display: "block", fontSize: 11.5, marginTop: 1 }}>
-                    {s.hint}
-                  </span>
-                )}
-              </span>
-            </button>
-          );
-        })}
       </div>
     </div>
   );

@@ -1,0 +1,1935 @@
+"""Canonical compatibility contracts for policy transfer.
+
+Task ids are labels, not interface proofs.  This module fingerprints the
+ordered tensor/control interface a warm-start actually depends on and compares
+every field fail-closed.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import tomllib
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+
+CONTRACT_SCHEMA = 2
+EVENT_CONTRACT_SCHEMA = 3
+REFERENCE_CLOCK_CONTRACT_SCHEMA = 4
+
+
+def contract_fingerprint(contract: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def recovery_snapshot_receipt_fingerprint(
+    receipt: Mapping[str, Any],
+) -> str:
+    """Fingerprint a server recovery receipt without its digest field.
+
+    The digest is carried alongside the receipt in the API and persisted in
+    the receipt itself.  Excluding that one field keeps the identity
+    non-recursive while binding every source checkpoint, contract, selection,
+    tuple, and worker-log provenance field.
+    """
+    body = copy.deepcopy(dict(receipt))
+    body.pop("receipt_digest", None)
+    try:
+        canonical = json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "recovery snapshot receipt must be canonical JSON data"
+        ) from exc
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _package_version(name: str) -> Optional[str]:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
+def _shape_for_observation_term(
+    *,
+    name: str,
+    source: str,
+    params: dict[str, Any],
+    joint_count: int,
+    action_dim: int,
+    command_cfg: Any,
+    env_cfg: Any,
+) -> Optional[list[int]]:
+    source = source.lower()
+    if "builtin_sensor" in source:
+        sensor = str(params.get("sensor_name") or "").lower()
+        if "imu" in sensor and any(token in sensor for token in ("lin", "ang", "acc", "gyro")):
+            return [3]
+    if source in {"projected_gravity", "base_lin_vel", "base_ang_vel"}:
+        return [3]
+    if source in {"joint_pos_rel", "joint_vel_rel", "joint_pos", "joint_vel"}:
+        return [joint_count]
+    if source == "last_action":
+        return [action_dim]
+    if source == "generated_commands":
+        command_name = params.get("command_name")
+        cfg = command_cfg.get(command_name) if hasattr(command_cfg, "get") else None
+        cls = type(cfg).__name__.lower() if cfg is not None else ""
+        if "velocitycommand" in cls:
+            return [3]
+    if source == "authored_event_phase_observation":
+        phase_count = params.get("phase_count")
+        if isinstance(phase_count, int) and not isinstance(
+                phase_count, bool) and phase_count > 0:
+            return [int(phase_count)]
+    if source == "authored_region_relative_observation":
+        center = params.get("center_m")
+        if (
+            isinstance(center, (list, tuple))
+            and len(center) == 3
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in center
+            )
+        ):
+            return [3]
+        return None
+    sensor_shape = _shape_from_sensor_cfg(
+        source=source,
+        sensor_name=params.get("sensor_name"),
+        env_cfg=env_cfg,
+    )
+    if sensor_shape is not None:
+        return sensor_shape
+    if params.get("sensor_name") is not None:
+        # A named sensor is structural evidence, not a hint. Unknown sensor
+        # geometry fails closed instead of being masked by token fallbacks.
+        return None
+    if any(token in source for token in ("height", "clock", "phase")):
+        return [1]
+    # A shape hint on a custom term is the generic extension point.
+    hinted = params.get("shape") or params.get("observation_shape")
+    if isinstance(hinted, (list, tuple)) and hinted and all(
+        isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in hinted
+    ):
+        return [int(v) for v in hinted]
+    return None
+
+
+def _shape_from_sensor_cfg(
+    *, source: str, sensor_name: Any, env_cfg: Any,
+) -> Optional[list[int]]:
+    """Infer common sensor-backed observation widths from immutable cfg.
+
+    This reads model element names from ``spec_fn`` but never constructs or
+    steps an environment, so compatibility admission remains CPU-only.
+    """
+    if not isinstance(sensor_name, str) or not sensor_name:
+        return None
+    scene = getattr(env_cfg, "scene", None)
+    sensors = getattr(scene, "sensors", ()) if scene is not None else ()
+    sensor = next(
+        (item for item in sensors if getattr(item, "name", None) == sensor_name),
+        None,
+    )
+    if sensor is None:
+        return None
+    if source == "height_scan":
+        pattern = getattr(sensor, "pattern", None)
+        size = getattr(pattern, "size", None)
+        resolution = getattr(pattern, "resolution", None)
+        if (
+            not isinstance(size, (list, tuple))
+            or len(size) != 2
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) > 0.0
+                for value in size
+            )
+            or not isinstance(resolution, (int, float))
+            or isinstance(resolution, bool)
+            or not math.isfinite(float(resolution))
+            or float(resolution) <= 0.0
+        ):
+            return None
+        counts: list[int] = []
+        for extent in size:
+            intervals = float(extent) / float(resolution)
+            rounded = round(intervals)
+            if abs(intervals - rounded) > 1e-6:
+                return None
+            counts.append(int(rounded) + 1)
+        return [math.prod(counts)]
+    if source == "foot_height":
+        frames = getattr(sensor, "frame", ())
+        frame_count = len(frames) if isinstance(frames, (list, tuple)) else 1
+        if str(getattr(sensor, "reduction", "")).lower() == "min":
+            return [frame_count]
+        pattern = getattr(sensor, "pattern", None)
+        sample_count = int(bool(getattr(pattern, "include_center", False)))
+        for ring in getattr(pattern, "rings", ()) or ():
+            sample_count += int(getattr(ring, "num_samples", 0) or 0)
+        return [frame_count * max(sample_count, 1)]
+    if source not in {"foot_air_time", "foot_contact", "foot_contact_forces"}:
+        return None
+    primary = getattr(sensor, "primary", None)
+    entity_name = getattr(primary, "entity", None)
+    raw_pattern = getattr(primary, "pattern", None)
+    patterns = (
+        [raw_pattern]
+        if isinstance(raw_pattern, str)
+        else list(raw_pattern or ())
+    )
+    entities = getattr(scene, "entities", {}) or {}
+    entity = entities.get(entity_name) if hasattr(entities, "get") else None
+    spec_fn = getattr(entity, "spec_fn", None)
+    if not callable(spec_fn) or not patterns or not all(
+        isinstance(pattern, str) for pattern in patterns
+    ):
+        return None
+    try:
+        # Keep the MjSpec alive while traversing its bound body sequence.
+        spec = spec_fn()
+        elements = (
+            spec.geoms
+            if str(getattr(primary, "mode", "")).lower() == "geom"
+            else spec.bodies
+        )
+        names = [
+            str(element.name)
+            for element in elements
+            if getattr(element, "name", None)
+        ]
+        matches = [
+            name for name in names
+            if any(re.fullmatch(pattern, name) for pattern in patterns)
+        ]
+        excludes = tuple(getattr(primary, "exclude", ()) or ())
+        matches = [
+            name for name in matches
+            if not any(re.fullmatch(str(exclude), name) for exclude in excludes)
+        ]
+    except Exception:
+        return None
+    if not matches:
+        return None
+    slots = max(int(getattr(sensor, "num_slots", 1) or 1), 1)
+    width = len(matches) * slots
+    if source == "foot_contact_forces":
+        width *= 3
+    return [width]
+
+
+def condition_policy_contract_on_reference_clock(
+    policy_contract: Mapping[str, Any],
+    reference_clock: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact schema-4 policy interface for ``reference_clock``.
+
+    This pure transform is intentionally narrower than general contract
+    migration: it appends the one immutable reference-clock observation to
+    both actor and critic interfaces and adjusts only their input/normalizer
+    widths.  It is useful when a caller already holds a verified project
+    contract and must bind it to the same clock used by generated rewards.
+    """
+    from sculptor.reference_clock import validate_reference_clock
+
+    if not isinstance(policy_contract, Mapping):
+        raise TypeError("policy contract must be a mapping")
+    clock = validate_reference_clock(reference_clock)
+    conditioned = copy.deepcopy(dict(policy_contract))
+    schema = conditioned.get("schema")
+    if schema == REFERENCE_CLOCK_CONTRACT_SCHEMA:
+        existing = validate_reference_clock(conditioned.get("reference_clock"))
+        if existing != clock:
+            raise ValueError(
+                "policy contract is already bound to a different reference clock"
+            )
+        return conditioned
+    if schema not in {CONTRACT_SCHEMA, EVENT_CONTRACT_SCHEMA}:
+        raise ValueError(
+            "reference-clock conditioning requires policy schema 2 or 3"
+        )
+
+    observations = conditioned.get("observations")
+    if not isinstance(observations, dict):
+        raise ValueError("policy contract observations are missing")
+    width = int(clock["shape"][0])
+    term = {
+        "name": clock["term_name"],
+        "source": clock["source"],
+        "shape": [width],
+    }
+    for rows_key, shape_key, label in (
+        ("ordered_terms", "shape", "actor"),
+        ("critic_ordered_terms", "critic_shape", "critic"),
+    ):
+        rows = observations.get(rows_key)
+        shape = observations.get(shape_key)
+        if not isinstance(rows, list) or not isinstance(shape, list) or len(shape) != 1:
+            raise ValueError(f"policy contract {label} observations are malformed")
+        if not isinstance(shape[0], int) or isinstance(shape[0], bool) or shape[0] <= 0:
+            raise ValueError(f"policy contract {label} observation width is invalid")
+        if any(row.get("name") == term["name"] for row in rows if isinstance(row, dict)):
+            raise ValueError(
+                f"policy contract {label} already defines reference clock term"
+            )
+        rows.append(copy.deepcopy(term))
+        observations[shape_key] = [shape[0] + width]
+
+    policy = conditioned.get("policy")
+    normalizer = policy.get("normalizer") if isinstance(policy, dict) else None
+    if not isinstance(normalizer, dict):
+        raise ValueError("policy contract normalizer contract is missing")
+    for present_key, shape_key, label in (
+        ("actor_present", "actor_shape", "actor"),
+        ("critic_present", "critic_shape", "critic"),
+    ):
+        present = normalizer.get(
+            present_key,
+            normalizer.get("present", False) if label == "actor" else False,
+        )
+        shape = normalizer.get(shape_key)
+        if present:
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 1
+                or not isinstance(shape[0], int)
+                or isinstance(shape[0], bool)
+                or shape[0] <= 0
+            ):
+                raise ValueError(
+                    f"policy contract {label} normalizer shape is malformed"
+                )
+            normalizer[shape_key] = [shape[0] + width]
+        elif shape is not None:
+            raise ValueError(
+                f"policy contract {label} normalizer shape exists without a normalizer"
+            )
+
+    conditioned["schema"] = REFERENCE_CLOCK_CONTRACT_SCHEMA
+    conditioned["reference_clock"] = clock
+    return conditioned
+
+
+def build_project_policy_contract(
+    project_dir: Path,
+    *,
+    observed_network: Optional[dict[str, Any]] = None,
+    world_selection_path: Path | None = None,
+    reference_clock: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the current project's complete warm-start target contract.
+
+    Unknown observation shapes raise instead of silently admitting a policy.
+    Custom tasks can expose ``params.shape`` on an observation term to extend
+    the generic inference without adding a robot-specific branch.
+    """
+    project_dir = Path(project_dir)
+    config = tomllib.loads((project_dir / "config.toml").read_text(encoding="utf-8"))
+    adapter = config.get("adapter") or {}
+    adapter_class = str(adapter.get("class") or "")
+    adapter_cfg = adapter.get("config") or {}
+    task_id = str(adapter_cfg.get("task_id") or adapter_cfg.get("env_id") or "")
+    if not adapter_class or not task_id:
+        raise ValueError("project adapter class/task_id is incomplete")
+
+    from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
+    from sculptor.eval.robot_manifest import robot_joint_names
+
+    joints = robot_joint_names(task_id)
+    if not joints:
+        raise ValueError(f"no ordered joint contract for task {task_id!r}")
+    joints = [str(name) for name in joints]
+    env_cfg = load_env_cfg(task_id)
+    event_observation: dict[str, Any] | None = None
+    selection_path = (
+        Path(world_selection_path)
+        if world_selection_path is not None
+        else project_dir / "env" / "selection_current.json"
+    )
+    if selection_path.is_file():
+        from sculptor.world.artifacts import WorldArtifactStore
+
+        store = WorldArtifactStore(selection_path.parent.parent)
+        selection = store.read_selection(selection_path)
+        if selection is None:
+            raise ValueError(
+                f"world selection is unreadable: {selection_path}")
+        task_path = store.resolve_ref(selection.refs["task"])
+        selected_task = json.loads(task_path.read_text(encoding="utf-8"))
+        # Every verified authored selection may change the effective policy
+        # interface (for example route-command observations), not only event
+        # programs. Apply it before enumerating ordered observations/actions.
+        from sculptor.world.compiler import apply_world_selection
+
+        apply_world_selection(
+            env_cfg,
+            selection_path,
+            train=False,
+            runtime_task_id=task_id,
+        )
+        event_sequence = selected_task.get("shared", {}).get(
+            "event_sequence")
+        # Preserve the schema-2 contract byte-for-byte for legacy selected
+        # worlds. Schema 3 is an explicit migration used only when the selected
+        # manifest adds the event-phase observation this function must
+        # fingerprint.
+        if isinstance(event_sequence, dict):
+            event_observation = {
+                "schema": 1,
+                "term_name": "authored_event_phase",
+                "encoding": "one_hot",
+                "ordered_phase_ids": [
+                    str(phase["id"])
+                    for phase in event_sequence["phases"]
+                ],
+            }
+    rl_cfg = load_rl_cfg(task_id)
+    actions = getattr(env_cfg, "actions", None) or {}
+    action_names = list(actions.keys()) if hasattr(actions, "keys") else []
+    if len(action_names) != 1:
+        raise ValueError(
+            f"task {task_id!r} must expose one ordered joint action term"
+        )
+    action_dim = len(joints)
+
+    observations = getattr(env_cfg, "observations", None) or {}
+    actor_group = (
+        observations.get("actor") or observations.get("policy")
+        if hasattr(observations, "get") else None
+    )
+    critic_group = (
+        observations.get("critic") or observations.get("value") or actor_group
+        if hasattr(observations, "get") else actor_group
+    )
+    commands = getattr(env_cfg, "commands", None) or {}
+
+    def observation_contract(group: Any, label: str) -> tuple[list[dict[str, Any]], int]:
+        terms = getattr(group, "terms", None) if group else None
+        if not isinstance(terms, dict) or not terms:
+            raise ValueError(
+                f"task {task_id!r} has no ordered {label} observation terms"
+            )
+        rows: list[dict[str, Any]] = []
+        for name, term in terms.items():
+            func = getattr(term, "func", None)
+            source = getattr(func, "__name__", None) if func else None
+            params = getattr(term, "params", None) or {}
+            shape = _shape_for_observation_term(
+                name=str(name),
+                source=str(source or name),
+                params=dict(params),
+                joint_count=len(joints),
+                action_dim=action_dim,
+                command_cfg=commands,
+                env_cfg=env_cfg,
+            )
+            if shape is None:
+                raise ValueError(
+                    f"cannot determine {label} observation shape for term "
+                    f"{name!r} ({source!r}); warm-start admission is blocked"
+                )
+            history = int(getattr(term, "history_length", 0) or 0)
+            if history > 0:
+                shape[0] *= history
+            rows.append({"name": str(name), "source": source, "shape": shape})
+        return rows, sum(math.prod(row["shape"]) for row in rows)
+
+    obs_rows, obs_dim = observation_contract(actor_group, "actor")
+    critic_obs_rows, critic_obs_dim = observation_contract(
+        critic_group, "critic",
+    )
+    canonical_reference_clock: dict[str, Any] | None = None
+    if reference_clock is not None:
+        from sculptor.reference_clock import validate_reference_clock
+
+        canonical_reference_clock = validate_reference_clock(reference_clock)
+        reference_term = {
+            "name": canonical_reference_clock["term_name"],
+            "source": canonical_reference_clock["source"],
+            "shape": list(canonical_reference_clock["shape"]),
+        }
+        for label, rows in (
+            ("actor", obs_rows), ("critic", critic_obs_rows),
+        ):
+            if any(row.get("name") == reference_term["name"] for row in rows):
+                raise ValueError(
+                    f"{label} observation already defines reference clock term"
+                )
+            rows.append(copy.deepcopy(reference_term))
+        width = int(canonical_reference_clock["shape"][0])
+        obs_dim += width
+        critic_obs_dim += width
+
+    actor_cfg = getattr(rl_cfg, "actor", None)
+    critic_cfg = getattr(rl_cfg, "critic", None)
+    if actor_cfg is None or critic_cfg is None:
+        raise ValueError(f"task {task_id!r} runner has no actor/critic model cfg")
+    network = observed_network or {}
+    observed_obs = network.get("obs_dim")
+    observed_action = network.get("action_dim")
+    if observed_obs is not None and int(observed_obs) != obs_dim:
+        raise ValueError(
+            f"checkpoint obs_dim {observed_obs} != task contract {obs_dim}"
+        )
+    if observed_action is not None and int(observed_action) != action_dim:
+        raise ValueError(
+            f"checkpoint action_dim {observed_action} != task contract {action_dim}"
+        )
+
+    sim = getattr(env_cfg, "sim", None)
+    mujoco = getattr(sim, "mujoco", None) if sim else None
+    timestep = float(getattr(mujoco, "timestep", 0.0) or 0.0)
+    decimation = int(getattr(env_cfg, "decimation", 0) or 0)
+    if timestep <= 0 or decimation <= 0:
+        raise ValueError(f"task {task_id!r} has no control timing contract")
+
+    actor_hidden = network.get("hidden_dims") or getattr(actor_cfg, "hidden_dims", ())
+    actor_activation = network.get("activation") or getattr(actor_cfg, "activation", None)
+    recurrent = {
+        "type": getattr(actor_cfg, "rnn_type", None),
+        "hidden_dim": int(getattr(actor_cfg, "rnn_hidden_dim", 0) or 0),
+        "num_layers": int(getattr(actor_cfg, "rnn_num_layers", 0) or 0),
+    }
+    actor_normalizer = bool(getattr(actor_cfg, "obs_normalization", False))
+    critic_normalizer = bool(getattr(critic_cfg, "obs_normalization", False))
+    return {
+        "schema": (
+            REFERENCE_CLOCK_CONTRACT_SCHEMA
+            if canonical_reference_clock is not None
+            else (
+                EVENT_CONTRACT_SCHEMA if event_observation is not None
+                else CONTRACT_SCHEMA
+            )
+        ),
+        "identity": {"adapter_class": adapter_class, "task_id": task_id},
+        **(
+            {"event_observation": event_observation}
+            if event_observation is not None
+            else {}
+        ),
+        **(
+            {"reference_clock": canonical_reference_clock}
+            if canonical_reference_clock is not None
+            else {}
+        ),
+        "joints": {"ordered_names": joints},
+        "observations": {
+            "ordered_terms": obs_rows,
+            "shape": [obs_dim],
+            "critic_ordered_terms": critic_obs_rows,
+            "critic_shape": [critic_obs_dim],
+        },
+        "actions": {
+            "ordered_names": joints,
+            "term_names": action_names,
+            "shape": [action_dim],
+        },
+        "policy": {
+            "actor": {
+                "class_name": str(getattr(actor_cfg, "class_name", "")),
+                "hidden_dims": [int(v) for v in actor_hidden],
+                "activation": str(actor_activation),
+                "recurrent": recurrent,
+            },
+            "critic": {
+                "class_name": str(getattr(critic_cfg, "class_name", "")),
+                "hidden_dims": [int(v) for v in getattr(critic_cfg, "hidden_dims", ())],
+                "activation": str(getattr(critic_cfg, "activation", "")),
+                "recurrent": {
+                    "type": getattr(critic_cfg, "rnn_type", None),
+                    "hidden_dim": int(getattr(critic_cfg, "rnn_hidden_dim", 0) or 0),
+                    "num_layers": int(getattr(critic_cfg, "rnn_num_layers", 0) or 0),
+                },
+            },
+            "normalizer": {
+                # ``present`` stays as a backwards-readable actor alias.
+                "present": actor_normalizer,
+                "actor_present": actor_normalizer,
+                "critic_present": critic_normalizer,
+                "actor_shape": [obs_dim] if actor_normalizer else None,
+                "critic_shape": (
+                    [critic_obs_dim] if critic_normalizer else None
+                ),
+            },
+        },
+        "timing": {
+            "sim_timestep_s": timestep,
+            "decimation": decimation,
+            "control_dt_s": round(timestep * decimation, 9),
+        },
+        "versions": {
+            "torch": _major_minor(_package_version("torch")),
+            "mjlab": _package_version("mjlab"),
+            "rsl_rl": _package_version("rsl-rl-lib"),
+            "adapter": _package_version("reward-sculptor"),
+        },
+    }
+
+
+def _major_minor(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    match = re.match(r"^(\d+\.\d+)", value)
+    return match.group(1) if match else value
+
+
+def compare_policy_contracts(
+    source: Optional[dict[str, Any]],
+    target: Optional[dict[str, Any]],
+    *,
+    roles: tuple[str, ...] = ("actor", "critic"),
+) -> list[str]:
+    if not isinstance(source, dict):
+        return ["source bundle is missing compatibility_contract"]
+    if not isinstance(target, dict):
+        return ["project target compatibility contract is unavailable"]
+    canonical_roles = _canonical_policy_roles(roles)
+    if canonical_roles is None:
+        return ["requested policy roles are invalid"]
+    if policy_contract_migration(
+        source, target, roles=canonical_roles,
+    ) is not None:
+        return []
+    reasons: list[str] = []
+    required_paths = (
+        ("schema",),
+        ("identity", "adapter_class"), ("identity", "task_id"),
+        ("joints", "ordered_names"),
+        ("actions", "ordered_names"), ("actions", "term_names"),
+        ("actions", "shape"),
+        ("timing", "sim_timestep_s"), ("timing", "decimation"),
+        ("timing", "control_dt_s"),
+        ("versions", "torch"), ("versions", "mjlab"),
+        ("versions", "rsl_rl"), ("versions", "adapter"),
+    )
+    role_paths = {
+        "actor": (
+            ("observations", "ordered_terms"),
+            ("observations", "shape"),
+            ("policy", "actor"),
+            ("policy", "normalizer", "present"),
+            ("policy", "normalizer", "actor_present"),
+            ("policy", "normalizer", "actor_shape"),
+        ),
+        "critic": (
+            ("observations", "critic_ordered_terms"),
+            ("observations", "critic_shape"),
+            ("policy", "critic"),
+            ("policy", "normalizer", "critic_present"),
+            ("policy", "normalizer", "critic_shape"),
+        ),
+    }
+    required_paths = required_paths + tuple(
+        path for role in canonical_roles for path in role_paths[role]
+    )
+    for path in required_paths:
+        left: Any = source
+        right: Any = target
+        for key in path:
+            left = left.get(key) if isinstance(left, dict) else None
+            right = right.get(key) if isinstance(right, dict) else None
+        label = ".".join(path)
+        nullable_equal = (
+            path in {
+                ("policy", "normalizer", "actor_shape"),
+                ("policy", "normalizer", "critic_shape"),
+            }
+            and left is None
+            and right is None
+        )
+        if nullable_equal:
+            continue
+        if left is None or right is None:
+            reasons.append(f"{label} is missing/unknown")
+        elif left != right:
+            reasons.append(f"{label} differs")
+    if reasons:
+        return reasons
+    source_projection = _policy_contract_role_projection(
+        source, roles=canonical_roles,
+    )
+    target_projection = _policy_contract_role_projection(
+        target, roles=canonical_roles,
+    )
+    return (
+        []
+        if source_projection == target_projection
+        else ["compatibility contract differs"]
+    )
+
+
+def _canonical_policy_roles(
+    roles: tuple[str, ...] | list[str],
+) -> tuple[str, ...] | None:
+    """Return one canonical, non-empty actor/critic role selection."""
+    if not isinstance(roles, (tuple, list)) or not roles:
+        return None
+    requested = set(roles)
+    if any(not isinstance(role, str) for role in roles) or not requested <= {
+        "actor", "critic",
+    }:
+        return None
+    return tuple(role for role in ("actor", "critic") if role in requested)
+
+
+def _policy_contract_role_projection(
+    contract: Mapping[str, Any],
+    *,
+    roles: tuple[str, ...],
+) -> dict[str, Any]:
+    """Remove unrequested policy-role bytes from a comparison projection."""
+    projected = copy.deepcopy(dict(contract))
+    observations = projected.get("observations")
+    policy = projected.get("policy")
+    normalizer = policy.get("normalizer") if isinstance(policy, dict) else None
+    for role, rows_key, shape_key, normalizer_shape_key in (
+        ("actor", "ordered_terms", "shape", "actor_shape"),
+        ("critic", "critic_ordered_terms", "critic_shape", "critic_shape"),
+    ):
+        if role in roles:
+            continue
+        if isinstance(observations, dict):
+            observations.pop(rows_key, None)
+            observations.pop(shape_key, None)
+        if isinstance(policy, dict):
+            policy.pop(role, None)
+        if isinstance(normalizer, dict):
+            normalizer.pop(f"{role}_present", None)
+            normalizer.pop(normalizer_shape_key, None)
+            if role == "actor":
+                normalizer.pop("present", None)
+    return projected
+
+
+def _supported_feed_forward_mlp_role(
+    contract: Mapping[str, Any], role: str,
+) -> bool:
+    """Prove the runtime knows how to remap this role's first layer.
+
+    The adapter migration only recognizes RSL-RL feed-forward MLP state
+    dictionaries rooted at ``mlp.0.weight``.  Unknown classes, missing
+    recurrent evidence, and active recurrent state therefore fail closed.
+    """
+    policy = contract.get("policy")
+    role_contract = policy.get(role) if isinstance(policy, Mapping) else None
+    if not isinstance(role_contract, Mapping):
+        return False
+    class_name = role_contract.get("class_name")
+    if not isinstance(class_name, str) or re.sub(
+        r"[^a-z0-9]", "", class_name.lower(),
+    ) not in {"mlp", "mlpmodel"}:
+        return False
+    recurrent = role_contract.get("recurrent")
+    if not isinstance(recurrent, Mapping) or recurrent.get("type") not in {
+        None, "",
+    }:
+        return False
+    return True
+
+
+def _observation_role_insertion_migration(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    rows_key: str,
+    shape_key: str,
+    role: str,
+) -> dict[str, Any] | None:
+    """Describe one exact ordered-subsequence observation migration.
+
+    Each source term must occur byte-for-byte in the target under the same
+    unique name and in the same order.  Target-only terms may appear between
+    those preserved terms.  Offsets are derived from declared term shapes so
+    the runtime can move an inherited input column (for example a trailing
+    reference clock) instead of incorrectly treating every new feature as a
+    tail append.
+    """
+    source_observations = source.get("observations")
+    target_observations = target.get("observations")
+    if not isinstance(source_observations, Mapping) or not isinstance(
+        target_observations, Mapping
+    ):
+        return None
+    source_rows = source_observations.get(rows_key)
+    target_rows = target_observations.get(rows_key)
+    source_shape = source_observations.get(shape_key)
+    target_shape = target_observations.get(shape_key)
+    if not isinstance(source_rows, list) or not isinstance(target_rows, list):
+        return None
+    if (
+        not isinstance(source_shape, list)
+        or len(source_shape) != 1
+        or not isinstance(source_shape[0], int)
+        or isinstance(source_shape[0], bool)
+        or source_shape[0] <= 0
+        or not isinstance(target_shape, list)
+        or len(target_shape) != 1
+        or not isinstance(target_shape[0], int)
+        or isinstance(target_shape[0], bool)
+        or target_shape[0] <= source_shape[0]
+    ):
+        return None
+
+    def validated_rows(
+        rows: list[Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, tuple[int, int]]] | None:
+        validated: list[dict[str, Any]] = []
+        offsets: dict[str, tuple[int, int]] = {}
+        offset = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            name = row.get("name")
+            shape = row.get("shape")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in offsets
+                or not isinstance(shape, list)
+                or not shape
+                or any(
+                    not isinstance(dimension, int)
+                    or isinstance(dimension, bool)
+                    or dimension <= 0
+                    for dimension in shape
+                )
+            ):
+                return None
+            width = math.prod(shape)
+            validated.append(copy.deepcopy(row))
+            offsets[name] = (offset, width)
+            offset += width
+        return validated, offsets
+
+    source_validated = validated_rows(source_rows)
+    target_validated = validated_rows(target_rows)
+    if source_validated is None or target_validated is None:
+        return None
+    canonical_source_rows, source_offsets = source_validated
+    canonical_target_rows, target_offsets = target_validated
+    if sum(width for _, width in source_offsets.values()) != source_shape[0]:
+        return None
+    if sum(width for _, width in target_offsets.values()) != target_shape[0]:
+        return None
+
+    target_by_name = {row["name"]: row for row in canonical_target_rows}
+    target_indices = {
+        row["name"]: index for index, row in enumerate(canonical_target_rows)
+    }
+    previous_target_index = -1
+    preserved_segments: list[dict[str, Any]] = []
+    for source_row in canonical_source_rows:
+        name = source_row["name"]
+        target_row = target_by_name.get(name)
+        target_index = target_indices.get(name)
+        if (
+            target_row != source_row
+            or target_index is None
+            or target_index <= previous_target_index
+        ):
+            return None
+        previous_target_index = target_index
+        source_offset, width = source_offsets[name]
+        target_offset, target_width = target_offsets[name]
+        if target_width != width:
+            return None
+        preserved_segments.append({
+            "term_name": name,
+            "source_offset": source_offset,
+            "target_offset": target_offset,
+            "width": width,
+        })
+
+    source_names = set(source_offsets)
+    inserted_segments = [
+        {
+            "term_name": row["name"],
+            "target_offset": target_offsets[row["name"]][0],
+            "width": target_offsets[row["name"]][1],
+        }
+        for row in canonical_target_rows
+        if row["name"] not in source_names
+    ]
+    extension_width = int(target_shape[0]) - int(source_shape[0])
+    if (
+        not inserted_segments
+        or sum(segment["width"] for segment in inserted_segments)
+        != extension_width
+    ):
+        return None
+    return {
+        "role": role,
+        "source_width": int(source_shape[0]),
+        "target_width": int(target_shape[0]),
+        "extension_width": extension_width,
+        "preserved_segments": preserved_segments,
+        "inserted_segments": inserted_segments,
+    }
+
+
+def _ordered_observation_insertion_migration(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    roles: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Admit only a same-schema, function-preserving term insertion."""
+    if source.get("schema") != target.get("schema"):
+        return None
+    if source.get("schema") not in {
+        CONTRACT_SCHEMA,
+        EVENT_CONTRACT_SCHEMA,
+        REFERENCE_CLOCK_CONTRACT_SCHEMA,
+    }:
+        return None
+
+    role_migrations: dict[str, dict[str, Any]] = {}
+    role_interfaces = {
+        "actor": ("ordered_terms", "shape"),
+        "critic": ("critic_ordered_terms", "critic_shape"),
+    }
+    for role in roles:
+        rows_key, shape_key = role_interfaces[role]
+        if not _supported_feed_forward_mlp_role(
+            source, role,
+        ) or not _supported_feed_forward_mlp_role(target, role):
+            return None
+        migration = _observation_role_insertion_migration(
+            source,
+            target,
+            rows_key=rows_key,
+            shape_key=shape_key,
+            role=role,
+        )
+        if migration is None:
+            return None
+        role_migrations[role] = migration
+
+    # Prove that observation rows/dimensions and their matching normalizer
+    # widths are the only changed bytes in the structural contract.
+    projected = copy.deepcopy(dict(target))
+    projected_observations = projected.get("observations")
+    source_observations = source.get("observations")
+    target_observations = target.get("observations")
+    if not isinstance(projected_observations, dict) or not isinstance(
+        source_observations, Mapping
+    ) or not isinstance(target_observations, Mapping):
+        return None
+    for role, (rows_key, shape_key) in role_interfaces.items():
+        if role in roles:
+            projected_observations[rows_key] = copy.deepcopy(
+                source_observations.get(rows_key)
+            )
+            projected_observations[shape_key] = copy.deepcopy(
+                source_observations.get(shape_key)
+            )
+
+    source_event = source.get("event_observation")
+    target_event = target.get("event_observation")
+    if source_event != target_event:
+        expected_event = {
+            "schema": 1,
+            "term_name": "authored_event_phase",
+            "encoding": "one_hot",
+            "ordered_phase_ids": ["route", "jump", "hold"],
+        }
+        if source_event is not None or target_event != expected_event:
+            return None
+        expected_event_term = {
+            "name": "authored_event_phase",
+            "source": "authored_event_phase_observation",
+            "shape": [3],
+        }
+        for role in roles:
+            rows_key, _shape_key = role_interfaces[role]
+            target_rows = target_observations.get(rows_key)
+            if not any(
+                segment.get("term_name") == "authored_event_phase"
+                and segment.get("width") == 3
+                for segment in role_migrations[role]["inserted_segments"]
+            ) or not isinstance(target_rows, list) or (
+                expected_event_term not in target_rows
+            ):
+                return None
+        projected.pop("event_observation", None)
+
+    projected_normalizer = projected.get("policy", {}).get("normalizer")
+    source_normalizer = source.get("policy", {}).get("normalizer")
+    target_normalizer = target.get("policy", {}).get("normalizer")
+    if not isinstance(projected_normalizer, dict) or not isinstance(
+        source_normalizer, Mapping
+    ) or not isinstance(target_normalizer, Mapping):
+        return None
+    for role in roles:
+        shape_key = f"{role}_shape"
+        present_key = f"{role}_present"
+        if source_normalizer.get(present_key) != target_normalizer.get(
+            present_key
+        ):
+            return None
+        migration = role_migrations[role]
+        source_normalizer_shape = source_normalizer.get(shape_key)
+        target_normalizer_shape = target_normalizer.get(shape_key)
+        if source_normalizer.get(present_key):
+            if source_normalizer_shape != [migration["source_width"]] or (
+                target_normalizer_shape != [migration["target_width"]]
+            ):
+                return None
+        elif source_normalizer_shape is not None or target_normalizer_shape is not None:
+            return None
+        projected_normalizer[shape_key] = copy.deepcopy(
+            source_normalizer_shape
+        )
+    if _policy_contract_role_projection(
+        projected, roles=roles,
+    ) != _policy_contract_role_projection(source, roles=roles):
+        return None
+
+    return {
+        "type": "zero_initialized_ordered_observation_insertions",
+        "from_schema": source.get("schema"),
+        "to_schema": target.get("schema"),
+        "roles": list(roles),
+        "extension_width": role_migrations["actor"]["extension_width"],
+        "role_migrations": role_migrations,
+        "optimizer_resume": False,
+    }
+
+
+def policy_contract_migration(
+    source: Optional[dict[str, Any]],
+    target: Optional[dict[str, Any]],
+    *,
+    roles: tuple[str, ...] = ("actor", "critic"),
+) -> dict[str, Any] | None:
+    """Admit an explicit function-preserving observation migration.
+
+    Same-schema targets may insert new, zero-initialized observation terms
+    around an exact ordered subsequence of source terms.  The historical
+    schema-2 event-phase and schema-4 reference-clock append migrations remain
+    separately admitted.  Every other byte of structural compatibility stays
+    exact.  This is policy initialization, never an optimizer/full-state
+    resume.
+    """
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        return None
+    canonical_roles = _canonical_policy_roles(roles)
+    if canonical_roles is None or "actor" not in canonical_roles:
+        return None
+    insertion_migration = _ordered_observation_insertion_migration(
+        source,
+        target,
+        roles=canonical_roles,
+    )
+    if insertion_migration is not None:
+        return insertion_migration
+    if target.get("schema") == REFERENCE_CLOCK_CONTRACT_SCHEMA:
+        from sculptor.reference_clock import (
+            REFERENCE_CLOCK_SOURCE,
+            REFERENCE_CLOCK_TERM,
+            validate_reference_clock,
+        )
+
+        try:
+            interface = validate_reference_clock(target.get("reference_clock"))
+        except (TypeError, ValueError):
+            return None
+        # Zero-padding is an exact function-preserving transform only for the
+        # feed-forward MLPs whose first input layer we can identify. Recurrent
+        # state layouts remain unsupported and fail closed.
+        for role in ("actor", "critic"):
+            recurrent = target.get("policy", {}).get(role, {}).get(
+                "recurrent", {}
+            )
+            if isinstance(recurrent, Mapping) and recurrent.get("type"):
+                return None
+        width = int(interface["shape"][0])
+        projected = copy.deepcopy(target)
+        projected.pop("reference_clock", None)
+        projected["schema"] = (
+            EVENT_CONTRACT_SCHEMA
+            if projected.get("event_observation") is not None
+            else CONTRACT_SCHEMA
+        )
+        observations = projected.get("observations")
+        if not isinstance(observations, dict):
+            return None
+        expected_term = {
+            "name": REFERENCE_CLOCK_TERM,
+            "source": REFERENCE_CLOCK_SOURCE,
+            "shape": [width],
+        }
+        for rows_key, shape_key in (
+            ("ordered_terms", "shape"),
+            ("critic_ordered_terms", "critic_shape"),
+        ):
+            rows = observations.get(rows_key)
+            shape = observations.get(shape_key)
+            if (
+                not isinstance(rows, list)
+                or not rows
+                or rows[-1] != expected_term
+                or not isinstance(shape, list)
+                or len(shape) != 1
+                or not isinstance(shape[0], int)
+                or shape[0] < width
+            ):
+                return None
+            observations[rows_key] = rows[:-1]
+            observations[shape_key] = [shape[0] - width]
+        normalizer = projected.get("policy", {}).get("normalizer")
+        if not isinstance(normalizer, dict):
+            return None
+        for present_key, shape_key in (
+            ("actor_present", "actor_shape"),
+            ("critic_present", "critic_shape"),
+        ):
+            present = normalizer.get(present_key)
+            shape = normalizer.get(shape_key)
+            if present:
+                if (
+                    not isinstance(shape, list)
+                    or len(shape) != 1
+                    or not isinstance(shape[0], int)
+                    or shape[0] < width
+                ):
+                    return None
+                normalizer[shape_key] = [shape[0] - width]
+            elif shape is not None:
+                return None
+        clock_receipt = {
+            "type": "zero_initialized_reference_clock_observation",
+            "from_schema": projected["schema"],
+            "to_schema": REFERENCE_CLOCK_CONTRACT_SCHEMA,
+            "observation_term": REFERENCE_CLOCK_TERM,
+            "extension_width": width,
+            "reference_clock_sha256": contract_fingerprint(interface),
+            "optimizer_resume": False,
+        }
+        if projected == source:
+            return clock_receipt
+        event_migration = policy_contract_migration(source, projected)
+        if (
+            isinstance(event_migration, dict)
+            and event_migration.get("type")
+            == "zero_initialized_event_phase_observation"
+        ):
+            return {
+                "type": "zero_initialized_observation_extensions",
+                "from_schema": source.get("schema"),
+                "to_schema": REFERENCE_CLOCK_CONTRACT_SCHEMA,
+                "extension_width": (
+                    int(event_migration["extension_width"]) + width
+                ),
+                "extensions": [event_migration, clock_receipt],
+                "optimizer_resume": False,
+            }
+        return None
+    if source.get("schema") != CONTRACT_SCHEMA \
+            or target.get("schema") != EVENT_CONTRACT_SCHEMA:
+        return None
+    interface = target.get("event_observation")
+    if not isinstance(interface, dict) or interface != {
+        "schema": 1,
+        "term_name": "authored_event_phase",
+        "encoding": "one_hot",
+        "ordered_phase_ids": ["route", "jump", "hold"],
+    }:
+        return None
+    width = len(interface["ordered_phase_ids"])
+    projected = copy.deepcopy(target)
+    projected["schema"] = CONTRACT_SCHEMA
+    projected.pop("event_observation", None)
+    observations = projected.get("observations")
+    if not isinstance(observations, dict):
+        return None
+    expected_term = {
+        "name": "authored_event_phase",
+        "source": "authored_event_phase_observation",
+        "shape": [width],
+    }
+    for rows_key, shape_key in (
+        ("ordered_terms", "shape"),
+        ("critic_ordered_terms", "critic_shape"),
+    ):
+        rows = observations.get(rows_key)
+        shape = observations.get(shape_key)
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or rows[-1] != expected_term
+            or not isinstance(shape, list)
+            or len(shape) != 1
+            or not isinstance(shape[0], int)
+            or shape[0] < width
+        ):
+            return None
+        observations[rows_key] = rows[:-1]
+        observations[shape_key] = [shape[0] - width]
+    normalizer = projected.get("policy", {}).get("normalizer")
+    if not isinstance(normalizer, dict):
+        return None
+    for present_key, shape_key in (
+        ("actor_present", "actor_shape"),
+        ("critic_present", "critic_shape"),
+    ):
+        present = normalizer.get(present_key)
+        shape = normalizer.get(shape_key)
+        if present:
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 1
+                or not isinstance(shape[0], int)
+                or shape[0] < width
+            ):
+                return None
+            normalizer[shape_key] = [shape[0] - width]
+        elif shape is not None:
+            return None
+    if projected != source:
+        return None
+    return {
+        "type": "zero_initialized_event_phase_observation",
+        "from_schema": CONTRACT_SCHEMA,
+        "to_schema": EVENT_CONTRACT_SCHEMA,
+        "observation_term": "authored_event_phase",
+        "extension_width": width,
+        "ordered_phase_ids": list(interface["ordered_phase_ids"]),
+        "optimizer_resume": False,
+    }
+
+
+def _completed_iteration_same_tuple_authority(
+    iter_dir: Path,
+    *,
+    iteration: int,
+    target_selection_path: Path,
+    target_selection_version: int,
+    target_tuple_hash: str,
+    source_tuple_hash: str,
+    target_contract: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Verify a completed checkpoint evaluated under the exact target tuple.
+
+    Schema-1 markers and absent markers deliberately do not qualify. A
+    schema-2 marker is security-sensitive evidence: once present, malformed
+    metadata or checkpoint bytes fail closed instead of falling back to a
+    weaker interpretation.
+    """
+    from sculptor.world.artifacts import canonical_json_bytes
+
+    iter_dir = Path(iter_dir).expanduser().resolve()
+    marker_path = iter_dir / "iteration_complete.json"
+    if marker_path.is_symlink():
+        raise ValueError("iteration completion marker must not be a symlink")
+    if not marker_path.exists():
+        return None
+    if not marker_path.is_file():
+        raise ValueError("iteration completion marker must be a regular file")
+    try:
+        marker_bytes = marker_path.read_bytes()
+        marker_payload = json.loads(marker_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("iteration completion marker is unreadable") from exc
+    if not isinstance(marker_payload, dict):
+        raise ValueError("iteration completion marker must be a JSON object")
+    marker_schema = marker_payload.get("schema")
+    if marker_schema == 1:
+        return None
+    if marker_schema != 2:
+        raise ValueError("iteration completion marker schema is unsupported")
+    if (
+        marker_payload.get("state") != "completed"
+        or type(marker_payload.get("iter")) is not int
+        or marker_payload.get("iter") != iteration
+    ):
+        raise ValueError(
+            "iteration completion marker does not attest this completed "
+            "iteration"
+        )
+
+    disclosed_checkpoint = marker_payload.get("checkpoint")
+    expected_sha256 = marker_payload.get("checkpoint_sha256")
+    expected_bytes = marker_payload.get("checkpoint_bytes")
+    evaluated_tuple_hash = marker_payload.get("world_selection_hash")
+    if (
+        not isinstance(disclosed_checkpoint, str)
+        or not disclosed_checkpoint.strip()
+    ):
+        raise ValueError("iteration completion marker has no checkpoint path")
+    if (
+        not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+    ):
+        raise ValueError(
+            "iteration completion marker has no valid checkpoint SHA-256"
+        )
+    if type(expected_bytes) is not int or expected_bytes <= 0:
+        raise ValueError(
+            "iteration completion marker has no valid checkpoint size"
+        )
+    if (
+        not isinstance(evaluated_tuple_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", evaluated_tuple_hash) is None
+    ):
+        raise ValueError(
+            "iteration completion marker has no valid world selection hash"
+        )
+
+    checkpoint_path = Path(disclosed_checkpoint).expanduser()
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = iter_dir / checkpoint_path
+    if checkpoint_path.is_symlink():
+        raise ValueError(
+            "iteration completion checkpoint must not be a symlink"
+        )
+    try:
+        resolved_checkpoint = checkpoint_path.resolve(strict=True)
+        resolved_iter_dir = iter_dir.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("iteration completion checkpoint is absent") from exc
+    if (
+        resolved_checkpoint.parent != resolved_iter_dir
+        or resolved_checkpoint.name not in {"checkpoint.pt", "checkpoint.zip"}
+        or not resolved_checkpoint.is_file()
+    ):
+        raise ValueError(
+            "iteration completion checkpoint is not the canonical iteration "
+            "checkpoint"
+        )
+
+    digest = hashlib.sha256()
+    actual_bytes = 0
+    try:
+        with resolved_checkpoint.open("rb") as checkpoint_handle:
+            for chunk in iter(
+                lambda: checkpoint_handle.read(1024 * 1024), b""
+            ):
+                digest.update(chunk)
+                actual_bytes += len(chunk)
+    except OSError as exc:
+        raise ValueError(
+            "iteration completion checkpoint is unreadable"
+        ) from exc
+    actual_sha256 = digest.hexdigest()
+    if actual_bytes <= 0:
+        raise ValueError("iteration completion checkpoint is empty")
+    if actual_sha256 != expected_sha256 or actual_bytes != expected_bytes:
+        raise ValueError(
+            "iteration completion checkpoint bytes disagree with the marker"
+        )
+
+    if evaluated_tuple_hash != target_tuple_hash:
+        if evaluated_tuple_hash == source_tuple_hash:
+            return None
+        raise ValueError(
+            "iteration completion marker world selection matches neither "
+            "the immutable source nor target tuple"
+        )
+
+    authority: dict[str, Any] = {
+        "kind": "completed_evaluation_same_tuple",
+        "completion_marker_path": str(marker_path),
+        "completion_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+        "checkpoint_path": str(resolved_checkpoint),
+        "checkpoint_sha256": actual_sha256,
+        "checkpoint_bytes": actual_bytes,
+        "evaluated_tuple_hash": evaluated_tuple_hash,
+        "target_selection_path": str(target_selection_path),
+        "target_selection_version": int(target_selection_version),
+        "target_tuple_hash": target_tuple_hash,
+    }
+
+    sidecar_path = iter_dir / "warm_start_effective_policy_contract.json"
+    if sidecar_path.is_symlink():
+        raise ValueError(
+            "origin-persisted warm-start policy contract must not be a symlink"
+        )
+    if not sidecar_path.exists():
+        raise ValueError(
+            "origin-persisted warm-start policy contract is absent"
+        )
+    if not sidecar_path.is_file():
+        raise ValueError(
+            "origin-persisted warm-start policy contract must be a regular file"
+        )
+    try:
+        sidecar_bytes = sidecar_path.read_bytes()
+        sidecar_payload = json.loads(sidecar_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "origin-persisted warm-start policy contract is unreadable"
+        ) from exc
+    if (
+        not isinstance(sidecar_payload, dict)
+        or sidecar_payload.get("schema")
+        not in (
+            CONTRACT_SCHEMA,
+            EVENT_CONTRACT_SCHEMA,
+            REFERENCE_CLOCK_CONTRACT_SCHEMA,
+        )
+        or canonical_json_bytes(sidecar_payload)
+        != canonical_json_bytes(target_contract)
+    ):
+        raise ValueError(
+            "origin-persisted warm-start policy contract does not "
+            "corroborate the completed evaluation target"
+        )
+    authority["corroborating_contract_path"] = str(sidecar_path)
+    authority["corroborating_contract_sha256"] = hashlib.sha256(
+        sidecar_bytes
+    ).hexdigest()
+    return authority
+
+
+def _reference_clock_from_world_selection(
+    project_dir: Path,
+    selection: Any,
+) -> dict[str, Any] | None:
+    """Read a reference clock from the exact reward pinned by a selection.
+
+    This is a data-only AST parse. It never imports generated reward code, and
+    a reward that claims tracking but omits its descriptor fails closed in
+    ``reference_clock_from_reward_spec`` rather than being reconstructed from
+    a filename or clip alias.
+    """
+    reward_ref = getattr(selection, "refs", {}).get("reward")
+    if reward_ref is None:
+        return None
+    reward_path = Path(str(getattr(reward_ref, "path", "") or ""))
+    if not reward_path.is_absolute():
+        reward_path = Path(project_dir) / reward_path
+    if not reward_path.is_file():
+        raise FileNotFoundError(
+            f"selection reward artifact is absent: {reward_path}"
+        )
+    from sculptor.reference_clock import reference_clock_from_reward_source
+
+    try:
+        return reference_clock_from_reward_source(
+            reward_path.read_text(encoding="utf-8")
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "selection reward has no valid immutable reference-clock contract"
+        ) from exc
+
+
+def build_iteration_warm_start_contract_receipt(
+    project_dir: Path,
+    iteration: int,
+    *,
+    target_selection_path: Path,
+    reference_clock: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attest an iteration's source tuple against one immutable target.
+
+    The iteration-owned ``artifact_tuple.json`` remains immutable attempt
+    lineage and must be byte-equivalent as canonical JSON to the selection it
+    names. A modern schema-2 completion marker may supersede that attempt as
+    policy-interface authority only when it verifies the canonical checkpoint
+    byte-for-byte and names the exact immutable target tuple under which the
+    checkpoint completed evaluation. Otherwise the historical source world is
+    reconstructed as before. Compatibility is admitted only for an exact
+    contract or the single explicit schema-2 -> schema-3 event-observation
+    migration above.
+    """
+    from sculptor.world.artifacts import (
+        WorldArtifactStore,
+        canonical_json_bytes,
+        file_sha256,
+    )
+
+    if (
+        not isinstance(iteration, int)
+        or isinstance(iteration, bool)
+        or iteration < 0
+    ):
+        raise ValueError("warm-start iteration must be a non-negative integer")
+    project_dir = Path(project_dir).expanduser().resolve()
+    tuple_path = project_dir / "runs" / f"iter_{iteration}" / "artifact_tuple.json"
+    if not tuple_path.is_file():
+        raise FileNotFoundError(
+            f"warm-start artifact tuple is absent: {tuple_path}"
+        )
+    try:
+        tuple_payload = json.loads(tuple_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"warm-start artifact tuple is unreadable: {tuple_path}"
+        ) from exc
+    if not isinstance(tuple_payload, Mapping):
+        raise ValueError("warm-start artifact tuple must be a JSON object")
+    selection_version = tuple_payload.get("selection_version")
+    if (
+        not isinstance(selection_version, int)
+        or isinstance(selection_version, bool)
+        or selection_version <= 0
+    ):
+        raise ValueError(
+            "warm-start artifact tuple has no valid selection_version"
+        )
+
+    store = WorldArtifactStore(project_dir)
+    source_selection_path = (
+        project_dir / "env" / f"selection_v{selection_version}.json"
+    )
+    source_selection = store.read_selection(source_selection_path)
+    if source_selection is None:
+        raise FileNotFoundError(
+            f"immutable source selection is absent: {source_selection_path}"
+        )
+    if canonical_json_bytes(dict(tuple_payload)) != canonical_json_bytes(
+        source_selection.to_dict()
+    ):
+        raise ValueError(
+            "warm-start artifact tuple does not exactly match its immutable "
+            "source selection"
+        )
+
+    target_selection_path = Path(target_selection_path).expanduser().resolve()
+    target_selection = store.read_selection(target_selection_path)
+    if target_selection is None:
+        raise FileNotFoundError(
+            f"immutable target selection is absent: {target_selection_path}"
+        )
+    if reference_clock is None:
+        reference_clock = _reference_clock_from_world_selection(
+            project_dir,
+            target_selection,
+        )
+    target_contract_kwargs: dict[str, Any] = {
+        "world_selection_path": target_selection_path,
+    }
+    if reference_clock is not None:
+        target_contract_kwargs["reference_clock"] = reference_clock
+    target_contract = build_project_policy_contract(
+        project_dir,
+        **target_contract_kwargs,
+    )
+    completed_authority = _completed_iteration_same_tuple_authority(
+        tuple_path.parent,
+        iteration=iteration,
+        target_selection_path=target_selection_path,
+        target_selection_version=target_selection.selection_version,
+        target_tuple_hash=target_selection.tuple_hash,
+        source_tuple_hash=source_selection.tuple_hash,
+        target_contract=target_contract,
+    )
+    source_checkpoint: dict[str, Any] = {}
+    if completed_authority is not None:
+        source_contract = copy.deepcopy(target_contract)
+        source_contract_authority = completed_authority
+        source_checkpoint = {
+            "checkpoint_path": completed_authority["checkpoint_path"],
+            "checkpoint_sha256": completed_authority["checkpoint_sha256"],
+            "checkpoint_bytes": completed_authority["checkpoint_bytes"],
+        }
+    else:
+        source_reference_clock = _reference_clock_from_world_selection(
+            project_dir,
+            source_selection,
+        )
+        source_contract_kwargs: dict[str, Any] = {
+            "world_selection_path": source_selection_path,
+        }
+        if source_reference_clock is not None:
+            source_contract_kwargs["reference_clock"] = source_reference_clock
+        source_contract = build_project_policy_contract(
+            project_dir,
+            **source_contract_kwargs,
+        )
+        source_contract_authority = {
+            "kind": "reconstructed_from_source_selection",
+            "selection_path": str(source_selection_path),
+        }
+    migration = policy_contract_migration(source_contract, target_contract)
+    if source_contract == target_contract:
+        compatibility = {
+            "type": "exact_policy_contract",
+            "from_schema": source_contract.get("schema"),
+            "to_schema": target_contract.get("schema"),
+            "optimizer_resume": False,
+        }
+    elif migration is not None:
+        compatibility = migration
+    else:
+        reasons = compare_policy_contracts(source_contract, target_contract)
+        raise ValueError(
+            "warm-start policy contract is incompatible with the immutable "
+            f"target selection: {'; '.join(reasons)}"
+        )
+
+    return {
+        "schema": 1,
+        "iteration": int(iteration),
+        "source": {
+            "artifact_tuple_path": str(tuple_path),
+            "artifact_tuple_sha256": file_sha256(tuple_path),
+            "selection_path": str(source_selection_path),
+            "selection_sha256": file_sha256(source_selection_path),
+            "selection_version": source_selection.selection_version,
+            "tuple_hash": source_selection.tuple_hash,
+            "contract": source_contract,
+            "contract_sha256": contract_fingerprint(source_contract),
+            "contract_authority": source_contract_authority,
+            **source_checkpoint,
+        },
+        "target": {
+            "selection_path": str(target_selection_path),
+            "selection_sha256": file_sha256(target_selection_path),
+            "selection_version": target_selection.selection_version,
+            "tuple_hash": target_selection.tuple_hash,
+            "contract": target_contract,
+            "contract_sha256": contract_fingerprint(target_contract),
+        },
+        "compatibility": compatibility,
+    }
+
+
+def build_recovery_snapshot_warm_start_contract_receipt(
+    project_dir: Path,
+    *,
+    recovery_receipt: Mapping[str, Any],
+    target_selection_path: Path,
+    reference_clock: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a runner receipt from one server-attested interrupted snapshot.
+
+    Recovery is deliberately separate from iteration warm-start admission.
+    An interrupted worker may have captured a newer launch selection and
+    effective policy contract than the iteration's early artifact tuple.  The
+    server receipt binds that observed runtime evidence to exact snapshot
+    bytes; this function verifies the receipt and compares its source contract
+    with the current immutable target without reinterpreting the stale tuple.
+    """
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    receipt = copy.deepcopy(dict(recovery_receipt))
+    if receipt.get("schema") != 1:
+        raise ValueError("recovery snapshot receipt schema is unsupported")
+    if receipt.get("kind") != "interrupted_ppo_snapshot":
+        raise ValueError("recovery snapshot receipt kind is unsupported")
+    snapshot_id = receipt.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9_-]{0,127}", snapshot_id
+    ):
+        raise ValueError("recovery snapshot id is not canonical")
+    receipt_digest = receipt.get("receipt_digest")
+    if not isinstance(receipt_digest, str) or not re.fullmatch(
+        r"[a-f0-9]{64}", receipt_digest
+    ):
+        raise ValueError("recovery snapshot receipt digest is not canonical")
+    if recovery_snapshot_receipt_fingerprint(receipt) != receipt_digest:
+        raise ValueError("recovery snapshot receipt digest does not match")
+
+    checkpoint = receipt.get("checkpoint")
+    source = receipt.get("source")
+    if not isinstance(checkpoint, Mapping) or not isinstance(source, Mapping):
+        raise ValueError(
+            "recovery snapshot receipt lacks checkpoint/source evidence"
+        )
+
+    def require_text(mapping: Mapping[str, Any], key: str) -> str:
+        value = mapping.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"recovery snapshot receipt has no {key}"
+            )
+        return value
+
+    def require_sha(mapping: Mapping[str, Any], key: str) -> str:
+        value = require_text(mapping, key)
+        if not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError(
+                f"recovery snapshot {key} is not a canonical SHA-256"
+            )
+        return value
+
+    checkpoint_sha256 = require_sha(checkpoint, "sha256")
+    if require_sha(checkpoint, "origin_sha256") != checkpoint_sha256:
+        raise ValueError(
+            "recovery snapshot copy differs from its origin checkpoint"
+        )
+    for key in ("path", "origin_path"):
+        require_text(checkpoint, key)
+    checkpoint_bytes = checkpoint.get("bytes")
+    ppo_step = checkpoint.get("ppo_step")
+    if (
+        not isinstance(checkpoint_bytes, int)
+        or isinstance(checkpoint_bytes, bool)
+        or checkpoint_bytes <= 0
+    ):
+        raise ValueError("recovery snapshot byte size must be positive")
+    if (
+        not isinstance(ppo_step, int)
+        or isinstance(ppo_step, bool)
+        or ppo_step <= 0
+    ):
+        raise ValueError("recovery snapshot PPO step must be positive")
+
+    source_contract = source.get("effective_policy_contract")
+    if not isinstance(source_contract, Mapping):
+        raise ValueError(
+            "recovery snapshot has no effective source policy contract"
+        )
+    source_contract = copy.deepcopy(dict(source_contract))
+    source_contract_sha256 = require_sha(
+        source, "effective_policy_contract_sha256",
+    )
+    if contract_fingerprint(source_contract) != source_contract_sha256:
+        raise ValueError(
+            "recovery snapshot source policy-contract fingerprint differs"
+        )
+    for key in (
+        "effective_policy_contract_path",
+        "selection_path",
+        "artifact_tuple_path",
+        "job_id",
+        "log_path",
+    ):
+        require_text(source, key)
+    for key in (
+        "selection_sha256",
+        "tuple_hash",
+        "artifact_tuple_sha256",
+        "log_sha256",
+    ):
+        require_sha(source, key)
+    selection_version = source.get("selection_version")
+    source_iteration = source.get("iteration")
+    last_observed_ppo_step = source.get("last_observed_ppo_step")
+    for label, value, minimum in (
+        ("selection_version", selection_version, 1),
+        ("iteration", source_iteration, 0),
+        ("last_observed_ppo_step", last_observed_ppo_step, 1),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < minimum
+        ):
+            raise ValueError(
+                f"recovery snapshot {label} is not a valid integer"
+            )
+    if ppo_step > last_observed_ppo_step:
+        raise ValueError(
+            "recovery snapshot PPO step exceeds observed worker progress"
+        )
+    if source.get("status") not in {"errored", "stopped"}:
+        raise ValueError(
+            "recovery snapshot source job is not terminally interrupted"
+        )
+    if not isinstance(source.get("matches_pinned_selection"), bool):
+        raise ValueError(
+            "recovery snapshot tuple/selection relation is not explicit"
+        )
+    if receipt.get("provenance_status") not in {
+        "origin_persisted", "legacy_reconstructed",
+    }:
+        raise ValueError(
+            "recovery snapshot provenance status is unsupported"
+        )
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    target_selection_path = Path(target_selection_path).expanduser().resolve()
+    store = WorldArtifactStore(project_dir)
+    target_selection = store.read_selection(target_selection_path)
+    if target_selection is None:
+        raise FileNotFoundError(
+            f"immutable target selection is absent: {target_selection_path}"
+        )
+    if reference_clock is None:
+        reference_clock = _reference_clock_from_world_selection(
+            project_dir,
+            target_selection,
+        )
+    target_contract_kwargs: dict[str, Any] = {
+        "world_selection_path": target_selection_path,
+    }
+    if reference_clock is not None:
+        target_contract_kwargs["reference_clock"] = reference_clock
+    target_contract = build_project_policy_contract(
+        project_dir,
+        **target_contract_kwargs,
+    )
+    migration = policy_contract_migration(source_contract, target_contract)
+    if source_contract == target_contract:
+        compatibility = {
+            "type": "exact_policy_contract",
+            "from_schema": source_contract.get("schema"),
+            "to_schema": target_contract.get("schema"),
+            "optimizer_resume": False,
+        }
+    elif migration is not None:
+        compatibility = migration
+    else:
+        reasons = compare_policy_contracts(source_contract, target_contract)
+        raise ValueError(
+            "recovery snapshot policy contract is incompatible with the "
+            f"immutable target selection: {'; '.join(reasons)}"
+        )
+
+    return {
+        "schema": 1,
+        "kind": "interrupted_ppo_snapshot",
+        "snapshot_id": snapshot_id,
+        "source": {
+            "checkpoint_sha256": checkpoint_sha256,
+            "contract": source_contract,
+            "contract_sha256": source_contract_sha256,
+            "load_cfg_keys": ["actor", "critic"],
+            "optimizer_resume": False,
+            "recovery_receipt": receipt,
+            "recovery_receipt_digest": receipt_digest,
+        },
+        "target": {
+            "selection_path": str(target_selection_path),
+            "selection_sha256": file_sha256(target_selection_path),
+            "selection_version": target_selection.selection_version,
+            "tuple_hash": target_selection.tuple_hash,
+            "contract": target_contract,
+            "contract_sha256": contract_fingerprint(target_contract),
+        },
+        "compatibility": compatibility,
+    }
+
+
+def build_skill_warm_start_contract_receipt(
+    *,
+    skill_id: str,
+    manifest_digest: str,
+    checkpoint_sha256: str,
+    tensor_signature_sha256: str | None,
+    source_contract: Mapping[str, Any],
+    target_contract: Mapping[str, Any],
+    target_receipt: Mapping[str, Any],
+    initialization_mode: str | None = None,
+) -> dict[str, Any]:
+    """Build one re-attestable imported/local skill initialization receipt."""
+    source = dict(source_contract)
+    target = dict(target_contract)
+    if initialization_mode not in {None, "actor_only", "actor_critic"}:
+        raise ValueError(
+            "starting-skill policy receipt requires actor_only or "
+            "actor_critic initialization"
+        )
+    requested_roles = (
+        ("actor",)
+        if initialization_mode == "actor_only"
+        else ("actor", "critic")
+    )
+    migration = policy_contract_migration(
+        source, target, roles=requested_roles,
+    )
+    # Older launch adapters did not pass the selected mode into this pure
+    # receipt builder.  A declared actor-only migration is still safe as a
+    # fallback because it is role-bound in the receipt and the runtime refuses
+    # to use it for actor+critic loading.  Compatibility admission remains the
+    # authority that decides whether actor_only is selectable.
+    if (
+        migration is None
+        and initialization_mode is None
+        and source != target
+    ):
+        requested_roles = ("actor",)
+        migration = policy_contract_migration(
+            source, target, roles=requested_roles,
+        )
+    if source == target:
+        compatibility = {
+            "type": "exact_policy_contract",
+            "from_schema": source.get("schema"),
+            "to_schema": target.get("schema"),
+            "optimizer_resume": False,
+        }
+    elif migration is not None:
+        compatibility = migration
+    else:
+        reasons = compare_policy_contracts(
+            source, target, roles=requested_roles,
+        )
+        raise ValueError(
+            "starting-skill policy contract is incompatible with the target: "
+            + "; ".join(reasons)
+        )
+    if not isinstance(skill_id, str) or not re.fullmatch(
+        r"[0-9a-f]{12}", skill_id
+    ):
+        raise ValueError("starting-skill skill_id is not canonical")
+    for label, value in (
+        ("manifest_digest", manifest_digest),
+        ("checkpoint_sha256", checkpoint_sha256),
+        ("tensor_signature_sha256", tensor_signature_sha256),
+    ):
+        if value is None and label == "tensor_signature_sha256":
+            continue
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", value
+        ):
+            raise ValueError(
+                f"starting-skill {label} is not a canonical SHA-256"
+            )
+    target_contract_sha256 = contract_fingerprint(target)
+    if (
+        target_receipt.get("policy_contract_required") is not True
+        or target_receipt.get("policy_contract_sha256")
+        != target_contract_sha256
+    ):
+        raise ValueError(
+            "starting-skill compact target receipt contradicts the full "
+            "policy contract"
+        )
+    return {
+        "schema": 1,
+        "kind": "starting_skill",
+        "source": {
+            "skill_id": skill_id,
+            "manifest_digest": manifest_digest,
+            "checkpoint_sha256": checkpoint_sha256,
+            "tensor_signature_sha256": tensor_signature_sha256,
+            "contract": source,
+            "contract_sha256": contract_fingerprint(source),
+        },
+        "target": {
+            **dict(target_receipt),
+            "contract": target,
+            "contract_sha256": target_contract_sha256,
+        },
+        "compatibility": compatibility,
+        "load_roles": list(requested_roles),
+    }
+
+
+__all__ = [
+    "CONTRACT_SCHEMA",
+    "EVENT_CONTRACT_SCHEMA",
+    "REFERENCE_CLOCK_CONTRACT_SCHEMA",
+    "build_project_policy_contract",
+    "build_iteration_warm_start_contract_receipt",
+    "build_recovery_snapshot_warm_start_contract_receipt",
+    "build_skill_warm_start_contract_receipt",
+    "compare_policy_contracts",
+    "contract_fingerprint",
+    "policy_contract_migration",
+    "recovery_snapshot_receipt_fingerprint",
+]

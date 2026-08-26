@@ -23,6 +23,7 @@ export const STATUS_META: Record<string, StatusMeta> = {
   running:    { label: "Running",    cls: "amber",   icon: "loader", spin: true },
   training:   { label: "Training",   cls: "amber",   icon: "loader", spin: true },
   completed:  { label: "Completed",  cls: "emerald", icon: "check" },
+  "project-history": { label: "Run history", cls: "slate", icon: "history" },
   succeeded:  { label: "Succeeded",  cls: "emerald", icon: "check" },
   errored:    { label: "Errored",    cls: "rose",    icon: "alert-triangle" },
   failed:     { label: "Failed",     cls: "rose",    icon: "alert-triangle" },

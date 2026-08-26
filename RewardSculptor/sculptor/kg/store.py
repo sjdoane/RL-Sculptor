@@ -38,6 +38,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -313,6 +314,7 @@ class SculptorKG:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        self._transaction_depth = 0
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate()
         self._conn.commit()
@@ -329,6 +331,20 @@ class SculptorKG:
         if "text_hash" not in cols:
             self._conn.execute(
                 "ALTER TABLE node_embeddings ADD COLUMN text_hash TEXT")
+        # Lexical index over paper BODIES. Paper retrieval ranks on
+        # `title + abstract + rationale` only, so a paper whose body answers a
+        # question but whose abstract never names the topic was unfindable —
+        # and extraction reads at most 28K chars, so most bodies were never
+        # even summarized into the graph. This index is the recall path over
+        # the other ~55%. FTS5 is optional in a SQLite build; degrade to
+        # "no lexical recall" rather than refusing to open the graph.
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS paper_fulltext "
+                "USING fts5(node_id UNINDEXED, arxiv_id UNINDEXED, body)")
+            self._fts_ok = True
+        except sqlite3.OperationalError:  # pragma: no cover — build-dependent
+            self._fts_ok = False
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def close(self) -> None:
@@ -344,12 +360,40 @@ class SculptorKG:
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
+        if self._transaction_depth > 0:
+            yield self._conn
+            return
         try:
             yield self._conn
             self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
+
+    @contextmanager
+    def transaction(self) -> Iterator["SculptorKG"]:
+        """Atomically group normal ``add_node``/``add_edge`` operations.
+
+        Store methods historically committed each write independently.  This
+        public boundary keeps that behavior for ordinary callers while letting
+        multi-edge scientific attestations publish all-or-nothing.  Nested
+        transactions join the outer unit instead of committing early.
+        """
+        outermost = self._transaction_depth == 0
+        if outermost:
+            self._conn.execute("BEGIN IMMEDIATE")
+        self._transaction_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._transaction_depth -= 1
+            if outermost:
+                self._conn.rollback()
+            raise
+        else:
+            self._transaction_depth -= 1
+            if outermost:
+                self._conn.commit()
 
     # ── nodes ───────────────────────────────────────────────────────────────
     def add_node(self, node: Any, *, upsert: bool = True) -> str:
@@ -420,6 +464,22 @@ class SculptorKG:
         )
         with self._tx() as cx:
             cx.execute(sql, (src, dst, rel, json.dumps(extra, default=str)))
+
+    def delete_edge(
+        self,
+        src: str,
+        dst: str,
+        relation: Relation | str,
+    ) -> bool:
+        """Delete one exact typed edge and report whether it existed."""
+
+        rel = relation.value if isinstance(relation, Relation) else relation
+        with self._tx() as cx:
+            cur = cx.execute(
+                "DELETE FROM edges WHERE src = ? AND dst = ? AND relation = ?",
+                (src, dst, rel),
+            )
+        return bool(cur.rowcount)
 
     def neighbors(
         self,
@@ -609,6 +669,54 @@ class SculptorKG:
                 "SELECT COUNT(*) FROM node_embeddings WHERE model = ?", (model,)
             ).fetchone()
         return int(r[0])
+
+    # ── full-text (lexical) index over paper bodies ─────────────────────────
+    def index_paper_fulltext(self, node_id: str, arxiv_id: str, body: str) -> bool:
+        """Index one paper body for lexical search. Replaces any prior row for
+        `node_id`, so re-indexing is idempotent. False when FTS5 is missing."""
+        if not getattr(self, "_fts_ok", False) or not body:
+            return False
+        with self._tx() as c:
+            c.execute("DELETE FROM paper_fulltext WHERE node_id = ?", (node_id,))
+            c.execute(
+                "INSERT INTO paper_fulltext(node_id, arxiv_id, body) "
+                "VALUES (?, ?, ?)", (node_id, str(arxiv_id or ""), body))
+        return True
+
+    def search_paper_fulltext(
+        self, query: str, *, limit: int = 20,
+    ) -> list[tuple[str, float]]:
+        """Rank paper node_ids by BM25 over their bodies, best first.
+
+        Returns `(node_id, score)` with score > 0 and larger = better (bm25()
+        is negated: SQLite returns lower-is-better). Empty when FTS5 is
+        unavailable, the query is blank, or the query is not valid FTS syntax —
+        a user's free-text question is not guaranteed to parse, and a search
+        that raises is worse than one that returns nothing.
+        """
+        if not getattr(self, "_fts_ok", False):
+            return []
+        terms = [t for t in re.findall(r"[A-Za-z0-9_]+", query or "") if len(t) > 2]
+        if not terms:
+            return []
+        # OR the terms: a body matching any of them is a candidate worth
+        # ranking. Quoting each defuses FTS operators in user text.
+        expr = " OR ".join(f'"{t}"' for t in terms)
+        try:
+            rows = self._conn.execute(
+                "SELECT node_id, bm25(paper_fulltext) AS score FROM paper_fulltext "
+                "WHERE paper_fulltext MATCH ? ORDER BY score LIMIT ?",
+                (expr, int(limit)),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(str(r["node_id"]), -float(r["score"])) for r in rows]
+
+    def count_paper_fulltext(self) -> int:
+        if not getattr(self, "_fts_ok", False):
+            return 0
+        return int(
+            self._conn.execute("SELECT COUNT(*) FROM paper_fulltext").fetchone()[0])
 
     def stats(self) -> dict[str, Any]:
         out: dict[str, Any] = {

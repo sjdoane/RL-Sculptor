@@ -1,12 +1,339 @@
 # HANDOFF — start here
 
-**You are picking up the RL-Sculptor project. When the user says "read handoff", read this whole file, then begin Task 1 in §4. Work autonomously through the big tasks in order; after you have implemented enough of a task (Task 1, and ideally Task 2), STOP and run the End-to-End Live UI Verification in §6 — drive the whole app through the browser, screenshot every page, confirm it matches expectations and looks good, then report with the screenshots before continuing.**
+**Current authority:** read `AGENTS.md`, then
+`docs/GUIDING_RESEARCH_CONTEXT.md`, then this newest section, then
+`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. The guiding context is the current
+research direction reconstructed from both Lokesh meetings and the primary
+SONIC/OGMP literature. The old numbered task queue below is historical
+context, not an instruction to restart already-completed work. Historical GPU
+heartbeat messages are also not launch authority.
 
 Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 - `RewardSculptor/` — the core Python library + `sculpt` CLI (the train→rollout→diagnose→edit loop, the paper knowledge graph, the objective-metric trust pipeline, adapters for MJLab/MuJoCo + Isaac). Run things with `uv run …` from inside `RewardSculptor/`.
 - `reward-sculptor-ui/` — FastAPI backend + React/Vite frontend that wraps the library (project lifecycle, robot picker, reward editor, KG browser, world builder, live run streaming, reports).
 
 Current git branch: `ship-20-ux-revamp` (do NOT work on `main`). Keep committing to this branch.
+
+## Latest implementation slice — evidence-authority audit fixes (2026-08-25)
+
+The comprehensive pre-OGMP audit found several cases where retained bytes,
+process progress, and researcher-facing labels carried more authority than the
+evidence justified. This slice closes those blockers. It was implemented
+uncommitted to preserve user-owned dirty work; the user then authorized the
+remaining-P1 closure below and committing, so the slice is now committed in
+four coherent sub-slices (core, backend, frontend, docs).
+
+- Reference target identity now includes the executed joint-position and
+  joint-velocity tables, sampling rule, phase mode, and terminal
+  zero-velocity hold. The frozen flat runtime digest includes the clock and
+  target-dispatch helpers. Actor and critic observation groups are both
+  required, and rollout rechecks the checkpoint policy-contract sidecar.
+  Ordinary reference loading hashes and decodes one captured byte snapshot.
+- Random-frame trajectory RSI is execution-disabled. The historical consumer
+  sampled a physical frame without applying the same per-environment offset to
+  actor, critic, reward, and clock; recognizing the schema is not permission to
+  launch that inconsistent path.
+- Train and rollout reuse is bound to exact request, effective-input, and
+  completion manifests. Schema-3 iteration completion re-verifies those
+  manifests, the current reward/initialization bytes, checkpoint, rollout, and
+  any precommitted objective-evaluation seed batch. An incomplete batch records
+  every seed failure but cannot complete or advance resume.
+- Every live worker must prove its exact ordered iteration plan. User early
+  stop is accepted only after the server re-reads and hashes its own
+  `stop: true` control sidecar. A successful exit is insufficient: completion
+  also requires a durable terminal receipt that re-verifies every schema-3
+  iteration. Restart reconciliation no longer lets an older success mask later
+  failed evidence, and the UI no longer infers completion from a later
+  `iter_started` event.
+- Reports select a policy only through canonical selection plus independent
+  objective authority. Their receipts bind the selected checkpoint, artifact
+  tuple, reward bytes, evidence, Markdown, video, and full input snapshot;
+  stale reports are visibly retained but their copy/download/video actions are
+  withheld. Deployment-qualified export fails closed, while a separately
+  labeled raw reproducibility download remains available with explicit
+  `not_certified` authority. Export snapshots and verifies exact bytes before
+  atomic publication.
+- The world grid includes conservative rotated authored-object extents. The
+  offline physical-scene audit now detects replicated cross-environment
+  geometry overlap and robot intrusion, so retained iter 36 is rejected rather
+  than green. Iter 13 remains rejected for its 9.899 m frame error.
+- Robot uploads use bounded streaming reads and bounded data-only archive
+  admission. They reject traversal, duplicate/case-colliding members, links,
+  executable/code members, bombs, XML includes/plugins/entities/external
+  paths, OBJ material loaders, and DAE external loaders before MuJoCo parses
+  the model.
+- Live MJLab launches have a backend CUDA/MJLab/RSL-RL/VRAM preflight; Tier-K
+  inspection remains CPU/data-only. MuJoCo arena exhaustion is classified
+  separately from GPU OOM. UI launch/readiness authority, raw-vs-qualified
+  export copy, project-lifecycle labels, reference identity, tabs, and recovery
+  remedies now match the backend contracts.
+
+Two mismatched local G1 provenance records were migrated to their exact
+retained clip hashes without changing clip bytes. They remain Tier K. The
+scientific boundary, research context, gap analysis, demo runbook, and Lokesh
+meeting brief now describe the same privileged-state displaced-object recovery
+experiment and correct OGMP/P-OGMP attribution. No GPU run, Tier-D
+certification, simulator rollout, or learned-behavior result was produced by
+this slice; software verification must not be presented as research evidence.
+
+Final consolidated verification for this uncommitted working tree:
+
+- core CPU suite: **3,166 passed, 1 optional-JAX skip, 7 GPU tests
+  deselected** in 224.22 s;
+- backend suite: **894 passed** in 188.81 s;
+- frontend suite: **135 passed** across 20 files in 6.93 s;
+- the browser-discovered dry-run receipt wording regression was corrected,
+  then its focused file remained **15/15 passed** and the production build was
+  rerun successfully;
+- TypeScript project compilation and Vite production build passed; both Python
+  production trees passed `compileall`; `git diff --check` passed; and every
+  changed production Python file passed Ruff with only the repository's
+  unchanged historical `edit.py` E402 import placement excluded. A broader
+  fatal-rule scan also reports the unchanged namespace-cleanup pattern in
+  `sculptor/__init__.py`; do not describe repository-wide Ruff as clean.
+- live browser QA on the retained weave-and-stop project confirmed neutral
+  lifecycle labels, invalid-scene and legacy-only evidence labels, stale-report
+  action withholding, raw-vs-qualified export language, a 409 qualified-export
+  refusal with exact blockers, aligned dry-run receipt/action authority,
+  keyboard tab navigation, and no console errors.
+
+The temporary backend/frontend servers were stopped afterward. No GPU
+training, simulator rollout, Tier-D certification, or new research result was
+produced by this slice.
+
+### Same-day follow-up — remaining audit P1s closed, wave committed (2026-08-25)
+
+After the audit report, the user authorized fixing the remaining open P1s and
+committing. Four closures, each with executed (not historical) verification:
+
+- **Live knowledge-graph purge.** The production store at
+  `~/.local/share/sculptor/kg/graph.db` contained a fabricated test subgraph
+  written on 2026-08-24 by two backend lineage tests that built a
+  `RunLineageSession` without `RS_KG_PATH`: three `lineage-project`
+  run/iteration nodes, a fixture world tuple, two fixture software
+  environments, a 16-frame fixture motion, and six edges — including the
+  store's ONLY `TRACKS` edge, carrying placeholder Tier-D hashes
+  (`7777…`/`8888…`/`9999…`). Every fixture endpoint was verified to have zero
+  non-fabricated edge references before deletion; the purge ran in one
+  transaction (nodes 2,884 → 2,877; edges 3,096 → 3,090; `TRACKS` count now
+  honestly 0; placeholder-hash edges 0). A pre-purge byte backup sits beside
+  the store as `graph.db.pre-purge-20260825.bak` — delete it once comfortable.
+- **Suite-wide KG isolation.** `backend/tests/conftest.py` gained an autouse
+  `_isolate_knowledge_graph` fixture pinning `RS_KG_PATH` into each test's
+  tmp dir (previously isolation was opt-in via `tmp_projects_root`), plus a
+  canary test that fails the suite if any backend test can resolve the shared
+  default store. Executed proof: the full backend suite run with no manual
+  isolation left the live store byte-identical (same mtime and size).
+- **Corrupt-rollout fail-closed.** `np.load` on a truncated
+  `trajectory.npz` raises `zipfile.BadZipFile`, which escaped the same-lane
+  evaluator's except tuple and turned the whole project's
+  `GET /projects/{slug}/policies` into an unhandled 500 (executed audit
+  repro). `BadZipFile`/`LargeZipFile` are now handled and such an iteration
+  reduces to an `unavailable` acceptance receipt with a reason, which
+  `_objective_proof_decision` maps to an honest `incomplete` — never a crash,
+  never a silent pass.
+- **Receipt-first same-lane authority.** New
+  `load_or_evaluate_iteration_acceptance` serves a persisted, self-verifying
+  `physical_acceptance_receipt.json` (schema + recomputed `receipt_sha256`
+  must match) before recomputing, and the policies route engages same-lane
+  authority when EITHER the precommitted contract OR a persisted receipt
+  exists. Deleting the contract after a failed verdict can no longer silently
+  revert pass authority to aggregated route/contact/hold components; a
+  tampered receipt with its contract also missing fails closed to
+  `unavailable`. Documented residual boundary: deleting BOTH files before any
+  evaluation ever runs still leaves no trace — closing that requires the
+  launch-side producer pinning the contract digest into worker-written
+  evidence, which does not exist yet. Four regression tests cover the new
+  semantics (corrupt archive, contract-deletion survival, tampered receipt,
+  terminal-receipt reuse without re-evaluation).
+
+Commit gates executed for the exact committed tree: core CPU suite
+**3,166 passed, 1 optional-JAX skip, 7 GPU-marked deselected** (242.6 s);
+backend suite **899 passed** (200.6 s) with the live KG verified
+byte-identical before/after; frontend **135 passed across 20 files** with a
+clean `tsc` check. The combined wave (audit fix implementation plus this P1
+closure) is committed in four coherent slices — core, backend, frontend,
+docs — on `ship-20-ux-revamp`. Audit coordination files
+(`AUDIT_COLLABORATION.md`, the two agent outboxes), `meeting-briefs/`, and
+`tmp/` remain deliberately uncommitted. Still open: the same-lane launch-side
+producer above, and the §12 research decisions (Tier-D evidence campaign,
+E4 rerun as a matched comparison).
+
+## Latest completed slice — SONIC notes and reviewed KG receipt (2026-08-24)
+
+Sam's handwritten SONIC notes and arXiv v4 have been reconciled into
+`docs/GUIDING_RESEARCH_CONTEXT.md`. The guide separates the public camera-free
+SONIC tracker, SONIC's separate kinematic planner and upstream VLA demo,
+Lokesh's unpublished visual adaptation, and RewardSculptor's proposed
+policy-training/recovery role. It records the exact controller, FSQ, loss,
+training-scale, planner, VLA, evaluation, and limitation facts plus the open
+architecture decisions for Lokesh.
+
+The KG seed sets include SONIC v4 and PHUMA. A deterministic nine-item SONIC
+catalog materializes source-pinned controller, FSQ/loss, training, BONES-SEED,
+reward, randomization, planner, VLA, and evaluation receipts. The exact S1–S4
+values are searchable, while the mutable dataset-card facts are separately
+pinned to the reviewed Hugging Face revision. Every item is explicitly
+`unsupported` until a real SONIC execution path exists; the paper recipe is not
+a RewardSculptor default. The KG paper list searches these fields; paper detail
+presents the reviewed capability receipt and fails closed on an ambiguous
+status. This is literature accessibility, not controller integration. See the
+most recent commit for the implementation. Final verification was 3,133 core
+tests passed (one optional JAX skip), 843 backend tests passed, 128 frontend
+tests passed, scoped Ruff F/E9 and Python compile checks, frontend typecheck,
+and a production build. Browser QA on the live project proved the nine-item
+receipt, exact-parameter filtering, unsupported status, and clean console. The
+live graph contains 2,884 nodes / 3,096 edges; the regenerated bundled graph
+contains 852 nodes / 706 edges.
+
+## 0. Current research program — adaptive policy training (2026-08-24)
+
+Sam's second meeting with Lokesh reframed the proposed contribution as an
+agentic **policy-training harness** between generated behavior data and one
+task-adapted controller. The canonical reconstruction, public SONIC/OGMP
+reading, exact RewardSculptor capability matrix, proposed displaced-object
+recovery benchmark, proposal seed, and open questions are in
+`docs/GUIDING_RESEARCH_CONTEXT.md`. Do not collapse public SONIC, the lab's
+unpublished visual behavior-adaptation work, the separate VLM behavior-data
+agent, and RewardSculptor into one system.
+
+The reference-guided rail-hop example below remains valuable plumbing evidence
+but is paused until Sam explicitly resumes it. It is not the proposed adaptive
+object-recovery research benchmark.
+
+## 0a. Paused physical example — reference-guided four-rail hopping (2026-08-23)
+
+The active goal is a fresh, visible G1 project that evolves a solved stationary
+one-leg-jump motion into four forward rail hops and a verified stop. It is not
+complete until the UI-launched run produces fresh objective physical evidence.
+
+The retained parent is
+`g1/50009_one_leg_jump_poses_60_jpos`: 229 samples at 60 Hz. Its retained
+`clip.npz` SHA-256 is
+`524dcaf9ce6d1b18c96febe9f2176f8e65e25edefc194eaec2fcfab41d57022f`;
+the legacy provenance value
+`92fc2431f99969e0835a91657a040c55a0cfe5db9db536d2daed533a7b9deca0`
+identifies the upstream dataset source, not the retained NPZ. The parent must
+first be materialized under a new immutable `origin_relative` root-frame
+identity with structured evidence. The visible composition then uses six
+contiguous, zero-blend spans: `prepare`, `hop_1`, `hop_2`, `hop_3`, `hop_4`,
+and `recover`. Its sampled duration and policy clock use `(N - 1) / fps`.
+
+Before live use, the exact composite must earn fresh Tier-D exact-schedule
+joint-position/root-height tracking evidence through the trusted local
+`MjlabAdapter`. Tier D is not a general dynamics, obstacle, contact, or root-XY
+certificate. The research run must separately prove that both actor and critic
+consume the immutable reference-phase observation and that the complete frozen
+mode runtime is unchanged.
+
+The evolved world is intentionally independent of the motion: four fixed
+0.06 m rails, four ordered landing disks, then a finish. The reference does
+not track root XY; the world reward must produce forward travel. Acceptance is
+conjunctive: four distinct support-cycle rail crossings, all disks and finish
+in order, no rail contacts or sustained fall, upright/default-like posture,
+both feet retained in finish, horizontal speed below 0.12 m/s, and 100
+uninterrupted quiet post-completion frames. A plausible video or high scalar
+reward is not sufficient.
+
+The framework gate is now committed as `e82b3fc` (core reference runtime),
+`f2359e3` (backend authority/lineage), and `6beaeda` (researcher UI). Final
+integrated verification was 3,065 core tests passed (one optional JAX skip),
+783 backend tests passed, 98 frontend tests passed, plus production typecheck,
+build, scoped Ruff F/E9, compileall, and diff checks. The next step is to
+materialize and certify the exact composite, then create and launch the fresh
+UI project. During a live GPU worker, do not edit reload-watched core or run
+intermediate GPU audits.
+
+## 0b. Current implementation — research starting points and honest OGMP integration (2026-08-17)
+
+The active implementation adds a researcher-facing starting-point workflow
+with three independent inputs: compatible policy weights, an immutable
+reference motion, and the project's already-promoted world. Portable
+`.rskill` uploads are bounded data-only archives. Safetensors policy tensors
+are checked against the exact adapter/task/robot/joint/action/observation/
+network contract and converted into a server-owned checkpoint. Motion-only
+uploads register a candidate; they do **not** authorize training until the
+exact Tier-D physics certificate is reverified against the target project's
+robot, task, ordered interface, simulator cadence, and software boundary.
+Uploaded controller/world declarations are verified, digested, and discarded;
+the UI must never imply they were staged or activated.
+
+Run launch now pins and rechecks the target contract after queueing, before
+subprocess creation. Policy lineage is earned only after the runner emits an
+exact successful load event. The knowledge graph distinguishes uploaded
+safetensors from the derived native policy, records conversion evidence, uses
+deterministic dirty-tree software identity, and permits `TRACKS` only with
+worker-observed Tier-D evidence. Reference, reward, world, mode graph, and
+execution-manifest identities remain separate.
+
+The OGMP UI is intentionally labeled **OGMP-inspired**. Implemented behavior
+is a validated linear phase-window automaton with an immutable execution
+manifest, explicit terminal-hold budget, per-mode reward scope, and offline
+per-mode/transition diagnostics. It does not claim queried/receding-horizon
+oracles, rho-bounded exploration, learned mode latents, predicate branching,
+or preference conditioning. Training and evaluation must consume the same
+certified cadence; retiming creates a new artifact and requires recertification.
+
+That boundary is now executable KG data rather than duplicated prose:
+`sculptor.kg.capabilities` materializes OGMP/Preferenced-OGMP concept nodes
+with exactly one `implemented`, `metadata_only`, or `unsupported` status edge.
+The modes API and persisted diagnostics derive their disclosures from this
+catalog, and CI resolves every evidence symbol behind an implemented or
+metadata-only claim. Materialization requires the real paper nodes and never
+overwrites their literature metadata.
+
+The implementation is now end-to-end rather than a UI-only selector:
+
+- New Run offers an explicit **From scratch / Project checkpoint / Imported
+  skill** decision, never silently choosing the newest checkpoint. Policy and
+  motion remain independently selectable, and the active project world never
+  changes as an upload side effect.
+- Portable `.rskill` publication is transactional and process-locked. Strict
+  JSON, bounded ZIP members, safetensors/NPZ contracts, reference registration,
+  server-owned weight conversion, receipts, and KG facts either all publish or
+  all roll back.
+- Mission skill publication retains exact reward, world, reference,
+  certificate, rollout, execution-contract, and boundary evidence. Every
+  checkpoint resolution re-admits the same Tier-D chain. Only a policy
+  checkpoint is reusable; source controller/world declarations remain inert.
+- Immediately before a real adapter train call, the worker emits a
+  content-addressed `ModeExecutionArtifact` and the KG records
+  `TrainingRun -[USES_MODE_EXECUTION]-> ModeExecutionArtifact`. The backend
+  independently re-derives and rechecks reward, clip, graph, manifest,
+  selection, and Tier-D identities before accepting that fact.
+- The production mode panel can record an immutable exact-context readiness
+  receipt. Its current state is deliberately `observe_only`: no generated,
+  validated, calibrated per-mode objective set is attached to training, so the
+  receipt grants no fitness or selection authority.
+- The research seed catalog has explicit source SHA, rationale, tags, and
+  concept anchors. Exact `sculpt kg extract --arxiv <id>` selection removes
+  title ambiguity; the current 19-source seed catalog passes its coverage
+  audit, including OGMP `2403.04205` and Preferenced OGMP `2410.01030`.
+
+Live browser QA covered New Run, all three starting-point paths, the imported
+receipt, desktop/mobile layout, and the Knowledge tab. It found and fixed two
+defects: mobile import content could overflow, and inspecting a legacy receipt
+without the new authorization block crashed the whole interface. Legacy
+receipts now remain inspectable, fail closed, and require re-import.
+
+Final CPU/UI verification for this slice:
+
+- core: **2,820 passed, 1 optional-JAX skip** (`pytest tests -q`);
+- backend: **709 passed** (`pytest backend/tests -q`);
+- frontend: **24 passed**, TypeScript typecheck passed, and the production
+  build completed across 2,773 modules;
+- core/backend `compileall`, `git diff --check`, and F/E9 Ruff checks over the
+  new authority modules and current skill/mode paths passed. The pre-existing
+  repository-wide Ruff backlog remains outside this slice; do not represent
+  the whole historical tree as lint-clean;
+- a fresh browser tab rechecked the three starting-point choices, selected a
+  legacy blocked receipt without crashing, confirmed its primary action stayed
+  disabled, verified both OGMP papers in Knowledge, and produced no error-level
+  console entries.
+
+Do not launch a GPU training job for this work. These checks prove the
+contracts, API, UI, and CPU orchestration; they do not constitute a new G1
+physics rollout, hardware claim, or physical-showcase acceptance proof.
 
 ---
 
@@ -25,7 +352,7 @@ Six commits landed on `ship-20-ux-revamp`, all tested (full library suite `2186 
 | `862c902` feat(world) | Authored `train.variations` are now consumed as per-episode mjlab reset events (object mass/friction, course platform heights). Multi-env-correct. |
 | `43c970a` feat(world) | Prompt-driven course counts ("4 boxes" → 4) + ball (`sphere`) / soccer-goal (`frame`) objects. |
 | `5e535ce` feat(world) | Hybrid LLM world author (`RS_WORLD_LLM_AUTHOR=1`): LLM proposes a full world spec, the existing validators gate it, offline templates are the fallback; deterministic capture/replay so the draft-hash contract holds. |
-| `d2662f7` feat(train) | Full physics domain randomization (mass, CoM, PD gains, motor strength, joint damping/armature, friction) applied at the world-independent chokepoint (`_apply_env_spec`) so it reaches **every mission stage and run**, always-on by default; + DeepMimic phase-RSI reset with joint-velocity init. Actuator-type + entity-name guarded (cartpole GPU smoke-train passes). |
+| `d2662f7` feat(train) | Full physics domain randomization (mass, CoM, PD gains, motor strength, joint damping/armature, friction) applied at the world-independent chokepoint (`_apply_env_spec`) so it reaches **every mission stage and run**, always-on by default. Historical note: this commit also added random-frame trajectory RSI with joint-velocity initialization, but the current worker execution-disables that path because reset state and policy/reward phase were not synchronized. Actuator-type + entity-name guarded (historical cartpole GPU smoke-train passed). |
 
 Two supporting docs:
 - `docs/RESEARCH_DIRECTION.md` — the full, research-validated future-direction analysis (from a lab meeting with a robotics PhD, Lokesh). **Read it — it is the "why" behind Tasks 1–4 below.**
@@ -373,3 +700,1370 @@ only reason this failure was visible at all.
 `train/logs/model_*.pt` **survive a crash**. After the 2026-07-26 reboot the
 policy was recoverable and only needed rollout + scoring — do not restart a
 certification from zero without checking `tierD_work/train/logs/` first.
+
+### Timesteps: what the literature says, and what the UI was showing
+
+New module `RewardSculptor/sculptor/refs/timing.py` — the literature snapshot,
+with sources in its docstring. Short version:
+
+* **Control at ~50 Hz is the sim2real convention** for legged/humanoid RL
+  (MuJoCo Playground, Booster Gym). That is what our mjlab G1 task uses.
+* **Physics 200–500 Hz via decimation**, not a slower integrator. mjlab: 0.005 s
+  × decimation 4.
+* **On hardware the PD loop underneath runs ~1 kHz**; the policy emits joint
+  targets, not torques, so it does not need that rate.
+* **Series elasticity moves the floor by an order of magnitude.** The spring
+  adds a fast mode needing `dt ≪ 1/ω_n` — SEA force-control studies use ~1e-5 s.
+  This is also why Brax needs finer steps than MuJoCo: MuJoCo's constraint
+  solver is implicit in the velocity update and tolerates steps that blow up an
+  explicit spring model. **A rigid-actuator G1 at 200 Hz is not evidence that
+  200 Hz suffices for an SEA model of the same robot.** `validate_timing(...,
+  series_elastic=True)` flags that rather than letting it pass.
+
+Conclusion: 200/50 Hz is correct and intentional for the rigid-actuator G1 we
+simulate. It should be revisited *per-task* only if an actuator model with
+series elasticity is added — not calibrated per-clip.
+
+`validate_timing` immediately found a real issue on the composite: control at
+50 Hz cannot represent a 120 fps reference above 25 Hz (Nyquist), so fast
+transients alias — and that composite's third phase is a kick.
+
+**The UI was showing the wrong number.** The Physics tab reported the MJCF's
+compiled timestep. The Unitree G1 XML declares no `<option timestep>`, so it
+compiled at MuJoCo's 0.002 s default and the tab said **500 Hz**, while mjlab's
+task config sets 0.005 s and training ran at **200 Hz**. The control rate — the
+one that must match the hardware loop — was not displayed anywhere. There is
+now a Timing card (physics / control / decimation + `validate_timing`
+findings), and the MJCF row is marked "overridden" so editing the XML timestep
+no longer looks like it changes what trains. Unresolvable tasks render
+"unknown" rather than a default.
+
+### Paper corpus: full text is stored, but only partly *read*
+
+Audited all Paper nodes after OGMP (2403.04205) turned out to be missing from
+the KG entirely. State now:
+
+| check | result |
+|---|---|
+| Paper nodes | 167 |
+| stub titles (`arxiv:…`, from a rate-limited ingest) | 0 |
+| missing full text on disk | 0 |
+| abstract-sized only | 0 |
+| corpus | 11.9 MB, p50 63.7 KB/paper |
+
+So the sidecars under `~/.local/share/sculptor/kg/pdfs/*.txt` are real bodies,
+not abstracts. Two places consume them differently, and the difference matters:
+
+* **`kg/extract.py`** (mines Techniques / FailureModes / RewardComponents) reads
+  a bounded middle slice: skip 1000 chars, then `MAX_EXCERPT_CHARS = 28_000`.
+  Measured coverage across the corpus is **p10 26% / p50 45% / p90 82%, and
+  zero papers are read end-to-end.** The worst are the long ones —
+  `2405.15568` at 9%, `2401.16889` at 12%. Anything the authors put after the
+  ~28 K mark (most Results, Discussion, and appendix tables) never reached the
+  extractor. Not a bug, but it bounds what the KG can possibly know.
+* **`kg/query.py`** ranks papers by `paper_embed_text()` =
+  `title + abstract + rationale` (`query.py:512`). Retrieval never touches
+  `full_text_path` — grep it, there are no hits in `query.py`, `research.py`,
+  or `retrieval_log.py`. A paper whose body answers a question but whose
+  abstract does not mention the topic will rank poorly no matter how good the
+  body is.
+
+Neither is worth fixing blind. Re-extracting 167 papers at full length is a
+large LLM spend, and chunk-embedding bodies changes retrieval ranking
+everywhere — both want a deliberate decision, not a silent upgrade.
+
+**OGMP was ingested this session** (35,231 B body; metadata healed by hand
+because the arXiv API 429'd through all 5 retries — `heal_stub_titles()` in
+`kg/ingest.py:272` is the supported path once the API is reachable).
+
+Two things fall out of actually reading it that the abstract does not tell you:
+
+1. **The paper gives no explicit transition-guard equations.** Mode transitions
+   emerge implicitly from the learned policy. Our `sculptor/modes.py`
+   `Guard`/`predicate` formalization is therefore an **extension beyond** OGMP,
+   not a reproduction of it — describe it that way.
+2. **Its tracking reward weights orientation.** Eq. 8 is
+   `0.475·e^(−5‖er_p‖) + 0.475·e^(−5‖er_o‖)` — position and orientation at
+   equal weight, plus `0.05·e^(−0.01‖u_t‖) − 0.3·𝟙(non-toe contact)`.
+
+   **Closed, 2026-07-26.** The gap was narrower than first written: `refs/
+   track.py` has *two* reward generators, and only one had orientation.
+   `generate_tracking_residual_reward_source` (reference-run path) already
+   tracked projected gravity; `generate_tracking_reward_source` — the one
+   `build_track_project` actually uses for Tier-D — did not, so every
+   certification attempt trained without it. Verified against the live
+   `tierD_work/rewards/current.py`: no `REFERENCE_GRAVITY`, no
+   `tracking_orientation`.
+
+   Now wired: `projected_gravity_from_quat()` derives the target from the
+   clip's `root_quat_wxyz` (mjlab publishes `projected_gravity_b` every step,
+   so that is the common frame), and it feeds both the scalar and batched
+   paths. Projected gravity rather than raw quaternion because it is
+   yaw-invariant — retargeting zeroes root translation, so a heading offset is
+   not an orientation error.
+
+   `TrackingErrors.orientation_err` reports it, and **deliberately does not
+   gate**. Nothing has ever passed Tier-D, so there is no evidence for an
+   achievable threshold; inventing one would be a made-up number. Set it from
+   data once a run certifies. `test_orientation_does_not_gate_certification`
+   pins that on purpose — a fully inverted rollout is still `feasible` today.
+
+---
+
+## 11. Progress update 2026-07-26 — the gauntlet runs PER MODE and PER TRANSITION
+
+Task 2 (§4), the gating half. `sculptor/modes.py` writes the hybrid automaton
+down and its own docstring says it stops short of running the gauntlet against
+it; this is that piece. Per-mode reward **authoring** is a separate, concurrent
+workstream (`sculptor/mode_rewards.py`) — untouched here.
+
+### What landed
+
+`sculptor/eval/mode_metrics.py`, `prompts/gen_mode_metric.md`,
+`prompts/review_mode_metric.md`, `tests/test_mode_metrics.py` (47 tests), plus
+two additive parameters on `generate_objective_metric`.
+
+1. **Per-mode scoring.** `score_modes(fn, arrays, behavior, meta, graph)` slices
+   a rollout to each mode's window and scores each slice, with `metrics_by_mode`
+   so a mode is graded by its OWN metric. On the test fixture — a rollout that
+   moves for its first half and is frozen for its second — the episode score is
+   **0.50 and looks survivable while `strike` scores 0.000**. That is the whole
+   claim: the degenerate half gets an address instead of being averaged away.
+   The iter-29 campaign in §9 is what this is for; nothing in that loop could
+   say which part of the route had collapsed, because nothing scored a part.
+   Slices cross the real untrusted-code boundary, not just a test callable: one
+   test drives `score_modes` with a metric loaded through
+   `load_generated_metric`, so the seccomp worker's array-IPC wire format is
+   exercised on sliced arrays.
+
+2. **Wall time, not frame counts.** Windows come from `mode_phase_windows`
+   (SECONDS), and `resolve_step_dt` READS the rollout's own `step_dt` and
+   **raises rather than defaulting to 0.02**. A 120 fps reference and a 50 Hz
+   rollout describe the same 2 s; matching by frame count would put a boundary
+   at frame 120 of a 100-frame rollout. This repo has shipped a silently-wrong
+   phase clock twice (§10: `episode_len_steps` from `max_iterations`; the
+   Physics tab's 500 vs 200 Hz), and a wrong clock here is worse than a crash —
+   every mode still gets a plausible score, attributed to the wrong mode.
+
+3. **An unentered mode is not a zero.** A mode the episode ended before reaching
+   is `scored: False, score: None`. "Never performed" and "performed
+   degenerately" are opposite diagnoses — the first says the policy stalls
+   earlier, the second says this mode's reward is wrong — and collapsing them to
+   0.0 destroys exactly what per-mode scoring adds.
+
+4. **Per-transition guard firing.** `check_transitions` answers, per guard,
+   whether it fired. Phase guard: *"the approach→strike guard fires at 1.000s
+   but the rollout is 40 frames (0.800s) long — the policy never left
+   approach."* Predicate guard: the verdict from `mission_runtime`'s isolated
+   seccomp evaluator, the SAME one that runs mission success criteria and never
+   an inline eval, as `modes.Guard` requires. No namespace → `fired: None`, an
+   explicit abstain that is never collapsed into `False`.
+
+5. **The existing quality machinery, re-pointed one mode at a time.**
+   `validate_mode_metrics` runs the **unmodified** `validate_generated_metric`
+   per mode with the mode's own goal and its own CROPPED slice of the reference
+   (`mode_reference_clip`, cut at the composition's real seam frames), so the
+   perturbation suite asks "can this metric tell THIS PHASE from this phase
+   reversed / frozen / shuffled". `calibrate_mode_metrics` runs
+   `calibrate_task_derived` per mode, which is what points the metric-blind
+   ladder author AND the metric-blind gaming author at the sub-behavior. That
+   last one is the least obvious and the sharpest test in the set: an
+   episode-wide gaming policy has to fool every phase at once, a mode-scoped one
+   only has to fool a two-second window. It defaults to `adversarial=True`
+   here — new surface starts strict rather than being loosened into strictness
+   later.
+
+6. **A per-mode report.** `mode_gauntlet_report` + `render_mode_report` key every
+   finding by mode and print the episode score **last** — leading with it is the
+   thing that hid the failure in the first place.
+
+### The per-mode goal must NOT be the episode goal
+
+`resolve_behavior_family` word-matches the whole goal string. Splice the episode
+goal into a mode goal and every mode of "run up and kick the ball" resolves to
+family `kick` — so the approach mode's non-degeneracy is anchored against a kick
+positive and an honest run-up metric is false-rejected. `mode_goal_text`
+therefore returns the mode's OWN goal only (a caller-supplied `mode_goals` entry,
+else the humanized mode name), and the episode goal reaches the author as
+*context* through the prompt appendix, where it informs the prose without
+steering family resolution. `goal_source` records which of the two was used, so a
+report never implies more grounding than there was.
+
+### What I deliberately did NOT gate, and why
+
+* **Guard firing.** Reported; gates nothing. Whether a guard fired is a fact
+  about the ROLLOUT (did the episode last long enough, did the predicate hold);
+  this package's gates judge METRICS. A policy that stalls in mode 1 is a thing
+  to diagnose, not evidence that mode 1's metric is bad.
+  `test_guard_firing_is_reported_but_never_fails_a_metric` pins it.
+* **Mode coverage.** The fraction of a mode's window a rollout reached is a
+  number in the record and nothing more. There is no data behind any particular
+  coverage floor — same reasoning as `TrackingErrors.orientation_err` in §10.
+* **`worst_mode_gap`** (episode score − worst scored mode). This is the exact
+  signature of "a degenerate sub-motion averaged away", and it is still only
+  reported. Where to draw a line on it is unknown, so drawing one would be an
+  invented number.
+* **No new synthetic positive, anywhere.** Running the gate "per mode" changes
+  WHICH GOAL is passed and nothing else.
+  `test_per_mode_validation_adds_no_synthetic_positive_to_the_fixed_battery`
+  asserts the `archetype_scores` and `gates` produced through the mode layer are
+  identical to a direct `validate_generated_metric` call. Nothing in
+  `metric_validate.py` / `metric_axioms.py` / `metric_gen.py` was relaxed; the
+  only change to `metric_gen.py` is two optional `*_appendix` parameters that ADD
+  system-prompt text (default `None` → byte-identical, pinned by a test) and can
+  neither remove a rule from the shared rubric nor touch a gate.
+
+### Found while doing this, and out of my scope
+
+1. **`modes.py` accepts a mode finer than the control rate.** `Mode("wind_up",
+   (0, 1))` on a 120 fps reference is 0.0083 s — below one step at 50 Hz.
+   `validate_mode_graph` only checks `lo < hi` in FRAMES, so it validates, and
+   nothing downstream can score it. `mode_metrics` reports it distinctly
+   (`shorter_than_one_step`) rather than mislabelling it "never entered", but the
+   real fix is for the automaton to know the control rate, or at minimum for
+   `validate_mode_graph`'s docstring to say frame ranges are unchecked against
+   it. Same family as the Nyquist finding in §10.
+2. **A phase guard is a clock, and "fired" invites a misread.** `modes.py` calls
+   a guard that never fires a diagnosable event, which is right — but "fired"
+   means only that the episode lasted long enough to reach the handover time,
+   NOT that the sub-behavior succeeded. What the mode achieved is what
+   `score_modes` measures. Worth one sentence in `Guard`'s docstring; today a
+   reader has to infer it.
+3. **`Mode` carries no goal text.** `Mode(name, frame_range, reward_terms,
+   success_predicate)` — a per-mode metric needs a goal, and
+   `modes_from_composition` derives names from free-text composition segment
+   labels (`mode_2` when unlabeled). A `goal_text` field would remove the
+   caller-supplied `mode_goals` map entirely.
+4. **The isolated criterion evaluator is private.**
+   `mission_runtime._evaluate_success_criterion` / `._build_criterion_namespace`
+   are the only isolated expression evaluator in the codebase, and `modes.Guard`
+   explicitly delegates predicate guards to them. `mode_metrics` imports the
+   private name knowingly — a second evaluator would be a second security
+   boundary to audit — but they want a public alias.
+5. **Nothing derives a predicate guard from data yet.** `modes_from_composition`
+   emits phase guards only, so every derived automaton's handovers are pure
+   clocks. Predicate guards work end to end here (tested against the real
+   sandbox) but have no producer.
+
+### Verification
+
+`tests/test_mode_metrics.py`: **47 passed**. Full library suite
+(`MUJOCO_GL=egl uv run pytest tests/ -q -m "not gpu"`): **2507 passed, 1 skipped
+(jax), 7 deselected, 0 failed**.
+
+GPU-marked tests were deselected on purpose — a ~6.5 h `sculpt refs track`
+certification was live on the GPU and a smoke train would have contended with
+it. Note that `conftest.py`'s auto-skip does not cover this case: it skips
+`@gpu` only when CUDA is ABSENT, and CUDA is present precisely because the
+certification is running, so a plain `pytest tests/` would have started a
+second GPU job. Re-run those 7 once the GPU is free.
+
+## 12. Progress update 2026-07-26 — per-mode reward AUTHORING
+
+Task 2 (§4), the authoring half, concurrent with §11's gating half.
+`sculptor/modes.py` writes the automaton down; §11 scores against it; this turns
+it into reward code. File ownership was disjoint by design — nothing here
+touches `sculptor/eval/**`, nothing in §11 touches `sculptor/mode_rewards.py`.
+
+### What landed
+
+`sculptor/mode_rewards.py`, `tests/test_mode_rewards.py` (50 tests),
+`tests/test_modes_cli.py` (13), and a `sculpt modes` CLI (`show` / `scaffold` /
+`author`).
+
+1. **The gating is derived, not authored.** The obvious approach — prompt an LLM
+   for one module handling all the modes — puts the gating inside generated
+   code, where it is unverifiable and silently wrong when the phase clock is
+   off. **Both real Tier-D failures in this repo were clock bugs, not reward
+   bugs** (§10). So `generate_mode_reward_scaffold` emits the clock, the windows
+   and the dispatch deterministically from the graph, and the LLM fills one
+   function body per mode. `apply_prompt_edit`'s KG grounding, repair retries and
+   pre-flight probes all keep working unchanged — the only new thing is what the
+   prompt asks for.
+
+2. **Two functions per mode, because mjlab only calls one of them.**
+   `adapters/mjlab.py:670` dispatches to `compute_reward_batched` and treats its
+   absence as a reward-contract violation. A scalar-only scaffold could never
+   have trained. Each mode now has a `_batched` twin, and `authored_modes`
+   requires BOTH — a mode written only in the scalar half evaluates correctly in
+   replay and pays exactly zero in training, which reads as a *bad* reward
+   rather than a missing one.
+
+3. **Per-env masking, not a scalar clock.** mjlab's envs reset independently, so
+   at any step they sit at different points in the automaton. `_mode_masks`
+   mirrors `active_mode` term for term and a test sweeps 260 steps asserting the
+   two paths never disagree about which mode owns an instant — a rollout is
+   SCORED through the scalar path (§11) and TRAINED through the batched one, and
+   disagreement would mean grading terms the policy was never paid for.
+
+4. **`torch.where`, not `mask * value`.** Every mode's function runs for every
+   env before masking (that is what makes it vectorizable), but a mode's terms
+   are only defined inside its own window. `0.0 * nan == nan`, so a multiply
+   lets one out-of-window env poison the whole batch. Measured on a mode whose
+   term is `sqrt(t - 1.0)`: a multiply spreads nan to **63 of 260 steps**,
+   `where` gives **0**, and the in-window value is untouched — a numerical bug
+   inside the window still surfaces, which is the right direction to fail in.
+
+5. **The tracking backbone, so a scaffold is trainable before it is authored.**
+   Pass `clip=` and the module carries the same two-Gaussian-plus-orientation
+   reward `refs/track.py` emits — the one that took a Tier-D rollout from 28% of
+   the reference's joint amplitude to 85%. Without it a scaffold pays zero until
+   every mode is authored, and even then nothing tells the policy to follow the
+   reference. With it, `sculpt modes scaffold` produces a trainable reward
+   immediately and authoring adds mode-specific task terms on top. That layering
+   is OGMP's own shape: one oracle tracked throughout, a per-mode objective
+   above it. The tracking clock stays GLOBAL over the composite (the automaton
+   decides which TASK terms apply; it does not change what the robot should be
+   tracking) — re-anchoring phase per mode is defensible but would mean the
+   backbone is no longer the version that has been measured.
+
+6. **The prompt budgets for its own limit.** `apply_prompt_edit` hard-rejects a
+   prompt over 2000 chars (`edit.py:2042`) and a behavior goal is free text a
+   user typed. Unbudgeted, a long goal failed at the *end* of the authoring
+   call, after the KG query, with an error about a character count. The fixed
+   part is now 1500 chars and the free text is truncated visibly, in
+   `--print-prompt`, before any model is called.
+
+### Verified live
+
+`sculpt modes show --clip-id novel-running-jump-kick--g1` reads the real
+composite's own provenance: 3 modes @ 120 fps — `approach` [0,150) = 0.000–1.250s
+from `50002_running_on_spot_poses_60_jpos`, `launch` [150,300) = 1.250–2.500s
+from `50002_one_leg_jump_poses_60_jpos`, `strike` [300,444) = 2.500–3.700s from
+`0016_kicking1_poses_120_jpos`. `sculpt modes scaffold` on that clip emits a
+386-line module: `N_JOINTS=29`, `N_PHASE=32`, `REFERENCE_DURATION_S=3.7`,
+`ORIENTATION_ERR_WEIGHT=4.0`, `supports_batched: True`. Both paths run finite
+over the whole episode, and the scalar/batched `joint_tracking` and
+`orientation_tracking` agree to **4e-8** (`root_tracking` differs by
+construction — scalar absolute z vs batched delta-from-frame-0, per §10's
+origin-relative finding). The generated module clears `edit.py`'s real
+`_call_compute_reward_batched` probe on an mjlab-shaped contract, on one
+declaring no info keys, and with the backbone present.
+
+### Still open in this lane
+
+1. ~~**No end-to-end LLM authoring pass has run.**~~ **Closed — see §13.**
+2. **The backbone duplicates `refs/track.py`'s emitter.** Both build the same
+   phase tables and the same two-Gaussian formula. `mode_rewards` imports the
+   pure helpers (`downsample_phase_targets`, `projected_gravity_from_quat`,
+   the weights) but re-emits the source text. Factoring out one shared fragment
+   is the right fix and was deliberately NOT done while a `refs track` job had
+   `track.py` loaded — worth doing next, since two copies of a phase clock is
+   exactly the shape of the bug that has bitten twice.
+3. **`Mode` still carries no goal text** — same finding as §11's #3, reached
+   independently. `generate_mode_reward_scaffold` takes a `goal_by_mode` map and
+   `mode_authoring_prompt` takes `mode_goal` for the same reason. A `goal_text`
+   field on `Mode` would delete both.
+
+### Found while doing this — a latent bug in `refs/track.py`
+
+**The Tier-D tracking reward's SCALAR `compute_reward` would crash on the real
+mjlab contract.** It slices `qpos[7:7+N_JOINTS]` assuming a full MuJoCo vector
+(7 free-joint DOFs + N actuated), but `MjlabAdapter.reward_contract()` for
+`Mjlab-Velocity-Flat-Unitree-G1` declares **`qpos: (29,)`** — actuated joints
+only. Feeding that layout in raises `qpos too short for 29 tracked joints`.
+
+Found the hard way: the identical slice in my backbone was rejected by
+`edit.py`'s scalar pre-flight probe during a real `sculpt modes author` run,
+*after* the model had already been called. `mode_rewards` now takes the trailing
+`N_JOINTS` (correct for both layouts, and the same slice the batched path uses)
+and prefers `info["base_height_delta"]` for root height, falling back to
+`qpos[2]` only when qpos really is a full MuJoCo vector.
+
+`track.py` is not currently *broken* by this, for two reasons that are both
+accidents: `build_track_project` writes `rewards/current.py` directly rather
+than through `apply_edits`, so nothing ever probes it; and the mjlab runner only
+ever calls `compute_reward_batched`. So the scalar half of the Tier-D reward is
+effectively dead code that would raise if anything exercised it — including any
+future replay-based scorer. **Not fixed here on purpose**: a ~6.5 h `sculpt refs
+track` certification had `track.py` loaded. Fix it together with the emitter
+dedup in #2 above.
+
+---
+
+## 13. Progress update 2026-07-27 — the authoring loop closes
+
+All three modes of `novel-running-jump-kick--g1` are now authored by a model
+through `sculpt modes author`, and the finished module clears every gate. This
+was §12's #1 and it is closed. Four things had to be fixed to get there, each
+found by running the thing rather than by reading it.
+
+### 1. The twin grew as modes got authored (and blew the output budget)
+
+Authoring is one mode per call and `apply_prompt_edit` regenerates the WHOLE
+module, so the first design carried each finished mode's body into the next
+call's twin — "so the model sees the real neighbours". By mode 3 that put the
+twin back at ~17 KB and **both attempts came back truncated**.
+
+What a model needs from a neighbour is which terms are already paid, not how.
+`summarize_authored_modes` replaces a finished neighbour's body with one line
+of component names. Twin size across the three calls: 10.9 KB → 11.4 KB →
+11.4 KB, flat. The summary never leaves the twin.
+
+### 2. A model asked for one function writes two
+
+The first successful edit called an `_info_b` helper it had defined at module
+level; `graft_mode_bodies` copied only the two mode functions, and the module
+failed the batched probe with `NameError: name '_info_b' is not defined`.
+
+`_carry_helpers` now transplants module-level definitions that the grafted
+bodies read and the base does not define — transitively, so a helper calling a
+helper comes along. It is scoped by construction: a name already defined in the
+base is never overwritten, so the dispatch, the windows and the other modes
+still cannot be touched. The prompt now also says a shared helper is fine and
+names the convention, which is how the final run produced `_launch_scalar`,
+`_launch_tensor`, `_launch_ramp01`, `_launch_ramp01_batched`.
+
+### 3. Attempt 1 truncated on EVERY run — it was the token ceiling
+
+Every real authoring call failed its first attempt with a truncation-shaped
+`SyntaxError` (`'(' was never closed`, `unterminated triple-quoted string`).
+`edit.MAX_TOKENS = 16000` shared with adaptive thinking is not enough for
+"write a single-leg-takeoff reward" *plus* carrying the module back.
+
+- `_call_llm` now takes an optional `max_tokens`, defaulting to `MAX_TOKENS`.
+  Threaded through `apply_edits` and `apply_prompt_edit`. **The shared default
+  is unchanged** — its 240 s HTTP timeout is calibrated against it for the
+  training-mission path, and that path is not what needed more room.
+- `sculpt modes author` passes 32000. The final mode authored on attempt 1
+  with no retry.
+- `_call_llm` also now checks `stop_reason == "max_tokens"` and raises
+  `EditValidationError` saying the response was **cut off, not wrong**. Raised
+  inside the repair-retry loop's `try`, so the next attempt is told to be
+  concise instead of being handed a baffling parse error.
+
+### 4. New gate: a mode may not read an `info` key the env never publishes
+
+The first authored mode reached for ten info keys through a helper doing
+`info.get(key, 0.0)`. All ten happened to be real. Had one not been, that term
+would have paid a constant 0.0 for the whole of training while the module
+imported, ran, and passed every existing probe — which is the exact shape of a
+gameable reward.
+
+`_probe_info_keys` runs the authored mode's two halves against a recording
+`info` dict built from the contract and rejects any key not in
+`expected_info_keys`. Recorded at runtime, so a key reached through a helper, a
+loop or an f-string is caught the same as a literal. This is an ADDITIVE gate;
+nothing was relaxed.
+
+### The result
+
+`sculpt modes author` x3 on `novel-running-jump-kick--g1`:
+
+```
+approach  0.00–1.25 s   frames [0,150)    from 50002_running_on_spot
+launch    1.25–2.50 s   frames [150,300)  from 50002_one_leg_jump
+strike    2.50–3.70 s   frames [300,444)  from 0016_kicking1
+```
+
+Batched dispatch walked across wall clock, `active_mode_index` and each mode's
+component:
+
+```
+t (s)          0.20    0.80    1.40    2.00    2.60    3.50
+active index   0       0       1       1       2       2
+mode_approach  2.197   2.197   0       0       0       0
+mode_launch    0       0       2.700   2.700   0       0
+mode_strike    0       0       0       0       0.387   1.210
+```
+
+Each mode pays only inside its own window; the index steps at 1.25 s and 2.5 s,
+which is seam frames 150 and 300 at 120 fps. Totals add the tracking backbone.
+
+What the model wrote for `launch`, unedited: `run_in_speed` ramped on
+`base_horizontal_speed`, `single_leg_support` paying most for exactly one foot
+in contact and less for flight, `takeoff_rise` on `base_height_delta`,
+`trail_leg_swing` as the max over the two legs of (height x swing speed) gated
+on that foot being airborne, an `action_rate` penalty, and an alive bonus —
+every term multiplied by `(1 - fallen)`. Scalar and batched halves compute the
+same quantity through shared helpers. That is a genuinely reasonable
+single-leg-takeoff reward and none of it is in the scaffold.
+
+### Verification
+
+- `2539 passed, 1 skipped` (jax) — up from 2526.
+- `tests/test_modes_cli.py` 22 tests, including the whole authoring machinery
+  with the model call stubbed: twin construction, graft, helper carry,
+  re-probe, the info-key gate firing and NOT false-positiving on the backbone,
+  and twin size staying flat across all three modes.
+- `tests/test_edit.py` +3 for the token ceiling, asserting `MAX_TOKENS` is
+  still 16000.
+- Both gates re-run against the real `v3.py`: clean for all three modes.
+
+### Still open
+
+The `sculpt modes author` output is a reward module, not a trained policy — it
+has not been through a training run yet. That is the natural next step and it
+needs the GPU, which recert5 still has.
+
+---
+
+## 14. Progress update 2026-07-27 — per-mode authoring is reachable from the UI
+
+`sculpt modes author` worked (§13) but only from a terminal. It now runs from
+the Rewards tab, and — the part that matters more — the CLI and the UI run the
+SAME implementation.
+
+### One implementation, not two
+
+`mode_rewards.author_mode` holds the whole sequence: stale-scaffold check,
+prompt, stub twin, neighbour summaries, `apply_prompt_edit`, graft, helper
+carry, re-validate, contract re-probe, info-key gate, silent-no-op check. The
+CLI was rewritten to call it; `cli.py` now decides only where the file goes and
+what to print. `probe_reward_module` / `probe_info_keys` moved into the library
+with it.
+
+This is not tidying. Duplicating that sequence into the backend would have put
+a second copy of the phase-window contract in the tree, which is the exact
+shape of the bug that has cost this repo two Tier-D certifications. The CLI's
+22 tests pass unchanged across the move — that is what makes it a refactor.
+
+### What was added
+
+- `mode_author` job kind + `backend/services/mode_jobs.py`, mirroring
+  `reward_jobs.py`'s `asyncio.to_thread` shape. 900 s ceiling.
+- `POST /projects/{slug}/references/{clip_id}/mode-reward/author` → 202 + job.
+  Refuses, each before any model call: unknown mode (naming the ones that
+  exist), missing scaffold, in-place write, a filename that escapes the
+  project, a second concurrent authoring job, a live sculpt run, and a missing
+  `ANTHROPIC_API_KEY`.
+- Authoring always chains to a NEW file (`mode_reward_v0` → `v1` → …), so the
+  scaffold survives a rejected edit and the caller chains by passing the
+  previous filename back.
+- `ModeRewardPanel` on the Rewards tab: scaffold, then one row per mode with
+  its window, a per-mode goal field, and an Author button. Shown when the
+  reward's `composition.reference_clip_id` is set. A non-composite clip gets an
+  explanatory banner rather than an error — one mode with nothing to transition
+  to is a real answer.
+
+### Verified live, not just in tests
+
+Against the running backend, through the HTTP API, all three modes of
+`novel-running-jump-kick--g1`:
+
+```
+scaffold  -> mode_reward_v0.py   0/3
+launch    -> mode_reward_v1.py   1/3   3m42s
+approach  -> mode_reward_v2.py   2/3
+strike    -> mode_reward_v3.py   3/3
+```
+
+`mode_reward_v3.py` in the real project passes the contract probe and the
+info-key gate for all three modes. Walked across wall clock with an upright
+`projected_gravity_b`, a 2.5 m/s run-in and a rise through takeoff:
+
+```
+t (s)          0.20    0.80    1.40    2.00    2.60    3.50
+active index   0       0       1       1       2       2
+mode_approach  1.480   1.164   0       0       0       0
+mode_launch    0       0       2.150   2.450   0       0
+mode_strike    0       0       0       0       0.650   0.950
+```
+
+Note this is a DIFFERENT authoring of `launch` than §13's, and a better one: it
+gates on `projected_gravity_b` for uprightness and projects `base_lin_vel_b`
+onto the up axis for takeoff velocity, where the CLI sample used only scalar
+info channels. Worth knowing when reading either — two samples of the same
+prompt produce different, both-valid rewards, which is the point of keeping the
+gating out of the model's hands.
+
+**A trap for whoever measures these next.** A first pass at the walk above fed
+`torch.randn * 0.05` as the state and `mode_launch` read 0.000 across its whole
+window — which looks exactly like a dead term. It was not: random
+`projected_gravity_b` normalizes to a random direction, the uprightness gate
+reads ~0, and everything downstream of it is multiplied by zero. Zero-or-noise
+state is fine for a shape probe and useless for a value probe. Feed physical
+gravity.
+
+### Verification
+
+- `2539 passed, 1 skipped` (library) — unchanged across the refactor.
+- `604 passed` (backend), `test_references.py` 42 → 50.
+- Frontend typechecks and builds.
+
+### Still open
+
+Same as §13: this is a reward module, not a trained policy. Training with it
+needs the GPU, which recert5 has (round 2 of 3 as of this writing).
+
+---
+
+## §15 — training with the authored per-mode reward, and the bug it exposed
+
+§13/§14 ended with "this is a reward module, not a trained policy." This closes
+that: a policy has now trained on the authored per-mode reward, driven entirely
+from the UI. Getting there surfaced a physics bug that had been silently
+corrupting **every run on an authored world**, not just this one.
+
+### Promotion — the gap that made the feature a no-op
+
+Authoring writes `mode_reward_v*.py`. `reward_store._V_RE` only recognizes
+`v<n>.py`, so those files are not in the version chain: pressing **New run**
+after authoring all three modes trained `v0.py`'s starter `alive_bonus` and
+discarded the work, silently.
+
+`promote_mode_reward` closes it — library, `sculpt modes promote`, a POST route,
+and a **Use for training** button. It refuses a module with any unauthored stub
+unless `allow_unauthored`, because a module where 2 of 3 modes still `return
+0.0` looks like a working reward to every downstream consumer.
+
+Live: `mode_reward_v3.py` → `v1.py`, `rewards/current.py` re-exports it, and the
+Rewards tab shows `Reward v1 · SCULPTOR`.
+
+### The bug: constraint buffers sized for the wrong scene
+
+First UI run died 18 learning iterations in with
+`ValueError: observation group 'actor' contains NaN`, behind **197,037** lines of
+`nefc overflow - please increase njmax to 336` on stderr.
+
+mjlab sizes `njmax`/`nconmax` per task against that task's **own** scene — the
+G1 flat velocity config pins `njmax=300` for a bare plane. An authored world
+replaces the scene, so the constant stops describing what the robot can touch.
+Measured on the 7-element box course at the real `num_envs=1024` config, 120
+steps of random actions:
+
+| njmax | nconmax | overflow lines | peak nefc/world | peak GPU |
+|------:|--------:|---------------:|----------------:|---------:|
+| 300 | 64 | 112,130 | 496 | ~3.5 GiB |
+| 768 | 256 | 0 | 625 | 3585 MiB |
+| 1536 | 512 | 0 | 532 | 3767 MiB |
+| 3072 | 1024 | 0 | 610 | 4289 MiB |
+
+**The default overflows on ~100% of steps.** Not an edge case near the crash —
+the physics was wrong from step 0 of every run that ever used an authored world.
+Overflow is silent: mjwarp drops constraint rows, prints to stderr, and keeps
+stepping with wrong contact forces until observations go NaN.
+
+`_reconcile_constraint_budget` (in `world/compiler.py`) raises the buffers when a
+world is applied, on both the train and eval paths. Two things worth keeping:
+
+- **It only ever raises.** A task asking for more knows something about its
+  scene that this function does not.
+- **`nconmax=None` counts as unset, not as "big enough."** None means "use
+  mjwarp's heuristic", and measured on this same scene the heuristic overflows
+  **worse** than the pinned default (68,974 vs 9,124 lines). Handing sizing back
+  to the simulator is not the fix here — that was the first thing tried.
+
+Overridable via `RS_WORLD_NJMAX` / `RS_WORLD_NCONMAX`; garbage values fall back
+to the measured floor.
+
+### Result
+
+Same run, after the fix — clean telemetry, zero overflow, event count 1,586
+instead of 20,000+:
+
+```
+Learning iteration 28/300      Mean reward: 177.91
+Total steps: 712704            Mean episode length: 131.71
+Steps per second: 7146
+Episode_Reward/sculptor_primary: 54.9698     <- the authored per-mode reward
+Episode_Reward/sculptor_survival: 22.8000
+Episode_Reward/sculptor_failure: -0.2500
+```
+
+Before the fix the same run reached mean reward 33.36 at learning iteration 17
+and then NaN'd. 
+
+### A note on what this says about the earlier runs
+
+Every past run on an authored world was training against dropped contacts. Runs
+that "just didn't converge" on a box course are now suspect — the physics they
+saw was not the physics the world describes. Worth re-reading any conclusion
+drawn from a course run before this commit.
+
+### Still open
+
+- The 197k-line stderr flood is fixed at the source, but nothing *diagnoses* an
+  overflow if a future world exceeds even the raised floor. A dedupe + one
+  `physics_edit_suggested`-style event would turn the next occurrence from a
+  wall of text into a finding.
+- recert5 finished: the composed clip is still **INFEASIBLE**, tier stays K.
+  `mean_joint_err 0.190` and `root_z_rmse 0.014` both pass, but it does not beat
+  the `0.165 rad` static baseline (`beats_static_baseline=false`). The reported
+  `motion_ratio 1.147` is a separate rollout-motion-amplitude diagnostic, not
+  the static-error ratio. Item #9 is a clip/tracker problem, not a threshold
+  problem; do not touch `STATIC_BASELINE_RATIO_MAX` to make it pass.
+
+  Measured the clip to find out why it loses to a static pose. It is **not** a
+  low-motion clip — the right knee sweeps 1.708 rad (98°) and leg joints average
+  0.206 rad of deviation. The problem is the *denominator*:
+
+  ```
+  whole-body mean |q - mean_q|   0.1489 rad   (8.5 deg)
+    leg joints (12)              0.2058 rad   peak 1.098
+    arm joints (14)              0.1178 rad
+  6/29 joints move < 0.05 rad on average
+  left/right wrist pitch + yaw:  0.0000 rad   <- frozen, all four
+  ```
+
+  `mean_joint_err_rad` averages uniformly over all 29 joints, so four
+  identically-frozen wrists plus two near-frozen joints deflate the static
+  baseline and the tracker's error together. The `beats_static_baseline` test
+  ends up decided partly by DoF that carry no task information at all.
+
+  Two separable questions for whoever picks this up, and they want different
+  fixes:
+  1. *Is the metric measuring the right thing?* A task-weighted or
+     motion-weighted joint error (weight by each joint's variance in the
+     reference) would stop dead wrists from voting. That is a metric change and
+     goes through the `metric_validate` gates like any other — it is **not** a
+     threshold relaxation, and must not be done by touching
+     `STATIC_BASELINE_RATIO_MAX`.
+  2. *Is the tracker actually learning the kick?* Independent of (1), 0.190 rad
+     mean error with a 1.098 rad peak excursion says it is smoothing through the
+     large leg swings. Look at per-joint error on `right_knee_joint` and
+     `right_hip_pitch_joint` specifically before concluding anything from the
+     whole-body average.
+
+  The frozen wrists are worth a look on their own — four DoF at exactly 0.0000
+  across all 444 frames is retargeting output, not human motion.
+
+---
+
+## §16 — what the first trained policy actually learned (and it isn't the kick)
+
+The run in §15 completed: 300 learning iterations, mean reward 177 → **3239**,
+`reward_spec.json` in `iter_1/` records `version: v1` with all three mode
+windows, so the policy demonstrably trained on the authored per-mode reward.
+
+It also learned to game it. `reward_trajectory.json`, first → last recorded
+sample:
+
+```
+mode_strike                  0.8064 -> 1.2979      strike.landing_absorption  0.4322 -> 0.6900
+mode_approach                0.0132 -> 0.0133      strike.landing_stability   0.3071 -> 0.5128
+mode_launch                  0.0037 -> 0.0040      joint_tracking             0.2700 -> 0.0343
+active_mode_index            1.4501 -> 1.8204      __episode_length          378    -> 535
+```
+
+Share of per-mode reward mass actually paid: **strike 98.6%, approach 1.0%,
+launch 0.4%.** Meanwhile `joint_tracking` — the term that makes the policy
+resemble the reference at all — fell by 8x.
+
+### Why
+
+Two effects compound, and neither is a bug in the generated code:
+
+1. **The terminal mode absorbs the tail.** The dispatch clamps time past the
+   last window into the last mode, matching `sculptor.modes.mode_at_frame`. The
+   windows are authored against a **3.7 s** clip; the mjlab G1 episode ran
+   **9.5–10.7 s** (cap 20 s). So `strike` owns 74–88% of every episode, not the
+   32% its authored window describes.
+
+   The model predicts `active_mode_index` 1.61 (at 477 steps) to 1.81 (at 1000);
+   observed mean was **1.75**. The clock is not drifting — this is the dispatch
+   working exactly as written.
+
+2. **Strike's terms pay ~15x more per step** than approach's, on top of owning
+   6x more time.
+
+Net: the cheapest policy is to survive a long episode standing stably and farm
+`landing_absorption` + `landing_stability` forever. Reward went up 18x. The
+robot is not doing a running jump kick.
+
+### The rollout confirms it visually and numerically
+
+`iter_1/rollout/keyframes/frame_04.png` and `frame_11.png` are, to the eye, the
+same image: same crouch, same arm position, same stance. Measured over the
+500-step (10 s) rollout, 64 envs:
+
+```
+mean_episode_length            500.0 steps   <- all 6 episodes hit the cap, zero terminations
+net horizontal displacement    0.297 m       -> 0.030 m/s   (the reference is a RUN)
+total path length              0.895 m
+root height                    0.798 -> 0.610 m, range 0.190 m over the whole episode
+joint |dev| from own mean      0.0384 rad (2.20 deg), last 8 s
+  reference clip, same measure 0.1489 rad (8.53 deg)   -> policy moves 4x LESS than the clip
+double support                 75.9%
+```
+
+A running jump kick that travels 30 cm in ten seconds at 3 cm/s, never leaves
+double support for long, and holds its joints four times stiller than the
+reference is not a running jump kick. The policy crouched once and held.
+
+### This is the reward-hacking the system exists to surface
+
+Worth being precise about what did and didn't work. The authoring loop, the
+graft, the info-key gate, promotion, and training all did their jobs — an LLM
+wrote three mode rewards, they were scoped correctly, and a policy optimized
+them. The failure is at the level *above* the per-mode terms: **nothing ties the
+episode to the clip**, so the automaton's proportions are silently rescaled by
+whatever episode length the base task happens to use.
+
+### Candidate fixes, in the order I would try them
+
+1. **End the episode when the automaton ends.** A reference-tracking episode
+   that runs 3x the clip is not tracking the clip for 2/3 of its life. This is
+   the honest fix and it makes every mode's authored window mean what it says.
+2. **Do not clamp — pay nothing past the terminal window.** Cheaper, but leaves
+   a long unrewarded tail the policy will still optimize against via the
+   survival bonus.
+3. **Normalize each mode's per-step pay by its window duration** so total mass
+   per mode matches the authored proportion. Fixes the magnitude half only; the
+   time-share half stays broken.
+
+Do **not** "fix" this by shrinking strike's weights by hand. The imbalance is
+structural — it would come back the moment the episode length changed.
+
+### Do not read the reward curve as progress
+
+Mean reward 177 → 3239 looks like a training success and is the opposite. Any
+future comparison across per-mode reward versions has to control for episode
+length, or it is comparing how long the robot stood up.
+
+---
+
+## §17 — the sculpt loop could train the per-mode reward but not evolve it
+
+The iteration in §16 finished all four stages. The last one failed:
+
+```
+[sculpt] iter 1: apply_edits skipped — EditValidationError: response was cut off
+at the 16000-token ceiling — the module is incomplete, not wrong.
+```
+
+The run completed and kept `v1`, so nothing was corrupted — but the whole point
+of the loop is that stage 4 writes `v2`. **A per-mode reward could be authored,
+promoted, and trained, and then the loop could not iterate on it.**
+
+### The diagnosis was right — only the write failed
+
+Worth being clear about what worked, because it is the strongest evidence so far
+that the loop functions. Stage 3 found the §16 reward hack **on its own**, from
+the same `reward_trajectory.json` I read by hand, at confidence 0.76:
+
+```
+failure_modes: reward_hacking, static_equilibrium, sparse_reward, reward_saturation
+```
+
+Its proposed edits, quoted:
+
+> `mode_strike` is the dominant component (0.81 → 1.30) versus every launch term
+> at ≤0.01 — a >100x imbalance that makes 'sit in the strike window and stay
+> alive' the highest-value policy: terminated stays 0.00, episode_length climbs
+> 378 → 535 (full horizon), and joint_tracking collapses 0.27 → 0.03 while
+> return rises.
+
+> `joint_tracking` degraded monotonically 0.27 → 0.03 while total return ROSE,
+> proving the posture/landing channel can be harvested with the reference motion
+> fully abandoned. Following PhysHOI's task-agnostic imitation reward, which
+> MULTIPLIES kinematic rewards together so none of them may be small, gate the
+> landing/posture credit …
+
+It also found something my hand analysis missed. Several mode terms are not
+merely outweighed — they are **identically dead**:
+
+```
+approach.run_speed              0.00 across all six windows
+launch.takeoff_rise             0.00
+launch.vertical_launch          0.00
+launch.single_support           0.00
+launch.trailing_leg_drive       0.00
+strike.apex_leg_swing           0.00   <- the actual kick
+strike.flight_foot_clearance    0.00
+```
+
+These are gated behind thresholds (speed, flight detection, apex height) that a
+frozen policy never reaches, so they pay nothing and produce no gradient toward
+ever reaching them. That is a cold-start problem in the authored terms, not a
+weighting problem, and it needs a different fix from §16's: dense,
+threshold-free terms that pay partial credit from the current state. §16's
+episode-length fix and this one are both required — neither alone is enough.
+
+So the pipeline diagnosed its own generated reward correctly and grounded the
+remedy in cited literature. The only broken link was the token budget for
+writing the result down.
+
+### Why
+
+`apply_edits` does a whole-module rewrite: the model emits the complete new
+`reward.py`. `MAX_TOKENS = 16000` is a comfortable ceiling for a hand-written
+reward and a wall for a generated one. The live module:
+
+```
+v0.py (starter alive_bonus)      57 lines    2.0 KB     ~0.5k tokens
+v1.py (3-mode automaton)      1,038 lines   49.4 KB    ~12.4k tokens
+  TARGET_JOINT_POS             8.3 KB   16.9%
+  TARGET_* tables total        9.9 KB   20.0%   <- ~2.5k tokens of pure DATA
+```
+
+A fifth of the module is inlined reference tables (32x29 joint targets, root
+heights, gravity vectors). The editor has to restate all of it verbatim to
+change one weight, and 12.4k of the 16k budget is gone before it writes
+anything new.
+
+### Fix
+
+`_rewrite_token_ceiling(source)` sizes the ceiling from the module being
+rewritten — `max(MAX_TOKENS, len(source)/3.5 * 1.6)`. It is a **floor, not a
+replacement**: every existing hand-written and gym reward keeps its calibrated
+16K budget byte-for-byte (the 240s HTTP timeout is tuned against it). The live
+`v1.py` gets 22,541.
+
+Note the earlier `stop_reason == "max_tokens"` detection is what made this
+diagnosable at all — without it this surfaces as
+`SyntaxError: '(' was never closed`, which reads as a model failure rather than
+a budget one, and sends you looking in the wrong place.
+
+**The ceiling alone was not the fix, and only replaying the real call showed
+that.** Raising `max_tokens` and leaving the HTTP timeout at its 240s wall just
+relocates the failure: the first replay of the per-mode edit at a 22,541 ceiling
+died on `anthropic.APITimeoutError` instead. The 240s figure was calibrated
+against `MAX_TOKENS`, so the two have to move as a pair —
+`_rewrite_http_timeout_s` scales the wall with the ceiling, floored at 240s so
+every existing call site keeps its tuned budget exactly.
+
+That cascaded once more. Authoring runs at `AUTHOR_MAX_TOKENS = 32000`, so one
+attempt is ~480s and `apply_prompt_edit`'s two attempts are ~960s — past the
+flat 900s `DEFAULT_MODE_AUTHOR_TIMEOUT_S`, which would have killed a legitimate
+retry. That budget is now *derived* from `_rewrite_http_timeout_s(
+AUTHOR_MAX_TOKENS)` (1440s) rather than hardcoded, so raising either ceiling
+cannot silently outgrow it again.
+
+Three coupled limits, one of which was only visible by making the real call.
+Worth remembering that the unit tests for the ceiling all passed while the
+end-to-end path was still broken.
+
+**And the ceiling itself was still wrong, because it was estimated.** The second
+replay got past the timeout and truncated anyway, twice. Counting with
+`messages.count_tokens` instead of guessing:
+
+```
+v1.py whole module     49,310 B -> 20,173 tok   2.44 B/tok
+  TARGET_JOINT_POS      8,326 B ->  5,540 tok   1.50 B/tok   <- 27% of the module
+  TARGET_GRAVITY        1,194 B ->    675 tok   1.77 B/tok
+```
+
+The 3.5 B/tok figure is right for prose-like Python and 30% optimistic here,
+because dense float literals tokenize about half as well as code. The "raised"
+ceiling of 22,541 was therefore only **1.12x** the module — and adaptive
+thinking is charged against the same budget, so there was never room. Now 2.2
+B/tok with 2.0x headroom: 44,827, or 2.22x the module, hard-capped at 64,000
+(`claude-opus-5` was probed and accepts at least 96,000).
+
+**This is the argument for the sidecar (#17), not a footnote to it.** One float
+table is 5,540 tokens — 27% of the module — that the editor must retype exactly
+on every single rewrite, and nothing checks it came back unchanged. The ceiling
+fix makes the loop work; moving the tables out is what makes it sane.
+
+### The better fix, not taken here
+
+Raising the ceiling treats the symptom. The real problem is that **~2.5k tokens
+of the module are data the LLM has no business rewriting** and cannot improve.
+Moving `TARGET_JOINT_POS` / `TARGET_ROOT_Z` / `TARGET_GRAVITY` into a sidecar
+loaded at import would cut a fifth of the module and remove a whole class of
+transcription risk — every rewrite currently re-types 928 floats and nothing
+checks they came back unchanged.
+
+That is a larger change: the scaffold generator, the validator, promotion, and
+`current.py`'s by-path loader all have to agree on where the sidecar lives and
+how it travels with a promoted version. `reward_store._extract_reward_spec` is
+AST-only and never executes the module, so it is unaffected — but a promoted
+`v<n>.py` that references a sidecar is no longer a single self-contained file,
+and that is the design question to settle first.
+
+Filed rather than done, because the ceiling fix unblocks the loop now and the
+sidecar change deserves its own review.
+
+### Verified end to end
+
+Third replay of the same call, with all three limits corrected:
+
+```
+old ceiling: 16000   new ceiling: 44827
+WROTE .../v2.py  (61,727 bytes, 1,235 lines)
+  TARGET_JOINT_POS     IDENTICAL
+  TARGET_ROOT_Z        IDENTICAL
+  TARGET_GRAVITY       IDENTICAL
+  _mode_approach / _mode_launch / _mode_strike        present
+  compute_reward / compute_reward_batched / _MODE_FNS present
+  MODE_WINDOWS_S                                      present
+```
+
+The loop can now evolve a per-mode reward. `v2` is a real edit, not a
+reformatting: `hyperparameters` goes from `{}` to a named set,
+`references` cites Bjelonic et al. (2025), a `grounding` map ties each
+hyperparameter to a paper, and the dead gated terms are replaced with floored
+variants (`launch_gate_floor`, `launch_support_floor`, `air_floor`,
+`land_vz_on_ref`) — which is what the diagnosis asked for. `mode_windows_s` is
+unchanged: the editor left the dispatch alone, as the scaffold instructs.
+
+The 928 floats came back byte-identical on this rewrite. That is one sample and
+nothing in the production path checks it — the replay harness did. #17 stands.
+
+**Method note.** This bug was "fixed" three times and only the third was real:
+raise the ceiling (unit tests green, end-to-end died on APITimeoutError) → scale
+the timeout (unit tests green, truncated twice more) → actually count the tokens.
+Every round the tests passed. The only thing that found the next layer was making
+the real call — the same lesson as the `njmax` bug in §15, where the build was
+green while the physics was wrong on 100% of steps.
+
+## §18 — the authored world was interpenetrating itself; §15–§16 are partly wrong
+
+Sam looked at the iter-1 replay and said the scene was "covered in weird orange,
+blue, and yellow overlapping boxes that are all inside of each other," with the
+robot "phased inside one." He was right, and the cause invalidates conclusions
+drawn in §15 and §16.
+
+### What was happening
+
+mjlab shares ONE MuJoCo model across every parallel environment and separates
+them by offsetting each robot to `env_origin_i`. Static authored geometry must
+therefore be repeated at every origin — `_world_spec_editor` does exactly that,
+deliberately, and the comment there explains why. What nothing checked is
+whether the grid PITCH is large enough to hold a course.
+
+  * `SceneCfg.env_spacing` defaults to **2.0 m** (mjlab, sized for a bare robot).
+  * The authored course reaches **6.80 m** forward of the origin.
+
+So each course overlapped its neighbours three deep, and because the course
+extends forward of the origin — where the robot spawns — every robot started
+inside one or more *other* environments' boxes.
+
+Measured on the real world, 64 envs, 60 steps, zero action:
+
+| env_spacing | spawns buried | peak nefc/world |
+|---|---|---|
+| 2.00 m (mjlab default) | **48 / 64** | 496 |
+| 7.80 m (reconciled) | **0 / 64** | 239 |
+
+Every authored world in the system is `kind: "plane"`, and every project with a
+course was affected: `gauntlet-demo`, `go1-parkouor`, `unitree-go1-2`,
+`unitree-go1-3`, `tracking-first-ui-verification`.
+
+### What this corrects
+
+**§15 is wrong about the njmax bug.** The task default is `njmax=300`. The
+buried scene peaks at 496 → overflow on ~100% of steps. The reconciled scene
+peaks at **239 — under the task's own default**. The constraint-budget floor
+raised in `0901428` was treating a symptom; the overflow was the burial. The
+floor stays (it never shrinks a larger task default, and a trained policy
+jumping on boxes will drive more contacts than a zero-action probe) but it is
+headroom now, not a necessity. The measurement table on
+`AUTHORED_WORLD_NJMAX` carries this correction inline.
+
+**§16's reward-hack conclusion is now suspect.** "The policy crouches and
+holds, 0.297 m in 10 s, zero terminations" was measured on a policy trained in
+a scene where its own legs started inside solid boxes. A robot that cannot
+translate is not the same finding as a robot that has *learned not to*. The
+diagnoser's read (98.6% of reward mass on `strike`) is a property of the reward
+function and still stands; the behavioural evidence has to be re-collected on a
+correctly-pitched scene before "reward hacking" is a claim rather than a guess.
+
+### The fix
+
+`_reconcile_env_spacing(env_cfg, world)` runs FIRST in `runtime_adjustments`,
+ahead of the constraint budget, so the buffer is sized for honest contacts:
+
+  * **Plane terrain** — widen `scene.env_spacing` to the authored footprint
+    measured *from the origin* (not first-box-to-last-box; the approach gap is
+    part of what has to clear) plus `AUTHORED_COURSE_CLEARANCE_M = 1.0`. Never
+    narrows a task that already asks for more.
+  * **Generator terrain** — origins come from terrain tiles and ignore the
+    knob, so a course that does not fit inside a tile raises
+    `WorldCompileError` rather than reaching the GPU. No world in the system
+    uses this path today; it is closed before one does.
+
+Emitted as a visible runtime adjustment:
+
+> `env grid pitch for authored scene: env_spacing 2→7.796 m (course footprint
+> 6.80 x 1.20 m about the origin; at 2 m every robot spawns inside a
+> neighbouring environment's boxes — silent in physics and in per-env
+> observations)`
+
+Separately, `_hide_untracked_authored_geometry` zeroes the alpha on other
+environments' course geoms and zone sites before the rollout renders. Alpha
+only — collision geometry, contacts and observations are untouched. This is the
+static-geometry analogue of the existing `max_extra_envs = 0`, which only ever
+hid neighbouring *robots*.
+
+### Why it stayed invisible
+
+Three independent silences stacked: physics kept stepping (MuJoCo resolves
+interpenetration by pushing, it does not error), per-environment observations
+looked ordinary (each robot sees plausible contact and height readings), and
+the one place it WAS visible — the rollout video — reads as a renderer bug
+rather than a physics bug. The njmax overflow was the only hard signal, and it
+was 197k unread stderr lines.
+
+Tests: `tests/test_world_compiler_gates.py` (7, incl. a property test that no
+repeat at ±k·pitch may contain the origin) and `tests/test_mjlab_adapter.py`
+(4, incl. alpha-only and never-raises). Library suite 2578 passed.
+
+## §19 — the second burial: route RSI dropped the robot through the platforms
+
+Sam looked at the post-§18 frame and said the robot was "still inside of the
+box… everything below the knees is inside of the box." He was right again, and
+it is a second, independent bug — §18 fixed course-vs-course overlap between
+environments; this one is the robot vs. its OWN course.
+
+`reset_robot_along_waypoint_route` (train-only route RSI, `midroute_probability
+= 0.5`) did this:
+
+```python
+root_state = robot.data.default_root_state[selected_env_ids].clone()
+root_state[:, :2] = local_xy + env.scene.env_origins[selected_env_ids, :2]
+```
+
+It rewrites **x and y only**. `z` stays at `default_root_state`'s value — the
+standing height above FLAT ground. But the route waypoints are the course
+primitives' centres, i.e. points on top of platforms 0.23–0.38 m tall. So every
+mid-route reset put the robot at plane height over a box and its shins ended up
+inside by exactly the box's own height.
+
+Measured on the real world, 32 envs, at reset:
+
+| | envs with a robot geom inside a box | worst penetration |
+|---|---|---|
+| before | **17 / 32** | 11.6 cm (`left_shin_collision`) |
+| after | **0 / 32** | — |
+
+17/32 ≈ 53% matches `midroute_probability = 0.5`: the half that reset at the
+course entrance were always fine, which is why nothing looked wrong half the
+time. Rendered check, pelvis vs. box top:
+
+| | pelvis z | box top | clearance |
+|---|---|---|---|
+| before | 0.680 m | 0.330 m | +0.350 m (needs 0.680) |
+| after | 1.059 m | 0.380 m | **+0.680 m** |
+
+0.680 m is the G1's standing pelvis height, and it now holds across every
+platform height in the course (0.281 / 0.330 / 0.380).
+
+### The fix
+
+`_surface_height_at(local_xy, support_boxes_m)` returns the top of whatever
+authored geometry is under each reset point (0 for open ground, the highest top
+where boxes overlap), and the reset adds it to the default standing height.
+`_reconcile_waypoint_course` now passes the course as
+`(x_min, x_max, y_min, y_max, top_z)` rows when it installs the event, so the
+wiring is covered too — the function being right is useless if the params never
+arrive.
+
+### Why it stayed invisible
+
+Same family of silences as §18, plus one worse: the **root height observation
+reads plausibly**. The robot really is at standing height above the plane; it
+is only wrong relative to the surface it is supposed to be standing on. Nothing
+in the observation vector distinguishes "standing on a 0.33 m box" from
+"buried 0.33 m in a 0.33 m box." Neither did I, until Sam looked at the picture
+— my own check tested the env ORIGIN point rather than the robot's geoms, which
+is a different question and passed while the bug was live.
+
+**Lesson worth keeping:** when checking a geometric invariant, test the thing
+that has to satisfy it (every robot collision geom), not a proxy for it (a
+point near where the robot ought to be).
+
+Tests: 6 in `tests/test_world_compiler_gates.py` — surface lookup incl.
+overlapping boxes and off-course points, full-clearance-on-every-platform,
+plane resets NOT lifted, back-compat with no course, and the install wiring.
+
+## 2026-08-18: fail-closed admission for the historical iter 38 policy
+
+Portable policy export now requires an exact compatibility-contract sidecar
+persisted when training ran. Iter 38 predates that sidecar, so its original
+bundle correctly fails. A narrow explicit `legacy_reconstructed` export path
+can instead retain and re-derive the contract from the origin job log, source
+config, and material-equivalent source/observed selection files. It verifies
+runtime actor/critic/action interfaces, policy topology, timing, config
+identity, selection alias, contract fingerprint and safetensors signature.
+
+The historical status admits only `actor_only` or `actor_critic`; optimizer,
+full and exact resume are always false. The UI discloses the status and blocks
+Apply until a dedicated acknowledgement is checked. The run route pins that
+status/digest/ack/mode receipt and the worker must reproduce it from the
+server-owned skill before launch.
+
+The attested demonstration artifact is:
+
+`/home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/exports/skill_g1-lab-showcase-weave-and-stop_iter38_legacy-reconstructed.rskill`
+
+Artifact SHA-256 is
+`d24f398af4270924b6cdee1aa4a2af83f8054fe4115827e5dc43317641d7e9a9`;
+provenance status/digest are `legacy_reconstructed` /
+`1c0ef86cdb3aefda0273568702c2f117b2563d287c8baa9cab29fb6e5f6713e4`.
+The exact rebuild command and full import receipt are in
+`CODEX_TO_CLAUDE_HANDOFF.md` and
+`reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`.
+
+## 2026-08-19: interrupted snapshot recovery is visible and fail-closed
+
+Fresh project `g1-slalom-jump-lab` has one selectable interrupted input:
+cycle 2 / PPO 50 from `job_d41e199695d2d7d8`, checkpoint SHA
+`fe1f41c83736d2f6c54159207263ed18c158e147461a2663ec8545509a5f2c8f`,
+opaque id `snap_8b0cf8e3235acd0e2c642504`, receipt digest
+`dbb64c8170f462044822ba5aa9518b6754e1226db6cca88f1db8344d04c56848`.
+It is reconstructed, interrupted, and unevaluated—not a completed policy or
+success. The UI requires separate uncertainty and reconstruction
+acknowledgements and transfers actor+critic only. The worker now treats exact
+actual-loaded bytes/roles and lineage as a fatal publication gate. See the two
+runbooks above for the visible relaunch and acceptance conjunction.
+
+## Iter 2 baseline: route-like video, no physical jump
+
+The completed fresh-project iter 2 policy is now an evaluated warm-start, but
+its official evidence is still diagnostic: 17/64 lanes reached raw route index
+5, 0/64 produced a valid three-frame jump, 0/64 entered HOLD, and 0/64 passed
+the authored conjunction. The high observe-only `route_channel` is dense
+travel and must not be read as route completion.
+
+The causal blockers were runtime-generic. A frozen 24-second TaskSpec was
+physically truncated by MjLab's 20-second registered default, and native
+linear-velocity tracking penalized vertical launch against a zero-Z command.
+Task termination is now authoritative before and after EnvSpec overlays. Only
+during a valid typed JUMP phase, linear tracking becomes horizontal-only and
+grounded-gait priors are masked; route, hold, invalid sequences, and all safety
+and landing supervision remain native. The next UI run keeps exact selection
+v8/reward v2/env v1 and starts actor+critic from iter 2 SHA
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`.
+Do not use the automatically proposed multi-factor reward v3/env v2 for this
+causal test.
+
+The first iter-2 launch click exposed a transfer-boundary bug before worker
+creation: preflight recompiled historical checkpoint selection v4 against the
+current robot registry, although current selection v8 itself matched exactly.
+Project-policy transfer now retains the historical tuple as disclosed
+training-attempt lineage but does not trust its sidecar as the sole interface
+authority. Exact
+schema-2 completion evidence re-verifies the canonical checkpoint SHA/bytes
+and proves its evaluated tuple is identical to the immutable target before the
+target contract can serve as source interface authority. Iter 2 binds
+checkpoint SHA `fb235700…10d0` to tuple `f06d4e…6074`; target selection v8 is
+that tuple. Its required sidecar corroborates the independently rebuilt contract;
+the sidecar and current target both fingerprint to
+`83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`;
+current target physics remains strictly recompiled and verified.
+
+## 2026-08-23: exact foot landing and retention evidence
+
+The objective-metric surface now includes optional `left_foot_pos_w` and
+`right_foot_pos_w` arrays captured directly from the simulator's ordered foot
+sites. These channels are additive: robots without a validated biped foot-site
+mapping keep the prior artifact shape rather than receiving fabricated zeros.
+
+For an authored finish-region channel, exact foot containment cancels the
+replicated-environment world origin with
+`(foot_pos_w - root_link_pos_w)[..., :2] - region_relative[..., :2]`.
+Landing metrics must require both feet inside on the first bilateral contact
+after an airborne interval and must veto any later valid frame where either
+foot leaves. Pelvis-in-region, a momentary landing frame, or a best 100-frame
+window is not proof of terminal retention.
+
+The active reference-guided demonstration remains unlaunched. No G1 library
+motion currently has an admissible Tier-D certificate; do not describe a
+Tier-K preview or the policy-only slalom experiment as reference following.
+
+## 2026-08-24: Tier-D tracker continuation is explicit and hash-verified
+
+The first complete physics-tracking attempt for
+`g1/four-rail-hop-modes-v2--g1` remains diagnostic Tier K. It completed all
+three 2,000-update stages and a pinned lane-0 rollout, but its static-baseline
+ratio was `0.862787` against the unchanged `<=0.80` gate (joint MAE
+`0.114937 rad`, root-Z RMSE `0.060565 m`, duration coverage `0.996491`). The
+policy reproduced the large right-leg motion but held much of the left support
+leg near a safer static pose. Do not relax the certificate threshold.
+
+The generated Tier-D reward now exposes immutable term scales and gives the
+gated joint trajectory the dominant mass (`joint=4.0`, `root=1.0`, measured-only
+orientation=`0.25`), normalized back to the historical perfect-return scale.
+Certification thresholds are unchanged. `refs track`
+also accepts an explicit `--resume-checkpoint` for a prior trusted local
+tracker attempt. Before GPU allocation it re-verifies the checkpoint SHA,
+adjacent runner metrics, exact policy-contract sidecar, and training
+environment artifacts, copies those bytes into the fresh run, and requires the
+first runtime load receipt to match the retained SHA. The prior reward SHA and
+the new requested reward SHA remain separate disclosed facts. This is tracker
+initialization, not a portable or exact optimizer-resume claim.
+
+The preserved diagnostic checkpoint SHA is
+`e43e296b9580c33d6aafb871a184935231ef64f33d8d2f4e3c2a2d474995043a`;
+its policy contract is
+`caeacce9cdf8364205e80c8c22ecf0c1c512e248580dd4d17fbaf4afb326a19d`.
+A real CPU-only continuation preflight passed and retained all three source
+artifacts. No fresh certification rollout has passed yet, so the reference-led
+task run remains blocked.
+
+Certified tracker policies now have a separate portable export boundary. A
+trusted local Tier-D tracker project may be converted to schema-3 `.rskill`
+only after its current certificate, final checkpoint, policy-contract sidecar,
+runner receipt, config, reward, and reference admission chain all re-verify.
+The archive contains canonical actor safetensors, the origin policy contract,
+and bounded JSON source-training evidence. It deliberately excludes critic,
+optimizer, raw `.pt`, reference motion, reward, world, controller, and mode
+executor bytes. Import preserves and re-verifies that evidence as inert
+provenance and admits only `actor_only` initialization; it never selects the
+source reference or claims exact resume. The current Tier-K attempt correctly
+cannot cross this exporter, so no portable tracker skill exists yet.
+
+## 2026-08-24: per-mode authoring binds intent without circular staleness
+
+Phase-reward authoring now records `phase-window-context-v2`. Its context
+digest covers the exact reference bytes and the immutable non-reward world
+tuple, but excludes both the reward member and mutable selection wrapper.
+Replacing only the reward during atomic promotion therefore no longer makes
+the newly promoted reward stale relative to itself; changes to task, world,
+catalog, clarifications, evaluation, env spec, or reference bytes still fail
+closed through the context and binding checks.
+
+The authoring brief now exposes WorldSpec-v2 objects and zones, along with
+relevant goal, region, entity, object, and contact channels under their real
+shaping-versus-metric-only access boundary. The UI chooses authoring intent in
+researcher order: behavior draft, then project description, then generated
+reward description.
+
+Every scaffold/list response also includes `mode-duration-qa-v1`. It states
+that per-step reward is accumulated raw, reports each mode's duration/share,
+and raises an advisory when one imbalanced window dominates the schedule. The
+same warning reaches the authoring prompt and UI. It does not block launch and
+does not normalize or otherwise alter reward semantics. No empirical
+per-mode reward-mass metric is claimed by this slice; rollout evidence remains
+the authority for deciding whether the advisory is materially harmful.
+
+Composition admission is now bounded and fail-closed. A composite accepts at
+most 16 segments, 240 fps, 10 seconds of crossfade, and 50,000 projected output
+frames; the segment limit is enforced before source arrays are loaded. Every
+parent must carry one supported, immutable root-frame convention, and the
+ordered inheritance receipts are re-read immediately before registration.
+Only a structured kinematic-gate refusal may be retried with strict checking
+disabled, and that retry is bound to the exact unchanged request. Missing root
+evidence, malformed bounds, ordinary composition errors, and edited retries
+cannot cross that authority.
+
+Reference-aware starting-policy migration now has an exact actor/critic role
+contract. It may zero-initialize only declared inserted observation terms,
+including the frozen authored-event interface and immutable reference clock,
+while moving every preserved input column and normalizer statistic to its
+target offset. Unsupported/recurrent architectures and undeclared schema
+changes fail closed. Actor-only imports prove only actor migration;
+actor-plus-critic loads require both mappings at route admission and again at
+the worker load receipt. This remains parameter initialization, never an
+optimizer-resume claim.
+
+## 2026-08-24: concise pre-OGMP scientific boundary and next benchmark
+
+`docs/CURRENT_SYSTEM_SCIENTIFIC_BOUNDARY.md` is the meeting-ready authority for
+the system before OGMP: one immutable elapsed-time reference, one scalar phase
+observation for actor and critic, a frozen tracking backbone, and a bounded
+task residual inside the auditable train/evaluate/diagnose loop. This path is
+implemented and regression-tested, but no local G1 reference has passed the
+fresh Tier-D boundary and no admitted end-to-end difficult-motion result
+exists. It is not SONIC, a reference generator, adaptive selector, visual
+policy, or general recovery controller.
+
+The old iter-36 box-weave acceptance is retracted. It predates the authored
+world grid-pitch fix: intended boxes were aligned, but neighboring copies of
+the course overlapped because the default `2.0 m` pitch was smaller than the
+course footprint. The old physical-scene audit did not test that cross-env
+geometry invariant. Keep the checkpoint and numbers only as diagnostic
+history; no post-fix rerun has restored physical acceptance.
+
+The chosen pre-OGMP experiment is a one-phase privileged-state counterfactual
+object-recovery benchmark. Start from one admitted nominal reference/controller,
+move or rotate the object after commitment, expose exact relative object and
+goal state (not pixels), and use one architecture/input contract across the
+claim-bearing arms. Compare no-reference and fixed-reference expert baselines,
+RewardSculptor, matched-budget Eureka-style reward search, and a
+Preferenced-OGMP-style feedback oracle under sealed held-out interventions.
+The phase-only arm is an observability lower bound, not a matched baseline.
+Only after that isolates a real adaptation gain should the project add
+perception or true OGMP modes.

@@ -68,12 +68,24 @@ bakes in "forward + upright + two feet" silently false-rejects them.
 
 ## INPUTS (ALL OTHER inputs are forbidden)
 
+  arrays["first_episode_valid_mask"] (T, E)  official temporal support for the
+                                            first episode in each lane. False
+                                            samples are reset/settling/padding,
+                                            never behavioral evidence
   arrays["joint_pos"]            (T, E, J)  joint angles over time/envs
   arrays["joint_vel"]            (T, E, J)  joint velocities
+  arrays.get("default_pose_rms") (T, E)     ordered-joint RMS deviation from
+                                            the instantiated robot's own
+                                            default pose; use this instead of
+                                            inventing joint-angle targets when
+                                            the goal requests default-like
+                                            terminal posture
   arrays["projected_gravity_b"]  (T, E, 3)  gravity in body frame; z < -0.85
                                             ≈ upright (yaw is NOT observable)
   arrays["root_link_pos_w"]      (T, E, 3)  base world position (x,y forward/
                                             lateral, z height)
+  arrays["root_link_ang_vel_b"]  (T, E, 3)  recorded base angular velocity in
+                                            the body frame
   behavior                       dict: max_episode_steps, rollout_num_envs,
                                  step_dt, mean_episode_length
   meta["joint_roles"]            dict {role: column index} — the runtime
@@ -88,6 +100,12 @@ Some adapters also expose, WHEN AVAILABLE (biped tasks), end-effector channels:
                                             (forward +) displacement — the clean
                                             forward-vs-rearward kick direction
   arrays.get("right_foot_pos_b") (T, E, 3)  right foot, same convention
+  arrays.get("left_foot_pos_w")  (T, E, 3)  left foot site in simulator world
+                                            coordinates; use with root world
+                                            position and a catalogued region
+                                            relative channel for exact region
+                                            containment
+  arrays.get("right_foot_pos_w") (T, E, 3)  right foot, same convention
   arrays.get("left_foot_contact")  (T, E)   1.0 when the left foot is on the
                                             ground, else 0.0 (support schedule)
   arrays.get("right_foot_contact") (T, E)   right foot ground contact
@@ -96,6 +114,31 @@ the DATA-SUFFICIENCY rule below, if a channel you need is absent you must
 ABSTAIN that check, never silently fall back to a magnitude proxy that re-opens
 a hole.
 Any array may be ABSENT — always `arrays.get(k)` + guard for None.
+
+For an authored region channel `region__NAME__relative = region_center_local -
+root_position_local`, compute a foot's exact XY displacement from its center as
+`(foot_pos_w - root_link_pos_w)[..., :2] - region_relative[..., :2]`.
+Environment origins cancel in that expression. Never compare a world-space foot
+position directly with a local authored-zone center. If the goal says that a
+landing or hold must remain inside, require every named foot inside at landing
+and every valid post-landing sample; a later exit is a hard veto even when an
+earlier consecutive hold window was long enough.
+
+When a temporal claim is requested (phase order, event count, a run, or a
+hold), `first_episode_valid_mask` is REQUIRED. Evaluate each environment only
+on its valid samples. Invalid reset/settling/padding frames may not start,
+extend, join, or complete a phase, event, consecutive run, window, or hold;
+runs may never bridge an invalid sample. Merely reading the mask while reducing
+the original unmasked timeline is not compliance. If too few valid samples
+remain to prove the requested sequence or duration, the completion gate fails.
+
+For a base-angular-velocity predicate, use `root_link_ang_vel_b` when it is
+available. Do not substitute `d(projected_gravity_b)/dt`: projected gravity
+cannot observe yaw and its numerical derivative is not base angular velocity.
+For whole-body or otherwise unqualified joint-velocity quiet/stillness, reduce
+over ALL columns of `joint_vel`. Named role subsets are appropriate for a
+phase-specific joint motion, but never for an unqualified terminal whole-body
+quiet gate.
 
 ## JOINT RESOLUTION SAFETY (a violation means the metric is rejected)
 
@@ -184,6 +227,11 @@ Any array may be ABSENT — always `arrays.get(k)` + guard for None.
    amplitude, terminal stillness/hold, posture, and sustained (not one-frame)
    state. A kick, jump, or oscillation performed in place must not pass a
    navigation/slalom metric merely because an authored flag says complete.
+   When the catalog exposes an `event__...__violation` channel for a one-shot
+   event sequence, reference that exact literal and require it to remain false.
+   It is authoritative evidence that an early, asymmetric/one-foot, or repeated
+   event attempt invalidated the episode; a later clean-looking cycle cannot
+   erase it.
 
 7. **METRIC ≠ REWARD (no style regularizers here).** The metric is a pass/fail
    competence gate. Do NOT put smoothness / action-rate / jerk / energy
@@ -274,6 +322,11 @@ cannot pass is an automatic self-rejection.
 
 ## TIME-SERIES HYGIENE (hard-won rejection causes)
 
+- Apply `first_episode_valid_mask` before every temporal reduction. Invalid
+  reset/settling/padding samples are hard boundaries: they cannot satisfy or
+  connect event ordering, transition counts, consecutive runs, windows, or
+  terminal holds. A post-route state with only 12 valid frames cannot prove a
+  requested 100-frame hold even if invalid padding repeats it for 100 frames.
 - NEVER smooth with zero-padded boundaries (`np.convolve(..., mode="same")`
   zero-pads: a rising signal's smoothed tail collapses toward half its true
   value, which can make the FINAL frames of a successful episode classify as
@@ -291,3 +344,9 @@ cannot pass is an automatic self-rejection.
   continuity: sparse violations can satisfy those summaries while breaking
   every genuine hold. The validator includes a competent terminal state with
   sparse one-frame interruptions specifically to reject this shortcut.
+- Evaluate every continuity predicate on UNSMOOTHED per-frame signals. Smoothing,
+  filtering, merging gaps, dilation, or debounce may support a graded diagnostic,
+  but must never bridge a violating frame inside the completion gate.
+- A stated frame count is exact. NEVER cap, scale, shorten, or replace it to fit
+  the available episode tail. If fewer qualifying frames remain, the completion
+  gate fails.

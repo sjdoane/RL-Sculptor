@@ -120,6 +120,14 @@ class StageSchema(BaseModel):
     reference_clip_id: Optional[str] = None
     reference_tier: Optional[str] = None
     reference_match_confidence: Optional[float] = None
+    # Exact dynamics-admission receipt persisted on the core Stage.  These are
+    # intentionally nullable for legacy reads; runnable attached stages fail
+    # closed unless all three are present and re-verify at launch.
+    reference_robot: Optional[str] = None
+    reference_clip_sha256: Optional[str] = None
+    reference_certificate_sha256: Optional[str] = None
+    reference_execution_contract_sha256: Optional[str] = None
+    reference_execution_boundary_sha256: Optional[str] = None
     # §D24 F1: mirrors sculptor.mission.Stage's reference_span_start_s/
     # _end_s/_confidence/_method — the goal-aligned SUB-SPAN of
     # `reference_clip_id` selected by `sculptor.refs.spans.

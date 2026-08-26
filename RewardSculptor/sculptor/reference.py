@@ -209,6 +209,13 @@ def validate_clip(clip: dict) -> list[str]:
                 not isinstance(c, np.ndarray) or c.shape != (z.shape[0],)
                 or not np.isfinite(c).all()):
             errors.append(f"{key} must be finite with shape [T]")
+    root_frame = clip.get("root_frame")
+    if root_frame is not None and root_frame not in {
+        "absolute", "origin_relative",
+    }:
+        errors.append(
+            "root_frame must be 'absolute' or 'origin_relative' when present"
+        )
     return errors
 
 
@@ -248,6 +255,8 @@ def save_clip(path: Path | str, clip: dict) -> Path:
     if clip.get("joint_names"):
         payload["joint_names"] = np.array(
             [str(n) for n in clip["joint_names"]])
+    if clip.get("root_frame") is not None:
+        payload["root_frame"] = np.asarray(str(clip["root_frame"]))
     np.savez_compressed(path, **payload)
     return path
 
@@ -269,6 +278,8 @@ def load_clip(path: Path | str) -> dict:
                 clip[opt] = z[opt].astype(np.float64)
         if "joint_names" in z.files:
             clip["joint_names"] = [str(n) for n in z["joint_names"]]
+        if "root_frame" in z.files:
+            clip["root_frame"] = str(z["root_frame"].item())
         if "meta_json" in z.files:
             try:
                 clip["meta"] = json.loads(bytes(z["meta_json"]).decode())

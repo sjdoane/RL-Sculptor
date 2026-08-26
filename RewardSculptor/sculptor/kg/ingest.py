@@ -33,7 +33,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
+import json
 import re
+import os
 import sys
 import time
 from pathlib import Path
@@ -199,6 +202,27 @@ def make_arxiv_client(
 ARXIV_PDF_URL_FMT = "https://arxiv.org/pdf/{arxiv_id}.pdf"
 
 
+def _materialize_reviewed_capabilities(
+    store: SculptorKG, arxiv_id: str,
+) -> None:
+    """Attach deterministic, human-reviewed mechanisms when available.
+
+    LLM extraction is intentionally not required for these narrow catalogs.
+    The materializer still requires the real Paper node and records an
+    explicit implementation status, so ingest cannot turn a paper claim into
+    a runtime capability by implication.
+    """
+
+    normalized = _normalize_arxiv_id(arxiv_id)
+    from sculptor.kg.sonic_capabilities import (
+        SONIC_ARXIV_ID,
+        materialize_sonic_capability_map,
+    )
+
+    if normalized == SONIC_ARXIV_ID:
+        materialize_sonic_capability_map(store)
+
+
 # §7.7: exponential backoff schedule for arxiv API retries. Arxiv's
 # rate-limit window is ~2 min; spacing retries at 10/30/60/120 s gives
 # one attempt immediately, two within the rate-limit window, and one
@@ -267,6 +291,42 @@ def _fetch_arxiv_metadata(
                 )
                 return None
     return None
+
+
+def backfill_full_text_index(
+    store: SculptorKG | None = None,
+) -> dict[str, int]:
+    """Index every Paper's stored body for lexical retrieval.
+
+    Bodies have always been written to disk, but nothing ever read them at
+    query time — paper ranking used `title + abstract + rationale` only, and
+    extraction summarized at most 28K chars per paper into the graph. This
+    makes the rest of the corpus reachable.
+
+    Idempotent: re-indexing a paper replaces its row. Returns counts of
+    `indexed` / `missing` (no body on disk) / `skipped` (FTS5 unavailable).
+    """
+    owns_store = store is None
+    store = store or SculptorKG()
+    out = {"indexed": 0, "missing": 0, "skipped": 0}
+    try:
+        for node in store.find_nodes(kind="Paper"):
+            path = getattr(node, "full_text_path", "") or ""
+            if not path or not os.path.isfile(path):
+                out["missing"] += 1
+                continue
+            try:
+                body = Path(path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                out["missing"] += 1
+                continue
+            ok = store.index_paper_fulltext(
+                node.id, str(getattr(node, "arxiv_id", "") or ""), body)
+            out["indexed" if ok else "skipped"] += 1
+        return out
+    finally:
+        if owns_store:
+            store.close()
 
 
 def heal_stub_titles(
@@ -402,6 +462,7 @@ def ingest_arxiv(
 
         pdf_path = _pdfs_dir(store) / _safe_pdf_name(arxiv_id)
         if existing is not None and not force and pdf_path.exists():
+            _materialize_reviewed_capabilities(store, arxiv_id)
             return existing  # fully idempotent: node + file both present
 
         # ── Metadata: arxiv API → fallback → stub ─────────────────────────
@@ -470,6 +531,7 @@ def ingest_arxiv(
                         if isinstance(existing, Paper) else "seed"),
         )
         store.add_node(paper, upsert=True)
+        _materialize_reviewed_capabilities(store, arxiv_id)
         return paper
     finally:
         if owns_store:
@@ -555,6 +617,7 @@ def ingest_from_seeds(
                     )
                     if enriched != existing:
                         store.add_node(enriched)
+                _materialize_reviewed_capabilities(store, arxiv_id)
                 print(f"[ingest]   skip {arxiv_id} — already present", flush=True)
                 results[arxiv_id] = "already_present"
                 continue
@@ -574,6 +637,113 @@ def ingest_from_seeds(
         if owns_store:
             store.close()
     return results
+
+
+def seed_coverage_report(
+    seeds_path: Path | str,
+    *,
+    store: SculptorKG,
+) -> dict[str, Any]:
+    """Audit that curated seed intent survived ingest and extraction.
+
+    A paper ID existing in SQLite is not enough. Curated research seeds carry
+    why the paper matters, retrieval tags, and (optionally) concept anchors
+    expected from extraction. This report also digests the stored text
+    sidecar, so the coverage result identifies exact source bytes rather than
+    merely asserting that some file once existed.
+    """
+    seeds_path = Path(seeds_path).expanduser().resolve()
+    with seeds_path.open("r", encoding="utf-8") as stream:
+        document = yaml.safe_load(stream) or {}
+    entries = document.get("papers", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"{seeds_path}: `papers` must be a list")
+
+    papers: dict[str, Any] = {}
+    for raw in entries:
+        if isinstance(raw, str):
+            raw = {"arxiv_id": raw}
+        if not isinstance(raw, dict):
+            continue
+        arxiv_id = _normalize_arxiv_id(str(
+            raw.get("arxiv_id") or raw.get("id") or ""
+        ))
+        if not arxiv_id:
+            continue
+        expected_tags = {
+            str(tag) for tag in (raw.get("tags") or []) if str(tag)
+        }
+        expected_concepts = [
+            str(value).strip().lower()
+            for value in (raw.get("expected_concepts") or [])
+            if str(value).strip()
+        ]
+        node = store.get_node(make_paper_id(arxiv_id))
+        row: dict[str, Any] = {
+            "present": isinstance(node, Paper),
+            "rationale_present": False,
+            "missing_tags": sorted(expected_tags),
+            "source_sha256": None,
+            "missing_concepts": expected_concepts,
+            "extracted": False,
+        }
+        if isinstance(node, Paper):
+            row["rationale_present"] = bool(node.rationale.strip())
+            row["missing_tags"] = sorted(expected_tags - set(node.tags))
+            row["extracted"] = bool(node.extracted)
+            if node.full_text_path:
+                source_path = Path(node.full_text_path)
+                if source_path.is_file():
+                    row["source_sha256"] = hashlib.sha256(
+                        source_path.read_bytes()
+                    ).hexdigest()
+            neighbor_text: list[str] = []
+            for _edge, other_id in store.neighbors(
+                node.id, direction="both"
+            ):
+                other = store.get_node(other_id)
+                if other is not None and dataclasses.is_dataclass(other):
+                    neighbor_text.append(json.dumps(
+                        dataclasses.asdict(other), sort_keys=True,
+                        default=str,
+                    ).lower())
+            corpus = "\n".join(neighbor_text)
+            row["missing_concepts"] = [
+                concept for concept in expected_concepts
+                if concept not in corpus
+            ]
+        row["ok"] = bool(
+            row["present"]
+            and row["rationale_present"]
+            and not row["missing_tags"]
+            and row["source_sha256"]
+            and not row["missing_concepts"]
+        )
+        papers[arxiv_id] = row
+    return {
+        "schema": 1,
+        "seeds_path": str(seeds_path),
+        "papers": papers,
+        "ok": bool(papers) and all(row["ok"] for row in papers.values()),
+        "missing_or_incomplete": sorted(
+            arxiv_id for arxiv_id, row in papers.items() if not row["ok"]
+        ),
+    }
+
+
+def assert_seed_coverage(
+    seeds_path: Path | str,
+    *,
+    store: SculptorKG,
+) -> dict[str, Any]:
+    """Return complete coverage or raise with every incomplete paper ID."""
+    report = seed_coverage_report(seeds_path, store=store)
+    if not report["ok"]:
+        raise ValueError(
+            "curated seed coverage is incomplete after ingest/extraction: "
+            + ", ".join(report["missing_or_incomplete"])
+        )
+    return report
 
 
 # ── CLI entry ───────────────────────────────────────────────────────────────

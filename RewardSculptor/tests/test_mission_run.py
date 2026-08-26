@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -470,6 +471,20 @@ def _make_mission(tmp_path: Path, n_stages: int = 2) -> Mission:
         decomposition_rationale="test",
     )
     mission_dir = tmp_path / "mission"
+    # Reference admission now resolves embodiment identity from the same
+    # authoritative project metadata written by the real project-creation
+    # flow.  Keep this shared mission fixture realistic instead of relying on
+    # the removed implicit-G1 fallback.
+    project_root = mission_dir.parent.parent
+    (project_root / "metadata.json").write_text(
+        json.dumps({
+            "robot_source": {
+                "kind": "library",
+                "library_slug": "g1",
+            },
+        }),
+        encoding="utf-8",
+    )
     save_mission(m, mission_dir)
     m.mission_dir = str(mission_dir.resolve())
 
@@ -523,6 +538,35 @@ def stub_adapter(monkeypatch):
     """
     monkeypatch.setattr(
         "sculptor.adapters.base.load_adapter", _stub_load_adapter,
+    )
+    # This module isolates mission orchestration and reference-RSI behavior;
+    # exact Tier-D admission is exercised independently in
+    # test_reference_admission_boundaries.py and test_refs_track.py.  Supply a
+    # verified-boundary stand-in so these legacy fixtures do not need to forge
+    # a physical rollout/certificate chain merely to reach the behavior under
+    # test.  Production still fails closed on every real attachment.
+    def _admit_test_stage(stage, *, expected_robot=None, root=None):
+        del root
+        clip_id = getattr(stage, "reference_clip_id", None)
+        if not clip_id:
+            return None
+        return SimpleNamespace(
+            robot=expected_robot or "g1",
+            clip_id=clip_id,
+            clip_content_sha256="1" * 64,
+            rollout_sha256="2" * 64,
+            certificate_sha256="3" * 64,
+            execution_contract_sha256="4" * 64,
+            execution_boundary_sha256="5" * 64,
+        )
+
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_stage_tierd_admission",
+        _admit_test_stage,
+    )
+    monkeypatch.setattr(
+        "sculptor.refs.track.require_tierd_target_compatibility",
+        lambda certificate, *_args, **_kwargs: certificate,
     )
 
 
@@ -4021,13 +4065,19 @@ def test_reference_signature_text_from_provenance(
     # this file).
     monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
+    exact_clip_path = (
+        lib_root / "g1" / "test_getup_clip" / refs_library.CLIP_FILENAME
+    )
     refs_library.write_provenance(
         "g1", "test_getup_clip",
         refs_library.make_provenance(
             clip_id="test_getup_clip", robot="g1",
             text="a subject rises from lying to standing",
             source={"dataset": "unit-test"}, license="internal",
-            attribution="unit-test fixture", content_sha256_="0" * 64,
+            attribution="unit-test fixture",
+            content_sha256_=refs_library.content_sha256(
+                exact_clip_path.read_bytes()
+            ),
         ),
         root=lib_root,
     )

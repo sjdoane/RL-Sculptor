@@ -23,6 +23,7 @@ Used by routes/kg.py.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -40,8 +41,13 @@ from backend.models.kg import (
     PaperDetail,
     PaperEntities,
     PaperSummary,
+    ResearchCapabilitySummary,
     TechniqueSummary,
 )
+
+
+class KGIntegrityError(RuntimeError):
+    """A reviewed graph claim is missing its required unambiguous status."""
 
 
 def shared_kg_db_path() -> Path:
@@ -127,10 +133,12 @@ def list_papers(
             if search:
                 needle = search.lower()
                 hay = (
-                    f"{p.title.lower()} "
-                    f"{' '.join((p.authors or [])).lower()} "
-                    f"{p.arxiv_id.lower()}"
-                )
+                    f"{p.title} {' '.join(p.authors or [])} {p.arxiv_id} "
+                    f"{getattr(p, 'abstract', '')} "
+                    f"{getattr(p, 'rationale', '')} "
+                    f"{' '.join(getattr(p, 'tags', []) or [])} "
+                    f"{_capability_search_text(kg, p.id)}"
+                ).lower()
                 if needle not in hay:
                     continue
             out.append(
@@ -152,7 +160,7 @@ def get_paper_detail(
     project_dir: Path, arxiv_id: str
 ) -> Optional[PaperDetail]:
     with _open_store(project_dir) as kg:
-        from sculptor.kg.schema import make_paper_id, Relation
+        from sculptor.kg.schema import make_paper_id
 
         paper_id = make_paper_id(arxiv_id)
         paper = kg.get_node(paper_id)
@@ -160,6 +168,7 @@ def get_paper_detail(
             return None
 
         entities = _entities_for_paper(kg, paper_id)
+        capabilities = _capabilities_for_paper(kg, paper_id)
 
         from datetime import datetime, timezone
 
@@ -181,9 +190,14 @@ def get_paper_detail(
             has_pdf=_paper_pdf_path(project_dir, paper.arxiv_id).is_file(),
             abstract=getattr(paper, "abstract", "") or "",
             conclusion_text=getattr(paper, "conclusion_text", "") or "",
+            rationale=getattr(paper, "rationale", "") or "",
+            tags=list(getattr(paper, "tags", []) or []),
+            source_url=getattr(paper, "source_url", "") or "",
+            provenance=getattr(paper, "provenance", "") or "",
             pdf_available=_paper_pdf_path(project_dir, paper.arxiv_id).is_file(),
             ingested_at=ingested_at,
             entities=entities,
+            capabilities=capabilities,
         )
 
 
@@ -232,6 +246,95 @@ def _entities_for_paper(kg: Any, paper_id: str) -> PaperEntities:
     out.failure_modes = _dedup(by_kind["FailureMode"])
     out.reward_components = _dedup(by_kind["RewardComponent"])
     out.environments = _dedup(by_kind["Environment"])
+    return out
+
+
+def _capability_search_text(kg: Any, paper_id: str) -> str:
+    """Plain lexical projection of reviewed claims for paper-list search.
+
+    This intentionally does not infer a product status. Status integrity is
+    enforced by the detail view; list search remains available even if an
+    unrelated old graph row needs repair.
+    """
+
+    from sculptor.kg.schema import Relation, ResearchCapability
+
+    chunks: list[str] = []
+    for _edge, other_id in kg.neighbors(
+        paper_id, relation=Relation.GROUNDS_CAPABILITY, direction="out"
+    ):
+        node = kg.get_node(other_id)
+        if not isinstance(node, ResearchCapability):
+            continue
+        chunks.extend((node.name, node.description, node.scope))
+        chunks.append(json.dumps(node.parameters, ensure_ascii=False, default=str))
+    return " ".join(chunks)
+
+
+def _capabilities_for_paper(
+    kg: Any, paper_id: str
+) -> list[ResearchCapabilitySummary]:
+    """Return source-pinned mechanisms, failing closed on status ambiguity."""
+
+    from sculptor.kg.schema import (
+        ImplementationStatus,
+        Relation,
+        ResearchCapability,
+    )
+
+    out: list[ResearchCapabilitySummary] = []
+    for grounding_edge, capability_id in kg.neighbors(
+        paper_id, relation=Relation.GROUNDS_CAPABILITY, direction="out"
+    ):
+        capability = kg.get_node(capability_id)
+        if not isinstance(capability, ResearchCapability):
+            raise KGIntegrityError(
+                f"{paper_id} grounds non-capability node {capability_id!r}"
+            )
+        status_edges = kg.neighbors(
+            capability.id,
+            relation=Relation.HAS_IMPLEMENTATION_STATUS,
+            direction="out",
+        )
+        if len(status_edges) != 1:
+            raise KGIntegrityError(
+                f"{capability.id} must have exactly one implementation "
+                f"status edge; found {len(status_edges)}"
+            )
+        status_node = kg.get_node(status_edges[0][1])
+        if not isinstance(status_node, ImplementationStatus):
+            raise KGIntegrityError(
+                f"{capability.id} status target {status_edges[0][1]!r} is "
+                "not an ImplementationStatus"
+            )
+        if status_node.status not in {
+            "implemented", "metadata_only", "unsupported"
+        }:
+            raise KGIntegrityError(
+                f"{capability.id} has unknown status {status_node.status!r}"
+            )
+        evidence = grounding_edge.data or {}
+        out.append(
+            ResearchCapabilitySummary(
+                id=capability.id,
+                name=capability.name,
+                description=capability.description,
+                scope=capability.scope,
+                parameters=dict(capability.parameters or {}),
+                implementation_status=status_node.status,
+                status_definition=status_node.definition,
+                code_evidence=list(capability.code_evidence or []),
+                provenance=capability.provenance,
+                paper_role=str(evidence.get("paper_role") or ""),
+                source_version=str(
+                    evidence.get("paper_version")
+                    or evidence.get("source_version")
+                    or ""
+                ),
+                source_locator=str(evidence.get("source_locator") or ""),
+            )
+        )
+    out.sort(key=lambda item: item.name.casefold())
     return out
 
 

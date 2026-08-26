@@ -12,7 +12,7 @@
  *      same gates. Every question still shows its explicit choices AND
  *      the disclosed "System decides" default; unanswered = default.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -24,8 +24,10 @@ import {
   useAuthorWorld,
   usePreviewWorldDraft,
 } from "@/hooks/useWorlds";
+import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
 import { ApiError } from "@/lib/api";
 import type { WorldAuthorResponse, WorldDraftPreview } from "@/lib/types";
+import { WORLD_ROBOT_MISMATCH_DETAIL } from "@/lib/worldLaunch";
 
 function errText(err: unknown): string {
   if (err instanceof ApiError) {
@@ -70,8 +72,22 @@ export default function AuthorWorldDialog({
   slug, onApplied,
 }: { slug: string; onApplied?: () => void }) {
   const [open, setOpen] = useState(false);
+  // Seeded from what the project already says it is building, so the task
+  // description isn't typed once here and again into the run dialog's
+  // behavior goal. A starting point only — it is freely editable, and this
+  // never writes back, so a goal set elsewhere is not clobbered.
+  const draftIntent = useBehaviorDraft(slug);
   const [prompt, setPrompt] = useState("");
+  const [promptSeeded, setPromptSeeded] = useState(false);
+  const seed = draftIntent.data?.behavior_goal ?? "";
+  useEffect(() => {
+    if (open && !promptSeeded && !prompt && seed) {
+      setPrompt(seed);
+      setPromptSeeded(true);
+    }
+  }, [open, promptSeeded, prompt, seed]);
   const [robot, setRobot] = useState("");
+  const [kgGrounding, setKgGrounding] = useState(true);
   const [draft, setDraft] = useState<WorldAuthorResponse | null>(null);
   const [page, setPage] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -129,7 +145,7 @@ export default function AuthorWorldDialog({
 
   const runAuthor = () => {
     author.mutate(
-      { prompt, robot_capability_id: robot.trim() || null },
+      { prompt, robot_capability_id: robot.trim() || null, kg_grounding: kgGrounding },
       {
         onSuccess: (d) => {
           setDraft(d);
@@ -250,6 +266,29 @@ export default function AuthorWorldDialog({
                   placeholder="project robot"
                 />
               </Field>
+              {/* The CLI has had `--kg-grounding/--no-kg-grounding` all
+                  along; the dialog sent neither, so authoring here was
+                  always grounded. Retrieval is best-effort and never blocks,
+                  so the reason to turn it off is a noisy or off-topic graph,
+                  not speed. */}
+              <label
+                className="rs-flex rs-gap-8"
+                style={{ alignItems: "flex-start", fontSize: 12 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={kgGrounding}
+                  onChange={(e) => setKgGrounding(e.target.checked)}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  Ground in the knowledge graph
+                  <span className="rs-sub" style={{ display: "block", fontSize: 11 }}>
+                    Cites this project's ingested papers when choosing terrain
+                    and task structure. Best-effort — it never blocks authoring.
+                  </span>
+                </span>
+              </label>
             </>
           ) : (
             <div style={{ display: "grid", minHeight: 0, height: "100%",
@@ -307,7 +346,9 @@ export default function AuthorWorldDialog({
                       <code className="mono">{draft.capability_id}</code>, but
                       the project&apos;s robot is{" "}
                       <code className="mono">{draft.project_capability_id}</code>.
-                      Training under this world uses the draft&apos;s robot.
+                      {" "}You can inspect this draft.{" "}
+                      <strong>Training is blocked.</strong>{" "}
+                      {WORLD_ROBOT_MISMATCH_DETAIL}
                     </span>
                   </div>
                 )}

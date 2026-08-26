@@ -78,6 +78,9 @@ def test_minimal_clip_yields_only_root_link_pos_w():
     assert "projected_gravity_b" not in arrays
     T = clip["root_pos_z"].shape[0]
     assert arrays["root_link_pos_w"].shape == (T, 4, 3)
+    assert arrays["first_episode_valid_mask"].shape == (T, 4)
+    assert arrays["first_episode_valid_mask"].dtype == np.bool_
+    assert np.all(arrays["first_episode_valid_mask"])
     np.testing.assert_allclose(
         arrays["root_link_pos_w"][:, :, 2], np.tile(clip["root_pos_z"][:, None], 4))
     # xy defaults to zero when the clip has no root_pos_xy.
@@ -180,8 +183,6 @@ def _g1_standing_clip(T: int = 10, fps: float = 20.0) -> dict:
 
 
 def test_fk_infers_standing_contacts_on_real_g1_mjcf():
-    from sculptor.refs.preview import PreviewUnavailable
-
     clip = _g1_standing_clip()
     try:
         arrays, meta = clip_to_arrays(clip, n_envs=2)

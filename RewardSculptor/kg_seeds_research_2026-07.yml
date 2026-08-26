@@ -10,6 +10,37 @@
 # Extract: sculpt kg extract --all   (LLM + PDF cost — run deliberately)
 
 papers:
+  # ── Foundation whole-body control (Lokesh review, reconciled 2026-08)
+  - arxiv_id: "2511.07820"
+    title: "SONIC: Supersizing Motion Tracking for Natural Humanoid Whole-Body Control"
+    rationale: "Primary public controller source for the proposed policy-training study. Grounds the camera-free 29-DoF G1 tracker, shared FSQ command interface, separate kinematic planner, upstream VLA integration, scale, and explicit limitations while preventing those claims from being attributed to RewardSculptor or Lokesh's unpublished visual adaptation."
+    tags: ["sonic", "g1", "foundation-controller", "motion-tracking", "fsq-token", "whole-body-control"]
+    source_url: "https://arxiv.org/html/2511.07820v4"
+    expected_concepts: ["universal token", "motion tracking", "kinematic motion planner", "proprioception"]
+  - arxiv_id: "2510.26236"
+    title: "PHUMA: Physically Reliable Humanoid Locomotion Dataset"
+    rationale: "External corpus behind SONIC's cross-dataset tracking result. Grounds the different-retargeting-pipeline caveat and keeps PHUMA's role separate from SONIC's own 611-hour training corpus."
+    tags: ["phuma", "humanoid-motion-data", "retargeting", "cross-dataset-evaluation", "g1"]
+    source_url: "https://arxiv.org/html/2510.26236"
+    expected_concepts: ["PhySINK", "physically reliable", "retargeting", "humanoid locomotion dataset"]
+
+  # ── Multi-mode reference policies (Lokesh review, reread 2026-08)
+  - arxiv_id: "2403.04205"
+    title: "OGMP: Oracle Guided Multi-mode Policies for Agile and Versatile Robot Control"
+    rationale: "Primary OGMP source. Grounds the distinction between a true online receding-horizon oracle with rho-bounded exploration and RewardSculptor's current fixed, episode-time phase-window scaffold; prevents the UI and reward authoring layer from overstating paper alignment."
+    tags: ["ogmp", "multi-mode-policy", "receding-horizon-oracle", "rho-bounded-exploration"]
+    # Anchors match the evidence-bearing extracted entities, not just paper-title
+    # vocabulary: the OGMP extraction calls these task-vital modes and a
+    # receding-horizon oracle.
+    expected_concepts: ["oracle", "rho", "vital modes", "receding-horizon"]
+  - arxiv_id: "2410.01030"
+    title: "Preferenced Oracle Guided Multi-mode Policies for Dynamic Bipedal Loco-Manipulation"
+    rationale: "OGMP follow-up for preference-conditioned loco-manipulation. Grounds future mode/task conditioning and preference variation while making clear that a static composed clip plus per-window reward terms is not yet a learned multi-mode controller."
+    tags: ["ogmp", "preference-conditioned", "loco-manipulation", "hybrid-automaton"]
+    # The extracted hybrid-automaton technique represents guards as discrete
+    # mode jumps driven by environment feedback.
+    expected_concepts: ["preference", "hybrid automaton", "mode jumps", "bipedal"]
+
   # ── LLM reward design: 2024-2026 successors of the Eureka line
   - arxiv_id: "2410.14660"
     title: "CARD: Coder-Agnostic Reward Design with Trajectory Preference Evaluation"

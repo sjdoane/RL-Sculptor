@@ -42,6 +42,10 @@ Dependency direction: **`reward-sculptor-ui` → `RewardSculptor`** (editable pa
 Each subproject has its own README with a deep dive:
 **[library README](RewardSculptor/README.md)** · **[UI README](reward-sculptor-ui/README.md)**.
 
+For the current lab research direction, exact capability boundary, SONIC/OGMP
+reading, and proposal seed, start with the
+**[guiding research context](docs/GUIDING_RESEARCH_CONTEXT.md)**.
+
 ---
 
 ## Architecture in one screen

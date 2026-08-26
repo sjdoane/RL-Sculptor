@@ -8,7 +8,7 @@ underlying Job.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal, Optional
+from typing import Any, Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,6 +31,15 @@ class RunParams(BaseModel):
     iterations: Annotated[int, Field(ge=1, le=100)] = 20
     no_kg: bool = False
     dry_run: bool = False
+
+    acknowledge_blind_fitness: bool = False
+    """Explicit authorization for a live run with no objective fitness.
+
+    This is deliberately independent from ``fitness_metric``.  Omitting a
+    metric is an experimental ablation, not an implicit default that a direct
+    API client may trigger accidentally.  Dry runs do not require the
+    acknowledgement because they are explicitly labeled non-live checks.
+    """
 
     # Advanced — Phase 4.
     training_iterations: Optional[
@@ -175,6 +184,36 @@ class RunParams(BaseModel):
     passes it to ``sculpt run --init-policy``.  It never changes the selected
     reward, environment, or objective-metric mode."""
 
+    warm_start_snapshot: Optional["WarmStartSnapshotRef"] = None
+    """Opaque content pins for one server-attested interrupted PPO save.
+    Loading is always actor+critic transfer; optimizer state and counters
+    intentionally restart."""
+
+    starting_skill_id: Optional[
+        Annotated[str, Field(pattern=r"^[a-f0-9]{12}$")]
+    ] = None
+    """Content-addressed shared/imported policy selected as the run's
+    starting point. It is resolved and hash-attested again at launch."""
+
+    expected_starting_skill_manifest_digest: Optional[
+        Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    ] = None
+    """Optimistic-concurrency pin returned by the starting-skill receipt.
+    Required with ``starting_skill_id`` so a stale picker cannot silently
+    launch a record whose admitted manifest changed after selection."""
+
+    initialization_mode: Optional[
+        Literal["actor_only", "actor_critic", "full_resume", "reference_only"]
+    ] = None
+    """What state to inherit. Imported bundles currently admit actor-only or
+    actor+critic transfer; full_resume is reserved for exact optimizer/run-state
+    compatible records and is rejected unless the record explicitly allows it."""
+
+    acknowledge_legacy_reconstructed_initialization: bool = False
+    """Required only for a policy whose compatibility contract was rebuilt
+    from retained historical evidence. It never authorizes optimizer/full or
+    exact resume and is rejected for origin-persisted policy contracts."""
+
     reference_clip_id: Optional[
         Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
     ] = None
@@ -188,6 +227,20 @@ class RunParams(BaseModel):
     """Reference-library embodiment namespace for ``reference_clip_id``.
     Required when a clip is selected so identically named clips can never be
     resolved from the wrong robot library."""
+
+
+class WarmStartSnapshotRef(BaseModel):
+    """Optimistic-concurrency pins for an interrupted PPO snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: Annotated[
+        str, Field(pattern=r"^snap_[a-f0-9]{24}$")
+    ]
+    checkpoint_sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    receipt_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    acknowledge_interrupted_snapshot: bool = False
+    acknowledge_legacy_reconstructed_snapshot: bool = False
 
 
 class RunControl(BaseModel):
@@ -267,6 +320,15 @@ class IterEventSummary(BaseModel):
     # progress_score — ranks iterations below the completion gate). None
     # when the metric doesn't emit it.
     progress: Optional[float] = None
+    # Stage-aware terminal truth. A non-empty checkpoint after PPO does not
+    # make the outer iteration completed when rollout/evaluation then fails.
+    failure_stage: Optional[Literal["evaluation"]] = None
+    ppo_iterations_completed: Optional[int] = None
+    ppo_iterations_requested: Optional[int] = None
+    checkpoint_preserved: bool = False
+    checkpoint_sha256: Optional[
+        Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    ] = None
     # §env generalization: diagnoser env-curriculum change applied at
     # this iter's boundary (env_spec_updated event): {"new_version":
     # "v2" | None, "applied": ["entropy_coef_scale=1.5", ...],
@@ -289,6 +351,7 @@ class ErrorClassification(BaseModel):
     suggestions: list[str] = []
     problem_type: str = "about:blank"
     action: Optional[dict] = None
+    evidence: Optional[dict] = None
 
 
 class RunSummary(BaseModel):
@@ -325,11 +388,63 @@ class RunSummary(BaseModel):
     mode: Optional[str] = None
 
 
+class AuthoredWorldExecutionPin(BaseModel):
+    """One immutable authored-world identity at a launch boundary."""
+
+    selection_version: Annotated[int, Field(ge=1)]
+    selection_path: Annotated[str, Field(min_length=1)]
+    selection_sha256: Annotated[
+        str, Field(pattern=r"^[a-f0-9]{64}$")
+    ]
+    tuple_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+
+class AuthoredWorldExecutionReceipt(BaseModel):
+    """Requested world plus the worker-observed identity, when available.
+
+    This is deliberately a server-derived receipt rather than a launch
+    parameter: API clients may request a world, but only the worker can attest
+    which immutable tuple was actually consumed.
+    """
+
+    requested: AuthoredWorldExecutionPin
+    observed: Optional[AuthoredWorldExecutionPin] = None
+
+
 class RunDetail(RunSummary):
     params: RunParams
+    # Server-resolved feasibility receipt. It is deliberately outside
+    # RunParams so direct API clients cannot self-assert Tier-D authority.
+    reference_feasibility: Optional[dict] = None
+    # Server-derived receipt for the objective-fitness launch decision.  The
+    # request bit remains in ``params`` for exact replay; this receipt records
+    # which authority admitted the run.
+    objective_fitness_receipt: Optional[dict] = None
+    # Server-derived queue/launch attestation for an imported starting skill.
+    # Kept outside RunParams so API clients cannot self-assert compatibility.
+    starting_skill_target_receipt: Optional[dict] = None
+    # Server-derived requested/observed authored-world execution identity.
+    # Kept outside RunParams so clients cannot self-assert EXECUTES_IN.
+    authored_world_execution_receipt: Optional[
+        AuthoredWorldExecutionReceipt
+    ] = None
     iterations: list[IterEventSummary]
     stdout_tail: list[str]                # last 200 in-memory lines
     total_event_count: int                # events list size
+
+
+class PolicyEvidenceValue(BaseModel):
+    """One objective-evidence value copied from the immutable iteration
+    sidecar. ``key`` is retained so the UI never invents a semantic label or
+    threshold that the metric did not record."""
+
+    key: str
+    value: float
+    kind: Literal["fraction", "count", "frames", "score", "value"]
+    comparison: Optional[Literal["gte", "lte", "eq"]] = None
+    threshold: Optional[float] = None
+    passed: Optional[bool] = None
+    semantics_source: Optional[str] = None
 
 
 class PolicySummary(BaseModel):
@@ -340,9 +455,96 @@ class PolicySummary(BaseModel):
     iter_index: int
     checkpoint: str                       # "checkpoint.pt" | "checkpoint.zip"
     checkpoint_bytes: int
+    checkpoint_sha256: Annotated[
+        str, Field(pattern=r"^[a-f0-9]{64}$")
+    ]
+    # Backward-compatible boolean for consumers that predate the explicit
+    # status below. True means every deployment precondition was verified; a
+    # checkpoint being downloadable or complete never sets it by itself.
+    deployable: bool
+    artifact_purpose: Literal["reproducibility"] = "reproducibility"
+    completion_authority: Literal["attested", "legacy_recovery"]
+    deployment_status: Literal["qualified", "not_certified"] = (
+        "not_certified"
+    )
+    deployment_blockers: list[str] = Field(default_factory=list)
+    physical_scene_status: Literal[
+        "aligned", "misaligned", "not_applicable", "unavailable"
+    ] = "unavailable"
+    lineage_status: Literal["verified", "incomplete", "failed"] = (
+        "incomplete"
+    )
+    origin_receipt_sha256: Optional[str] = None
+    reference_clock_sha256: Optional[str] = None
     primary_metric: Optional[float] = None
     fitness: Optional[float] = None
     reward_version: Optional[str] = None
+    # Objective identity is separate from the score. Older artifacts often
+    # contain a scalar but no immutable metric identity; those fields stay
+    # null rather than letting the UI imply the numbers are comparable.
+    metric_id: Optional[str] = None
+    metric_version: Optional[str] = None
+    metric_source: Optional[str] = None
+    metric_sha256: Optional[str] = None
+    criterion_status: Literal["passed", "failed", "not_recorded"] = (
+        "not_recorded"
+    )
+    evidence_status: Literal["complete", "partial", "unavailable"] = (
+        "unavailable"
+    )
+    route_evidence: Optional[PolicyEvidenceValue] = None
+    contact_evidence: Optional[PolicyEvidenceValue] = None
+    hold_evidence: Optional[PolicyEvidenceValue] = None
+    # Content-bound reducer receipt for an explicitly precommitted physical
+    # acceptance contract. When present it supersedes independently
+    # aggregated route/contact/hold values as the pass authority.
+    same_lane_acceptance: Optional[dict[str, Any]] = None
+    # Conjunctive, fail-closed interpretation of the exact evidence fields
+    # above. ``evidence_status=complete`` means only that three values exist;
+    # it never means those values met their declared comparisons.
+    objective_proof_status: Literal[
+        "passed", "failed", "incomplete"
+    ] = "incomplete"
+    objective_proof_blockers: list[str] = Field(default_factory=list)
+    # Worker-authored video-lane identity. ``verified`` requires all four
+    # behavior.json fields, an explicit precommitted selector, equal requested
+    # and resolved indices, and a finite [0, 1] batch percentile. Missing
+    # fields are never reconstructed from launch parameters.
+    lane_evidence_status: Literal[
+        "verified", "incomplete", "mismatch", "unavailable"
+    ] = "unavailable"
+    requested_evidence_env_index: Optional[int] = None
+    resolved_evidence_env_index: Optional[int] = None
+    resolved_episode_percentile: Optional[float] = None
+    evidence_lane_selection: Optional[str] = None
+    rollout_available: bool = False
+    # True only for a coherent on-disk selection receipt: top-level selected
+    # index + source and the matching candidate's selected=true marker.
+    selected: bool = False
+    selection_source: Optional[str] = None
+
+
+class PolicyRecoverySnapshot(BaseModel):
+    """One periodic PPO save from an iteration with no promoted checkpoint.
+
+    These rows are recovery inputs only.  They carry no rollout, objective, or
+    success claim, and the exact digest must be echoed when launching.
+    """
+
+    snapshot_id: Annotated[
+        str, Field(pattern=r"^snap_[a-f0-9]{24}$")
+    ]
+    iteration: Annotated[int, Field(ge=0)]
+    ppo_step: Annotated[int, Field(gt=0)]
+    source_job_id: str
+    source_job_status: Literal["errored", "stopped"]
+    last_observed_ppo_iteration: Annotated[int, Field(gt=0)]
+    checkpoint_bytes: int
+    checkpoint_sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    receipt_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    provenance_status: Literal["origin_persisted", "legacy_reconstructed"]
+    selectable: bool
+    blocker: Optional[str] = None
 
 
 class RunWSMessage(BaseModel):

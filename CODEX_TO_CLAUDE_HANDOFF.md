@@ -2,6 +2,22 @@
 > On "read handoff", read `HANDOFF.md` and begin its Task 1. This file below is
 > older, task-specific history kept for reference only.
 
+## Current 2026-08-17 handoff
+
+The active rules are `AGENTS.md`; the current implementation state is
+`HANDOFF.md` §0; the complete researcher and artifact contract is
+`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`. The current slice is the secure
+portable starting-point workflow, target-bound Tier-D admission, exact runtime
+load/lineage evidence, honest OGMP-inspired UI, and deterministic KG identity.
+Treat policy, motion, and world as independent inputs. A registered motion is
+not training-authorized until its target-specific Tier-D boundary passes.
+Controller/world declarations from an upload are inert evidence, not staged
+runtime components. No GPU launch is part of this handoff. Final verification
+is green: core 2,820 passed (one optional-JAX skip), backend 709 passed,
+frontend 24 passed plus typecheck/build, scoped F/E9 and compile checks passed,
+and a fresh browser pass found no console errors. See `HANDOFF.md` §0 for the
+exact honest boundary and browser findings.
+
 ---
 
 # Latest handoff — mission success-criterion process isolation (2026-07-19)
@@ -3504,7 +3520,7 @@ The UI resolved iter 34 checkpoint SHA
 `7f49a4c75116e094004431da87e5318ee9e57dd51576419a18f9ad1f63aebca1`;
 startup proves the explicit UI recovery and actor+critic warm start.
 
-This is the first live proof with generic command-only post-entry
+This was the first live run exercising generic command-only post-entry
 follow-through. Intermediate raw disk entry still advances the frozen route
 immediately while an unfinished typed obstacle-away maneuver retains its
 existing safe-cap command and reward firewall. Terminal raw entry likewise
@@ -3581,7 +3597,7 @@ definition, evaluator, robot, or task. Focused compiler + Mjlab adapter tests
 are **71 passed**; scoped Ruff (`F,E9`), compileall, and `git diff --check`
 pass.
 
-## Iter 36 live raw-completion dwell proof 2026-07-26 (Codex)
+## Iter 36 historical launch record 2026-07-26 (acceptance retracted below)
 
 UI New Run job `job_81f8bddf6568cccf` is running iter 36 from clean captured
 commit `c6daa6ea4f5d45bd3dac2f295c7437f23bf90cb1`. Exact promoted recovery
@@ -3596,12 +3612,13 @@ The UI resolved iter 35 checkpoint SHA
 startup proves actor+critic loading from that exact file and PPO iteration
 `0/750`.
 
-This is the first live proof in which terminal stillness supervision becomes
+This launch was the first run intended to make terminal stillness supervision
 eligible on immutable raw route completion, aligned with the unchanged
 authored two-second dwell. The separate bounded center-directed command still
 builds the existing `0.100 m` in-disk retention depth before zero velocity.
 All preceding route, clearance, command, contact, success, and evidence
-semantics remain unchanged.
+semantics remained unchanged. Its later acceptance is retracted below because
+the authored worlds were not isolated across environments.
 
 The visible New Run settings are Auto, one 750-PPO cycle, 1,024 environments
 on `cuda:0`, seed 42, two 1,000-step 1920x1080 episodes, precommitted evidence
@@ -3620,7 +3637,7 @@ official all-lane trajectory/fitness, lane-10 behavior/keyframes/full video,
 and Results physical-scene audit. Acceptance remains the complete physical
 conjunction, including 100 uninterrupted post-success frames inside finish.
 
-## Iter 36 accepted physical showcase 2026-07-26 (Codex)
+## Iter 36 historical pre-grid-fix diagnostic 2026-07-26 (retracted 2026-08-24)
 
 Iter 36/job `job_81f8bddf6568cccf` completed cleanly and preserved checkpoint
 SHA
@@ -3633,17 +3650,19 @@ boxes. Realism is `ok`, frozen fitness is `0.19907`, and progress is
 
 The official first-episode all-lane audit reports:
 
-- all five actual `0.350 m` regions in order and index 5: **64/64**;
+- reported own-course `0.350 m` regions in order and index 5: **64/64**;
 - authored success: **61/64**;
-- forbidden-contact-free: **61/64**, with failures by box `[2, 2, 0, 0]`;
+- reported contact-free under the then-scoped four intended-box sensors:
+  **61/64**, with failures by box `[2, 2, 0, 0]`;
 - no sustained fall: **64/64**;
 - 100-frame horizontal holds: **4/64**;
 - 100-frame horizontal/angular/joint-velocity holds: **2/64**;
 - 100-frame posture-qualified holds: **15/64**;
 - strict 100-frame whole-body holds: **2/64**.
 
-Most importantly, the precommitted rendered evidence is itself an accepted
-full conjunction. `behavior.json` records requested/resolved lane 10,
+At the time, the precommitted rendered evidence was reported as an accepted
+full conjunction; that acceptance is retracted below. `behavior.json` records
+requested/resolved lane 10,
 selection `precommitted`, return percentile `1.0`, and rendered return
 `53.47784`. Lane 10 enters the five actual regions at
 `[161, 310, 510, 642, 757]`, reaches index 5 at 757, declares authored
@@ -3660,7 +3679,249 @@ thresholds. The official keyframes and full 20-second video visibly show an
 upright robot traversing the alternating sides of the actual orange boxes,
 entering the finish, and settling into the sustained terminal stance.
 
-This is the first fresh, precommitted, aligned, contact-free physical proof
-that satisfies the complete showcase conjunction. Preserve iter 36 as the
-accepted checkpoint and evidence baseline. No further recovery run is
-required.
+This was originally recorded as the first fresh physical proof, but that
+acceptance is retracted. The run predates the authored-world grid-pitch fix:
+its intended boxes were aligned, while neighboring copies of the course
+overlapped because the default `2.0 m` pitch was smaller than the course
+footprint. The physical-scene audit did not check absence of neighboring
+collision geometry. Preserve iter 36 only as pre-fix diagnostic history; no
+post-fix rerun has re-established the conjunction.
+
+## Iter 38 historical policy admission for the visible continuation demo (2026-08-18)
+
+The original iter 38 portable bundle now fails closed, as it should: that
+historical run predates the training-time
+`warm_start_effective_policy_contract.json` sidecar, so its generated contract
+has no origin-persisted authority. Do not weaken this check and do not label
+the source an exact resume.
+
+A narrow `legacy_reconstructed` path now admits only actor/critic
+initialization after re-deriving the contract from retained immutable
+evidence. Export/import verifies the exact evidence descriptors, the runtime
+actor/critic observation rows, action rows, actor/critic MLP topology,
+normalizers and controller cadence, the source config adapter/task identity,
+and the material selection alias from v47 to v48. The source/observed
+selections must retain identical tuple hash, evaluation lineage, and refs.
+Safetensors keys, dtypes, ranks, shapes, tensor signature, contract
+fingerprint, and archive descriptors remain independently rechecked.
+
+The researcher-facing picker marks this contract **legacy reconstructed** and
+keeps **Use this starting point** disabled until the user checks the explicit
+historical-reconstruction acknowledgement. Only `actor_only` and
+`actor_critic` are possible. Optimizer restore, full resume, and exact resume
+remain false. The run route pins the status, digest, acknowledgement and mode;
+the worker reloads the server-owned record and must reproduce the same receipt
+before subprocess creation. Import remains a structurally selectable
+candidate (`training_authorized: false`) until the worker emits exact load
+proof.
+
+Rebuild the attested iter 38 artifact with:
+
+```bash
+cd /home/samjd/projects/RewardSculptor
+.venv/bin/python -m sculptor.cli export \
+  --config /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/config.toml \
+  --iter 38 --portable --robot g1 \
+  --out /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/exports/skill_g1-lab-showcase-weave-and-stop_iter38_legacy-reconstructed.rskill \
+  --legacy-origin-job-log /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/runs/_run_job_9e2fc89751dcf75b.log \
+  --legacy-source-selection /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/env/selection_v47.json \
+  --legacy-observed-selection /home/samjd/.local/share/reward-sculptor/projects/g1-lab-showcase-weave-and-stop/env/selection_v48.json
+```
+
+Current rebuilt artifact SHA-256 is
+`d24f398af4270924b6cdee1aa4a2af83f8054fe4115827e5dc43317641d7e9a9`.
+Its contract digest is
+`dceda370cd66209943f3549a7f949a5f74ce2945a7f3f6cebc602b40cdc825a7`;
+provenance digest is
+`1c0ef86cdb3aefda0273568702c2f117b2563d287c8baa9cab29fb6e5f6713e4`;
+and the re-derived runtime-interface digest is
+`44e5e73070458a4a0fcd0261e9371fa3cf993ff75e8ceea52013d0a5adbe44b1`.
+A clean import produces manifest digest
+`92ef68202a88bc422d5cbefd58c26edfd6f5e7bd0dd9626a7f92fd3d5e44a81d`,
+tensor signature
+`b96ae7f14ec239da1d56b4f945c2f7c66a2d611373aac91e6e5fb9adafd601ff`,
+`provenance_status: legacy_reconstructed`, allowed modes
+`[actor_only, actor_critic]`, `selectable: true`, `compatible: true`, and
+`training_authorized: false` pending route/worker proof.
+
+## Fresh slalom-to-jump continuation and actuator-identity repair (2026-08-18)
+
+The continuation demonstration now lives in a genuinely new project:
+`g1-slalom-jump-lab`. Its frozen task extends the attested slalom prior with
+one bilateral jump at the finish, a supported-landing requirement, and a
+100-frame upright whole-body hold. The first complete New Run flow was
+performed visibly in the UI. It imported the historical iter-38 bundle,
+selected actor+critic, required the reconstruction acknowledgement, pinned the
+schema-2 to schema-3 zero-initialized event-phase migration, generated
+`gen_001` as observe-only, and launched job `job_623c9e0616876759`.
+
+That job failed closed before PPO. The worker correctly refused to emit
+`warm_start_loaded`: MjLab robot factories returned independent wrappers over
+a shared articulation constant, and the runner's DC-motor enforcement mutated
+that shared object. Admission had pinned stock G1 hash `799777468601…`, while
+the actual velocity-limited robot and every subsequent factory call hashed to
+`7971d1a570b9…`. This was process-order-dependent physics drift, not a bad
+checkpoint or an installed-file change.
+
+The generic repair makes every robot factory result owned, declares the G1 and
+Go1 DC back-EMF actuator profiles in the immutable robot capability, and uses
+that same composed asset for admission, training, rollout, and effective
+runtime verification. New manifests independently pin the installed base
+asset and composed runtime asset. The legacy registered-task enforcement path
+is copy-on-write; environment flags cannot alter authored-world physics.
+Strict installed-asset and frozen-MJB verification remain unchanged.
+
+Verification for this slice: 186 focused adapter/compiler/runtime/warm-start
+tests passed after aligning the warm-start event source-inspection regression
+with its extracted receipt helper; all 152 world tests passed, the new
+ownership/identity regression passed, scoped Ruff
+`F,E9`, compileall, and diff check passed. The fresh project's existing
+selection predates the composed-physics manifest and must be re-admitted in the
+UI before relaunch. Preserve the failed job log as diagnostic evidence; do not
+reuse its selection as runtime authority.
+
+## Interrupted PPO-50 recovery for the fresh jump continuation (2026-08-19)
+
+Job `job_d41e199695d2d7d8` was interrupted by CUDA/Warp error 999 after the
+truthful last-observed PPO iteration 58. It produced no rollout or success
+evidence. Its latest durable periodic save is cycle 2 / PPO 50, 6,202,705
+bytes, SHA-256
+`fe1f41c83736d2f6c54159207263ed18c158e147461a2663ec8545509a5f2c8f`.
+
+Commit `7812c87` adds a fail-closed interrupted-snapshot path. The server copied
+the checkpoint, effective policy contract, source selection, artifact tuple,
+and unique producer log into an immutable recovery record before exposing it
+to the UI. The current opaque receipt is:
+
+- snapshot id: `snap_8b0cf8e3235acd0e2c642504`;
+- receipt digest:
+  `dbb64c8170f462044822ba5aa9518b6754e1226db6cca88f1db8344d04c56848`;
+- source job/status: `job_d41e199695d2d7d8` / `errored`;
+- provenance: `legacy_reconstructed`;
+- source selection: v6 / tuple
+  `f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`;
+- effective policy-contract fingerprint:
+  `83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`.
+
+The UI deliberately separates this row from completed checkpoints, labels it
+interrupted and unevaluated, and requires two acknowledgements: the snapshot
+may be worse than the starting policy, and its receipt was reconstructed after
+the interruption. It transfers exactly actor + critic; optimizer, counters,
+exploration state, and resume claims reset. No file path is accepted from the
+browser.
+
+The worker must re-resolve the opaque receipt, reproduce the exact policy
+contract, and emit an unadapted `warm_start_loaded` for exactly one actor and
+one critic from the cached SHA above. Actual loaded path/bytes are re-hashed.
+Missing, duplicate, extra, adapted, or lineage-rejected evidence quarantines
+outputs and errors the run even if the subprocess exits zero.
+
+The next visible launch should keep the existing jump goal and use one outer
+cycle, 750 PPO iterations, 1,024 envs on `cuda:0`, seed 42, two 1,200-step
+1920x1080 rollouts, precommitted evidence environment 10, Auto, `gen_001`
+observe-only, and exact promoted recovery off. Do not call PPO-50 evaluated or
+successful. Do not edit reload-watched core or run a GPU audit once the worker
+is live.
+
+## Iter 2 physical baseline and phase-correct jump continuation
+
+The fresh project's first completed/evaluated continuation checkpoint is iter
+2, SHA-256
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`.
+The visible evaluation-only UI job was `job_8b81d661ef49b31f`. Its evaluation
+tuple is selection v8 / tuple
+`f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`,
+reward v2 SHA
+`22fc7521463f9f62d0844d026ef53194c7c4a70a47b29f8c11efdd18e499bfa5`,
+and env v1 SHA
+`d0c4d54e1e7d527ff41f418d15443ecab60fee036ad06ff2b60204bac21d8703`.
+The older checkpoint-training tuple in `artifact_tuple.json` is lineage, not
+the evaluation tuple; keep those two labels distinct.
+
+The immutable 64-lane trajectory is diagnostic, not successful: 17/64 lanes
+reached raw index 5 and JUMP, none reached HOLD or authored success, 58/64 were
+contact-free, no lane had the required three-frame bilateral air event, and
+the maximum apex gain was only `0.01083 m`. Lane 10 was contact-free and
+reached index 5 at frame 986, but had only 13 JUMP frames, no measurable jump,
+`0.149 m/s` final horizontal speed, pose RMS `0.672`, and zero strict hold
+frames. The scene itself is exact after env-origin subtraction. `gen_001`'s
+`route_channel=0.99949` is dense travel shaping, not raw route completion; it
+is observe-only, uncalibrated (Spearman 0, trust 0.4), and must never replace
+the physical audit.
+
+Two generic conflicts explain that result. First, the frozen TaskSpec declares
+24 seconds while MjLab's registered G1 default terminated the official
+rollout at 20 seconds. Median JUMP entry was frame 940, leaving only 59 frames,
+so the route, jump, landing, and 100-frame hold conjunction was structurally
+unprovable. TaskSpec termination is now applied to the simulator before route
+scheduling and reasserted after EnvSpec overlays. Second, MjLab's native
+linear-velocity tracker treats vertical velocity as an error against zero;
+with the authored weight/std it nearly cancels the entire launch reward.
+During only a valid typed JUMP phase it now uses the same Gaussian over XY
+error, while grounded-gait priors (`pose`, `foot_clearance`,
+`foot_swing_height`, `body_ang_vel`, `angular_momentum`) are masked. ROUTE,
+HOLD, invalid event sequences, and worlds without this capability remain
+native. Uprightness, yaw tracking, hardware limits when present, action
+smoothness, slip, landing, contact, survival, and terminal-stillness terms stay
+active.
+
+Reject the automatically proposed reward v3/env v2 for the next causal run:
+it simultaneously changes launch height, velocity, weight, and entropy, its
+counterfactual credit is almost entirely ordinary supported gait, and it
+missed the horizon conflict. The next run must keep selection v8 exactly and
+change only the generic runtime arbitration above. Focused compiler/adapter
+verification is 132 passed; scoped Ruff `F,E9`, compileall, and diff check
+pass.
+
+Launch visibly from evaluated project policy iter 2 with actor+critic, one
+750-PPO cycle, 1,024 envs on `cuda:0`, seed 42, two 1,200-step 1920x1080
+rollouts, Auto, `gen_001` observe-only, precommitted evidence environment 10,
+and exact promoted recovery off. Require exact actor+critic load of the SHA
+above, a 24-second runtime-horizon receipt, the JUMP arbitration receipt, and
+PPO iteration 0 before treating training as live. Do not edit reload-watched
+core or run a GPU audit after launch.
+
+The first launch click on clean commit `42a51d4` correctly failed before job
+allocation. Its iter-2 `artifact_tuple.json` names historical source selection
+v4, whose robot descriptor predates the composed-actuator capability, so the
+policy-contract preflight tried to recompile old physics against the current
+registry and reported `robot capability descriptor differs from admission`.
+This did not indicate a target-world mismatch: current selection v8 and the
+runtime descriptor both hash to
+`f74481454e8fdff1f0e646708bacf213669b8957be91c2f6df0a36e0ad57ba8f`.
+
+Iteration policy transfer now separates those authorities without trusting a
+mutable sidecar. The exact historical artifact tuple remains disclosed
+training-attempt lineage. A shortcut is admitted only when the schema-2
+completion marker re-verifies the canonical checkpoint path, exact bytes/SHA,
+iteration/state, and an evaluated tuple identical to the immutable target.
+For iter 2 the marker binds checkpoint SHA
+`fb2357005265dbfbe70278bcb369e84c50e2dfb1b71e2ac2dcbeea8864ba10d0`
+and tuple `f06d4e5477c9b93b8c2551b7871e272c5bdd9f973bfc030dcbc83f1cb8356074`;
+target selection v8 is that exact tuple. The effective-contract sidecar is
+required corroborating evidence, not root authority. Its file hashes to
+`a5257cd4b3240a5fd0be704c0c9ab42c90020a48d5749cbb55cdc06f7f9ce7c0`
+and its canonical contract fingerprint is
+`83b59f111675889b7b1febbd00fbe4459e8b198b07f5d7241ec791fdb0bdd7c0`.
+It must equal the independently rebuilt target contract. Missing or legacy
+completion evidence and markers tied to the disclosed source tuple retain
+strict historical source reconstruction; same-target evidence without the
+sidecar, an unrelated third tuple, and malformed modern evidence fail closed.
+The actual project receipt now produces exact schema-3 actor+critic admission
+with the two contract fingerprints equal. The focused policy-contract suite is
+23 passed.
+
+## Reference-guided demo status (2026-08-23)
+
+No G1 motion in the local library currently has a valid Tier-D certificate, so
+no live UI launch may honestly claim reference following yet. The leading
+candidate is `g1/50009_one_leg_jump_poses_60_jpos` (229 frames at 60 Hz,
+content SHA `92fc2431f99969e0835a91657a040c55a0cfe5db9db536d2daed533a7b9deca0`).
+It must pass the physics-tracking certificate before attachment.
+
+Objective evidence now has additive direct world-space left/right foot-site
+positions. A landing pass must place both feet inside the finish on first
+bilateral contact after flight and retain both there on every later valid
+frame. The reference path is currently an immutable phase-indexed reward, not
+general OGMP policy conditioning: arbitrary reference phase/mode is not yet an
+actor observation, and the policy-only slalom run is not reference-guided.

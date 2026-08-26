@@ -2,9 +2,10 @@ import { useNavigate } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, EmptyState, Sparkline } from "@/components/rs/primitives";
-import { useDashboard, useSystemInfo } from "@/hooks/useDashboard";
+import { useDashboard, useRunningSlugs, useSystemInfo } from "@/hooks/useDashboard";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useProjects } from "@/hooks/useProjects";
+import { projectBadgeStatus } from "@/lib/projectStatus";
 import { formatRelative } from "@/lib/utils";
 import type { JobSummary, ProjectSummary } from "@/lib/types";
 
@@ -35,7 +36,10 @@ const JOB_KIND_LABEL: Record<string, string> = {
   kg_viz_render: "KG graph",
 };
 
-function ProjectCard({ p, onOpen }: { p: ProjectSummary; onOpen: () => void }) {
+function ProjectCard(
+  { p, running, onOpen }:
+  { p: ProjectSummary; running: boolean; onOpen: () => void },
+) {
   return (
     <button className="rs-pcard" onClick={onOpen} aria-label={"Open project " + p.display_name}>
       <div className="rs-pcard-top">
@@ -50,7 +54,9 @@ function ProjectCard({ p, onOpen }: { p: ProjectSummary; onOpen: () => void }) {
             {humanizeSlug(p.library_slug) || (p.env_id ?? "—")}
           </div>
         </div>
-        <Badge status={p.status} />
+        {/* §Ship 37: the card used to read "Draft" for the very project
+            listed as running in Active jobs directly above it. */}
+        <Badge status={projectBadgeStatus(p.status, running)} />
       </div>
       <div className="rs-pcard-foot">
         <div>
@@ -175,6 +181,7 @@ export default function Dashboard() {
   const dash = useDashboard();
   const projects = useProjects();
   const active = dash.data?.active_jobs ?? [];
+  const runningSlugs = useRunningSlugs();
   const list = projects.data ?? [];
   // Recent slice only — the Projects page owns the full list. Duplicating
   // it here made the two pages compete for the same job.
@@ -254,7 +261,12 @@ export default function Dashboard() {
               ) : (
                 <div className="rs-grid-cards">
                   {recent.map((p) => (
-                    <ProjectCard key={p.slug} p={p} onOpen={() => nav(`/projects/${p.slug}`)} />
+                    <ProjectCard
+                      key={p.slug}
+                      p={p}
+                      running={runningSlugs.has(p.slug)}
+                      onOpen={() => nav(`/projects/${p.slug}`)}
+                    />
                   ))}
                   <button className="rs-newcard" onClick={() => nav("/library")}>
                     <Icon name="plus" size={22} />

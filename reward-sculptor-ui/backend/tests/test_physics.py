@@ -873,6 +873,7 @@ def test_mjcf_unavailable_reason_explains_gymnasium_builtin(
     fake = RobotLibrary(entries_by_slug={
         "hopper_gym": RobotEntry(
             slug="hopper_gym",
+            reference_robot="hopper",
             display_name="Hopper (gym)",
             category="Other",
             description="",
@@ -1469,3 +1470,63 @@ def test_motor_limits_route_rejects_pydantic_out_of_range(
         json={"motors": {"j": {"gear_ratio": 99999}}},
     )
     assert r.status_code == 422
+
+
+# ── timing panel (physics vs control rate) ───────────────────────────
+def _write_config(project_dir: Path, task_id: str | None) -> None:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    body = "[adapter]\nclass = \"mjlab\"\n\n[adapter.config]\n"
+    if task_id is not None:
+        body += f'task_id = "{task_id}"\n'
+    (project_dir / "config.toml").write_text(body, encoding="utf-8")
+
+
+def test_timing_is_none_without_a_resolvable_task(tmp_path: Path) -> None:
+    """Unknown must stay unknown. Defaulting to 200/50 Hz would recreate the
+    exact guessing this panel exists to remove."""
+    from backend.services.physics import resolve_timing
+
+    _write_config(tmp_path, None)
+    assert resolve_timing(tmp_path, 0.002) is None
+    _write_config(tmp_path, "Definitely-Not-A-Task")
+    assert resolve_timing(tmp_path, 0.002) is None
+
+
+def test_timing_reports_the_task_rate_and_flags_the_mjcf_override(
+    tmp_path: Path,
+) -> None:
+    """The G1 MJCF compiles to 0.002 s (MuJoCo's default — the XML declares no
+    timestep) while the task trains at 0.005 s. The panel has to report the
+    task's number and say the MJCF one is not what runs."""
+    from backend.services.physics import resolve_timing
+
+    _write_config(tmp_path, "Mjlab-Velocity-Flat-Unitree-G1")
+    t = resolve_timing(tmp_path, 0.002)
+    if t is None:
+        pytest.skip("mjlab not installed")
+    assert t["physics_dt"] == 0.005 and t["physics_hz"] == 200.0
+    assert t["decimation"] == 4
+    assert t["control_dt"] == 0.02 and t["control_hz"] == 50.0
+    assert t["mjcf_timestep"] == 0.002
+    assert t["mjcf_overridden"] is True
+    assert t["findings"] == []          # the shipped G1 timing is clean
+
+
+def test_a_matching_mjcf_timestep_is_not_flagged_as_overridden(
+    tmp_path: Path,
+) -> None:
+    from backend.services.physics import resolve_timing
+
+    _write_config(tmp_path, "Mjlab-Velocity-Flat-Unitree-G1")
+    t = resolve_timing(tmp_path, 0.005)
+    if t is None:
+        pytest.skip("mjlab not installed")
+    assert t["mjcf_overridden"] is False
+
+
+def test_summary_payload_carries_timing_key(tmp_path: Path) -> None:
+    """Serialisation contract — the frontend reads `summary.timing`."""
+    from backend.services.physics import MjcfSummary
+
+    assert "timing" in MjcfSummary().to_dict()
+    assert MjcfSummary().to_dict()["timing"] is None

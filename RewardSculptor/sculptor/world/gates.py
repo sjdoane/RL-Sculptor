@@ -31,6 +31,7 @@ from sculptor.world.compiler import (
     resolve_course,
     resolve_objects,
 )
+from sculptor.world.observation_geometry import height_scan_ray_count
 from sculptor.world.task_spec import validate_task_spec
 from sculptor.world.world_spec import validate_world_spec
 
@@ -209,7 +210,7 @@ def estimate_budget(world: Mapping[str, Any], task: Mapping[str, Any]) -> dict[s
         group, ())) for group in ("desired", "forbidden", "terminate_on"))
     height_scan = task.get("shared", {}).get("observations", {}).get(
         "height_scan", "auto")
-    rays = 45 if height_scan is True or (
+    rays = height_scan_ray_count() if height_scan is True or (
         height_scan == "auto" and terrain.get("kind") == "generator") else 0
     return {
         "geoms": geoms, "contacts": contacts, "rays": rays,
@@ -386,6 +387,41 @@ def _object_radius(resolved: Mapping[str, Any]) -> float:
     return max(map(float, opening)) / 2 + float(nominal.get("post_radius_m", 0.05))
 
 
+def _axis_aligned_box_half_extents(
+    resolved: Mapping[str, Any],
+) -> np.ndarray | None:
+    """Return exact half extents for an unrotated box, else ``None``.
+
+    The general placement gate intentionally uses conservative bounding
+    spheres.  Long, thin, axis-aligned fixtures (rails, lane dividers, low
+    beams) can have disjoint boxes whose spheres overlap, however.  For this
+    common exact case an AABB test is both safer and less conservative; rotated
+    objects retain the existing bounding-sphere fallback.
+    """
+    if resolved.get("shape") != "box":
+        return None
+    nominal = resolved.get("nominal")
+    if not isinstance(nominal, Mapping):
+        return None
+    try:
+        size = np.asarray(nominal["size_m"], dtype=float)
+        quaternion = np.asarray(
+            resolved.get("quaternion_wxyz", (1.0, 0.0, 0.0, 0.0)),
+            dtype=float,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if size.shape != (3,) or quaternion.shape != (4,):
+        return None
+    identity = (
+        abs(abs(float(quaternion[0])) - 1.0) <= 1e-9
+        and float(np.linalg.norm(quaternion[1:])) <= 1e-9
+    )
+    if not identity:
+        return None
+    return size / 2.0
+
+
 def _placement_gate(
     world: Mapping[str, Any], task: Mapping[str, Any],
     compiled: CompiledWorld | None,
@@ -402,8 +438,26 @@ def _placement_gate(
         left_pos = np.asarray(left["position_m"], dtype=float)
         for right_name in names[left_index + 1:]:
             right = objects[right_name]
-            distance = float(np.linalg.norm(
-                left_pos - np.asarray(right["position_m"], dtype=float)))
+            right_pos = np.asarray(right["position_m"], dtype=float)
+            left_half = _axis_aligned_box_half_extents(left)
+            right_half = _axis_aligned_box_half_extents(right)
+            if left_half is not None and right_half is not None:
+                separation = np.abs(left_pos - right_pos)
+                required_axes = left_half + right_half
+                # Touching faces are allowed, matching the prior sphere test's
+                # small penetration tolerance. Any separated axis proves the
+                # boxes do not overlap.
+                if np.any(separation + 1e-4 >= required_axes):
+                    continue
+                violations.append(_violation(
+                    "placement", "object_overlap",
+                    f"shared.objects.{left_name}|{right_name}",
+                    "axis-aligned object boxes overlap",
+                    separation_m=separation.tolist(),
+                    minimum_axis_separation_m=required_axes.tolist(),
+                ))
+                continue
+            distance = float(np.linalg.norm(left_pos - right_pos))
             required = _object_radius(left) + _object_radius(right)
             if distance + 1e-4 < required:
                 violations.append(_violation(

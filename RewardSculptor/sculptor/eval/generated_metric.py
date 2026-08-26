@@ -6,9 +6,10 @@ spec contract in `spec_metrics.py`:
     def compute_spec(arrays, behavior, meta) -> dict[str, float]
         # returns {"spec_score": float in [0,1], ...sub-components}
 
-computed PURELY from the persisted physical rollout arrays (joint_pos,
-joint_vel, projected_gravity_b, root_link_pos_w + behavior.json +
-joint_names) — NEVER from LLM judgment. It is generated from the NL goal,
+computed PURELY from the persisted physical rollout arrays (official
+first-episode validity, joint_pos, joint_vel, projected_gravity_b,
+root_link_pos_w, root_link_ang_vel_b + behavior.json + joint_names) — NEVER
+from LLM judgment. It is generated from the NL goal,
 then put through a validation chain (safety/contract/determinism/bounds +
 a monotonicity audit) and an independent LLM review, and must EARN
 steer-rights via calibration (Spearman vs a hand-authored ground-truth
@@ -121,10 +122,15 @@ REQUIRED_ROLES_ATTR = "REQUIRED_JOINT_ROLES"
 #: spec_metrics.py array contract; kept here as the single allow-list a
 #: generated metric is constrained to.
 _LEGACY_ALLOWED_ARRAYS = (
+    "first_episode_valid_mask",
     "joint_pos",
     "joint_vel",
+    # Ordered-joint RMS deviation from the environment-owned default pose.
+    # Optional for legacy rollouts; metrics must guard it with arrays.get.
+    "default_pose_rms",
     "projected_gravity_b",
     "root_link_pos_w",
+    "root_link_ang_vel_b",
     # §Metric-quality laws (LAW 3/4): per-foot ground contact (T, E) and
     # foot position in the PELVIS frame (T, E, 3) — anterior (x) component
     # is the signed forward-kick direction; the contact schedule
@@ -135,6 +141,11 @@ _LEGACY_ALLOWED_ARRAYS = (
     "right_foot_contact",
     "left_foot_pos_b",
     "right_foot_pos_b",
+    # Optional direct site positions in world coordinates.  These are needed
+    # for exact authored-region containment because pelvis-frame positions and
+    # projected gravity do not determine the robot's world yaw.
+    "left_foot_pos_w",
+    "right_foot_pos_w",
 )
 # Guard the externally-visible legacy tuple while moving its canonical
 # definition to the catalog module shared by compiler and runtime.
@@ -677,6 +688,19 @@ def make_generated_fitness_fn(
     """`fitness_fn(iter_dir) -> float` for a generated metric module —
     scores `iter_dir/rollout` (0.0 on any failure)."""
     module_path = Path(module_path)
+    metric_meta: dict[str, Any] = {}
+    try:
+        loaded_meta = json.loads(
+            (module_path.parent / "meta.json").read_text(encoding="utf-8")
+        )
+        if isinstance(loaded_meta, dict):
+            metric_meta = loaded_meta
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    try:
+        metric_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    except OSError:
+        metric_sha256 = None
 
     def _fitness(iter_dir: Any) -> float:
         result = compute_generated_metric(
@@ -716,6 +740,17 @@ def make_generated_fitness_fn(
     catalog = resolve_channel_catalog(channel_catalog)
     _fitness.channel_catalog_hash = (  # type: ignore[attr-defined]
         catalog.catalog_hash if catalog else None)
+    # Persisted by sculpt.py into each fitness.json. These attributes are
+    # provenance only; they do not grant the generated metric steering rights.
+    _fitness.metric_id = (  # type: ignore[attr-defined]
+        str(metric_meta.get("id") or module_path.parent.name)
+    )
+    _fitness.metric_version = (  # type: ignore[attr-defined]
+        str(metric_meta["version"])
+        if metric_meta.get("version") is not None else None
+    )
+    _fitness.metric_source = "generated"  # type: ignore[attr-defined]
+    _fitness.metric_sha256 = metric_sha256  # type: ignore[attr-defined]
     return _fitness
 
 

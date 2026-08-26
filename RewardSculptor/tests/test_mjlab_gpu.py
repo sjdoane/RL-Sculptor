@@ -124,7 +124,8 @@ def test_tracking_reward_uses_reset_relative_height_on_real_g1(
         }
         reward_path = tmp_path / "tracking_reward.py"
         reward_path.write_text(generate_tracking_residual_reward_source(
-            clip=clip, clip_id="gpu-reset-relative"), encoding="utf-8")
+            clip=clip, clip_id="gpu-reset-relative", robot="g1"),
+            encoding="utf-8")
 
         Term = _build_sculptor_term_class((
             "qpos", "qvel", "base_lin_vel_b", "base_ang_vel_b",

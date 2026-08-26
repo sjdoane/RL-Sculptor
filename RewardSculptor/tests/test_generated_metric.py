@@ -2,6 +2,7 @@
 validation gates. GPU-free; metrics are written to temp .py files."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -25,6 +26,21 @@ def compute_spec(arrays, behavior, meta):
     up = float(np.mean(grav[..., 2] < -0.85))
     speed = 1.0 - float(np.exp(-disp / 2.0))
     return {"spec_score": float(np.clip(speed * up, 0.0, 1.0)), "disp": disp, "up": up}
+'''
+
+GOOD_WITH_DEFAULT_POSE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    grav = arrays.get("projected_gravity_b")
+    default = arrays.get("default_pose_rms")
+    if root is None or grav is None or default is None:
+        return {"spec_score": 0.0}
+    disp = float(np.linalg.norm(
+        root[-1, :, :2].mean(0) - root[0, :, :2].mean(0)))
+    up = float(np.mean(grav[..., 2] < -0.85))
+    terminal = float(np.exp(-np.mean(default[-10:]) / 0.5))
+    speed = 1.0 - float(np.exp(-disp / 2.0))
+    return {"spec_score": float(np.clip(speed * up * terminal, 0.0, 1.0))}
 '''
 
 BAD_IMPORT = '''import os
@@ -230,6 +246,12 @@ def test_validate_good_metric_passes(tmp_path):
     assert s["active"] > s["still"] and s["active"] > s["fallen"]
 
 
+def test_validator_fixtures_supply_default_pose_rms(tmp_path):
+    p = _write(tmp_path, "good_default_pose.py", GOOD_WITH_DEFAULT_POSE)
+    validated = validate_generated_metric(GOOD_WITH_DEFAULT_POSE, p)
+    assert validated["ok"], validated["reasons"]
+
+
 def test_validate_rejects_forbidden_import(tmp_path):
     p = _write(tmp_path, "bi.py", BAD_IMPORT)
     v = validate_generated_metric(BAD_IMPORT, p)
@@ -426,23 +448,28 @@ REQUIRED_JOINT_ROLES = ["left_hip_pitch", "right_hip_pitch", "left_knee", "right
 def compute_spec(arrays, behavior, meta):
     jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
     pg = arrays.get("projected_gravity_b")
-    if jp is None or root is None or pg is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if jp is None or root is None or pg is None or valid is None:
         return {"spec_score": 0.0}
     roles = (meta or {}).get("joint_roles", {}) or {}
     idx = [roles[r] for r in ("left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee") if r in roles]
     if not idx:
         return {"spec_score": 0.0}
-    z = root[..., 2]
-    drop = float(np.mean(z[:5].mean(axis=0) - z.min(axis=0)))               # pelvis dips
-    ret = float(np.mean(np.abs(z[-5:].mean(axis=0) - z[:5].mean(axis=0))))  # and returns
-    rom = float(np.mean(np.max(jp[..., idx], axis=0) - np.min(jp[..., idx], axis=0)))
-    up0 = float(np.mean(pg[:5, ..., 2].mean(axis=0) < -0.85))
-    gate = 1.0
-    gate *= 1.0 if drop > 0.20 else 0.0
-    gate *= 1.0 if ret < 0.08 else 0.0
-    gate *= 1.0 if up0 > 0.7 else 0.0
-    amp = float(np.clip(rom / 1.2, 0.0, 1.0))
-    return {"spec_score": float(np.clip(gate * amp, 0.0, 1.0))}
+    scores = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 10:
+            scores.append(0.0)
+            continue
+        z = root[keep, env, 2]
+        drop = float(z[:5].mean() - z.min())
+        ret = float(abs(z[-5:].mean() - z[:5].mean()))
+        lane_jp = jp[keep, env]
+        rom = float(np.max(lane_jp[:, idx]) - np.min(lane_jp[:, idx]))
+        up0 = float(np.mean(pg[keep[:5], env, 2]) < -0.85)
+        gate = float(drop > 0.20 and ret < 0.08 and up0 > 0.7)
+        scores.append(float(np.clip(gate * rom / 1.2, 0.0, 1.0)))
+    return {"spec_score": float(np.mean(scores))}
 '''
 
 ALL_ZERO = '''def compute_spec(arrays, behavior, meta):
@@ -584,6 +611,10 @@ def test_calibrate_4array_metric_now_passes(tmp_path):
 
 def test_compute_and_resolve_generated_metric(tmp_path):
     p = _write(tmp_path, "good.py", GOOD)
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "id": "generated-weave-stop",
+        "version": "v7",
+    }), encoding="utf-8")
     # synthetic rollout dir: forward-travelling, upright.
     rollout = tmp_path / "rollout"
     rollout.mkdir()
@@ -600,6 +631,10 @@ def test_compute_and_resolve_generated_metric(tmp_path):
     # fitness fn scores iter_dir/rollout.
     fit = make_generated_fitness_fn(p)
     assert fit(tmp_path) == pytest.approx(out["spec_score"])
+    assert fit.metric_id == "generated-weave-stop"
+    assert fit.metric_version == "v7"
+    assert fit.metric_source == "generated"
+    assert fit.metric_sha256 == hashlib.sha256(p.read_bytes()).hexdigest()
     # resolver dispatches a .py path to the generated fitness fn.
     assert resolve_fitness_fn(str(p))(tmp_path) == pytest.approx(out["spec_score"])
     # missing rollout → honest 0.0, never raises.
@@ -709,6 +744,50 @@ def test_generate_objective_metric_rejects_bad_and_retries(tmp_path):
     assert client.messages.creates == 3  # retried up to the cap on failure
 
 
+def test_metric_prompt_requires_raw_exact_continuity() -> None:
+    from sculptor.prompts import load_prompt
+
+    prompt = load_prompt("gen_objective_metric")
+    assert "UNSMOOTHED per-frame signals" in prompt
+    assert "must never bridge a violating frame" in prompt
+    assert "A stated frame count is exact" in prompt
+    assert "NEVER cap, scale, shorten" in prompt
+    assert "first_episode_valid_mask" in prompt
+    assert "Invalid reset/settling/padding frames may not start" in prompt
+    assert "runs may never bridge an invalid sample" in prompt
+    assert "use `root_link_ang_vel_b`" in prompt
+    assert "ALL columns of `joint_vel`" in prompt
+
+
+def test_validation_retry_feedback_is_cumulative(tmp_path, monkeypatch) -> None:
+    import sculptor.eval.metric_gen as metric_gen
+
+    validation_results = iter([
+        {"ok": False, "reasons": ["[continuous-hold] preserve this failure"]},
+        {"ok": False, "reasons": ["[channel-catalog] fix this too"]},
+        {"ok": False, "reasons": ["[nondegeneracy] final failure"]},
+    ])
+
+    monkeypatch.setattr(
+        metric_gen,
+        "validate_generated_metric",
+        lambda *args, **kwargs: next(validation_results),
+    )
+    client = _CycleClient(GOOD, GOOD, GOOD)
+    record = metric_gen.generate_objective_metric(
+        "hold 100 uninterrupted frames",
+        tmp_path / "cumulative-feedback",
+        client=client,
+        max_attempts=3,
+        review=False,
+    )
+
+    assert not record["accepted"]
+    assert "[continuous-hold] preserve this failure" in client.messages.users[1]
+    assert "[continuous-hold] preserve this failure" in client.messages.users[2]
+    assert "[channel-catalog] fix this too" in client.messages.users[2]
+
+
 def test_generate_objective_metric_review_can_veto(tmp_path):
     from sculptor.eval.metric_gen import generate_objective_metric
     # validation passes but the reviewer rejects → not accepted.
@@ -794,10 +873,18 @@ def test_generate_emits_regenerating_on_validation_failure(tmp_path):
 COARSE_DIP = '''import numpy as np
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
-    if root is None:
+    valid = arrays.get("first_episode_valid_mask")
+    if root is None or valid is None:
         return {"spec_score": 0.0}
-    z = root[..., 2]; drop = float(np.mean(z[:6].mean(0) - z.min(0)))
-    return {"spec_score": 1.0 if drop > 0.20 else 0.0}
+    passed = []
+    for env in range(root.shape[1]):
+        keep = np.flatnonzero(valid[:, env])
+        if keep.size < 7:
+            passed.append(False)
+            continue
+        z = root[keep, env, 2]
+        passed.append(bool(z[:6].mean() - z.min() > 0.20))
+    return {"spec_score": float(np.mean(passed))}
 '''
 
 
@@ -1072,18 +1159,26 @@ def test_sample_source_raises_on_max_tokens_truncation():
         content = [type("B", (), {"type": "text",
                    "text": "```python\ndef compute_spec(a, b, m): return {'spec_score': 0.0}\n```"})()]
 
+    seen = {}
+
+    class _MessagesOk:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return _Ok()
+
     class _ClientOk:
-        messages = type("M", (), {"create": lambda self, **kw: _Ok()})()
+        messages = _MessagesOk()
 
     assert "def compute_spec" in _sample_source(_ClientOk(), "sys", "user", model="m")
+    assert seen["max_tokens"] == 32000
+    assert seen["thinking"] == {"type": "adaptive"}
+    assert seen["output_config"] == {"effort": "medium"}
 
 
 def test_graded_discrimination_ranks_and_is_deterministic():
     """The offline selector: a SHARP, smoothly-grading metric out-scores a COARSE
     binary one and a degenerate one, and is byte-deterministic across calls (it must
     add no nondeterminism to selection)."""
-    import numpy as np
-
     from sculptor.eval.generated_metric import inject_joint_roles
     from sculptor.eval.metric_validate import _NAMES_12, graded_discrimination
 
@@ -1112,8 +1207,6 @@ def test_graded_discrimination_is_amplitude_invariant():
     metric (a binary gate returning 5.0) saturates to [1,1,1] and CANNOT out-rank a
     smooth monotone grader on raw output scale — amplitude is an author artifact, not
     discrimination (the review's confirmed mis-rank)."""
-    import numpy as np
-
     from sculptor.eval.generated_metric import inject_joint_roles
     from sculptor.eval.metric_validate import _NAMES_12, graded_discrimination
 

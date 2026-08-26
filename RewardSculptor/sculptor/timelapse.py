@@ -28,6 +28,7 @@ and is wired into the CLI as `sculpt report`.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import re
@@ -35,7 +36,13 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+
+REPORT_RECEIPT_SCHEMA = 1
+REPORT_RECEIPT_NAME = "final_report.receipt.json"
 
 
 # ── Small path helpers ──────────────────────────────────────────────────
@@ -91,10 +98,110 @@ def _find_iter_dirs(runs_dir: Path) -> list[Path]:
         return []
     for d in runs_dir.iterdir():
         m = re.fullmatch(r"iter_(\d+)", d.name)
-        if m and d.is_dir():
+        if m and d.is_dir() and not d.is_symlink():
             dirs.append((int(m.group(1)), d))
     dirs.sort(key=lambda x: x[0])
     return [d for _, d in dirs]
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Hash one plain file, returning ``None`` for missing/linked inputs."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _completion_receipt(iter_dir: Path) -> dict[str, Any] | None:
+    """Verify the modern completion marker and exact phase/checkpoint bytes.
+
+    Legacy rollout/fitness heuristics remain useful for recovery, but reports
+    must not upgrade them into completed scientific iterations. Schema-3
+    verification is delegated to the same CPU/data-only core contract used by
+    the backend, including its request/input/completion manifest relationships.
+    """
+    try:
+        from sculptor.run_manifests import verify_iteration_completion_marker
+
+        return verify_iteration_completion_marker(iter_dir)
+    except Exception:  # noqa: BLE001 - report completion fails closed
+        return None
+
+
+def _completed_iter_dirs(runs_dir: Path) -> list[Path]:
+    return [
+        iter_dir for iter_dir in _find_iter_dirs(runs_dir)
+        if _completion_receipt(iter_dir) is not None
+    ]
+
+
+def _report_claim_inputs(
+    selected_dir: Path,
+    completion: dict[str, Any],
+) -> dict[str, Any]:
+    """Digest the fixed input set behind a selected-policy report claim."""
+    checkpoint = selected_dir / str(completion["checkpoint"])
+    artifact_tuple = _load_json(selected_dir / "artifact_tuple.json")
+    reward_ref = ((artifact_tuple.get("refs") or {}).get("reward") or {})
+    reward_path = reward_ref.get("path")
+    declared_reward_sha = reward_ref.get("sha256")
+    actual_reward_sha = None
+    if isinstance(reward_path, str) and reward_path:
+        project = selected_dir.parent.parent
+        try:
+            reward_candidate = (project / reward_path).resolve(strict=True)
+            if (
+                not (project / reward_path).is_symlink()
+                and reward_candidate.is_relative_to(project.resolve(strict=True))
+            ):
+                actual_reward_sha = _sha256_file(reward_candidate)
+        except (OSError, RuntimeError):
+            actual_reward_sha = None
+    return {
+        "completion_marker_sha256": completion.get("marker_sha256"),
+        "phase_manifests_sha256": completion.get("phase_manifests_sha256"),
+        "checkpoint_sha256": _sha256_file(checkpoint),
+        "artifact_tuple_sha256": _sha256_file(
+            selected_dir / "artifact_tuple.json"
+        ),
+        "selected_reward_path": reward_path,
+        "selected_reward_declared_sha256": declared_reward_sha,
+        "selected_reward_sha256": actual_reward_sha,
+        "fitness_sha256": _sha256_file(selected_dir / "fitness.json"),
+        "metrics_sha256": _sha256_file(selected_dir / "metrics.json"),
+        "behavior_sha256": _sha256_file(
+            selected_dir / "rollout" / "behavior.json"
+        ),
+        "rollout_sha256": _sha256_file(
+            selected_dir / "rollout" / "rollout.mp4"
+        ),
+        "run_context_sha256": _sha256_file(
+            selected_dir / "run_context.json"
+        ),
+        "physical_acceptance_contract_sha256": _sha256_file(
+            selected_dir / "physical_acceptance_contract.json"
+        ),
+        "physical_acceptance_receipt_sha256": _sha256_file(
+            selected_dir / "physical_acceptance_receipt.json"
+        ),
+    }
 
 
 def _iter_number(iter_dir: Path) -> int:
@@ -102,32 +209,69 @@ def _iter_number(iter_dir: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
-def _select_report_iter_dir(iter_dirs: list[Path]) -> Path | None:
-    """Choose the same completed policy the Results UI should foreground.
+def _select_report_iter_dir(
+    project: Path,
+    iter_dirs: list[Path],
+    selection_authority: dict[str, Any] | None,
+) -> Path | None:
+    """Resolve a selected policy only from a byte-bound server authority.
 
-    A diagnosis may create newer reward/environment drafts after training.
-    Report provenance must instead follow an immutable completed policy. Among
-    completed policies with objective fitness, select the highest fitness and
-    break ties toward the newer iteration. Fall back to the newest completed
-    iteration, then the newest directory for legacy projects without markers.
+    Score and recency are deliberately absent.  The backend may issue an
+    authority only after the canonical selection receipt and independent
+    objective proof pass.  Standalone/legacy callers still receive a useful
+    descriptive run-history report, but it contains no ``Selected`` claim.
     """
-    completed: list[Path] = []
-    scored: list[tuple[float, int, Path]] = []
-    for iter_dir in iter_dirs:
-        marker = _load_json(iter_dir / "iteration_complete.json")
-        if marker.get("state") != "completed":
-            continue
-        completed.append(iter_dir)
-        fitness = _load_json(iter_dir / "fitness.json").get("fitness")
-        try:
-            scored.append((float(fitness), _iter_number(iter_dir), iter_dir))
-        except (TypeError, ValueError):
-            pass
-    if scored:
-        return max(scored, key=lambda item: (item[0], item[1]))[2]
-    if completed:
-        return completed[-1]
-    return iter_dirs[-1] if iter_dirs else None
+    if not isinstance(selection_authority, dict):
+        return None
+    selected = selection_authority.get("selected_iter_index")
+    selection_sha = selection_authority.get("selection_receipt_sha256")
+    checkpoint_sha = selection_authority.get("selected_checkpoint_sha256")
+    objective_sha = selection_authority.get("objective_evidence_sha256")
+    objective_receipt = selection_authority.get("objective_evidence_receipt")
+    claim_inputs = selection_authority.get("claim_inputs")
+    claim_inputs_sha = selection_authority.get("claim_inputs_sha256")
+    authority_status = selection_authority.get("status")
+    authority_digest = selection_authority.get("authority_digest")
+    unsigned = {
+        key: value for key, value in selection_authority.items()
+        if key != "authority_digest"
+    }
+    if (
+        authority_status != "verified"
+        or type(selected) is not int
+        or not isinstance(selection_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", selection_sha) is None
+        or not isinstance(checkpoint_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha) is None
+        or not isinstance(objective_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", objective_sha) is None
+        or not isinstance(objective_receipt, dict)
+        or objective_receipt.get("objective_proof_status") != "passed"
+        or objective_sha != _canonical_digest(objective_receipt)
+        or not isinstance(claim_inputs, dict)
+        or not isinstance(claim_inputs_sha, str)
+        or claim_inputs_sha != _canonical_digest(claim_inputs)
+        or not isinstance(authority_digest, str)
+        or authority_digest != _canonical_digest(unsigned)
+        or _sha256_file(project / "reports" / "selection.json") != selection_sha
+    ):
+        return None
+    matches = [d for d in iter_dirs if _iter_number(d) == selected]
+    if len(matches) != 1:
+        return None
+    selected_dir = matches[0]
+    completion = _completion_receipt(selected_dir)
+    if completion is None:
+        return None
+    current_claim_inputs = _report_claim_inputs(selected_dir, completion)
+    if (
+        claim_inputs != current_claim_inputs
+        or checkpoint_sha != completion.get("checkpoint_sha256")
+        or current_claim_inputs.get("selected_reward_declared_sha256")
+        != current_claim_inputs.get("selected_reward_sha256")
+    ):
+        return None
+    return selected_dir
 
 
 def _load_selected_reward_spec(
@@ -140,10 +284,26 @@ def _load_selected_reward_spec(
         artifact_tuple = _load_json(selected_iter_dir / "artifact_tuple.json")
         reward_ref = ((artifact_tuple.get("refs") or {}).get("reward") or {})
         reward_rel = reward_ref.get("path")
-        if isinstance(reward_rel, str) and reward_rel:
-            candidate = (project / reward_rel).resolve()
-            project_root = project.resolve()
-            if candidate.is_relative_to(project_root) and candidate.is_file():
+        reward_sha = reward_ref.get("sha256")
+        if (
+            isinstance(reward_rel, str)
+            and reward_rel
+            and isinstance(reward_sha, str)
+            and re.fullmatch(r"[0-9a-f]{64}", reward_sha) is not None
+        ):
+            raw_candidate = project / reward_rel
+            try:
+                candidate = raw_candidate.resolve(strict=True)
+                project_root = project.resolve(strict=True)
+            except (OSError, RuntimeError):
+                candidate = raw_candidate
+                project_root = project.resolve()
+            if (
+                not raw_candidate.is_symlink()
+                and candidate.is_relative_to(project_root)
+                and candidate.is_file()
+                and _sha256_file(candidate) == reward_sha
+            ):
                 return _load_reward_spec(candidate)
     return _load_final_reward_spec(rewards_dir)
 
@@ -478,14 +638,16 @@ def _write_final_report_md(
 
     first_iter = iter_dirs[0] if iter_dirs else None
     last_iter = selected_iter_dir or (iter_dirs[-1] if iter_dirs else None)
+    selection_claimed = selected_iter_dir is not None
     first_behavior = _load_json(first_iter / "rollout" / "behavior.json") if first_iter else {}
     last_behavior = _load_json(last_iter / "rollout" / "behavior.json") if last_iter else {}
 
-    starting_metric = metric_history[0] if metric_history else None
-    selected_position = (
-        iter_dirs.index(last_iter)
-        if last_iter is not None and last_iter in iter_dirs
-        else len(iter_dirs) - 1
+    first_index = _iter_number(first_iter) if first_iter is not None else -1
+    selected_position = _iter_number(last_iter) if last_iter is not None else -1
+    starting_metric = (
+        metric_history[first_index]
+        if 0 <= first_index < len(metric_history)
+        else None
     )
     ending_metric = (
         metric_history[selected_position]
@@ -519,7 +681,7 @@ def _write_final_report_md(
 
     # Summary table rows
     summary_rows: list[dict] = []
-    for position, d in enumerate(iter_dirs):
+    for d in iter_dirs:
         m = re.fullmatch(r"iter_(\d+)", d.name)
         if not m:
             continue
@@ -532,8 +694,8 @@ def _write_final_report_md(
         summary_rows.append({
             "iter": i,
             "metric": (
-                metric_history[position]
-                if position < len(metric_history)
+                metric_history[i]
+                if i < len(metric_history)
                 else None
             ),
             "num_references_added": n_refs,
@@ -547,6 +709,16 @@ def _write_final_report_md(
     lines.append(f"- **Adapter**: `{adapter_class}`")
     lines.append(f"- **Project**: `{project}`")
     lines.append(f"- **Iterations completed**: {len(iter_dirs)}")
+    if selection_claimed:
+        lines.append(
+            "- **Selection authority**: canonical receipt + independent "
+            "objective proof verified"
+        )
+    else:
+        lines.append(
+            "- **Selection authority**: unavailable — this is descriptive run "
+            "history and makes no selected-policy or task-success claim"
+        )
     lines.append(
         f"- **Primary metric (`{primary_key}`)**: "
         f"{starting_metric:+.4f} → {ending_metric:+.4f} "
@@ -554,7 +726,11 @@ def _write_final_report_md(
         if starting_metric is not None and ending_metric is not None
         else f"- **Primary metric (`{primary_key}`)**: n/a"
     )
-    lines.append(f"- **Selected policy reward module**: "
+    reward_label = (
+        "Selected policy reward module"
+        if selection_claimed else "Latest completed-run reward module"
+    )
+    lines.append(f"- **{reward_label}**: "
                  f"[`rewards/{final_reward_path.name}`](rewards/{final_reward_path.name})  "
                  f"(version `{final_reward_spec.get('version', '?')}`)")
     video_status = "[final.mp4](" + str(final_mp4_path.as_posix()) + ")" if final_mp4_ok else \
@@ -566,7 +742,8 @@ def _write_final_report_md(
     lines.append(f"**Starting** (iter {_iter_number(first_iter) if first_iter else '?'}): "
                  f"{_describe_behavior(first_behavior, behavior_metric_names)}")
     lines.append("")
-    lines.append(f"**Selected** (iter {_iter_number(last_iter) if last_iter else '?'}): "
+    ending_label = "Selected" if selection_claimed else "Latest completed (not selected)"
+    lines.append(f"**{ending_label}** (iter {_iter_number(last_iter) if last_iter else '?'}): "
                  f"{_describe_behavior(last_behavior, behavior_metric_names)}\n")
 
     # Top 3 most impactful edits
@@ -655,6 +832,228 @@ def _write_final_report_md(
     return out
 
 
+def _tracked_file(path: Path, root: Path) -> dict[str, Any]:
+    """Stable identity for an input that may legitimately be absent."""
+    digest = _sha256_file(path)
+    try:
+        relpath = path.relative_to(root).as_posix()
+    except ValueError:
+        relpath = path.name
+    size = None
+    if digest is not None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            digest = None
+    return {"path": relpath, "sha256": digest, "bytes": size}
+
+
+def _iteration_input_snapshot(iter_dir: Path, root: Path) -> dict[str, Any]:
+    completion = _completion_receipt(iter_dir)
+    if completion is None:  # defensive; callers pre-filter
+        raise ValueError(f"iteration is not attested complete: {iter_dir}")
+    checkpoint = iter_dir / str(completion["checkpoint"])
+    tracked = [
+        iter_dir / "iteration_complete.json",
+        checkpoint,
+        iter_dir / "artifact_tuple.json",
+        iter_dir / "fitness.json",
+        iter_dir / "metrics.json",
+        iter_dir / "reward_spec.json",
+        iter_dir / "diagnosis.json",
+        iter_dir / "run_context.json",
+        Path(str(checkpoint) + ".policy_contract.json"),
+        iter_dir / "physical_acceptance_contract.json",
+        iter_dir / "physical_acceptance_receipt.json",
+        iter_dir / "rollout" / "behavior.json",
+        iter_dir / "rollout" / "trajectory.npz",
+        iter_dir / "rollout" / "rollout.mp4",
+    ]
+    return {
+        "iter_index": completion["iter_index"],
+        "completion": completion,
+        "files": [_tracked_file(path, root) for path in tracked],
+    }
+
+
+def _single_project_input_snapshot(project: Path) -> dict[str, Any]:
+    completed = _completed_iter_dirs(project / "runs")
+    reward_files = sorted(
+        (
+            path for path in (project / "rewards").glob("v*.py")
+            if re.fullmatch(r"v\d+\.py", path.name)
+        ),
+        key=lambda path: int(path.stem[1:]),
+    ) if (project / "rewards").is_dir() else []
+    return {
+        "config": _tracked_file(project / "config.toml", project),
+        "selection": _tracked_file(
+            project / "reports" / "selection.json", project,
+        ),
+        "metric_history": _tracked_file(
+            project / "reports" / "metric_history.json", project,
+        ),
+        "provenance": _tracked_file(
+            project / "reports" / "provenance.json", project,
+        ),
+        "rewards": [_tracked_file(path, project) for path in reward_files],
+        "iterations": [
+            _iteration_input_snapshot(iter_dir, project)
+            for iter_dir in completed
+        ],
+    }
+
+
+def report_input_snapshot(
+    source_root: Path | str,
+    *,
+    source_kind: str = "project",
+) -> dict[str, Any]:
+    """Return the exact report inputs used for staleness detection."""
+    root = Path(source_root).resolve()
+    if source_kind == "project":
+        return {
+            "schema": REPORT_RECEIPT_SCHEMA,
+            "source_kind": "project",
+            "project": _single_project_input_snapshot(root),
+        }
+    if source_kind != "mission":
+        raise ValueError(f"unknown report source kind: {source_kind!r}")
+    stages_root = root / "stages"
+    stages: list[dict[str, Any]] = []
+    if stages_root.is_dir():
+        for stage_dir in sorted(stages_root.iterdir(), key=lambda p: p.name):
+            if stage_dir.is_dir() and not stage_dir.is_symlink():
+                stages.append({
+                    "stage": stage_dir.name,
+                    "inputs": _single_project_input_snapshot(stage_dir),
+                })
+    return {
+        "schema": REPORT_RECEIPT_SCHEMA,
+        "source_kind": "mission",
+        "mission": _tracked_file(root / "mission.json", root),
+        "stages": stages,
+    }
+
+
+def _write_report_receipt(
+    source_root: Path,
+    *,
+    source_kind: str,
+    report_path: Path,
+    mp4_path: Path,
+    selection_authority: dict[str, Any] | None,
+) -> Path:
+    snapshot = report_input_snapshot(source_root, source_kind=source_kind)
+    selected = (
+        selection_authority.get("selected_iter_index")
+        if isinstance(selection_authority, dict)
+        and selection_authority.get("status") == "verified"
+        else None
+    )
+    receipt = {
+        "schema": REPORT_RECEIPT_SCHEMA,
+        "source_kind": source_kind,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "report_sha256": _sha256_file(report_path),
+        "final_mp4_sha256": _sha256_file(mp4_path),
+        "input_snapshot": snapshot,
+        "input_digest": _canonical_digest(snapshot),
+        "claim": {
+            "status": "verified" if selected is not None else "descriptive_only",
+            "selected_iter_index": selected,
+            "selection_authority_digest": (
+                selection_authority.get("authority_digest")
+                if selected is not None else None
+            ),
+            "selection_receipt_sha256": (
+                selection_authority.get("selection_receipt_sha256")
+                if selected is not None else None
+            ),
+            "objective_evidence_sha256": (
+                selection_authority.get("objective_evidence_sha256")
+                if selected is not None else None
+            ),
+            "objective_evidence_receipt": (
+                selection_authority.get("objective_evidence_receipt")
+                if selected is not None else None
+            ),
+            "claim_inputs": (
+                selection_authority.get("claim_inputs")
+                if selected is not None else None
+            ),
+            "claim_inputs_sha256": (
+                selection_authority.get("claim_inputs_sha256")
+                if selected is not None else None
+            ),
+        },
+    }
+    receipt_path = source_root / "reports" / REPORT_RECEIPT_NAME
+    receipt_path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False),
+        encoding="utf-8",
+    )
+    return receipt_path
+
+
+def inspect_report_state(
+    source_root: Path | str,
+    *,
+    source_kind: str = "project",
+) -> dict[str, Any]:
+    """Classify a retained report as missing/current/stale, fail closed."""
+    root = Path(source_root).resolve()
+    report_path = root / "reports" / "final_report.md"
+    if not report_path.is_file() or report_path.is_symlink():
+        return {
+            "state": "missing", "reason": "report has not been built",
+            "claim_status": "unavailable", "selected_iter_index": None,
+        }
+    receipt_path = root / "reports" / REPORT_RECEIPT_NAME
+    receipt = _load_json(receipt_path)
+    if not isinstance(receipt, dict) or receipt.get("schema") != REPORT_RECEIPT_SCHEMA:
+        return {
+            "state": "stale",
+            "reason": "retained report predates input-bound report receipts",
+            "claim_status": "unavailable",
+            "selected_iter_index": None,
+        }
+    claim = receipt.get("claim")
+    claim = claim if isinstance(claim, dict) else {}
+    base = {
+        "claim_status": claim.get("status", "unavailable"),
+        "selected_iter_index": claim.get("selected_iter_index"),
+        "generated_at": receipt.get("generated_at"),
+    }
+    if (
+        receipt.get("source_kind") != source_kind
+        or receipt.get("report_sha256") != _sha256_file(report_path)
+        or receipt.get("final_mp4_sha256")
+        != _sha256_file(root / "reports" / "final.mp4")
+    ):
+        return {
+            "state": "stale",
+            "reason": "report bytes or source identity differ from its receipt",
+            **base,
+        }
+    try:
+        current = report_input_snapshot(root, source_kind=source_kind)
+        current_digest = _canonical_digest(current)
+    except Exception as exc:  # noqa: BLE001 - status reads fail closed
+        return {
+            "state": "stale",
+            "reason": f"current report inputs could not be verified: {type(exc).__name__}",
+            **base,
+        }
+    if receipt.get("input_digest") != current_digest:
+        return {
+            "state": "stale",
+            "reason": "selection, evidence, run, reward, or artifact inputs changed",
+            **base,
+        }
+    return {"state": "current", "reason": None, **base}
+
+
 # ── Public entry ────────────────────────────────────────────────────────
 @dataclass
 class ReportResult:
@@ -663,10 +1062,15 @@ class ReportResult:
     final_report_md_path: Path
     ffmpeg_stderr: str = ""
     selected_iter_indices: list[int] = dataclasses.field(default_factory=list)
+    report_receipt_path: Path | None = None
+    report_claim_status: str = "descriptive_only"
 
 
 def build_report(
-    config_path: Path | str, out_mp4: Path | str,
+    config_path: Path | str,
+    out_mp4: Path | str,
+    *,
+    selection_authority: dict[str, Any] | None = None,
 ) -> ReportResult:
     """Produce final.mp4 + final_report.md. `config_path` is a Sculptor
     project config.toml; `out_mp4` is where the video is written."""
@@ -675,7 +1079,7 @@ def build_report(
     project = config_path.parent
     runs_dir = project / "runs"
     rewards_dir = project / "rewards"
-    iter_dirs = _find_iter_dirs(runs_dir)
+    iter_dirs = _completed_iter_dirs(runs_dir)
 
     # Ferret out behavior_goal. Prefer the latest iteration's diagnosis.json,
     # fall back to [target].name in config.
@@ -692,10 +1096,11 @@ def build_report(
     metric_history_obj = _load_json(project / "reports" / "metric_history.json")
     metric_history: list[float] = list(metric_history_obj.get("history", []))
 
-    # The Results UI foregrounds a completed policy, not a later diagnosis
-    # draft. Keep report behavior/reward provenance attached to that policy's
-    # immutable artifact tuple.
-    selected_iter_dir = _select_report_iter_dir(iter_dirs)
+    # A selected-policy claim is earned only by the byte-bound authority the
+    # backend issues after canonical selection + objective-proof verification.
+    selected_iter_dir = _select_report_iter_dir(
+        project, iter_dirs, selection_authority,
+    )
     final_reward_path, final_reward_spec = _load_selected_reward_spec(
         project, selected_iter_dir, rewards_dir)
 
@@ -703,22 +1108,26 @@ def build_report(
     provenance = _load_json(project / "reports" / "provenance.json") or {}
 
     # Select iters for the video + gather label info
-    selected = _select_iter_indices(len(iter_dirs))
+    selected_positions = _select_iter_indices(len(iter_dirs))
+    selected = [_iter_number(iter_dirs[position]) for position in selected_positions]
     primary_key = str((cfg.get("iteration", {}) or {})
                       .get("primary_metric", "mean_return"))
 
     panel_videos: list[Path] = []
     panel_labels: list[str] = []
-    for idx in selected:
-        d = iter_dirs[idx]
+    for position in selected_positions:
+        d = iter_dirs[position]
+        iter_number = _iter_number(d)
         mp4 = d / "rollout" / "rollout.mp4"
         if not _probe_video_ok(mp4):
             sys.stderr.write(
-                f"[report] iter_{idx}'s rollout.mp4 missing or too small "
+                f"[report] iter_{iter_number}'s rollout.mp4 missing or too small "
                 f"({mp4}); dropping from time-lapse.\n")
             continue
-        metric = metric_history[idx] if idx < len(metric_history) else None
-        iter_number = _iter_number(d)
+        metric = (
+            metric_history[iter_number]
+            if 0 <= iter_number < len(metric_history) else None
+        )
         if metric is None:
             label = f"Iter {iter_number}"
         else:
@@ -739,11 +1148,16 @@ def build_report(
         title_png,
         behavior_goal=behavior_goal,
         total_iters=len(iter_dirs),
-        starting_metric=metric_history[0] if metric_history else None,
+        starting_metric=(
+            metric_history[_iter_number(iter_dirs[0])]
+            if iter_dirs
+            and 0 <= _iter_number(iter_dirs[0]) < len(metric_history)
+            else None
+        ),
         ending_metric=(
-            metric_history[iter_dirs.index(selected_iter_dir)]
-            if selected_iter_dir in iter_dirs
-            and iter_dirs.index(selected_iter_dir) < len(metric_history)
+            metric_history[_iter_number(selected_iter_dir or iter_dirs[-1])]
+            if iter_dirs
+            and 0 <= _iter_number(selected_iter_dir or iter_dirs[-1]) < len(metric_history)
             else None
         ),
         primary_key=primary_key,
@@ -785,11 +1199,24 @@ def build_report(
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
         selected_iter_dir=selected_iter_dir,
     )
+    receipt_path = _write_report_receipt(
+        project,
+        source_kind="project",
+        report_path=md_path,
+        mp4_path=out_mp4,
+        selection_authority=(
+            selection_authority if selected_iter_dir is not None else None
+        ),
+    )
 
     return ReportResult(
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
         final_report_md_path=md_path, ffmpeg_stderr=stderr,
         selected_iter_indices=selected,
+        report_receipt_path=receipt_path,
+        report_claim_status=(
+            "verified" if selected_iter_dir is not None else "descriptive_only"
+        ),
     )
 
 
@@ -842,7 +1269,7 @@ def _collect_stage_data(stage_dir: Path) -> _StageReportData:
 
     runs_dir = stage_dir / "runs"
     rewards_dir = stage_dir / "rewards"
-    iter_dirs = _find_iter_dirs(runs_dir)
+    iter_dirs = _completed_iter_dirs(runs_dir)
 
     metric_history_obj = _load_json(stage_dir / "reports" / "metric_history.json")
     metric_history: list[float] = list(metric_history_obj.get("history", []))
@@ -895,8 +1322,16 @@ def _write_mission_report_section(
     iter_dirs = data.iter_dirs
     metric_history = data.metric_history
     primary_key = data.primary_key
-    starting_metric = metric_history[0] if metric_history else None
-    ending_metric = metric_history[-1] if metric_history else None
+    first_index = _iter_number(iter_dirs[0]) if iter_dirs else -1
+    last_index = _iter_number(iter_dirs[-1]) if iter_dirs else -1
+    starting_metric = (
+        metric_history[first_index]
+        if 0 <= first_index < len(metric_history) else None
+    )
+    ending_metric = (
+        metric_history[last_index]
+        if 0 <= last_index < len(metric_history) else None
+    )
 
     lines.append(f"- **Adapter**: `{data.adapter_class}`")
     lines.append(f"- **Iterations completed**: {len(iter_dirs)}")
@@ -916,9 +1351,9 @@ def _write_mission_report_section(
     first_behavior = _load_json(iter_dirs[0] / "rollout" / "behavior.json")
     last_behavior = _load_json(iter_dirs[-1] / "rollout" / "behavior.json")
     lines.append("**Behavior: starting vs ending**\n")
-    lines.append(f"- Starting (iter 0): "
+    lines.append(f"- Starting (iter {first_index}): "
                  f"{_describe_behavior(first_behavior, data.behavior_metric_names)}")
-    lines.append(f"- Ending (iter {len(iter_dirs) - 1}): "
+    lines.append(f"- Ending (iter {last_index}; not a selected-policy claim): "
                  f"{_describe_behavior(last_behavior, data.behavior_metric_names)}\n")
 
     ranked = [e for e in data.edits if e.delta is not None
@@ -945,7 +1380,7 @@ def _write_mission_report_section(
         if not m:
             continue
         i = int(m.group(1))
-        metric = metric_history[i] if i < len(metric_history) else None
+        metric = metric_history[i] if 0 <= i < len(metric_history) else None
         m_s = f"{metric:+.4f}" if isinstance(metric, (int, float)) else "n/a"
         lines.append(f"| {i} | {m_s} |")
     lines.append("")
@@ -1012,21 +1447,28 @@ def _select_mission_panels(
         # panel budget (it already returns ≤3 for n<=... but for larger
         # n it also returns exactly 3, so this cap is defensive).
         selected = _select_iter_indices(n)[:_MAX_PANELS_PER_STAGE]
-        for idx in selected:
-            d = data.iter_dirs[idx]
+        for position in selected:
+            d = data.iter_dirs[position]
+            iter_index = _iter_number(d)
             mp4 = d / "rollout" / "rollout.mp4"
             if not _probe_video_ok(mp4):
                 sys.stderr.write(
-                    f"[mission report] stage {data.stage_name!r} iter_{idx}'s "
+                    f"[mission report] stage {data.stage_name!r} "
+                    f"iter_{iter_index}'s "
                     f"rollout.mp4 missing or too small ({mp4}); dropping "
                     f"from time-lapse.\n")
                 continue
-            metric = (data.metric_history[idx]
-                      if idx < len(data.metric_history) else None)
+            metric = (
+                data.metric_history[iter_index]
+                if 0 <= iter_index < len(data.metric_history) else None
+            )
             if metric is None:
-                label = f"{data.stage_name} · iter {idx}"
+                label = f"{data.stage_name} · iter {iter_index}"
             else:
-                label = f"{data.stage_name} · iter {idx} · {data.primary_key}={metric:+.3f}"
+                label = (
+                    f"{data.stage_name} · iter {iter_index} · "
+                    f"{data.primary_key}={metric:+.3f}"
+                )
             panel_videos.append(mp4)
             panel_labels.append(label)
     return panel_videos, panel_labels
@@ -1091,12 +1533,24 @@ def build_mission_report(
         title_png,
         behavior_goal=mission.goal,
         total_iters=total_iters,
-        starting_metric=(stage_data_ordered[0].metric_history[0]
-                         if stage_data_ordered and stage_data_ordered[0].metric_history
-                         else None),
-        ending_metric=(stage_data_ordered[-1].metric_history[-1]
-                       if stage_data_ordered and stage_data_ordered[-1].metric_history
-                       else None),
+        starting_metric=(
+            stage_data_ordered[0].metric_history[
+                _iter_number(stage_data_ordered[0].iter_dirs[0])
+            ]
+            if stage_data_ordered and stage_data_ordered[0].iter_dirs
+            and _iter_number(stage_data_ordered[0].iter_dirs[0])
+            < len(stage_data_ordered[0].metric_history)
+            else None
+        ),
+        ending_metric=(
+            stage_data_ordered[-1].metric_history[
+                _iter_number(stage_data_ordered[-1].iter_dirs[-1])
+            ]
+            if stage_data_ordered and stage_data_ordered[-1].iter_dirs
+            and _iter_number(stage_data_ordered[-1].iter_dirs[-1])
+            < len(stage_data_ordered[-1].metric_history)
+            else None
+        ),
         primary_key=(first_with_history.primary_key
                     if first_with_history is not None else "mean_return"),
         adapter_class=(stage_data_ordered[0].adapter_class
@@ -1131,6 +1585,13 @@ def build_mission_report(
         mission=mission, mission_dir=mission_dir, stage_data=stage_data,
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
     )
+    receipt_path = _write_report_receipt(
+        mission_dir,
+        source_kind="mission",
+        report_path=md_path,
+        mp4_path=out_mp4,
+        selection_authority=None,
+    )
 
     # selected_iter_indices has no single-run meaning for a mission; report
     # the per-stage-ordered index list flattened (0-based within each
@@ -1140,10 +1601,16 @@ def build_mission_report(
         if data.load_error or not data.iter_dirs:
             continue
         selected_indices.extend(
-            _select_iter_indices(len(data.iter_dirs))[:_MAX_PANELS_PER_STAGE])
+            _iter_number(data.iter_dirs[position])
+            for position in _select_iter_indices(
+                len(data.iter_dirs),
+            )[:_MAX_PANELS_PER_STAGE]
+        )
 
     return ReportResult(
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
         final_report_md_path=md_path, ffmpeg_stderr=stderr,
         selected_iter_indices=selected_indices,
+        report_receipt_path=receipt_path,
+        report_claim_status="descriptive_only",
     )

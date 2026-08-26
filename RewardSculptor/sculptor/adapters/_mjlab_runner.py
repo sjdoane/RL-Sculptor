@@ -23,10 +23,19 @@ reward terms unchanged (useful for the GPU smoke test).
 from __future__ import annotations
 
 import argparse
+from functools import wraps
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
+
+from sculptor.runtime_inputs import (
+    capture_environment_artifacts,
+    capture_reward_module_artifact,
+    environment_artifacts_for_phase,
+)
 
 
 # ── Component capture sink (§7.1 / §7.2 — Eureka-style reward reflection) ──
@@ -58,6 +67,158 @@ _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE = 2.0
 # Command tracking, direct contact, survival, and native realism terms are
 # separate rewards and remain active.
 _CLEARANCE_STAGE_PRIMARY_SCALE = 0.0
+
+
+def _runtime_file_sha256(path: str | Path, *, label: str) -> str:
+    """Hash one runner input/output without interpreting its bytes."""
+    resolved = Path(path).expanduser().resolve()
+    try:
+        data = resolved.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {label} at {resolved}: {exc}") from exc
+    return hashlib.sha256(data).hexdigest()
+
+
+def _capture_runner_reward_artifact(
+    path: str | Path, *, label: str,
+) -> dict[str, Any]:
+    """Capture the loader+selected reward mapping as a fatal runner input."""
+    try:
+        return capture_reward_module_artifact(path)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {label}: {exc}") from exc
+
+
+def _validate_loaded_reward_artifact(
+    reward_module: Any,
+    artifact: Mapping[str, Any],
+) -> None:
+    """Prove a selector actually re-exported its admitted immutable module."""
+    if artifact.get("selection_kind") == "direct":
+        return
+    selected = artifact.get("selected")
+    selected_path = (
+        Path(str(selected.get("path"))).resolve()
+        if isinstance(selected, Mapping) else None
+    )
+    selected_module = getattr(reward_module, "_mod", None)
+    raw_selected_file = getattr(selected_module, "__file__", None)
+    if (
+        selected_path is None
+        or not isinstance(raw_selected_file, str)
+        or Path(raw_selected_file).resolve() != selected_path
+    ):
+        raise RuntimeError(
+            "reward selector did not load its admitted immutable module"
+        )
+    for name in (
+        "compute_reward",
+        "REWARD_SPEC",
+        "compute_reward_batched",
+        "reference_clock_batched",
+        "reference_target_index_batched",
+    ):
+        selected_value = getattr(selected_module, name, None)
+        loader_value = getattr(reward_module, name, None)
+        if selected_value is None:
+            if loader_value is not None:
+                raise RuntimeError(
+                    f"reward selector invents absent selected surface {name}"
+                )
+            continue
+        if loader_value is not selected_value:
+            raise RuntimeError(
+                f"reward selector does not exactly re-export selected {name}"
+            )
+
+
+def _load_explicit_eval_reset(path: str | Path) -> dict[str, Any]:
+    """Load an explicitly requested reset or fail closed.
+
+    Adapter construction validates this file once, but it remains an external
+    file until the rollout subprocess reads it.  A deletion, malformed rewrite,
+    or non-object replacement in that window must abort evaluation rather than
+    silently reverting to the task's default reset.
+    """
+    resolved = Path(path).expanduser().resolve()
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"explicit --eval-reset {resolved} is unreadable/invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"explicit --eval-reset {resolved} must contain a JSON object, "
+            f"got {type(payload).__name__}"
+        )
+    return payload
+
+
+def _apply_runtime_seed(
+    seed: int,
+    *,
+    env_cfg: Any = None,
+    rl_cfg: Any = None,
+) -> dict[str, Any]:
+    """Apply one seed to every runtime RNG before env/runner construction.
+
+    Core RNG failures are fatal: recording a requested integer while leaving a
+    generator unseeded is not reproducibility evidence.  Config objects are
+    marked applied only when they expose a writable ``seed`` field.
+    """
+    import random
+
+    import numpy as np
+    import torch
+
+    normalized = int(seed)
+    if not 0 <= normalized <= 2**32 - 1:
+        raise ValueError(
+            "runtime seed must be an integer in the shared Python/NumPy/"
+            "Torch domain 0..4294967295"
+        )
+    random.seed(normalized)
+    np.random.seed(normalized)
+    torch.manual_seed(normalized)
+
+    env_cfg_applied = False
+    if env_cfg is not None and hasattr(env_cfg, "seed"):
+        try:
+            env_cfg.seed = normalized
+        except Exception as exc:  # noqa: BLE001 - explicit seed must fail closed
+            raise RuntimeError(f"cannot apply seed to environment config: {exc}") from exc
+        env_cfg_applied = True
+
+    rl_cfg_applied = False
+    if rl_cfg is not None and hasattr(rl_cfg, "seed"):
+        try:
+            rl_cfg.seed = normalized
+        except Exception as exc:  # noqa: BLE001 - explicit seed must fail closed
+            raise RuntimeError(f"cannot apply seed to runner config: {exc}") from exc
+        rl_cfg_applied = True
+
+    return {
+        "schema": "reward-sculptor-seed-application-v1",
+        "applied_seed": normalized,
+        "python_random": True,
+        "numpy_global": True,
+        "torch_global": True,
+        "env_cfg": env_cfg_applied,
+        "rl_cfg": rl_cfg_applied,
+    }
+
+# Native locomotion-shaping terms that prescribe a grounded gait or suppress
+# the body dynamics needed for an authored vertical JUMP.  Hardware limits,
+# contact safety, horizontal/yaw command tracking, uprightness, action
+# smoothness, slip, and landing-impact terms intentionally remain active.
+_EVENT_JUMP_MASKED_REALISM_TERMS = frozenset({
+    "pose",
+    "foot_clearance",
+    "foot_swing_height",
+    "body_ang_vel",
+    "angular_momentum",
+})
 
 
 def _install_sculptor_termination_economics(
@@ -104,6 +265,35 @@ def _to_host_numpy(value: Any) -> Any:
     if callable(to_numpy):
         candidate = to_numpy()
     return np.asarray(candidate)
+
+
+def _select_biped_foot_site_positions(
+    site_pos_w: Any,
+    left_index: int,
+    right_index: int,
+) -> tuple[Any, Any] | None:
+    """Select ordered left/right world-space foot-site tensors.
+
+    The helper is backend-neutral: NumPy arrays and simulator tensors both
+    support the indexing operation, and transfer to host memory remains the
+    caller's responsibility.  Malformed or stale site tables fail soft so an
+    adapter without the optional biped evidence keeps its historical rollout
+    surface instead of emitting mislabeled positions.
+    """
+    shape = getattr(site_pos_w, "shape", None)
+    if shape is None or len(shape) != 3 or int(shape[-1]) != 3:
+        return None
+    if (
+        left_index < 0
+        or right_index < 0
+        or left_index == right_index
+        or max(left_index, right_index) >= int(shape[1])
+    ):
+        return None
+    return (
+        site_pos_w[:, left_index, :],
+        site_pos_w[:, right_index, :],
+    )
 
 
 def _record_components(
@@ -240,6 +430,113 @@ def _load_reward_module(path: str) -> Any:
     return mod
 
 
+def _build_reference_clock_observation_class(reward_module: Any):
+    """Bind the policy observation to the exact loaded reward module."""
+    import torch
+
+    from sculptor.reference_clock import (
+        REFERENCE_CLOCK_SOURCE,
+        reference_clock_from_module,
+    )
+
+    descriptor = reference_clock_from_module(reward_module)
+    if descriptor is None:
+        raise ValueError("reward module has no reference clock")
+
+    class ReferenceClockObservationTerm:
+        def __init__(self, cfg, env):  # type: ignore[no-untyped-def]
+            del cfg
+            self._env = env
+            self._module = reward_module
+
+        def __call__(self, env):  # type: ignore[no-untyped-def]
+            like = env.episode_length_buf.to(dtype=torch.float32)
+            step_dt = torch.full_like(like, float(env.step_dt))
+            value = self._module.reference_clock_batched(
+                {
+                    "episode_length": like,
+                    "step_dt": step_dt,
+                },
+                like,
+            )
+            if not torch.is_tensor(value) or tuple(value.shape) != (
+                int(env.num_envs), 1,
+            ):
+                raise RuntimeError(
+                    "reference clock observation must have shape (num_envs, 1)"
+                )
+            if not torch.isfinite(value).all():
+                raise RuntimeError("reference clock observation is non-finite")
+            return value.to(device=env.device, dtype=torch.float32)
+
+    # Policy-contract enumeration records callable names. Pin a stable public
+    # source name instead of a local factory class name.
+    ReferenceClockObservationTerm.__name__ = REFERENCE_CLOCK_SOURCE
+    return ReferenceClockObservationTerm, descriptor
+
+
+def _install_reference_clock_observation(
+    env_cfg: Any,
+    reward_module: Any,
+) -> dict[str, Any] | None:
+    """Append one shared reference phase column to actor and critic groups."""
+    from sculptor.reference_clock import (
+        REFERENCE_CLOCK_TERM,
+        reference_clock_from_module,
+    )
+
+    descriptor = reference_clock_from_module(reward_module)
+    if descriptor is None:
+        return None
+    observations = getattr(env_cfg, "observations", None)
+    if not isinstance(observations, dict):
+        raise RuntimeError(
+            "reference-conditioned policy requires observation groups"
+        )
+    from mjlab.managers.observation_manager import ObservationTermCfg
+
+    term_class, descriptor = _build_reference_clock_observation_class(
+        reward_module
+    )
+    role_aliases = {
+        "actor": {"actor", "policy"},
+        "critic": {"critic", "value"},
+    }
+    present_roles: set[str] = set()
+    all_terms: list[dict[str, Any]] = []
+    for group_name in ("actor", "critic", "policy", "value"):
+        group = observations.get(group_name)
+        terms = getattr(group, "terms", None)
+        if not isinstance(terms, dict):
+            continue
+        all_terms.append(terms)
+        present_roles.update(
+            role for role, aliases in role_aliases.items()
+            if group_name in aliases
+        )
+    missing_roles = sorted({"actor", "critic"} - present_roles)
+    if missing_roles:
+        raise RuntimeError(
+            "reference-conditioned policy requires actor and critic "
+            f"observation groups; missing {missing_roles}"
+        )
+
+    installed_terms: set[int] = set()
+    for terms in all_terms:
+        if id(terms) in installed_terms:
+            continue
+        installed_terms.add(id(terms))
+        if REFERENCE_CLOCK_TERM in terms:
+            raise RuntimeError(
+                f"observation term {REFERENCE_CLOCK_TERM!r} already exists"
+            )
+        terms[REFERENCE_CLOCK_TERM] = ObservationTermCfg(
+            func=term_class,
+            params={},
+        )
+    return descriptor
+
+
 def _cfg_to_dict(cfg: Any) -> dict[str, Any]:
     """Convert a rsl_rl / mjlab config dataclass to a plain dict.
 
@@ -335,6 +632,7 @@ def _motion_quality_info(
 def _build_sculptor_term_class(
     schema_keys: tuple[str, ...], robot_capability: Any | None = None,
     world_bundle: Any | None = None,
+    reward_module: Any | None = None,
 ):
     """Factory for the reward-term class. Kept inside the function so
     heavy imports (mjlab, torch) only happen when the runner is actually
@@ -357,7 +655,7 @@ def _build_sculptor_term_class(
             path = cfg.params["reward_module_path"]
             self._schema_keys = schema_keys
             self._robot_capability = robot_capability
-            mod = _load_reward_module(path)
+            mod = reward_module or _load_reward_module(path)
             if not hasattr(mod, "compute_reward_batched"):
                 raise AttributeError(
                     f"reward module {path!r} missing compute_reward_batched; "
@@ -761,25 +1059,28 @@ def reset_joints_to_reference(
     explicit target vector instead of the standing default + a random
     offset).
 
-    §DeepMimic phase RSI (arXiv 1804.02717): when `joint_pos_traj` ([K, J], K
-    downsampled reference frames) is given INSTEAD of a single `joint_pos_target`,
-    each env samples a random frame k∈[0,K) at reset and initializes from THAT
-    frame — so the batch covers the whole motion manifold, not one posture (the
-    canonical RSI that "enables parallel learning of the motion phases"). When
-    `joint_vel_traj` is also given, the joint VELOCITIES are initialized from the
-    same frame too (a dynamic skill's mid-motion pose is meaningless at rest); the
-    prior single-target path leaves velocity at the default (zeros).
+    Random-frame trajectory RSI is deliberately rejected.  Sampling physical
+    state from frame k while restarting the policy/reward clock at frame zero
+    is not DeepMimic phase RSI.  It remains disabled until one immutable
+    per-environment offset is consumed by reset, actor, critic, and reward.
 
-    `joint_pos_target` / `joint_pos_traj` must already be tensors on `env.device`
-    with one element per joint (J) selected by `asset_cfg` — the caller
-    (`_apply_env_spec`) resolves/validates J against the robot's actual joint
-    count before injecting this event; a mismatch is a clear `ValueError` there,
-    never a silent misassignment here.
+    `joint_pos_target` must already be a tensor with one element per joint (J)
+    selected by `asset_cfg` — the caller (`_apply_env_spec`) resolves/validates
+    J against the robot's actual joint count before injecting this event.  The
+    trajectory parameters are reserved only to produce the explicit failure
+    above; they are not an alternate execution path.
     """
     import torch
 
     from mjlab.managers.scene_entity_config import SceneEntityCfg
     from mjlab.utils.lab_api.math import sample_uniform
+
+    if joint_pos_traj is not None or joint_vel_traj is not None:
+        raise RuntimeError(
+            "random-frame reference trajectory reset is disabled: it does "
+            "not yet install one immutable per-environment phase offset into "
+            "actor, critic, reward target selection, and reset state"
+        )
 
     if asset_cfg is None:
         asset_cfg = SceneEntityCfg("robot")
@@ -792,18 +1093,8 @@ def reset_joints_to_reference(
     soft_joint_pos_limits = asset.data.soft_joint_pos_limits
 
     joint_vel = default_joint_vel[env_ids][:, asset_cfg.joint_ids].clone()
-    if joint_pos_traj is not None:
-        # Phase RSI: per-env random reference frame.
-        pos_traj = joint_pos_traj.to(device=env.device, dtype=torch.float32)
-        k = int(pos_traj.shape[0])
-        frame = torch.randint(0, max(1, k), (n,), device=env.device)
-        joint_pos = pos_traj[frame].clone()                      # [n, J]
-        if joint_vel_traj is not None:
-            vel_traj = joint_vel_traj.to(device=env.device, dtype=torch.float32)
-            joint_vel = vel_traj[frame].clone()                  # [n, J]
-    else:
-        target = joint_pos_target.to(device=env.device, dtype=torch.float32)
-        joint_pos = target.unsqueeze(0).expand(n, -1).clone()
+    target = joint_pos_target.to(device=env.device, dtype=torch.float32)
+    joint_pos = target.unsqueeze(0).expand(n, -1).clone()
     if joint_pos_noise:
         joint_pos = joint_pos + sample_uniform(
             -float(joint_pos_noise), float(joint_pos_noise),
@@ -849,6 +1140,25 @@ def _apply_world_selection(
     return bundle
 
 
+def _reassert_authored_task_termination(
+    env_cfg: Any, world_bundle: Any | None,
+) -> None:
+    """Keep frozen TaskSpec termination authoritative after EnvSpec overlays."""
+    if world_bundle is None:
+        return
+    from sculptor.world.compiler import _reconcile_task_termination
+
+    for adjustment in _reconcile_task_termination(
+        env_cfg, world_bundle.manifest
+    ):
+        print(
+            "[runner] authored-world runtime adjustment reasserted after "
+            f"EnvSpec: {adjustment}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset[str]:
     """Return base reward terms that are part of an authored command contract.
 
@@ -880,6 +1190,208 @@ def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset
     return frozenset()
 
 
+def _authored_event_jump_phase(env: Any) -> Any:
+    """Return valid per-environment JUMP-phase truth from a typed command.
+
+    The compiler's authored event command is the sole owner of ROUTE → JUMP →
+    HOLD state.  Reward arbitration consumes that capability directly instead
+    of inferring takeoff from contacts, robot height, or a task/robot name.
+    Missing or malformed sequence-violation truth fails closed: native reward
+    behavior is retained rather than granting jump-specific shaping after an
+    invalid event.
+    """
+    import torch
+
+    jump_phase = torch.zeros(
+        int(env.num_envs), device=env.device, dtype=torch.bool)
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        return jump_phase
+
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+        except (KeyError, RuntimeError):
+            continue
+        event_sequence_id = str(
+            getattr(term, "event_sequence_id", ""))
+        if not event_sequence_id:
+            continue
+        event_phase = getattr(term, "event_phase", None)
+        event_sequence_violation = getattr(
+            term, "event_sequence_violation", None)
+        if (
+            not torch.is_tensor(event_phase)
+            or tuple(event_phase.shape) != tuple(jump_phase.shape)
+            or not torch.is_tensor(event_sequence_violation)
+            or tuple(event_sequence_violation.shape) != tuple(jump_phase.shape)
+        ):
+            raise RuntimeError(
+                f"authored event command {event_sequence_id!r} exposes "
+                "malformed phase or sequence-violation truth"
+            )
+        jump_phase |= (
+            (event_phase.to(device=env.device, dtype=torch.long) == 1)
+            & ~event_sequence_violation.to(
+                device=env.device, dtype=torch.bool)
+        )
+    return jump_phase
+
+
+def _build_event_jump_linear_velocity_tracker(native_func: Any) -> Any:
+    """Keep authored horizontal tracking without suppressing vertical launch.
+
+    MjLab's native linear-velocity reward assumes commanded Z velocity is zero
+    and therefore includes ``actual_z**2`` in its error.  That is appropriate
+    for ROUTE and HOLD, but it directly rewards staying grounded during an
+    explicitly authored JUMP phase.  Replace only that valid phase's value
+    with the same Gaussian over XY error.  Route, hold, invalid sequences, and
+    environments without the typed capability remain byte-for-byte native.
+    """
+    if getattr(native_func, "_sculptor_event_jump_horizontal_only", False):
+        return native_func
+
+    @wraps(native_func)
+    def event_jump_horizontal_tracker(env: Any, **params: Any) -> Any:
+        import torch
+
+        native_reward = native_func(env, **params)
+        jump_phase = _authored_event_jump_phase(env)
+        if (
+            not torch.is_tensor(native_reward)
+            or tuple(native_reward.shape) != tuple(jump_phase.shape)
+        ):
+            return native_reward
+
+        asset_cfg = params.get("asset_cfg")
+        asset_name = str(getattr(asset_cfg, "name", "robot"))
+        asset = env.scene[asset_name]
+        command = env.command_manager.get_command(params["command_name"])
+        if command is None:
+            raise RuntimeError(
+                f"authored command {params['command_name']!r} is absent"
+            )
+        actual = asset.data.root_link_lin_vel_b
+        xy_error = torch.sum(
+            torch.square(command[:, :2] - actual[:, :2]), dim=1)
+        std = float(params["std"])
+        horizontal_reward = torch.exp(-xy_error / std**2)
+        return torch.where(
+            jump_phase.to(device=native_reward.device),
+            horizontal_reward.to(
+                device=native_reward.device, dtype=native_reward.dtype),
+            native_reward,
+        )
+
+    event_jump_horizontal_tracker._sculptor_event_jump_horizontal_only = True
+    return event_jump_horizontal_tracker
+
+
+def _mask_event_jump_reward(env: Any, value: Any) -> Any:
+    """Zero one native term only on valid authored JUMP lanes."""
+    import torch
+
+    jump_phase = _authored_event_jump_phase(env)
+    if (
+        not torch.is_tensor(value)
+        or value.ndim < 1
+        or int(value.shape[0]) != int(jump_phase.shape[0])
+    ):
+        return value
+    broadcast_shape = (int(jump_phase.shape[0]),) + (1,) * (value.ndim - 1)
+    return torch.where(
+        jump_phase.to(device=value.device).reshape(broadcast_shape),
+        torch.zeros_like(value),
+        value,
+    )
+
+
+def _build_event_jump_masked_reward_term(native_func: Any) -> Any:
+    """Wrap a function or stateful term while preserving native bookkeeping."""
+    import inspect
+
+    if getattr(native_func, "_sculptor_event_jump_masked", False):
+        return native_func
+
+    if inspect.isclass(native_func):
+        class EventJumpMaskedTerm(native_func):  # type: ignore[misc,valid-type]
+            def __call__(self, env: Any, *args: Any, **kwargs: Any) -> Any:
+                value = super().__call__(env, *args, **kwargs)
+                return _mask_event_jump_reward(env, value)
+
+        EventJumpMaskedTerm.__name__ = (
+            f"EventJumpMasked{native_func.__name__}")
+        EventJumpMaskedTerm.__qualname__ = EventJumpMaskedTerm.__name__
+        EventJumpMaskedTerm._sculptor_event_jump_masked = True
+        return EventJumpMaskedTerm
+
+    @wraps(native_func)
+    def event_jump_masked(env: Any, *args: Any, **kwargs: Any) -> Any:
+        value = native_func(env, *args, **kwargs)
+        return _mask_event_jump_reward(env, value)
+
+    event_jump_masked._sculptor_event_jump_masked = True
+    return event_jump_masked
+
+
+def _install_authored_event_jump_linear_tracking(
+    rewards: Mapping[str, Any], world_bundle: Any | None,
+) -> bool:
+    """Install phase-correct linear tracking for ROUTE/JUMP/HOLD programs."""
+    if "track_linear_velocity" not in _full_weight_authored_command_rewards(
+        world_bundle
+    ):
+        return False
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    event_sequence = (
+        task_shared.get("event_sequence")
+        if isinstance(task_shared, Mapping)
+        else None
+    )
+    phases = (
+        event_sequence.get("phases", ())
+        if isinstance(event_sequence, Mapping)
+        else ()
+    )
+    if not (
+        isinstance(phases, (list, tuple))
+        and len(phases) == 3
+        and all(isinstance(phase, Mapping) for phase in phases)
+        and tuple(str(phase.get("id", "")) for phase in phases)
+        == ("route", "jump", "hold")
+    ):
+        return False
+
+    term = rewards.get("track_linear_velocity")
+    native_func = getattr(term, "func", None)
+    if term is None or not callable(native_func):
+        return False
+    if getattr(native_func, "_sculptor_event_jump_horizontal_only", False):
+        return True
+    term.func = _build_event_jump_linear_velocity_tracker(native_func)
+    return True
+
+
+def _install_authored_event_jump_realism_firewall(
+    rewards: Mapping[str, Any], world_bundle: Any | None,
+) -> tuple[str, ...]:
+    """Mask grounded-gait priors only for a valid authored JUMP phase."""
+    if not _install_authored_event_jump_linear_tracking(
+        rewards, world_bundle
+    ):
+        return ()
+    masked: list[str] = []
+    for name in sorted(_EVENT_JUMP_MASKED_REALISM_TERMS):
+        term = rewards.get(name)
+        native_func = getattr(term, "func", None)
+        if term is None or not callable(native_func):
+            continue
+        term.func = _build_event_jump_masked_reward_term(native_func)
+        masked.append(name)
+    return tuple(masked)
+
+
 def _authored_terminal_standing_enabled(world_bundle: Any | None) -> bool:
     """Whether the compiled command contract has a terminal dwell phase."""
     return _authored_terminal_hold_s(world_bundle) > 0.0
@@ -893,10 +1405,24 @@ def _authored_terminal_hold_s(world_bundle: Any | None) -> float:
     task_shared = getattr(manifest, "task_shared", {})
     goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
     success = goal.get("success", {}) if isinstance(goal, Mapping) else {}
+    event_sequence = (
+        task_shared.get("event_sequence")
+        if isinstance(task_shared, Mapping)
+        else None
+    )
     try:
         hold_s = float(success.get("hold_s", 0.0))
     except (TypeError, ValueError):
-        return 0.0
+        hold_s = 0.0
+    if isinstance(event_sequence, Mapping):
+        try:
+            phases = event_sequence["phases"]
+            hold_s = max(
+                hold_s,
+                float(phases[2]["minimum_hold_s"]),
+            )
+        except (KeyError, IndexError, TypeError, ValueError):
+            return 0.0
     return hold_s if hold_s > 0.0 else 0.0
 
 
@@ -945,6 +1471,28 @@ def _reward_module_declares(reward_module_path: Any, key: str) -> bool:
         return bool(isinstance(spec, dict) and spec.get(key))
     except Exception:  # noqa: BLE001 — see docstring
         return False
+
+
+def _reward_spec_tracks_reference(spec: Any) -> bool:
+    """Return the one canonical reference-tracking capability verdict.
+
+    Flat reference rewards predate mode authoring and declare
+    ``reference_tracking``. Mode rewards declare ``tracking_enabled`` because
+    the same scaffold can intentionally be task-only. Those are two wire
+    formats for one runtime fact: an active immutable motion prior makes the
+    task's posture/gait defaults competitors rather than realism priors.
+    """
+    return bool(
+        isinstance(spec, Mapping)
+        and (spec.get("reference_tracking") or spec.get("tracking_enabled"))
+    )
+
+
+def _reward_module_tracks_reference(reward_module: Any) -> bool:
+    """Classify the exact module already loaded for this training run."""
+    return _reward_spec_tracks_reference(
+        getattr(reward_module, "REWARD_SPEC", None)
+    )
 
 
 def _authored_terminal_stillness_weight(
@@ -1171,6 +1719,29 @@ def _authored_terminal_stillness_state(
         try:
             term = manager.get_term(name)
         except (KeyError, AttributeError):
+            continue
+        event_sequence_id = getattr(term, "event_sequence_id", "")
+        event_phase = getattr(term, "event_phase", None)
+        if event_sequence_id:
+            # Event-authored tasks earn terminal supervision only in their
+            # immutable HOLD phase.  Do not trust a generic standing flag for
+            # this path: it may also be true during route-retention command
+            # completion, which is intentionally distinct from phase truth.
+            violation = getattr(term, "event_sequence_violation", None)
+            if (
+                not torch.is_tensor(event_phase)
+                or tuple(event_phase.shape) != tuple(standing.shape)
+                or not torch.is_tensor(violation)
+                or tuple(violation.shape) != tuple(standing.shape)
+            ):
+                raise RuntimeError(
+                    "event terminal stillness requires shape-validated "
+                    "phase and sequence-violation truth"
+                )
+            standing |= (
+                (event_phase.to(device=env.device, dtype=torch.long) == 2)
+                & ~violation.to(device=env.device, dtype=torch.bool)
+            )
             continue
         flag = getattr(term, "is_standing_env", None)
         if flag is not None and tuple(flag.shape) == tuple(standing.shape):
@@ -1559,7 +2130,7 @@ _DEFAULT_PHYSICS_DR: dict[str, tuple[float, float]] = {
 
 
 def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
-                    train: bool = True, task_id: str = "") -> None:
+                    train: bool = True, task_id: str = "") -> dict[str, Any]:
     """§RL_SCULPTOR_AUDIT (env generalization, 2026-07-04): apply a
     validated env spec to the loaded task cfg, before the env is built.
     General successor to the retired jump-only `_apply_env_profile` —
@@ -1591,7 +2162,14 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         # spec still gets the always-on physics DR below — the "in any case"
         # guarantee that every training run/stage is domain-randomized.
         if not train:
-            return
+            return {
+                "schema": "reward-sculptor-env-spec-application-v1",
+                "phase": "rollout",
+                "requested": [],
+                "applied": [],
+                "dead": [],
+                "errors": [],
+            }
         spec = {}
     import math
 
@@ -1609,8 +2187,10 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         for _k, _v in _DEFAULT_PHYSICS_DR.items():
             train_sec.setdefault(_k, _v)
     applied: list[str] = []
+    application_errors: list[str] = []
 
     def _skip(what: str, e: Exception) -> None:
+        application_errors.append(f"{what}: {type(e).__name__}: {e}")
         print(f"[runner] env-spec: {what} skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
@@ -1796,22 +2376,26 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     # a silent misassignment): the caller already validated the spec
     # schema-wise, but "does this vector match THIS robot" is a
     # robot-specific check the schema layer cannot make.
-    # §DeepMimic phase RSI (arXiv 1804.02717): a full downsampled reference
-    # TRAJECTORY (reset_joint_pos_trajectory [K][J], + optional _vel_) takes
-    # precedence over the single median posture — the reset event then samples a
-    # random frame per env and initializes joint pos AND vel from it, so the
-    # batch covers the whole motion manifold instead of one pose.
+    # A full trajectory cannot be installed honestly yet.  The historical
+    # implementation sampled frame k for physical state but restarted actor,
+    # critic and reward at phase zero.  Fail before environment construction;
+    # the fixed target remains the only supported reference-posture reset.
     jpt = train_sec.get("reset_joint_pos_target")
     jpt_traj = train_sec.get("reset_joint_pos_trajectory")
     jvt_traj = train_sec.get("reset_joint_vel_trajectory")
     jpt_noise = train_sec.get("reset_joint_pos_noise_rad")
-    if jpt is not None or jpt_traj is not None:
+    if jpt_traj is not None or jvt_traj is not None:
+        raise RuntimeError(
+            "reference trajectory RSI is not an executable training "
+            "capability until reset, actor, critic, and reward share one "
+            "immutable per-environment phase offset; use the fixed "
+            "reset_joint_pos_target path"
+        )
+    if jpt is not None:
         try:
             from sculptor.eval.robot_manifest import robot_joint_names
 
-            # Joint width comes from the trajectory's frames when present, else
-            # the single target.
-            width = len(jpt_traj[0]) if jpt_traj is not None else len(jpt)
+            width = len(jpt)
             canonical = robot_joint_names(task_id)
             if canonical is not None and width != len(canonical):
                 raise ValueError(
@@ -1830,32 +2414,9 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                     "asset_cfg": SceneEntityCfg(
                         _primary_robot_entity(env_cfg), joint_names=(".*",)),
                 }
-                if jpt_traj is not None:
-                    params["joint_pos_traj"] = torch.tensor(
-                        [[float(x) for x in frame] for frame in jpt_traj],
-                        dtype=torch.float32)
-                    # Only carry the velocity trajectory when its shape matches
-                    # (same K frames, same J) — the reset event indexes it with a
-                    # frame sampled from the position traj, so a mismatch would
-                    # crash at reset. A validated spec can't reach here mismatched;
-                    # this is the defensive backstop for an unvalidated caller.
-                    vel_ok = (jvt_traj is not None
-                              and len(jvt_traj) == len(jpt_traj)
-                              and len(jvt_traj[0]) == width)
-                    if vel_ok:
-                        params["joint_vel_traj"] = torch.tensor(
-                            [[float(x) for x in frame] for frame in jvt_traj],
-                            dtype=torch.float32)
-                    elif jvt_traj is not None:
-                        _skip("phase-RSI velocity trajectory", RuntimeError(
-                            "shape mismatch with position trajectory — "
-                            "using default joint velocities"))
-                    label = (f"phase-RSI {len(jpt_traj)} frames×{width} joints"
-                             + (", +vel" if vel_ok else ""))
-                else:
-                    params["joint_pos_target"] = torch.tensor(
-                        [float(x) for x in jpt], dtype=torch.float32)
-                    label = f"{width} joints"
+                params["joint_pos_target"] = torch.tensor(
+                    [float(x) for x in jpt], dtype=torch.float32)
+                label = f"{width} joints"
                 reset["reset_robot_joints_to_reference"] = EventTermCfg(
                     func=reset_joints_to_reference, mode="reset", params=params)
                 applied.append(
@@ -2054,10 +2615,18 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     print(f"[runner] env-spec applied (train={train}): {applied}"
           + (f"; NOT APPLICABLE on this task cfg: {dead}" if dead else ""),
           file=sys.stderr, flush=True)
+    return {
+        "schema": "reward-sculptor-env-spec-application-v1",
+        "phase": "train" if train else "rollout",
+        "requested": sorted(requested),
+        "applied": list(applied),
+        "dead": sorted(dead),
+        "errors": list(application_errors),
+    }
 
 
 def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
-                       task_id: str = "") -> None:
+                       task_id: str = "", strict: bool = False) -> dict[str, Any]:
     """§D17: apply a stage-FIXED eval-rollout reset override — a small
     ALLOWLISTED subset of `sculptor.reference.derive_eval_reset`'s
     payload (single deterministic values, not train-iterable ranges).
@@ -2080,9 +2649,20 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
     rollout. Announces what it actually wrote so the runner log makes a
     reference-derived lying-start eval visible, not silent."""
     if not payload:
-        return
+        return {
+            "schema": "reward-sculptor-eval-reset-application-v1",
+            "requested": [],
+            "applied": [],
+            "dead": [],
+            "errors": [],
+        }
+
+    requested = sorted(str(key) for key in payload)
+    applied_fields: list[str] = []
+    application_errors: list[str] = []
 
     def _skip(what: str, e: Exception) -> None:
+        application_errors.append(f"{what}: {type(e).__name__}: {e}")
         print(f"[runner] eval-reset: {what} skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
@@ -2103,12 +2683,15 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
                     if z is not None:
                         pose_range["z"] = (float(z), float(z))
                         wrote.append("z")
+                        applied_fields.append("reset_height_offset_m")
                     if pitch is not None:
                         pose_range["pitch"] = (float(pitch), float(pitch))
                         wrote.append("pitch")
+                        applied_fields.append("reset_pitch_offset_rad")
                     if roll is not None:
                         pose_range["roll"] = (float(roll), float(roll))
                         wrote.append("roll")
+                        applied_fields.append("reset_roll_offset_rad")
                 if vz is not None:
                     vr = params.get("velocity_range")
                     if not isinstance(vr, dict):
@@ -2116,6 +2699,7 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
                         params["velocity_range"] = vr
                     vr["z"] = (float(vz), float(vz))
                     wrote.append("vz")
+                    applied_fields.append("reset_vertical_velocity_mps")
                 if wrote:
                     applied.append(f"reset_base→eval_reset({','.join(wrote)})")
         except Exception as e:  # noqa: BLE001
@@ -2156,19 +2740,46 @@ def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
                 applied.append(
                     f"events:+reset_robot_joints_to_reference"
                     f"({len(jpt)} joints)")
+                applied_fields.append("reset_joint_pos_target")
+                if jpt_noise is not None:
+                    applied_fields.append("reset_joint_pos_noise_rad")
         except Exception as e:  # noqa: BLE001
             _skip("eval reference joint-posture reset", e)
 
     if payload.get("fell_over_termination") is False:
         try:
             terms = getattr(env_cfg, "terminations", None)
-            if isinstance(terms, dict) and terms.pop("fell_over", None) is not None:
-                applied.append("terminations:fell_over→removed")
+            if not isinstance(terms, dict):
+                raise TypeError("task cfg exposes no termination mapping")
+            marker = object()
+            removed = terms.pop("fell_over", marker)
+            if "fell_over" in terms:  # defensive for exotic mappings
+                raise RuntimeError("fell_over termination remained enabled")
+            applied_fields.append("fell_over_termination")
+            applied.append(
+                "terminations:fell_over→removed"
+                if removed is not marker
+                else "terminations:fell_over→already_absent"
+            )
         except Exception as e:  # noqa: BLE001
             _skip("eval fell_over removal", e)
 
     print(f"[runner] eval reset: reference-derived lying start "
           f"(stage-fixed): {applied}", file=sys.stderr, flush=True)
+    dead = sorted(set(requested) - set(applied_fields))
+    receipt = {
+        "schema": "reward-sculptor-eval-reset-application-v1",
+        "requested": requested,
+        "applied": sorted(set(applied_fields)),
+        "dead": dead,
+        "errors": application_errors,
+    }
+    if strict and (dead or application_errors):
+        raise RuntimeError(
+            "explicit evaluation reset was not applied exactly: "
+            f"dead={dead}, errors={application_errors}"
+        )
+    return receipt
 
 
 def _apply_rl_spec(rl_cfg: Any, spec: "dict | None") -> None:
@@ -2226,6 +2837,189 @@ def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
     _apply_rl_spec(rl_cfg, jump_preset_spec())
 
 
+def _configured_init_std(rl_cfg: Any) -> Optional[float]:
+    """The exploration std a *fresh* policy would start from, or None.
+
+    Reads `actor.distribution_cfg["init_std"]` — the value rsl_rl's
+    `GaussianDistribution` uses to initialize `std_param`. None when the
+    task uses a deterministic or non-Gaussian actor, which is the signal
+    to leave a warm-started policy's noise alone.
+    """
+    dist = getattr(getattr(rl_cfg, "actor", None), "distribution_cfg", None)
+    if not isinstance(dist, dict):
+        return None
+    try:
+        init_std = float(dist.get("init_std"))
+    except (TypeError, ValueError):
+        return None
+    return init_std if init_std > 0.0 else None
+
+
+def _clamp_warm_started_noise(runner: Any, ceiling: float) -> Optional[dict]:
+    """Cap a warm-started policy's exploration noise at `ceiling`.
+
+    A warm start loads actor weights from a checkpoint, and for a Gaussian
+    policy that includes the learned action-noise std. Across chained sculpt
+    iterations that std ratchets *up*: measured on platform-ascent-showcase
+    it went 1.05 → 1.39 → 1.71 over three iterations against an `init_std`
+    of 1.0, and since mjlab's `action_rate_l2` penalty grows as 2σ² the
+    inherited noise alone came to cost more per step than the entire task
+    reward paid — every episode ended in `fell_over` and the run read as
+    "the reward does nothing".
+
+    Exploration scale is a property of the training run about to start, not
+    knowledge carried by the checkpoint — the same reasoning that already
+    makes the warm-start path skip the source optimizer's Adam momentum.
+    So the bound is one-directional: a policy that converged to *less* noise
+    than a fresh one keeps that precision, while anything above the fresh-init
+    value is drift and gets clamped back. Returns the before/after summary
+    when it changed anything, else None.
+    """
+    import torch
+
+    distribution = getattr(getattr(runner, "alg", None), "actor", None)
+    distribution = getattr(distribution, "distribution", None)
+    scalar = getattr(distribution, "std_param", None)
+    logged = getattr(distribution, "log_std_param", None)
+    param = scalar if scalar is not None else logged
+    if param is None:
+        return None
+
+    with torch.no_grad():
+        std = param.detach() if scalar is not None else param.detach().exp()
+        before = float(std.mean())
+        if before <= ceiling:
+            return None
+        if scalar is not None:
+            param.detach().clamp_(max=ceiling)
+        else:
+            param.detach().clamp_(max=float(torch.log(torch.tensor(ceiling))))
+        after = scalar if scalar is not None else logged.detach().exp()
+        return {"std_before": before, "std_after": float(after.detach().mean()),
+                "ceiling": ceiling}
+
+
+def _install_learning_vitals(runner: Any, total_iters: int) -> bool:
+    """Emit per-iteration `learning_vitals` events by wrapping the logger.
+
+    rsl_rl prints everything a person needs to judge a run — mean return,
+    episode length, exploration std, and the per-component reward breakdown —
+    but only as console text, so the UI sees an hour of unstructured log lines
+    behind a percentage bar. Every failure diagnosed on this project so far was
+    a number sitting in that text: an inherited action std that made the
+    action-rate penalty outgrow the task reward, then the same penalty growing
+    back under a tripled entropy bonus. Both are obvious the moment the
+    strongest positive and negative components are put side by side.
+
+    Wraps `runner.logger.log` rather than reimplementing it, so the numbers
+    reported are exactly the numbers rsl_rl computed. Returns False when the
+    runner has no logger to wrap — telemetry must never be a reason a run
+    fails to start.
+    """
+    import statistics
+
+    logger = getattr(runner, "logger", None)
+    original = getattr(logger, "log", None)
+    if not callable(original):
+        return False
+
+    def _mean(buf: Any) -> Optional[float]:
+        try:
+            return float(statistics.mean(buf)) if len(buf) else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _components() -> dict[str, float]:
+        """Mean of each `Episode_Reward/<name>` term over the window.
+
+        Averaged across `ep_extras` the same way rsl_rl averages them for its
+        own console block, so the two never disagree. Must be read before the
+        wrapped call — `log` clears the buffer on its way out.
+        """
+        import torch
+
+        acc: dict[str, list[float]] = {}
+        for ep in getattr(logger, "ep_extras", None) or []:
+            for key, val in ep.items():
+                name = str(key)
+                if not name.startswith("Episode_Reward/"):
+                    continue
+                try:
+                    v = (float(val.mean()) if isinstance(val, torch.Tensor)
+                         else float(val))
+                except (TypeError, ValueError):
+                    continue
+                acc.setdefault(name[len("Episode_Reward/"):], []).append(v)
+        return {k: statistics.mean(v) for k, v in acc.items() if v}
+
+    def _logged(it, start_it, total_it, *a, **kw):
+        # The wrapped call must happen no matter what: it is the run's own
+        # logging, not ours. Anything we add is best-effort on top.
+        try:
+            # rsl_rl calls this positionally:
+            #   log(it, start_it, total_it, collect_time, learn_time,
+            #       loss_dict, learning_rate, action_std, rnd_weight, ...)
+            # so after the three named parameters `action_std` is a[4].
+            # Guarded rather than indexed blindly: a signature change should
+            # cost this one field, not the whole event.
+            action_std = kw.get("action_std")
+            if action_std is None and len(a) >= 5:
+                action_std = a[4]
+            std = (float(action_std.mean())
+                   if hasattr(action_std, "mean") else None)
+            comps = _components()
+            top = max(comps.items(), key=lambda kv: kv[1], default=None)
+            bottom = min(comps.items(), key=lambda kv: kv[1], default=None)
+            payload = {
+                "type": "learning_vitals",
+                "rl_iter": int(it),
+                "rl_total": int(total_it or total_iters),
+                "mean_reward": _mean(getattr(logger, "rewbuffer", [])),
+                "mean_ep_len": _mean(getattr(logger, "lenbuffer", [])),
+                "action_std": std,
+            }
+            # The pair that decides whether the task is worth doing: what pays
+            # most, and what costs most. When the cost outgrows the pay, the
+            # policy's best move is to stop trying — which reads from outside
+            # as "the reward does nothing".
+            if top is not None and top[1] > 0:
+                payload["top_reward"] = {"term": top[0],
+                                         "value": round(top[1], 4)}
+            if bottom is not None and bottom[1] < 0:
+                payload["top_penalty"] = {"term": bottom[0],
+                                          "value": round(bottom[1], 4)}
+            print("[SCULPT-EVENT] " + json.dumps(payload), flush=True)
+        except Exception as e:  # noqa: BLE001 — never break a run to report on it
+            print(f"[runner] learning vitals skipped: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+        return original(it, start_it, total_it, *a, **kw)
+
+    logger.log = _logged
+    return True
+
+
+def _completed_iter_progress_event(
+    *, max_iterations: int, elapsed_s: float, completed: bool,
+) -> dict[str, Any] | None:
+    """Return the terminal 100% tick only after ``runner.learn`` succeeds.
+
+    This deliberately returns ``None`` when training raises.  Emitting a
+    synthetic max-iteration event from a ``finally`` block made interrupted
+    runs look complete in the UI even though only the last periodic
+    ``model_N.pt`` snapshot was durable.
+    """
+    if not completed:
+        return None
+    return {
+        "type": "iter_progress",
+        "rl_iter": int(max_iterations),
+        "rl_total": int(max_iterations),
+        "pct": 100.0,
+        "elapsed_s": round(float(elapsed_s), 1),
+        "eta_s": 0.0,
+    }
+
+
 def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
     """Keep directly-parameterized Gaussian policy noise positive.
 
@@ -2276,6 +3070,1140 @@ def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
     return handle
 
 
+def _event_observation_extension_width(world_bundle: Any | None) -> int:
+    """Width of the manifest-declared event phase observation, or zero."""
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    event_sequence = (
+        task_shared.get("event_sequence")
+        if isinstance(task_shared, Mapping)
+        else None
+    )
+    phases = (
+        event_sequence.get("phases")
+        if isinstance(event_sequence, Mapping)
+        else None
+    )
+    return len(phases) if isinstance(phases, list) else 0
+
+
+def _zero_extend_observation_state_dict(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    extension_width: int,
+    role: str,
+    column_migration: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Explicitly migrate one feed-forward observation interface.
+
+    Only the first MLP input columns and matching normalizer vectors may grow.
+    ``column_migration`` is an immutable policy-contract receipt describing
+    where every preserved semantic term moves in the target interface.  The
+    legacy no-receipt path remains a strict tail append.  Every other tensor
+    shape remains exact.  New columns are zero, so the inherited policy is
+    behaviorally identical; normalizer defaults are mean=0,
+    std/variance=1.
+    """
+    import torch
+
+    if extension_width <= 0:
+        raise RuntimeError("observation extension width must be positive")
+    if set(source) != set(target):
+        raise RuntimeError(
+            f"{role} checkpoint keys differ from the effective policy contract"
+        )
+    input_key = "mlp.0.weight"
+    source_input = source.get(input_key)
+    target_input = target.get(input_key)
+    source_input_shape = tuple(getattr(source_input, "shape", ()))
+    target_input_shape = tuple(getattr(target_input, "shape", ()))
+    if (
+        len(source_input_shape) != 2
+        or len(target_input_shape) != 2
+        or source_input_shape[0] != target_input_shape[0]
+        or target_input_shape[1] != source_input_shape[1] + extension_width
+    ):
+        raise RuntimeError(
+            f"{role} first-layer shape does not match the admitted "
+            "observation migration"
+        )
+
+    if column_migration is None:
+        source_width = source_input_shape[1]
+        target_width = target_input_shape[1]
+        migration: Mapping[str, Any] = {
+            "role": role,
+            "source_width": source_width,
+            "target_width": target_width,
+            "extension_width": extension_width,
+            "preserved_segments": [{
+                "term_name": "legacy_observation_prefix",
+                "source_offset": 0,
+                "target_offset": 0,
+                "width": source_width,
+            }],
+            "inserted_segments": [{
+                "term_name": "legacy_observation_extension",
+                "target_offset": source_width,
+                "width": extension_width,
+            }],
+        }
+    else:
+        migration = column_migration
+
+    if (
+        migration.get("role") != role
+        or migration.get("source_width") != source_input_shape[1]
+        or migration.get("target_width") != target_input_shape[1]
+        or migration.get("extension_width") != extension_width
+    ):
+        raise RuntimeError(
+            f"{role} column migration disagrees with checkpoint tensor widths"
+        )
+    preserved = migration.get("preserved_segments")
+    inserted = migration.get("inserted_segments")
+    if not isinstance(preserved, list) or not isinstance(inserted, list):
+        raise RuntimeError(f"{role} column migration has no segment mapping")
+
+    source_cursor = 0
+    previous_preserved_target_offset = -1
+    seen_term_names: set[str] = set()
+    target_segments: list[tuple[int, int, str]] = []
+    canonical_preserved: list[tuple[int, int, int]] = []
+    for segment in preserved:
+        if not isinstance(segment, Mapping):
+            raise RuntimeError(f"{role} preserved segment is malformed")
+        term_name = segment.get("term_name")
+        source_offset = segment.get("source_offset")
+        target_offset = segment.get("target_offset")
+        width = segment.get("width")
+        if (
+            not isinstance(term_name, str)
+            or not term_name
+            or not isinstance(source_offset, int)
+            or isinstance(source_offset, bool)
+            or not isinstance(target_offset, int)
+            or isinstance(target_offset, bool)
+            or not isinstance(width, int)
+            or isinstance(width, bool)
+            or width <= 0
+            or term_name in seen_term_names
+            or source_offset != source_cursor
+            or target_offset < 0
+            or target_offset <= previous_preserved_target_offset
+            or target_offset + width > target_input_shape[1]
+        ):
+            raise RuntimeError(f"{role} preserved segment is not canonical")
+        seen_term_names.add(term_name)
+        source_cursor += width
+        previous_preserved_target_offset = target_offset
+        canonical_preserved.append((source_offset, target_offset, width))
+        target_segments.append((target_offset, width, "preserved"))
+    if source_cursor != source_input_shape[1]:
+        raise RuntimeError(
+            f"{role} preserved segments do not cover every source column"
+        )
+    inserted_width = 0
+    previous_inserted_target_offset = -1
+    for segment in inserted:
+        if not isinstance(segment, Mapping):
+            raise RuntimeError(f"{role} inserted segment is malformed")
+        term_name = segment.get("term_name")
+        target_offset = segment.get("target_offset")
+        width = segment.get("width")
+        if (
+            not isinstance(term_name, str)
+            or not term_name
+            or not isinstance(target_offset, int)
+            or isinstance(target_offset, bool)
+            or not isinstance(width, int)
+            or isinstance(width, bool)
+            or width <= 0
+            or term_name in seen_term_names
+            or target_offset < 0
+            or target_offset <= previous_inserted_target_offset
+            or target_offset + width > target_input_shape[1]
+        ):
+            raise RuntimeError(f"{role} inserted segment is not canonical")
+        seen_term_names.add(term_name)
+        inserted_width += width
+        previous_inserted_target_offset = target_offset
+        target_segments.append((target_offset, width, "inserted"))
+    if inserted_width != extension_width:
+        raise RuntimeError(
+            f"{role} inserted segments do not match the admitted width"
+        )
+    target_cursor = 0
+    for target_offset, width, _kind in sorted(target_segments):
+        if target_offset != target_cursor:
+            raise RuntimeError(
+                f"{role} target segments overlap or leave unmapped columns"
+            )
+        target_cursor += width
+    if target_cursor != target_input_shape[1]:
+        raise RuntimeError(
+            f"{role} target segments do not cover every target column"
+        )
+
+    adapted = dict(source)
+    changed: list[str] = []
+    normalizer_padding = {
+        "obs_normalizer._mean": 0.0,
+        "obs_normalizer._std": 1.0,
+        "obs_normalizer._var": 1.0,
+    }
+    for key in source:
+        source_value = source[key]
+        target_value = target[key]
+        source_shape = tuple(getattr(source_value, "shape", ()))
+        target_shape = tuple(getattr(target_value, "shape", ()))
+        if source_shape == target_shape:
+            continue
+        if key == input_key:
+            remapped = torch.zeros(
+                target_shape,
+                device=source_value.device,
+                dtype=source_value.dtype,
+            )
+            for source_offset, target_offset, width in canonical_preserved:
+                remapped[:, target_offset:target_offset + width] = (
+                    source_value[:, source_offset:source_offset + width]
+                )
+            adapted[key] = remapped
+            changed.append(key)
+            continue
+        if key in normalizer_padding and (
+            len(source_shape) in (1, 2)
+            and len(target_shape) == len(source_shape)
+            and source_shape[:-1] == target_shape[:-1]
+            and target_shape[-1] == source_shape[-1] + extension_width
+        ):
+            remapped = torch.full(
+                target_shape,
+                normalizer_padding[key],
+                device=source_value.device,
+                dtype=source_value.dtype,
+            )
+            for source_offset, target_offset, width in canonical_preserved:
+                remapped[..., target_offset:target_offset + width] = (
+                    source_value[..., source_offset:source_offset + width]
+                )
+            adapted[key] = remapped
+            changed.append(key)
+            continue
+        raise RuntimeError(
+            f"{role} tensor {key!r} shape {source_shape} cannot satisfy "
+            f"effective target shape {target_shape}"
+        )
+    if input_key not in changed:
+        raise RuntimeError(
+            f"{role} warm start did not require the declared "
+            f"{extension_width}-column observation extension"
+        )
+    for key, value in adapted.items():
+        if tuple(getattr(value, "shape", ())) != tuple(
+                getattr(target[key], "shape", ())):
+            raise RuntimeError(
+                f"{role} adapted tensor {key!r} still violates target shape"
+            )
+    return adapted, tuple(changed)
+
+
+def _prepare_event_observation_warm_start(
+    runner: Any,
+    checkpoint: Path,
+    *,
+    output_dir: Path,
+    extension_width: int,
+    load_role: str,
+    observation_terms: tuple[str, ...] = ("authored_event_phase",),
+    role_migrations: Mapping[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Materialize and hash a provenance-bearing compatible checkpoint.
+
+    The function name is retained for compatibility; ``observation_terms``
+    records whether the admitted zero columns represent authored event phase,
+    reference phase, or their explicitly composed migration.
+    """
+    import hashlib
+    import torch
+
+    loaded = torch.load(checkpoint, weights_only=False, map_location="cpu")
+    if not isinstance(loaded, dict):
+        raise RuntimeError("warm-start checkpoint is not a state dictionary")
+    algorithm = getattr(runner, "alg", None)
+    role_models = {
+        "actor": getattr(algorithm, "actor", None),
+        "critic": getattr(algorithm, "critic", None),
+    }
+    requested_roles = (
+        ("actor",) if load_role == "actor_only" else ("actor", "critic")
+    )
+    needs_extension: list[bool] = []
+    for role in requested_roles:
+        model = role_models[role]
+        source_state = loaded.get(f"{role}_state_dict")
+        if model is None or not isinstance(source_state, Mapping):
+            raise RuntimeError(f"checkpoint/runner has no {role} state")
+        source_input = source_state.get("mlp.0.weight")
+        target_input = model.state_dict().get("mlp.0.weight")
+        source_shape = tuple(getattr(source_input, "shape", ()))
+        target_shape = tuple(getattr(target_input, "shape", ()))
+        needs_extension.append(source_shape != target_shape)
+    if not any(needs_extension):
+        for role in requested_roles:
+            source_state = loaded[f"{role}_state_dict"]
+            target_state = role_models[role].state_dict()
+            if set(source_state) != set(target_state) or any(
+                tuple(getattr(source_state[key], "shape", ()))
+                != tuple(getattr(target_state[key], "shape", ()))
+                for key in source_state
+            ):
+                raise RuntimeError(
+                    f"{role} differs from the effective observation contract"
+                )
+        exact_receipt: dict[str, Any] = {
+            "adapted": False,
+            "extension_width": int(extension_width),
+            "observation_terms": list(observation_terms),
+        }
+        if len(observation_terms) == 1:
+            exact_receipt["observation_term"] = observation_terms[0]
+        return checkpoint, exact_receipt
+    if not all(needs_extension):
+        raise RuntimeError(
+            "actor and critic disagree about the observation extension"
+        )
+    adapted_checkpoint = dict(loaded)
+    changed: dict[str, list[str]] = {}
+    for role in requested_roles:
+        model = role_models[role]
+        if model is None:
+            raise RuntimeError(f"runner has no {role} model")
+        state_key = f"{role}_state_dict"
+        source_state = loaded.get(state_key)
+        if not isinstance(source_state, Mapping):
+            raise RuntimeError(f"checkpoint has no {state_key}")
+        role_migration: Mapping[str, Any] | None = None
+        role_extension_width = extension_width
+        if role_migrations is not None:
+            candidate = role_migrations.get(role)
+            if not isinstance(candidate, Mapping):
+                raise RuntimeError(
+                    f"admitted observation migration has no {role} mapping"
+                )
+            role_migration = candidate
+            declared_width = candidate.get("extension_width")
+            if (
+                not isinstance(declared_width, int)
+                or isinstance(declared_width, bool)
+                or declared_width <= 0
+            ):
+                raise RuntimeError(
+                    f"admitted {role} observation width is invalid"
+                )
+            role_extension_width = declared_width
+        adapted_state, changed_keys = _zero_extend_observation_state_dict(
+            source_state,
+            model.state_dict(),
+            extension_width=role_extension_width,
+            role=role,
+            column_migration=role_migration,
+        )
+        adapted_checkpoint[state_key] = adapted_state
+        changed[role] = list(changed_keys)
+
+    adapted_name = (
+        "warm_start_event_observation.pt"
+        if observation_terms == ("authored_event_phase",)
+        else "warm_start_observation_extension.pt"
+    )
+    adapted_path = output_dir / adapted_name
+    torch.save(adapted_checkpoint, adapted_path)
+    digest = hashlib.sha256(adapted_path.read_bytes()).hexdigest()
+    extension_receipt: dict[str, Any] = {
+        "adapted": True,
+        "adapted_checkpoint": str(adapted_path),
+        "adapted_checkpoint_sha256": digest,
+        "extension_width": int(extension_width),
+        "observation_terms": list(observation_terms),
+        "padding": {
+            "input_columns": 0.0,
+            "normalizer_mean": 0.0,
+            "normalizer_std": 1.0,
+            "normalizer_variance": 1.0,
+        },
+        "changed_tensors": changed,
+    }
+    if role_migrations is not None:
+        extension_receipt["role_migrations"] = {
+            role: dict(role_migrations[role])
+            for role in requested_roles
+        }
+    if len(observation_terms) == 1:
+        extension_receipt["observation_term"] = observation_terms[0]
+    return adapted_path, extension_receipt
+
+
+def _event_policy_contract_admission_kind(
+    admitted_migration: Mapping[str, Any],
+    effective_contract: Mapping[str, Any],
+    *,
+    extension_width: int,
+) -> str:
+    """Classify an admitted observation-interface warm-start relation.
+
+    The historical function name remains as a compatibility seam for focused
+    tests and callers.  The classifier now also admits the reference-clock
+    extension (alone or after the authored event extension).  Every accepted
+    mapping is byte-for-byte the receipt that ``policy_contract_migration``
+    emits; arbitrary tensor padding never becomes an implicit migration.
+    """
+    expected_migration = {
+        "type": "zero_initialized_event_phase_observation",
+        "from_schema": 2,
+        "to_schema": 3,
+        "observation_term": "authored_event_phase",
+        "extension_width": int(extension_width),
+        "ordered_phase_ids": ["route", "jump", "hold"],
+        "optimizer_resume": False,
+    }
+    if dict(admitted_migration) == expected_migration:
+        return "zero_initialized_event_phase_observation"
+
+    if admitted_migration.get("type") == (
+        "zero_initialized_ordered_observation_insertions"
+    ):
+        role_migrations = admitted_migration.get("role_migrations")
+        declared_roles = admitted_migration.get("roles")
+        observations = effective_contract.get("observations")
+        if (
+            not isinstance(role_migrations, Mapping)
+            or not isinstance(declared_roles, list)
+            or not declared_roles
+            or declared_roles
+            != [
+                role for role in ("actor", "critic")
+                if role in declared_roles
+            ]
+            or any(role not in {"actor", "critic"} for role in declared_roles)
+            or "actor" not in declared_roles
+            or not isinstance(observations, Mapping)
+        ):
+            raise RuntimeError(
+                "ordered observation migration has no role mappings"
+            )
+        shape_keys = {"actor": "shape", "critic": "critic_shape"}
+        for role in declared_roles:
+            shape_key = shape_keys[role]
+            role_migration = role_migrations.get(role)
+            target_shape = observations.get(shape_key)
+            if (
+                not isinstance(role_migration, Mapping)
+                or role_migration.get("role") != role
+                or not isinstance(target_shape, list)
+                or len(target_shape) != 1
+                or role_migration.get("target_width") != target_shape[0]
+                or not isinstance(
+                    role_migration.get("preserved_segments"), list
+                )
+                or not isinstance(
+                    role_migration.get("inserted_segments"), list
+                )
+            ):
+                raise RuntimeError(
+                    f"ordered observation migration has an invalid {role} mapping"
+                )
+        if set(role_migrations) != set(declared_roles):
+            raise RuntimeError(
+                "ordered observation migration has undeclared role mappings"
+            )
+        actor_migration = role_migrations["actor"]
+        if (
+            admitted_migration.get("extension_width")
+            != actor_migration.get("extension_width")
+            or admitted_migration.get("from_schema")
+            != effective_contract.get("schema")
+            or admitted_migration.get("to_schema")
+            != effective_contract.get("schema")
+            or admitted_migration.get("optimizer_resume") is not False
+        ):
+            raise RuntimeError(
+                "ordered observation migration metadata is inconsistent"
+            )
+        return "zero_initialized_ordered_observation_insertions"
+
+    if effective_contract.get("schema") == 4:
+        from sculptor.policy_contract import contract_fingerprint
+        from sculptor.reference_clock import validate_reference_clock
+
+        try:
+            clock = validate_reference_clock(
+                effective_contract.get("reference_clock")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "effective policy contract has an invalid reference clock"
+            ) from exc
+        clock_width = int(clock["shape"][0])
+        clock_migration = {
+            "type": "zero_initialized_reference_clock_observation",
+            "from_schema": (
+                3 if effective_contract.get("event_observation") is not None
+                else 2
+            ),
+            "to_schema": 4,
+            "observation_term": clock["term_name"],
+            "extension_width": clock_width,
+            "reference_clock_sha256": contract_fingerprint(clock),
+            "optimizer_resume": False,
+        }
+        if dict(admitted_migration) == clock_migration:
+            return "zero_initialized_reference_clock_observation"
+
+        event_interface = effective_contract.get("event_observation")
+        event_width = (
+            len(event_interface.get("ordered_phase_ids", ()))
+            if isinstance(event_interface, Mapping)
+            else 0
+        )
+        combined_migration = {
+            "type": "zero_initialized_observation_extensions",
+            "from_schema": 2,
+            "to_schema": 4,
+            "extension_width": event_width + clock_width,
+            "extensions": [
+                {
+                    **expected_migration,
+                    "extension_width": event_width,
+                },
+                clock_migration,
+            ],
+            "optimizer_resume": False,
+        }
+        if (
+            event_width > 0
+            and dict(admitted_migration) == combined_migration
+        ):
+            return "zero_initialized_observation_extensions"
+
+    effective_schema = effective_contract.get("schema")
+    expected_exact = {
+        "type": "exact_policy_contract",
+        "from_schema": effective_schema,
+        "to_schema": effective_schema,
+        "optimizer_resume": False,
+    }
+    if dict(admitted_migration) == expected_exact:
+        return "exact_policy_contract"
+
+    raise RuntimeError(
+        "runner received an unrecognized observation-interface "
+        "policy-contract migration"
+    )
+
+
+def _observation_terms_for_contract_admission(
+    admitted_migration: Mapping[str, Any],
+    effective_contract: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return the ordered observation columns named by an admission receipt."""
+    migration_type = admitted_migration.get("type")
+    if migration_type == "exact_policy_contract":
+        terms: list[str] = []
+        event = effective_contract.get("event_observation")
+        if isinstance(event, Mapping):
+            term = event.get("term_name", "authored_event_phase")
+            if isinstance(term, str) and term:
+                terms.append(term)
+        clock = effective_contract.get("reference_clock")
+        if isinstance(clock, Mapping):
+            term = clock.get("term_name")
+            if isinstance(term, str) and term:
+                terms.append(term)
+        return tuple(terms)
+    if migration_type == "zero_initialized_observation_extensions":
+        extensions = admitted_migration.get("extensions")
+        if not isinstance(extensions, list):
+            raise RuntimeError("combined observation migration has no extensions")
+        terms = tuple(
+            str(item.get("observation_term"))
+            for item in extensions
+            if isinstance(item, Mapping) and item.get("observation_term")
+        )
+        if len(terms) != len(extensions):
+            raise RuntimeError(
+                "combined observation migration has an unnamed extension"
+            )
+        return terms
+    if migration_type == "zero_initialized_ordered_observation_insertions":
+        role_migrations = admitted_migration.get("role_migrations")
+        actor = (
+            role_migrations.get("actor")
+            if isinstance(role_migrations, Mapping)
+            else None
+        )
+        inserted = (
+            actor.get("inserted_segments")
+            if isinstance(actor, Mapping)
+            else None
+        )
+        if not isinstance(inserted, list) or not inserted:
+            raise RuntimeError(
+                "ordered observation migration has no actor insertions"
+            )
+        terms = tuple(
+            str(segment.get("term_name"))
+            for segment in inserted
+            if isinstance(segment, Mapping) and segment.get("term_name")
+        )
+        if len(terms) != len(inserted):
+            raise RuntimeError(
+                "ordered observation migration has an unnamed insertion"
+            )
+        return terms
+    term = admitted_migration.get("observation_term")
+    if isinstance(term, str) and term:
+        return (term,)
+    raise RuntimeError("observation migration has no named observation term")
+
+
+def _expected_warm_start_checkpoint_sha256() -> str | None:
+    """Resolve the immutable source digest pin for every warm-start kind.
+
+    ``SCULPTOR_WARM_START_CHECKPOINT_SHA256`` is the generic launch
+    authority used by project checkpoints and interrupted snapshots.  The
+    older starting-skill-specific name remains an admitted compatibility
+    alias for portable imports.  If both are present they must name the same
+    bytes; otherwise the runner fails before ``runner.load``.
+    """
+    generic = os.environ.get("SCULPTOR_WARM_START_CHECKPOINT_SHA256")
+    imported_skill = os.environ.get(
+        "SCULPTOR_STARTING_SKILL_CHECKPOINT_SHA256"
+    )
+    if generic and imported_skill and generic != imported_skill:
+        raise RuntimeError(
+            "generic warm-start and starting-skill checkpoint digest pins "
+            "disagree"
+        )
+    expected = generic or imported_skill
+    if expected is None:
+        return None
+    if (
+        len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+    ):
+        raise RuntimeError(
+            "warm-start checkpoint digest pin must be canonical lowercase "
+            "SHA-256"
+        )
+    return expected
+
+
+def _verify_warm_start_checkpoint_sha256(actual_sha256: str) -> str | None:
+    """Verify checkpoint bytes against the launch pin, when one is set."""
+    expected = _expected_warm_start_checkpoint_sha256()
+    if expected and actual_sha256 != expected:
+        raise RuntimeError(
+            "pretrained policy digest differs from the immutable "
+            "warm-start launch pin: expected "
+            f"{expected}, got {actual_sha256}"
+        )
+    return expected
+
+
+def _policy_contract_sidecar_path(checkpoint: Path) -> Path:
+    """Server-owned exact-interface receipt for a locally trained checkpoint."""
+    return Path(str(Path(checkpoint)) + ".policy_contract.json")
+
+
+def _read_local_checkpoint_policy_contract(
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Read one exact local checkpoint contract, rejecting stale sidecars."""
+    from sculptor.policy_contract import contract_fingerprint
+
+    path = _policy_contract_sidecar_path(checkpoint)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "checkpoint interface validation requires the exact local "
+            f"checkpoint policy-contract sidecar at {path}"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema", "checkpoint_sha256", "policy_contract",
+        "policy_contract_sha256",
+    }:
+        raise RuntimeError("checkpoint policy-contract sidecar is malformed")
+    contract = payload.get("policy_contract")
+    if (
+        payload.get("schema") != 1
+        or payload.get("checkpoint_sha256") != checkpoint_sha256
+        or not isinstance(contract, dict)
+        or payload.get("policy_contract_sha256")
+        != contract_fingerprint(contract)
+    ):
+        raise RuntimeError(
+            "checkpoint policy-contract sidecar disagrees with the exact "
+            "checkpoint bytes or contract"
+        )
+    return contract
+
+
+def _validate_rollout_checkpoint_policy_contract(
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str,
+    expected_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fail before policy load unless checkpoint and rollout interfaces match.
+
+    The expected contract is rebuilt from the rollout's exact project,
+    reference clock, and world selection.  Exact comparison binds both actor
+    and critic ordered observations, normalizers, architecture, action space,
+    control timing, clock, and world tuple; matching width alone is not an
+    admissible substitute.
+    """
+    from sculptor.policy_contract import contract_fingerprint
+
+    observed = _read_local_checkpoint_policy_contract(
+        checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+    expected = dict(expected_contract)
+    expected_sha256 = contract_fingerprint(expected)
+    observed_sha256 = contract_fingerprint(observed)
+    if observed != expected or observed_sha256 != expected_sha256:
+        raise RuntimeError(
+            "rollout checkpoint policy contract differs from the current "
+            "actor/critic observation, reference-clock, world, timing, or "
+            "policy interface"
+        )
+    return {
+        "schema": "reward-sculptor-rollout-policy-contract-v1",
+        "checkpoint_sha256": checkpoint_sha256,
+        "policy_contract_sha256": expected_sha256,
+        "sidecar": str(_policy_contract_sidecar_path(checkpoint)),
+        "sidecar_sha256": _runtime_file_sha256(
+            _policy_contract_sidecar_path(checkpoint),
+            label="rollout checkpoint policy-contract sidecar",
+        ),
+    }
+
+
+def _write_local_checkpoint_policy_contract(
+    checkpoint: Path,
+    policy_contract: Mapping[str, Any],
+) -> Path:
+    """Atomically bind a completed local checkpoint to its exact interface."""
+    import hashlib
+
+    from sculptor.policy_contract import contract_fingerprint
+
+    checkpoint = Path(checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    payload = {
+        "schema": 1,
+        "checkpoint_sha256": digest,
+        "policy_contract": dict(policy_contract),
+        "policy_contract_sha256": contract_fingerprint(dict(policy_contract)),
+    }
+    path = _policy_contract_sidecar_path(checkpoint)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    return path
+
+
+def _attest_warm_start_policy_contract(
+    *,
+    world_selection: str | Path,
+    extension_width: int,
+    source_checkpoint_sha256: str,
+    reference_clock: Mapping[str, Any] | None = None,
+    source_checkpoint_path: Path | None = None,
+    project_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Rebuild and attest every UI-pinned warm-start policy contract.
+
+    Contract admission is independent of whether checkpoint tensors need an
+    event-observation extension.  In particular, an exact schema-2 load still
+    has to prove its source receipt, immutable target selection, and declared
+    exact migration before ``runner.load`` sees the checkpoint.
+    """
+    from sculptor.policy_contract import (
+        build_project_policy_contract,
+        contract_fingerprint,
+        policy_contract_migration,
+    )
+
+    pin_names = (
+        "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON",
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON",
+        "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256",
+        "SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256",
+        "SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON",
+    )
+    pins = {name: os.environ.get(name) for name in pin_names}
+    contract_pin_present = any(pins.values())
+    if contract_pin_present and not all(pins.values()):
+        raise RuntimeError("warm-start policy-contract pin is incomplete")
+    if not contract_pin_present and extension_width > 0:
+        # The only unpinned local admission is an exact chained checkpoint
+        # produced by this runner.  It is not a migration: the sidecar binds
+        # the source bytes to the same schema-4 reference interface rebuilt
+        # from the exact generated reward. Event or shape extension still
+        # requires the pre-queue immutable migration receipt.
+        if reference_clock is None or source_checkpoint_path is None:
+            raise RuntimeError(
+                "observation-interface warm start requires a full immutable "
+                "policy-contract receipt"
+            )
+        from sculptor.reference_clock import validate_reference_clock
+
+        canonical_clock = validate_reference_clock(reference_clock)
+        clock_width = int(canonical_clock["shape"][0])
+        if int(extension_width) != clock_width or project_dir is None:
+            raise RuntimeError(
+                "direct local warm starts admit only an exact reference-clock "
+                "interface; event or arbitrary extensions require launch pins"
+            )
+        source_contract = _read_local_checkpoint_policy_contract(
+            Path(source_checkpoint_path),
+            checkpoint_sha256=source_checkpoint_sha256,
+        )
+        selection_path = Path(world_selection).expanduser().resolve()
+        contract_kwargs: dict[str, Any] = {
+            "reference_clock": canonical_clock,
+        }
+        if selection_path.is_file():
+            contract_kwargs["world_selection_path"] = selection_path
+        try:
+            effective_contract = build_project_policy_contract(
+                Path(project_dir).expanduser().resolve(),
+                **contract_kwargs,
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "failed to rebuild the direct local reference policy contract"
+            ) from exc
+        if source_contract != effective_contract:
+            raise RuntimeError(
+                "direct local checkpoint policy contract differs from the "
+                "exact runtime reference interface"
+            )
+        effective_sha = contract_fingerprint(effective_contract)
+        exact = {
+            "type": "exact_policy_contract",
+            "from_schema": effective_contract.get("schema"),
+            "to_schema": effective_contract.get("schema"),
+            "optimizer_resume": False,
+        }
+        admission_kind = _event_policy_contract_admission_kind(
+            exact, effective_contract, extension_width=extension_width,
+        )
+        receipt = {
+            "schema": 1,
+            "source": {
+                "checkpoint_sha256": source_checkpoint_sha256,
+                "contract": source_contract,
+                "contract_sha256": effective_sha,
+            },
+            "target": {
+                "contract": effective_contract,
+                "contract_sha256": effective_sha,
+            },
+            "compatibility": exact,
+        }
+        return {
+            "active": True,
+            "contract_pin_present": False,
+            "effective_contract": effective_contract,
+            "effective_contract_sha256": effective_sha,
+            "source_contract_sha256": effective_sha,
+            "admitted_migration": exact,
+            "admitted_contract_receipt": receipt,
+            "admission_kind": admission_kind,
+        }
+    if not contract_pin_present:
+        return {
+            "active": False,
+            "contract_pin_present": False,
+            "effective_contract": None,
+            "effective_contract_sha256": None,
+            "admitted_migration": None,
+            "admitted_contract_receipt": None,
+            "admission_kind": None,
+        }
+
+    selection_path = Path(world_selection).expanduser().resolve()
+    if not selection_path.is_file():
+        raise RuntimeError(
+            "warm-start policy-contract attestation requires the immutable "
+            f"world selection: {selection_path}"
+        )
+    project_dir = selection_path.parent.parent
+    try:
+        contract_kwargs: dict[str, Any] = {
+            "world_selection_path": selection_path,
+        }
+        if reference_clock is not None:
+            contract_kwargs["reference_clock"] = reference_clock
+        actual_contract = build_project_policy_contract(
+            project_dir,
+            **contract_kwargs,
+        )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "failed to rebuild the effective policy contract from the "
+            "immutable world selection"
+        ) from exc
+    actual_contract_sha256 = contract_fingerprint(actual_contract)
+
+    if contract_pin_present:
+        try:
+            effective_contract = json.loads(str(
+                pins["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_JSON"]
+            ))
+            admitted_migration = json.loads(str(
+                pins["SCULPTOR_POLICY_CONTRACT_MIGRATION_JSON"]
+            ))
+            admitted_contract_receipt = json.loads(str(
+                pins[
+                    "SCULPTOR_WARM_START_POLICY_CONTRACT_RECEIPT_JSON"
+                ]
+            ))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "warm-start policy-contract pin is invalid JSON"
+            ) from exc
+        if not isinstance(effective_contract, dict) or not isinstance(
+            admitted_migration, dict
+        ):
+            raise RuntimeError(
+                "warm-start policy-contract pin must contain objects"
+            )
+        if (
+            not isinstance(admitted_contract_receipt, dict)
+            or admitted_contract_receipt.get("schema") != 1
+            or not isinstance(admitted_contract_receipt.get("source"), dict)
+            or not isinstance(admitted_contract_receipt.get("target"), dict)
+        ):
+            raise RuntimeError(
+                "warm-start policy-contract receipt is malformed"
+            )
+        pinned_contract_sha256 = str(
+            pins["SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256"]
+        )
+        source_contract_sha256 = str(
+            pins["SCULPTOR_SOURCE_POLICY_CONTRACT_SHA256"]
+        )
+        if (
+            contract_fingerprint(effective_contract)
+            != pinned_contract_sha256
+        ):
+            raise RuntimeError(
+                "effective policy-contract JSON disagrees with its "
+                "immutable fingerprint pin"
+            )
+        if (
+            actual_contract != effective_contract
+            or actual_contract_sha256 != pinned_contract_sha256
+        ):
+            raise RuntimeError(
+                "effective policy contract rebuilt from the immutable world "
+                "selection differs from the pre-queue launch pin"
+            )
+        admission_kind = _event_policy_contract_admission_kind(
+            admitted_migration,
+            effective_contract,
+            extension_width=extension_width,
+        )
+        receipt_source = admitted_contract_receipt["source"]
+        receipt_target = admitted_contract_receipt["target"]
+        receipt_source_contract = receipt_source.get("contract")
+        receipt_checkpoint_sha256 = receipt_source.get("checkpoint_sha256")
+        if isinstance(receipt_source_contract, dict):
+            migration_roles = admitted_migration.get("roles")
+            recomputed_migration = policy_contract_migration(
+                receipt_source_contract,
+                actual_contract,
+                roles=(
+                    tuple(migration_roles)
+                    if isinstance(migration_roles, list)
+                    else ("actor", "critic")
+                ),
+            )
+            if receipt_source_contract == actual_contract:
+                recomputed_compatibility: dict[str, Any] | None = {
+                    "type": "exact_policy_contract",
+                    "from_schema": receipt_source_contract.get("schema"),
+                    "to_schema": actual_contract.get("schema"),
+                    "optimizer_resume": False,
+                }
+            else:
+                recomputed_compatibility = recomputed_migration
+        else:
+            recomputed_compatibility = None
+        if (
+            not isinstance(receipt_source_contract, dict)
+            or recomputed_compatibility is None
+            or recomputed_compatibility != admitted_migration
+            or contract_fingerprint(receipt_source_contract)
+            != source_contract_sha256
+            or receipt_source.get("contract_sha256")
+            != source_contract_sha256
+            or receipt_target.get("contract") != effective_contract
+            or receipt_target.get("contract_sha256")
+            != actual_contract_sha256
+            or admitted_contract_receipt.get("compatibility")
+            != admitted_migration
+            or (
+                receipt_checkpoint_sha256 is not None
+                and receipt_checkpoint_sha256
+                != source_checkpoint_sha256
+            )
+        ):
+            raise RuntimeError(
+                "warm-start policy-contract receipt disagrees with the "
+                "admitted runner pins or checkpoint"
+            )
+    event_interface = effective_contract.get("event_observation")
+    interface_phases = (
+        event_interface.get("ordered_phase_ids")
+        if isinstance(event_interface, dict)
+        else None
+    )
+    runtime_clock_width = 0
+    canonical_runtime_clock: dict[str, Any] | None = None
+    if reference_clock is not None:
+        from sculptor.reference_clock import validate_reference_clock
+
+        try:
+            canonical_runtime_clock = validate_reference_clock(reference_clock)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("runtime reference clock is invalid") from exc
+        runtime_clock_width = int(canonical_runtime_clock["shape"][0])
+    runtime_event_width = int(extension_width) - runtime_clock_width
+    if runtime_event_width < 0:
+        raise RuntimeError(
+            "runtime observation extension width is smaller than the "
+            "reference-clock interface"
+        )
+    if runtime_event_width > 0:
+        if (
+            interface_phases != ["route", "jump", "hold"]
+            or len(interface_phases) != runtime_event_width
+        ):
+            raise RuntimeError(
+                "effective policy contract lacks the runtime event "
+                "observation interface"
+            )
+    elif event_interface is not None:
+        raise RuntimeError(
+            "pinned policy contract declares an event observation, but the "
+            "applied runtime world has no event interface"
+        )
+
+    pinned_clock = effective_contract.get("reference_clock")
+    if canonical_runtime_clock is None:
+        if pinned_clock is not None:
+            raise RuntimeError(
+                "pinned policy contract declares a reference clock, but the "
+                "runtime reward has no reference clock"
+            )
+    elif pinned_clock != canonical_runtime_clock:
+        raise RuntimeError(
+            "pinned policy contract reference clock differs from the exact "
+            "runtime reward module"
+        )
+
+    return {
+        "active": True,
+        "contract_pin_present": contract_pin_present,
+        "effective_contract": effective_contract,
+        "effective_contract_sha256": actual_contract_sha256,
+        "source_contract_sha256": source_contract_sha256,
+        "admitted_migration": admitted_migration,
+        "admitted_contract_receipt": admitted_contract_receipt,
+        "admission_kind": admission_kind,
+    }
+
+
+def _warm_start_loaded_receipt(
+    *,
+    requested_source: Path,
+    requested_sha256: str,
+    loaded_checkpoint: Path,
+    loaded_sha256: str,
+    load_cfg: Mapping[str, bool],
+    effective_policy_contract_sha256: str | None,
+    extension_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Earned initialization receipt for the exact bytes runner.load used."""
+    adapted = bool(extension_receipt.get("adapted"))
+    return {
+        "type": "warm_start_loaded",
+        # Backwards-readable aliases keep denoting requested source intent.
+        "source": str(requested_source),
+        "source_sha256": requested_sha256,
+        "source_sha8": requested_sha256[:8],
+        "requested_source": str(requested_source),
+        "requested_source_sha256": requested_sha256,
+        "loaded_checkpoint": str(loaded_checkpoint),
+        "loaded_checkpoint_sha256": loaded_sha256,
+        "loaded_checkpoint_sha8": loaded_sha256[:8],
+        "adapted": adapted,
+        "derived_from": (
+            {
+                "source": str(requested_source),
+                "source_sha256": requested_sha256,
+            }
+            if adapted
+            else None
+        ),
+        "policy_contract_migration": (
+            (
+                extension_receipt.get(
+                    "admitted_policy_contract_migration", {}
+                ).get("type")
+                if isinstance(
+                    extension_receipt.get(
+                        "admitted_policy_contract_migration"
+                    ), Mapping,
+                )
+                else None
+            )
+            if adapted else None
+        ),
+        "effective_policy_contract_sha256": (
+            effective_policy_contract_sha256
+        ),
+        "source_policy_contract_sha256": extension_receipt.get(
+            "source_policy_contract_sha256"
+        ),
+        "admitted_policy_contract_migration": extension_receipt.get(
+            "admitted_policy_contract_migration"
+        ),
+        "policy_contract_receipt": extension_receipt.get(
+            "policy_contract_receipt"
+        ),
+        "policy_contract_receipt_sha256": extension_receipt.get(
+            "policy_contract_receipt_sha256"
+        ),
+        "load_cfg_keys": sorted(
+            key for key, value in load_cfg.items() if value
+        ),
+    }
+
+
 def _cmd_train(args: argparse.Namespace) -> None:
     # Lazy heavy imports — stay out of the module top.
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -2284,7 +4212,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    train_environment_artifacts = environment_artifacts_for_phase(
+        capture_environment_artifacts(
+            env_spec_path=getattr(args, "env_spec", "") or None,
+            world_selection_path=(
+                getattr(args, "world_selection", "") or None
+            ),
+        ),
+        "train",
+    )
+
     env_cfg = load_env_cfg(args.task_id)
+    rl_cfg = load_rl_cfg(args.task_id)
+    train_seed_application = _apply_runtime_seed(
+        int(args.seed), env_cfg=env_cfg, rl_cfg=rl_cfg,
+    )
     env_cfg.scene.num_envs = args.num_envs
     # Authored geometry/task semantics are applied first. Legacy EnvSpec then
     # overlays only its separate reset/randomization/optimizer surface.
@@ -2295,11 +4237,47 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # a named --env-profile preset; neither → task defaults, no-op).
     # train=True additionally applies the train-only curricula section.
     env_spec = _resolve_env_spec(args)
-    _apply_env_spec(env_cfg, env_spec, train=True, task_id=args.task_id)
-    # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
-    # the TRAIN env too (not just rollout) so the policy trains against the same
-    # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
-    _enforce_actuator_limits(env_cfg)
+    train_env_spec_application = _apply_env_spec(
+        env_cfg, env_spec, train=True, task_id=args.task_id,
+    )
+    _reassert_authored_task_termination(env_cfg, world_bundle)
+    # Authored worlds already carry their admitted actuator profile. Only a
+    # legacy registered task may receive the environment-gated compatibility
+    # transform, and it must receive it in both training and rollout.
+    if world_bundle is None:
+        _enforce_actuator_limits(env_cfg)
+
+    reward_module = None
+    reference_clock = None
+    train_reward_sha256 = None
+    train_reward_artifact = None
+    train_input_checkpoint_requested_sha256 = None
+    train_input_checkpoint_loaded_sha256 = None
+    train_input_checkpoint_load_completed = False
+    if args.reward_module_path:
+        train_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="training reward module",
+        )
+        train_reward_sha256 = train_reward_artifact["selected"]["sha256"]
+        reward_module = _load_reward_module(args.reward_module_path)
+        _validate_loaded_reward_artifact(reward_module, train_reward_artifact)
+        if _capture_runner_reward_artifact(
+            args.reward_module_path, label="training reward module",
+        ) != train_reward_artifact:
+            raise RuntimeError(
+                "training reward module changed while it was being loaded"
+            )
+        reference_clock = _install_reference_clock_observation(
+            env_cfg, reward_module,
+        )
+        if reference_clock is not None:
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "reference_clock_observation_installed",
+                    "reference_clock": reference_clock,
+                }, sort_keys=True),
+                flush=True,
+            )
 
     # Reward injection (optional).
     if args.reward_module_path:
@@ -2344,8 +4322,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
         # `_install_sculptor_termination_economics` below (survival guard +
         # explicit non-timeout termination penalty), which is why dropping
         # `upright` here does not reopen the fall-immediately failure mode.
-        tracking = _reward_module_declares(args.reward_module_path,
-                                           "reference_tracking")
+        # Use the exact module already loaded and byte-attested above. A
+        # second path import can disagree under mutation, and checking only
+        # the legacy flat-reward flag misclassifies mode tracking rewards.
+        tracking = _reward_module_tracks_reference(reward_module)
         if isinstance(existing, dict):
             kept, dropped = [], []
             for k in list(existing.keys()):
@@ -2369,6 +4349,22 @@ def _cmd_train(args: argparse.Namespace) -> None:
                     file=sys.stderr, flush=True)
         else:
             env_cfg.rewards = {}
+
+        event_jump_masked_terms = (
+            _install_authored_event_jump_realism_firewall(
+                env_cfg.rewards, world_bundle)
+        )
+        event_jump_horizontal_tracking = bool(
+            event_jump_masked_terms
+            or getattr(
+                getattr(
+                    env_cfg.rewards.get("track_linear_velocity"),
+                    "func", None,
+                ),
+                "_sculptor_event_jump_horizontal_only",
+                False,
+            )
+        )
 
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
         terminal_hold_s = _authored_terminal_hold_s(world_bundle)
@@ -2408,6 +4404,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             _load_authored_robot_capability(
                 getattr(args, "world_selection", "")),
             world_bundle,
+            reward_module,
         )
         env_cfg.rewards["sculptor_primary"] = RewardTermCfg(
             func=SculptorRewardTerm,
@@ -2427,6 +4424,18 @@ def _cmd_train(args: argparse.Namespace) -> None:
             print(
                 "[runner] preserved authored command supervision at full weight: "
                 + ", ".join(sorted(full_weight_terms)),
+                file=sys.stderr,
+                flush=True,
+            )
+        if event_jump_horizontal_tracking:
+            print(
+                "[runner] installed authored JUMP-phase reward arbitration: "
+                "track_linear_velocity is horizontal-only; grounded-gait "
+                "priors masked=" + ",".join(event_jump_masked_terms) + "; "
+                "all native rewards restored for ROUTE/HOLD and invalid "
+                "event sequences; upright, angular tracking, hardware "
+                "limits, action smoothness, slip, landing, contact, and "
+                "survival terms remain active when present",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2478,7 +4487,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
     from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
     from mjlab.tasks.registry import load_runner_cls
 
-    rl_cfg = load_rl_cfg(args.task_id)
     rl_cfg.max_iterations = args.max_iterations
     # PPO exploration from the env spec's train section (e.g.
     # entropy_coef_scale). Train-time only — rollout never optimizes.
@@ -2510,18 +4518,312 @@ def _cmd_train(args: argparse.Namespace) -> None:
             raise FileNotFoundError(
                 f"--load-pretrained-policy not found: {ckpt}"
             )
+        load_role = str(args.pretrained_load_role or "actor_critic")
+        if load_role not in ("actor_only", "actor_critic"):
+            raise ValueError(
+                "--pretrained-load-role must be actor_only or actor_critic"
+            )
         load_cfg = {
             "actor": True,
-            "critic": True,
+            "critic": load_role == "actor_critic",
             "optimizer": False,
             "iteration": False,
             "rnd": False,
         }
-        # Cheap forensics: short checksum so Ship-16's mission orchestrator
-        # can later verify the path matches its known stage checkpoint.
-        source_sha8 = _hashlib.sha256(ckpt.read_bytes()).hexdigest()[:8]
+        source_digest = _hashlib.sha256()
+        with ckpt.open("rb") as checkpoint_stream:
+            for chunk in iter(lambda: checkpoint_stream.read(1 << 20), b""):
+                source_digest.update(chunk)
+        source_sha256 = source_digest.hexdigest()
+        _verify_warm_start_checkpoint_sha256(source_sha256)
+        load_path = ckpt
+        effective_contract_sha256: str | None = None
+        extension_receipt: dict[str, Any] = {"adapted": False}
+        event_extension_width = _event_observation_extension_width(world_bundle)
+        reference_extension_width = (
+            int(reference_clock["shape"][0])
+            if isinstance(reference_clock, Mapping)
+            else 0
+        )
+        extension_width = event_extension_width + reference_extension_width
+        contract_attestation = _attest_warm_start_policy_contract(
+            world_selection=getattr(args, "world_selection", ""),
+            extension_width=extension_width,
+            source_checkpoint_sha256=source_sha256,
+            reference_clock=reference_clock,
+            source_checkpoint_path=ckpt,
+            project_dir=(
+                Path(args.reward_module_path).expanduser().resolve().parent.parent
+                if args.reward_module_path else None
+            ),
+        )
+        admission_kind = contract_attestation.get("admission_kind")
+        contract_requires_adaptation = bool(
+            contract_attestation["active"]
+            and admission_kind != "exact_policy_contract"
+        )
+        # Exact schema-2 warm starts have no tensor extension, but they still
+        # carry the same immutable receipt/selection attestation as event
+        # migrations.  Persist that proof before runner.load rather than
+        # silently skipping all contract checks when extension_width == 0.
+        if (
+            contract_attestation["active"]
+            and extension_width == 0
+            and not contract_requires_adaptation
+        ):
+            effective_contract = contract_attestation[
+                "effective_contract"
+            ]
+            effective_contract_sha256 = contract_attestation[
+                "effective_contract_sha256"
+            ]
+            admitted_migration = contract_attestation[
+                "admitted_migration"
+            ]
+            admitted_contract_receipt = contract_attestation[
+                "admitted_contract_receipt"
+            ]
+            effective_contract_path = (
+                output_dir / "warm_start_effective_policy_contract.json"
+            )
+            effective_contract_path.write_text(
+                json.dumps(
+                    effective_contract,
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            receipt_artifact_path: Path | None = None
+            receipt_artifact_sha256: str | None = None
+            if admitted_contract_receipt is not None:
+                receipt_artifact_path = (
+                    output_dir / "warm_start_policy_contract_receipt.json"
+                )
+                receipt_artifact_path.write_text(
+                    json.dumps(
+                        admitted_contract_receipt,
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                receipt_artifact_sha256 = _hashlib.sha256(
+                    receipt_artifact_path.read_bytes()
+                ).hexdigest()
+            extension_receipt.update({
+                "extension_width": 0,
+                "observation_term": None,
+                "source_policy_contract_sha256": contract_attestation[
+                    "source_contract_sha256"
+                ],
+                "admitted_policy_contract_migration": admitted_migration,
+                "policy_contract_receipt": (
+                    str(receipt_artifact_path)
+                    if receipt_artifact_path is not None
+                    else None
+                ),
+                "policy_contract_receipt_sha256": (
+                    receipt_artifact_sha256
+                ),
+            })
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "warm_start_observation_contract_verified",
+                    "source": str(ckpt),
+                    "source_sha256": source_sha256,
+                    "effective_policy_contract": str(
+                        effective_contract_path),
+                    "effective_policy_contract_sha256": (
+                        effective_contract_sha256),
+                    "effective_policy_contract_schema": (
+                        effective_contract.get("schema")),
+                    **extension_receipt,
+                }),
+                flush=True,
+            )
+        if extension_width > 0 or contract_requires_adaptation:
+            from sculptor.policy_contract import contract_fingerprint
+
+            pinned_contract_sha256 = os.environ.get(
+                "SCULPTOR_EFFECTIVE_POLICY_CONTRACT_SHA256"
+            )
+            if not contract_attestation["active"]:
+                raise RuntimeError(
+                    "observation-interface warm start has no admitted policy "
+                    "contract"
+                )
+            contract_pin_present = bool(
+                contract_attestation["contract_pin_present"]
+            )
+            effective_contract = contract_attestation["effective_contract"]
+            admitted_migration = contract_attestation["admitted_migration"]
+            admitted_contract_receipt = contract_attestation[
+                "admitted_contract_receipt"
+            ]
+            admission_kind = contract_attestation["admission_kind"]
+            source_contract_sha256 = contract_attestation[
+                "source_contract_sha256"
+            ]
+            effective_contract_sha256 = contract_fingerprint(
+                effective_contract)
+            if (
+                pinned_contract_sha256
+                and effective_contract_sha256 != pinned_contract_sha256
+            ):
+                raise RuntimeError(
+                    "effective policy contract differs from the immutable "
+                    "pre-queue launch pin"
+                )
+            if admitted_contract_receipt is not None:
+                receipt_source = admitted_contract_receipt["source"]
+                receipt_target = admitted_contract_receipt["target"]
+                receipt_source_contract = receipt_source.get("contract")
+                if (
+                    not isinstance(receipt_source_contract, dict)
+                    or contract_fingerprint(receipt_source_contract)
+                    != source_contract_sha256
+                    or receipt_target.get("contract") != effective_contract
+                    or receipt_target.get("contract_sha256")
+                    != effective_contract_sha256
+                    or receipt_source.get("contract_sha256")
+                    != source_contract_sha256
+                    or admitted_contract_receipt.get("compatibility")
+                    != admitted_migration
+                ):
+                    raise RuntimeError(
+                        "warm-start policy-contract receipt disagrees with "
+                        "the admitted runner pins"
+                    )
+            event_interface = effective_contract.get("event_observation")
+            if event_extension_width:
+                if (
+                    not isinstance(event_interface, dict)
+                    or event_interface.get("ordered_phase_ids")
+                    != ["route", "jump", "hold"]
+                ):
+                    raise RuntimeError(
+                        "effective policy contract lacks the admitted event "
+                        "observation interface"
+                    )
+            pinned_reference_clock = effective_contract.get("reference_clock")
+            if reference_extension_width:
+                if pinned_reference_clock != reference_clock:
+                    raise RuntimeError(
+                        "effective policy contract lacks the exact runtime "
+                        "reference-clock observation interface"
+                    )
+            elif pinned_reference_clock is not None:
+                raise RuntimeError(
+                    "effective policy contract declares a reference clock, "
+                    "but the runtime reward has none"
+                )
+            effective_contract_path = (
+                output_dir / "warm_start_effective_policy_contract.json"
+            )
+            effective_contract_path.write_text(
+                json.dumps(
+                    effective_contract,
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            receipt_artifact_path: Path | None = None
+            receipt_artifact_sha256: str | None = None
+            if admitted_contract_receipt is not None:
+                receipt_artifact_path = (
+                    output_dir / "warm_start_policy_contract_receipt.json"
+                )
+                receipt_artifact_path.write_text(
+                    json.dumps(
+                        admitted_contract_receipt,
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                receipt_artifact_sha256 = _hashlib.sha256(
+                    receipt_artifact_path.read_bytes()
+                ).hexdigest()
+            adaptation_width = (
+                0
+                if admission_kind == "exact_policy_contract"
+                else int(admitted_migration.get("extension_width", 0))
+            )
+            role_migrations = (
+                admitted_migration.get("role_migrations")
+                if admission_kind
+                == "zero_initialized_ordered_observation_insertions"
+                else None
+            )
+            observation_terms = _observation_terms_for_contract_admission(
+                admitted_migration,
+                effective_contract,
+            )
+            load_path, extension_receipt = (
+                _prepare_event_observation_warm_start(
+                    runner,
+                    ckpt,
+                    output_dir=output_dir,
+                    extension_width=adaptation_width,
+                    load_role=load_role,
+                    observation_terms=observation_terms,
+                    role_migrations=role_migrations,
+                )
+            )
+            if contract_pin_present:
+                adapted = bool(extension_receipt.get("adapted"))
+                if admission_kind == "exact_policy_contract" and adapted:
+                    raise RuntimeError(
+                        "exact policy-contract warm start unexpectedly "
+                        "required an observation migration"
+                    )
+                if admission_kind != "exact_policy_contract" and not adapted:
+                    raise RuntimeError(
+                        "declared observation migration did not change "
+                        "the checkpoint interface"
+                    )
+            extension_receipt.update({
+                "source_policy_contract_sha256": source_contract_sha256,
+                "admitted_policy_contract_migration": admitted_migration,
+                "policy_contract_receipt": (
+                    str(receipt_artifact_path)
+                    if receipt_artifact_path is not None
+                    else None
+                ),
+                "policy_contract_receipt_sha256": (
+                    receipt_artifact_sha256
+                ),
+            })
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": (
+                        "warm_start_observation_extended"
+                        if extension_receipt.get("adapted")
+                        else "warm_start_observation_contract_verified"
+                    ),
+                    "source": str(ckpt),
+                    "source_sha256": source_sha256,
+                    "effective_policy_contract": str(
+                        effective_contract_path),
+                    "effective_policy_contract_sha256": (
+                        effective_contract_sha256),
+                    "effective_policy_contract_schema": (
+                        effective_contract.get("schema")),
+                    **extension_receipt,
+                }),
+                flush=True,
+            )
+        loaded_digest = _hashlib.sha256()
+        with load_path.open("rb") as checkpoint_stream:
+            for chunk in iter(
+                lambda: checkpoint_stream.read(1 << 20), b""
+            ):
+                loaded_digest.update(chunk)
+        loaded_sha256 = loaded_digest.hexdigest()
         try:
-            _ = runner.load(str(ckpt), load_cfg=load_cfg)
+            _ = runner.load(str(load_path), load_cfg=load_cfg)
         except (RuntimeError, OSError, EOFError, Exception) as e:
             # Broaden beyond RuntimeError per Ship-15 audit — torch.load
             # can raise UnpicklingError (corrupt file), OSError (bad
@@ -2541,17 +4843,45 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 "or truncated, or (c) the rsl_rl version that wrote "
                 "the checkpoint has drifted from the one loading it."
             ) from e
+        train_input_checkpoint_requested_sha256 = source_sha256
+        train_input_checkpoint_loaded_sha256 = loaded_sha256
+        train_input_checkpoint_load_completed = True
         print(
-            "[SCULPT-EVENT] " + json.dumps({
-                "type": "warm_start_loaded",
-                "source": str(ckpt),
-                "source_sha8": source_sha8,
-                "load_cfg_keys": sorted(
-                    k for k, v in load_cfg.items() if v
-                ),
-            }),
+            "[SCULPT-EVENT] " + json.dumps(
+                _warm_start_loaded_receipt(
+                    requested_source=ckpt,
+                    requested_sha256=source_sha256,
+                    loaded_checkpoint=load_path,
+                    loaded_sha256=loaded_sha256,
+                    load_cfg=load_cfg,
+                    effective_policy_contract_sha256=(
+                        effective_contract_sha256),
+                    extension_receipt=extension_receipt,
+                )
+            ),
             flush=True,
         )
+        # The actor weights just loaded include the learned exploration std,
+        # which ratchets up across chained warm starts until the action-rate
+        # penalty outweighs the task reward. Bound it by what a fresh policy
+        # would start from; see `_clamp_warm_started_noise`.
+        init_std = _configured_init_std(rl_cfg)
+        clamped = (None if init_std is None
+                   else _clamp_warm_started_noise(runner, init_std))
+        if clamped is not None:
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "warm_start_noise_clamped", **clamped}),
+                flush=True,
+            )
+            print(
+                f"[runner] warm start carried action-noise std "
+                f"{clamped['std_before']:.3f}, above this task's fresh-init "
+                f"{clamped['ceiling']:.3f} — clamped to "
+                f"{clamped['std_after']:.3f} so the inherited noise does not "
+                f"pay the action-rate penalty for the whole run",
+                file=sys.stderr, flush=True,
+            )
 
     # Progress poller — watches the logs dir for new model_<N>.pt
     # checkpoints rsl_rl writes every `save_interval` iters and emits
@@ -2651,11 +4981,18 @@ def _cmd_train(args: argparse.Namespace) -> None:
     _poll_thread = _threading.Thread(target=_progress_poller, daemon=True)
     _poll_thread.start()
     std_guard_handle = _install_scalar_std_guard(runner)
+    # The progress poller above says how far along the run is; this says
+    # whether it is going anywhere.
+    if not _install_learning_vitals(runner, int(args.max_iterations)):
+        print("[runner] learning vitals unavailable: runner exposes no logger",
+              file=sys.stderr, flush=True)
+    _learn_completed = False
     try:
         runner.learn(
             num_learning_iterations=args.max_iterations,
             init_at_random_ep_len=True,
         )
+        _learn_completed = True
     finally:
         if std_guard_handle is not None:
             std_guard_handle.remove()
@@ -2689,18 +5026,19 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 )
         # Disable the sink so rollout / next-iter training start clean.
         _COMPONENT_SINK = None
-        # Final tick at 100 % so the UI snaps to "done" immediately.
-        print(
-            "[SCULPT-EVENT] " + _json.dumps({
-                "type": "iter_progress",
-                "rl_iter": int(args.max_iterations),
-                "rl_total": int(args.max_iterations),
-                "pct": 100.0,
-                "elapsed_s": round(_time.time() - _t0, 1),
-                "eta_s": 0.0,
-            }),
-            flush=True,
+        # Final tick at 100% only when the learning call actually returned.
+        # On an exception, the last periodic snapshot remains the honest
+        # progress authority and the UI must continue to show interruption.
+        _terminal_progress = _completed_iter_progress_event(
+            max_iterations=int(args.max_iterations),
+            elapsed_s=_time.time() - _t0,
+            completed=_learn_completed,
         )
+        if _terminal_progress is not None:
+            print(
+                "[SCULPT-EVENT] " + _json.dumps(_terminal_progress),
+                flush=True,
+            )
 
     # Capture the latest periodic checkpoint rsl_rl wrote under logs/.
     # Avoid runner.save() — it internally calls `wandb.save(path, ...)`
@@ -2734,6 +5072,45 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 file=sys.stderr, flush=True,
             )
 
+    policy_contract_sidecar: Path | None = None
+    output_policy_contract_sha256: str | None = None
+    output_policy_contract_sidecar_sha256: str | None = None
+    if reference_clock is not None:
+        from sculptor.policy_contract import build_project_policy_contract
+
+        if not args.reward_module_path:
+            raise RuntimeError(
+                "reference-conditioned checkpoint has no exact reward project"
+            )
+        reward_project_dir = (
+            Path(args.reward_module_path).expanduser().resolve().parent.parent
+        )
+        contract_kwargs: dict[str, Any] = {
+            "reference_clock": reference_clock,
+        }
+        selection_path = Path(
+            getattr(args, "world_selection", "") or ""
+        ).expanduser().resolve()
+        if selection_path.is_file():
+            contract_kwargs["world_selection_path"] = selection_path
+        effective_checkpoint_contract = build_project_policy_contract(
+            reward_project_dir,
+            **contract_kwargs,
+        )
+        policy_contract_sidecar = _write_local_checkpoint_policy_contract(
+            ckpt_path,
+            effective_checkpoint_contract,
+        )
+        from sculptor.policy_contract import contract_fingerprint
+
+        output_policy_contract_sha256 = contract_fingerprint(
+            effective_checkpoint_contract
+        )
+        output_policy_contract_sidecar_sha256 = _runtime_file_sha256(
+            policy_contract_sidecar,
+            label="training output policy-contract sidecar",
+        )
+
     metrics = {
         "task_id": args.task_id,
         "num_envs": args.num_envs,
@@ -2742,7 +5119,59 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "device": args.device,
         "reward_injection": bool(args.reward_module_path),
         "checkpoint_path": str(ckpt_path),
+        "policy_contract_sidecar": (
+            str(policy_contract_sidecar)
+            if policy_contract_sidecar is not None else None
+        ),
     }
+    if train_reward_sha256 is not None:
+        assert train_reward_artifact is not None
+        observed_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="training reward module",
+        )
+        if observed_reward_artifact != train_reward_artifact:
+            raise RuntimeError(
+                "training reward module changed during the training process"
+            )
+        observed_reward_sha256 = observed_reward_artifact["selected"]["sha256"]
+        observed_train_environment_artifacts = environment_artifacts_for_phase(
+            capture_environment_artifacts(
+                env_spec_path=getattr(args, "env_spec", "") or None,
+                world_selection_path=(
+                    getattr(args, "world_selection", "") or None
+                ),
+            ),
+            "train",
+        )
+        if observed_train_environment_artifacts != train_environment_artifacts:
+            raise RuntimeError("training environment inputs changed during training")
+        metrics["runtime_artifacts"] = {
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "train",
+            "reward_module_sha256": observed_reward_sha256,
+            "requested_max_iterations": int(args.max_iterations),
+            "requested_seed": int(args.seed),
+            "requested_num_envs": int(args.num_envs),
+            "seed_application": train_seed_application,
+            "environment_artifacts": observed_train_environment_artifacts,
+            "env_spec_application": train_env_spec_application,
+            "input_checkpoint_requested_sha256": (
+                train_input_checkpoint_requested_sha256
+            ),
+            "input_checkpoint_loaded_sha256": (
+                train_input_checkpoint_loaded_sha256
+            ),
+            "input_checkpoint_load_completed": (
+                train_input_checkpoint_load_completed
+            ),
+            "output_checkpoint_sha256": _runtime_file_sha256(
+                ckpt_path, label="training output checkpoint",
+            ),
+            "output_policy_contract_sha256": output_policy_contract_sha256,
+            "output_policy_contract_sidecar_sha256": (
+                output_policy_contract_sidecar_sha256
+            ),
+        }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     _write_world_curriculum_stats(env, output_dir)
@@ -2825,6 +5254,50 @@ def _configure_rollout_viewer(env_cfg: Any, args: Any) -> None:
     except Exception as e:  # noqa: BLE001 — cosmetics must never kill a rollout
         print(f"[runner] viewer config skipped: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
+
+
+def _hide_untracked_authored_geometry(env: Any, env_idx: int) -> None:
+    """Make other environments' authored courses invisible in rollout video.
+
+    `max_extra_envs = 0` above stops mjlab drawing neighbouring ROBOTS, but
+    authored course geometry lives in the shared worldbody — one copy per env
+    origin, always in the model, always drawn. At training widths that fills
+    the frame with a field of identical courses and buries the one the tracked
+    robot is actually running, which reads as a broken scene.
+
+    Alpha only. `geom_rgba`/`site_rgba` are render inputs; collision geometry,
+    contacts and every observation are untouched, so the video shows the same
+    physics it always did — just the tracked environment's slice of it.
+
+    FULLY DEFENSIVE, like the viewer config: cosmetics must never kill a run.
+    """
+    try:
+        import re as _re
+
+        model = env.sim.mj_model
+        keep = f"__env_{int(env_idx):04d}"
+        hidden = 0
+        for array, count, getter in (
+            (getattr(model, "geom_rgba", None), model.ngeom, model.geom),
+            (getattr(model, "site_rgba", None), model.nsite, model.site),
+        ):
+            if array is None:
+                continue
+            for index in range(count):
+                name = getter(index).name or ""
+                if not _re.match(r"(obstacle|zone)__.*__env_\d{4}$", name):
+                    continue
+                if name.endswith(keep):
+                    continue
+                array[index][3] = 0.0
+                hidden += 1
+        if hidden:
+            print(f"[runner] rollout video: hid {hidden} authored geoms/sites "
+                  f"belonging to environments other than env {env_idx}",
+                  file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — cosmetics must never kill a rollout
+        print(f"[runner] authored-geometry culling skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
 
 def _apply_ground_texture(env_cfg: Any) -> None:
@@ -2910,86 +5383,53 @@ def _apply_ground_texture(env_cfg: Any) -> None:
 # re-supply the velocity_limit mjlab dropped. Per-pattern no-load speeds, cited from
 # mjlab's own robot constants (single source of truth):
 #   G1  g1_constants.py:91-178   Go1 go1_constants.py:40-72
-_ACTUATOR_VELOCITY_LIMITS: dict[str, float] = {
-    # Unitree G1 (rad/s)
-    ".*_knee_joint": 20.0, ".*_hip_roll_joint": 20.0,                       # 7520-22
-    ".*_hip_pitch_joint": 32.0, ".*_hip_yaw_joint": 32.0, "waist_yaw_joint": 32.0,   # 7520-14
-    ".*_elbow_joint": 37.0, ".*_shoulder_pitch_joint": 37.0,
-    ".*_shoulder_roll_joint": 37.0, ".*_shoulder_yaw_joint": 37.0,
-    ".*_wrist_roll_joint": 37.0,                                            # 5020
-    ".*_wrist_pitch_joint": 22.0, ".*_wrist_yaw_joint": 22.0,               # 4010
-    ".*_ankle_pitch_joint": 37.0, ".*_ankle_roll_joint": 37.0,
-    "waist_pitch_joint": 37.0, "waist_roll_joint": 37.0,                    # 2×5020
-    # Unitree Go1 (rad/s)
-    ".*_hip_joint": 30.1, ".*_thigh_joint": 30.1, ".*_calf_joint": 20.06,
-}
-
-
 def _recover_velocity_limit(actuator_cfg: Any) -> "float | None":
     """The real motor no-load speed (rad/s) for an actuator group, recovered from
     its `target_names_expr` (cited from mjlab's robot constants — same source of
     truth that defines the group). None when no pattern matches (an unknown
     robot/group → the caller leaves it unchanged), so this never invents a limit."""
-    patterns = getattr(actuator_cfg, "target_names_expr", None) or ()
-    lims = [_ACTUATOR_VELOCITY_LIMITS[p] for p in patterns
-            if p in _ACTUATOR_VELOCITY_LIMITS]
-    return min(lims) if lims else None
+    from sculptor.world.capabilities import (
+        LEGACY_UNITREE_DC_MOTOR_PROFILE,
+        actuator_velocity_limit,
+    )
+
+    return actuator_velocity_limit(
+        actuator_cfg, LEGACY_UNITREE_DC_MOTOR_PROFILE,
+    )
 
 
 def _enforce_actuator_limits(env_cfg: Any) -> None:
     """Swap every `BuiltinPositionActuatorCfg` → `DcMotorActuatorCfg` so the sim
     enforces each motor's VELOCITY (no-load speed) limit via mjlab's research-standard
-    torque-speed model, on top of the torque (effort) limit it already clamps. Mutates
-    `env_cfg` BEFORE the env is built, so it is active in BOTH train and rollout (the
-    policy trains against — and is evaluated under — the same constrained physics).
+    torque-speed model, on top of the torque (effort) limit it already clamps. Replaces
+    each entity with an owned copy BEFORE the env is built, so it is active in BOTH
+    train and rollout without mutating MjLab's shared robot constants.
 
-    Gated by `RS_ENFORCE_ACTUATOR_LIMITS` (default ON — Sam's call 2026-06-20; set to
-    0/off to disable and recover the old velocity-unconstrained physics). FULLY
-    DEFENSIVE: any group whose velocity_limit can't be recovered, or any API drift,
-    leaves the actuator unchanged + warns — a run never breaks. `saturation_effort =
-    effort_limit` (the conservative triangular torque-speed envelope; raise to the
-    true peak/stall torque when a datasheet is known for a flat-topped curve)."""
+    Gated by `RS_ENFORCE_ACTUATOR_LIMITS` for legacy registered tasks. Authored worlds
+    compose the same versioned profile during admission, so a process flag cannot
+    change their pinned physics. Any unknown group is left unchanged with a warning.
+    `saturation_effort = effort_limit` gives the conservative triangular envelope."""
     import os
     if os.environ.get("RS_ENFORCE_ACTUATOR_LIMITS", "1").strip().lower() not in (
             "1", "true", "on", "yes"):
         return
     try:
-        from mjlab.actuator import BuiltinPositionActuatorCfg, DcMotorActuatorCfg
-    except Exception as e:  # noqa: BLE001 — mjlab without DcMotor → leave as-is
-        print(f"[runner] actuator-limit enforcement skipped (no DcMotorActuatorCfg): "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        return
-    try:
+        from sculptor.world.capabilities import (
+            LEGACY_UNITREE_DC_MOTOR_PROFILE,
+            apply_actuator_profile,
+        )
+
         entities = getattr(getattr(env_cfg, "scene", None), "entities", None) or {}
-        items = entities.items() if hasattr(entities, "items") else []
+        items = list(entities.items()) if hasattr(entities, "items") else []
         for ekey, ent in items:
             art = getattr(ent, "articulation", None)
             acts = list(getattr(art, "actuators", None) or []) if art is not None else []
             if not acts:
                 continue
-            new_acts, swapped, unresolved = [], 0, []
-            for a in acts:
-                vlim = _recover_velocity_limit(a)
-                eff = getattr(a, "effort_limit", None)
-                if isinstance(a, BuiltinPositionActuatorCfg) and vlim is not None and eff:
-                    extra = {}
-                    for f in ("viscous_damping", "frictionloss"):
-                        v = getattr(a, f, None)
-                        if v is not None:
-                            extra[f] = v
-                    new_acts.append(DcMotorActuatorCfg(
-                        target_names_expr=a.target_names_expr,
-                        stiffness=a.stiffness, damping=a.damping,
-                        effort_limit=float(eff), armature=a.armature,
-                        velocity_limit=float(vlim),
-                        saturation_effort=float(eff),   # conservative triangular envelope
-                        **extra))
-                    swapped += 1
-                else:
-                    new_acts.append(a)   # unrecoverable / non-builtin → unchanged
-                    if isinstance(a, BuiltinPositionActuatorCfg):
-                        unresolved.append(getattr(a, "target_names_expr", "?"))
-            art.actuators = tuple(new_acts)
+            owned, swapped, unresolved = apply_actuator_profile(
+                ent, LEGACY_UNITREE_DC_MOTOR_PROFILE, strict=False,
+            )
+            entities[ekey] = owned
             msg = (f"[runner] actuator-limit enforcement: entity {ekey!r} — "
                    f"{swapped}/{len(acts)} groups → DcMotor (velocity-limited)")
             if unresolved:
@@ -3037,6 +5477,22 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     keyframes_dir = output_dir / "keyframes"
     keyframes_dir.mkdir(exist_ok=True)
+    rollout_environment_artifacts = environment_artifacts_for_phase(
+        capture_environment_artifacts(
+            env_spec_path=getattr(args, "env_spec", "") or None,
+            eval_reset_path=getattr(args, "eval_reset", "") or None,
+            world_selection_path=(
+                getattr(args, "world_selection", "") or None
+            ),
+        ),
+        "rollout",
+    )
+    rollout_reward_sha256 = None
+    rollout_reward_artifact = None
+    reference_clock = None
+    rollout_checkpoint_sha256 = _runtime_file_sha256(
+        args.checkpoint_path, label="rollout checkpoint",
+    )
 
     n_episodes = int(args.n_episodes)
     # mujoco_warp amortizes kernel-launch overhead across envs; anything
@@ -3054,6 +5510,9 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    rollout_seed_application = _apply_runtime_seed(
+        int(args.seed), env_cfg=env_cfg,
+    )
     # Rollout loads the materialized evaluation artifact from the selected
     # tuple; it never re-samples WorldSpec generators from a seed.
     world_bundle = _apply_world_selection(
@@ -3067,8 +5526,64 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # here — evaluation starts from the honest task state, or the
     # metric's view (upright_start / return-to-start-height) would be
     # corrupted by mid-air spawns.
-    _apply_env_spec(
+    rollout_env_spec_application = _apply_env_spec(
         env_cfg, _resolve_env_spec(args), train=False, task_id=args.task_id)
+    _reassert_authored_task_termination(env_cfg, world_bundle)
+    if getattr(args, "reward_module_path", None):
+        rollout_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="rollout reward module",
+        )
+        rollout_reward_sha256 = rollout_reward_artifact["selected"]["sha256"]
+        reward_module = _load_reward_module(args.reward_module_path)
+        _validate_loaded_reward_artifact(reward_module, rollout_reward_artifact)
+        if _capture_runner_reward_artifact(
+            args.reward_module_path, label="rollout reward module",
+        ) != rollout_reward_artifact:
+            raise RuntimeError(
+                "rollout reward module changed while it was being loaded"
+            )
+        reference_clock = _install_reference_clock_observation(
+            env_cfg, reward_module,
+        )
+        if reference_clock is not None:
+            print(
+                "[SCULPT-EVENT] " + json.dumps({
+                    "type": "reference_clock_observation_installed",
+                    "phase": "rollout",
+                    "reference_clock": reference_clock,
+                }, sort_keys=True),
+                flush=True,
+            )
+    if reference_clock is not None:
+        from sculptor.policy_contract import build_project_policy_contract
+
+        reward_project_dir = (
+            Path(args.reward_module_path).expanduser().resolve().parent.parent
+        )
+        contract_kwargs: dict[str, Any] = {
+            "reference_clock": reference_clock,
+        }
+        selection_path = Path(
+            getattr(args, "world_selection", "") or ""
+        ).expanduser().resolve()
+        if selection_path.is_file():
+            contract_kwargs["world_selection_path"] = selection_path
+        expected_rollout_contract = build_project_policy_contract(
+            reward_project_dir,
+            **contract_kwargs,
+        )
+        contract_receipt = _validate_rollout_checkpoint_policy_contract(
+            Path(args.checkpoint_path),
+            checkpoint_sha256=rollout_checkpoint_sha256,
+            expected_contract=expected_rollout_contract,
+        )
+        print(
+            "[SCULPT-EVENT] " + json.dumps({
+                "type": "rollout_checkpoint_policy_contract_verified",
+                **contract_receipt,
+            }, sort_keys=True),
+            flush=True,
+        )
     # §D17: stage-FIXED eval-reset override — reference-derived lying
     # start for get-up stages, applied ONLY here (never to training),
     # AFTER the shared-only env-spec above and strictly ADDITIVE to it.
@@ -3076,42 +5591,29 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # byte-identical no-op. See `_apply_eval_reset`'s docstring and
     # `sculptor.reference.derive_eval_reset` for the full rationale.
     _eval_reset_arg = getattr(args, "eval_reset", "") or ""
+    eval_reset_application = _apply_eval_reset(
+        env_cfg, None, task_id=args.task_id,
+    )
     if _eval_reset_arg:
-        try:
-            _eval_reset_payload = json.loads(
-                Path(_eval_reset_arg).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            print(f"[runner] --eval-reset {_eval_reset_arg!r} unreadable "
-                  f"({type(e).__name__}: {e}) — ignored", file=sys.stderr,
-                  flush=True)
-            _eval_reset_payload = None
-        _apply_eval_reset(
-            env_cfg, _eval_reset_payload, task_id=args.task_id)
+        _eval_reset_payload = _load_explicit_eval_reset(_eval_reset_arg)
+        eval_reset_application = _apply_eval_reset(
+            env_cfg, _eval_reset_payload, task_id=args.task_id, strict=True,
+        )
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # 720p + no ghost neighbor envs in the background (cosmetic, guarded).
     _configure_rollout_viewer(env_cfg, args)
-    # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
-    # the rollout physics matches what the policy trained under.
-    _enforce_actuator_limits(env_cfg)
+    # Authored physics is descriptor-pinned. Legacy registered tasks repeat
+    # the same compatibility transform used in training.
+    if world_bundle is None:
+        _enforce_actuator_limits(env_cfg)
     # §Selection statistics: deterministic eval seeding for repeat rollouts
     # of the SAME checkpoint (multi-seed evaluation / fresh-seed re-eval of
-    # the kept best). --seed 0 (default) leaves the legacy RNG state
-    # untouched. Reset-event randomization draws from torch's global RNG;
+    # the kept best). Seed 0 is applied like every other accepted seed.
+    # Reset-event randomization draws from torch's global RNG;
     # cfg.seed is additionally honored when the cfg exposes it.
-    _eval_seed = int(getattr(args, "seed", 0) or 0)
-    if _eval_seed:
-        try:
-            import torch
-            torch.manual_seed(_eval_seed)
-        except Exception:  # noqa: BLE001 — seeding is best-effort
-            pass
-        np.random.seed(_eval_seed % (2**32 - 1))
-        if hasattr(env_cfg, "seed"):
-            try:
-                env_cfg.seed = _eval_seed
-            except Exception:  # noqa: BLE001 — frozen cfg tolerated
-                pass
+    # The requested seed was applied fail-closed before any world/reset
+    # mutation or environment construction. Seed 0 is a real seed too.
     # §manipulation telemetry: registered (non-authored) tasks get generic
     # object/end-effector/contact/target channels discovered from the scene
     # cfg + capability descriptors — the artifact contract the YAM
@@ -3138,6 +5640,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
+    _hide_untracked_authored_geometry(
+        env, int(getattr(args, "render_env_index", 0) or 0))
     world_channel_recorder = None
     if world_bundle is not None:
         from sculptor.world.runtime import (
@@ -3275,6 +5779,10 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     runner_cls = load_runner_cls(args.task_id) or MjlabOnPolicyRunner
     runner = runner_cls(wrapped, agent_cfg_dict, None, args.device)
     runner.load(args.checkpoint_path)
+    if _runtime_file_sha256(
+        args.checkpoint_path, label="rollout checkpoint",
+    ) != rollout_checkpoint_sha256:
+        raise RuntimeError("rollout checkpoint changed while it was being loaded")
     policy = runner.get_inference_policy(device=args.device)
 
     import torch
@@ -3323,6 +5831,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # policy is exploiting.
     joint_pos_buf: list[np.ndarray] = []
     joint_vel_buf: list[np.ndarray] = []
+    default_pose_rms_buf: list[np.ndarray] = []
     action_buf: list[np.ndarray] = []
     actuator_force_buf: list[np.ndarray] = []
     # §reports: torque in JOINT space (qfrc_actuator) — aligned with joint_vel/names,
@@ -3334,7 +5843,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     root_link_lin_vel_b_buf: list[np.ndarray] = []
     root_link_ang_vel_b_buf: list[np.ndarray] = []
     # §Metric-quality laws (LAW 3/4): per-foot ground contact + foot position
-    # in the pelvis frame, persisted to the metric arrays so an objective
+    # in both pelvis and world frames, persisted to the metric arrays so an objective
     # metric can measure signed forward-kick DIRECTION (anterior foot
     # displacement) and the single-vs-double support SCHEDULE (one-leg-balance
     # veto). Biped-only — stay empty (and are dropped at save time) on tasks
@@ -3343,6 +5852,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     right_foot_contact_buf: list[np.ndarray] = []
     left_foot_pos_b_buf: list[np.ndarray] = []
     right_foot_pos_b_buf: list[np.ndarray] = []
+    left_foot_pos_w_buf: list[np.ndarray] = []
+    right_foot_pos_w_buf: list[np.ndarray] = []
     per_term_reward_buf: dict[str, list[np.ndarray]] = {}
     # Post-step mjlab state is already reset for environments whose `done`
     # fired.  These masks let artifact finalization preserve only each env's
@@ -3487,6 +5998,13 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             jp = _tensor_to_np(getattr(d, "joint_pos", None))
             if jp is not None:
                 joint_pos_buf.append(jp)
+                default_jp = _tensor_to_np(
+                    getattr(d, "default_joint_pos", None)
+                )
+                if default_jp is not None and default_jp.shape == jp.shape:
+                    default_pose_rms_buf.append(np.sqrt(np.mean(
+                        np.square(jp - default_jp), axis=-1,
+                    )).astype(np.float32, copy=False))
             jv = _tensor_to_np(getattr(d, "joint_vel", None))
             if jv is not None:
                 joint_vel_buf.append(jv)
@@ -3508,8 +6026,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             rav = _tensor_to_np(getattr(d, "root_link_ang_vel_b", None))
             if rav is not None:
                 root_link_ang_vel_b_buf.append(rav)
-            # §Metric-quality laws (LAW 3/4): per-foot contact + pelvis-frame
-            # foot position. Each signal is independently guarded so a missing
+            # §Metric-quality laws (LAW 3/4): per-foot contact plus pelvis- and
+            # world-frame foot position. Each signal is independently guarded so a missing
             # sensor/site degrades to "field absent" (an empty buf is dropped
             # at save time) rather than crashing the rollout — same discipline
             # as _foot_info. Contact columns 0/1 = left/right (mjlab wiring,
@@ -3529,24 +6047,32 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                                 right_foot_contact_buf.append(rc)
                     except Exception:  # noqa: BLE001
                         pass
-                if _quat_apply_inverse is not None:
-                    try:
-                        sp = getattr(d, "site_pos_w", None)        # (N, S, 3)
-                        rq = getattr(d, "root_link_quat_w", None)  # (N, 4)
-                        rpw = getattr(d, "root_link_pos_w", None)  # (N, 3)
-                        li, ri = _feet["li"], _feet["ri"]
-                        if (sp is not None and rq is not None and rpw is not None
-                                and sp.shape[1] > max(li, ri)):
-                            lf_b = _quat_apply_inverse(rq, sp[:, li, :] - rpw)
-                            rf_b = _quat_apply_inverse(rq, sp[:, ri, :] - rpw)
-                            lfp = _tensor_to_np(lf_b)
-                            rfp = _tensor_to_np(rf_b)
-                            if lfp is not None:
-                                left_foot_pos_b_buf.append(lfp)
-                            if rfp is not None:
-                                right_foot_pos_b_buf.append(rfp)
-                    except Exception:  # noqa: BLE001
-                        pass
+                try:
+                    sp = getattr(d, "site_pos_w", None)        # (N, S, 3)
+                    li, ri = _feet["li"], _feet["ri"]
+                    selected = _select_biped_foot_site_positions(sp, li, ri)
+                    if selected is not None:
+                        lf_w, rf_w = selected
+                        lfp_w = _tensor_to_np(lf_w)
+                        rfp_w = _tensor_to_np(rf_w)
+                        if lfp_w is not None:
+                            left_foot_pos_w_buf.append(lfp_w)
+                        if rfp_w is not None:
+                            right_foot_pos_w_buf.append(rfp_w)
+                        if _quat_apply_inverse is not None:
+                            rq = getattr(d, "root_link_quat_w", None)  # (N, 4)
+                            rpw = getattr(d, "root_link_pos_w", None)  # (N, 3)
+                            if rq is not None and rpw is not None:
+                                lf_b = _quat_apply_inverse(rq, lf_w - rpw)
+                                rf_b = _quat_apply_inverse(rq, rf_w - rpw)
+                                lfp_b = _tensor_to_np(lf_b)
+                                rfp_b = _tensor_to_np(rf_b)
+                                if lfp_b is not None:
+                                    left_foot_pos_b_buf.append(lfp_b)
+                                if rfp_b is not None:
+                                    right_foot_pos_b_buf.append(rfp_b)
+                except Exception:  # noqa: BLE001
+                    pass
         ap = _tensor_to_np(action)
         if ap is not None:
             action_buf.append(ap)
@@ -3697,6 +6223,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     for key, buf in (
         ("joint_pos", joint_pos_buf),
         ("joint_vel", joint_vel_buf),
+        ("default_pose_rms", default_pose_rms_buf),
         ("joint_torque", joint_torque_buf),
         ("action", action_buf),
         ("actuator_force", actuator_force_buf),
@@ -3708,6 +6235,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         ("right_foot_contact", right_foot_contact_buf),
         ("left_foot_pos_b", left_foot_pos_b_buf),
         ("right_foot_pos_b", right_foot_pos_b_buf),
+        ("left_foot_pos_w", left_foot_pos_w_buf),
+        ("right_foot_pos_w", right_foot_pos_w_buf),
     ):
         arr = _stack_if_consistent(buf)
         if arr is not None:
@@ -3740,6 +6269,81 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[runner] manipulation-telemetry finalize skipped: "
                   f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    ordered_joint_names = list(limits_snapshot.get("joint_names") or [])
+    observed_checkpoint_sha256 = _runtime_file_sha256(
+        args.checkpoint_path, label="rollout checkpoint",
+    )
+    if observed_checkpoint_sha256 != rollout_checkpoint_sha256:
+        raise RuntimeError("rollout checkpoint changed during rollout")
+    observed_reward_sha256 = None
+    if rollout_reward_sha256 is not None:
+        assert rollout_reward_artifact is not None
+        observed_reward_artifact = _capture_runner_reward_artifact(
+            args.reward_module_path, label="rollout reward module",
+        )
+        if observed_reward_artifact != rollout_reward_artifact:
+            raise RuntimeError("rollout reward module changed during rollout")
+        observed_reward_sha256 = observed_reward_artifact["selected"]["sha256"]
+    observed_rollout_environment_artifacts = environment_artifacts_for_phase(
+        capture_environment_artifacts(
+            env_spec_path=getattr(args, "env_spec", "") or None,
+            eval_reset_path=getattr(args, "eval_reset", "") or None,
+            world_selection_path=(
+                getattr(args, "world_selection", "") or None
+            ),
+        ),
+        "rollout",
+    )
+    if observed_rollout_environment_artifacts != rollout_environment_artifacts:
+        raise RuntimeError("rollout environment inputs changed during rollout")
+    trajectory_contract = {
+        "schema": "reward-sculptor-trajectory-v1",
+        "layout": ["time", "environment", "feature"],
+        "ordered_joint_names": ordered_joint_names,
+        "control_dt_s": float(getattr(env, "step_dt", 0.0) or 0.0),
+        "root_link_pos_w_frame": "world",
+        "first_episode_lane": 0,
+        "valid_mask": {
+            "key": "first_episode_valid_mask",
+            "semantics": "true_prefix_before_first_done",
+            "invalid_state": "frozen_last_valid_sample",
+            "state_samples": "post_step_after_valid_transition",
+        },
+        "runtime_artifacts": {
+            "schema": "reward-sculptor-runner-artifacts-v2",
+            "phase": "rollout",
+            "reward_module_sha256": observed_reward_sha256,
+            "checkpoint_sha256": observed_checkpoint_sha256,
+            "checkpoint_load_completed": True,
+            "environment_artifacts": observed_rollout_environment_artifacts,
+            "env_spec_application": rollout_env_spec_application,
+            "eval_reset_application": eval_reset_application,
+            "requested_seed": int(args.seed),
+            "applied_seed": int(rollout_seed_application["applied_seed"]),
+            "seed_application": rollout_seed_application,
+            "requested_n_episodes": int(args.n_episodes),
+            "configured_n_episodes": int(n_episodes),
+            "requested_max_episode_steps": int(args.max_episode_steps),
+            "configured_max_episode_steps": int(max_steps),
+            "requested_task_id": str(args.task_id),
+            "configured_task_id": str(args.task_id),
+            "configured_num_envs": int(num_envs),
+            "completed_first_episodes": int(
+                ep_done[:n_episodes].sum().item()
+            ),
+        },
+    }
+    # A Unicode scalar keeps the receipt data-only and loadable with
+    # `allow_pickle=False`.  Tier-D copies this NPZ verbatim and re-validates
+    # the receipt before it may trust any recorded trajectory channel.
+    trajectory["trajectory_contract_json"] = np.asarray(
+        json.dumps(
+            trajectory_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+    )
     np.savez_compressed(output_dir / "trajectory.npz", **trajectory)
 
     # §7.1 / §7.2: per-term time-series as JSON (Eureka Appendix F shape).
@@ -3789,6 +6393,30 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "step_dt": float(getattr(env, "step_dt", 0.0) or 0.0),
         "max_episode_steps": int(max_steps),
         "rollout_num_envs": int(num_envs),
+    }
+    import hashlib as _behavior_hashlib
+
+    ordered_joint_names_sha256 = _behavior_hashlib.sha256(
+        json.dumps(
+            ordered_joint_names,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    behavior["terminal_proof_contract"] = {
+        "minimum_hold_s": float(_authored_terminal_hold_s(world_bundle)),
+        "minimum_hold_frames": int(round(
+            _authored_terminal_hold_s(world_bundle)
+            / max(float(getattr(env, "step_dt", 0.02) or 0.02), 1e-9)
+        )),
+        "horizontal_speed_m_s": 0.12,
+        "angular_speed_rad_s": 0.5,
+        "joint_speed_rms_rad_s": 1.0,
+        "upright_gravity_z_max": -0.7,
+        "default_pose_rms_rad": 0.6,
+        "default_pose_channel": "default_pose_rms",
+        "ordered_joint_names_sha256": ordered_joint_names_sha256,
+        "ordered_joint_count": len(ordered_joint_names),
     }
     if world_bundle is not None:
         shaping_evidence = _reward_visible_rollout_evidence(
@@ -3917,10 +6545,26 @@ def main() -> None:
             "mission orchestrator to chain skills across stages."
         ),
     )
+    p_train.add_argument(
+        "--pretrained-load-role", default="actor_critic",
+        choices=("actor_only", "actor_critic"),
+        help=(
+            "Select which compatible state dictionaries to inherit. "
+            "Optimizer/iteration/RND are always reset."
+        ),
+    )
 
     p_roll = sub.add_parser("rollout")
     p_roll.add_argument("--task-id", required=True)
     p_roll.add_argument("--checkpoint-path", required=True)
+    p_roll.add_argument(
+        "--reward-module-path",
+        default=None,
+        help=(
+            "exact reward module used to reconstruct a reference-conditioned "
+            "policy observation interface"
+        ),
+    )
     p_roll.add_argument("--output-dir", required=True)
     p_roll.add_argument("--n-episodes", type=int, default=3)
     p_roll.add_argument("--max-episode-steps", type=int, default=500)

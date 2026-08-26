@@ -3,11 +3,15 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
+import { ModeRewardPanel } from "@/components/ModeRewardPanel";
+import { useBehaviorDraft } from "@/hooks/useBehaviorDraft";
+import { resolveModeAuthoringGoal } from "@/lib/behaviorFlow";
+import { referenceRobotForProject } from "@/lib/referenceRobot";
 import { AuthorBadge, Btn, Delta, Modal } from "@/components/rs/primitives";
 import { MonacoDiffLazy, MonacoLazy } from "@/components/MonacoLazy";
 import { useJob, useJobEvents } from "@/hooks/useJob";
 import { useMissions } from "@/hooks/useMissions";
-import { useRuns } from "@/hooks/useRuns";
+import { hasActiveRun, useRuns } from "@/hooks/useRuns";
 import {
   useRegenerateRewardTemplate,
   useReward,
@@ -37,7 +41,7 @@ const SCULPT_LOCK_NOTE =
 // browser (localStorage), so it shows once and stays gone.
 const REWARDS_EXPLAINER_KEY = "rs.rewardsExplainer.dismissed";
 
-function RewardsExplainer() {
+export function RewardsExplainer() {
   const [dismissed, setDismissed] = useState(() => {
     try { return localStorage.getItem(REWARDS_EXPLAINER_KEY) === "1"; }
     catch { return false; /* private mode */ }
@@ -52,12 +56,13 @@ function RewardsExplainer() {
     <div className="rs-banner info" style={{ alignItems: "flex-start" }}>
       <Icon name="info" size={17} />
       <span className="rs-grow" style={{ lineHeight: 1.55 }}>
-        <b>How reward evolution works.</b> Each training iteration, the sculptor trains a policy
-        with the current reward, watches the rollout, diagnoses the failure, and writes the next
-        reward version. Versions that improve the tracked metric are kept; regressions are
-        reverted. The list below is that history — every version can be read, diffed against its
-        parent, and traced to the diagnosis that produced it. You can also fork any version by
-        hand, or ask Claude for a rewrite in the prompt box.
+        <b>How reward evolution works.</b> Each iteration can train with the current reward,
+        inspect its rollout, diagnose a failure, and write a candidate reward. The launch plan
+        decides what controls selection: a <b>steered</b> objective may keep or revert candidates,
+        an <b>observe-only</b> objective records evidence without choosing the reward, and an
+        acknowledged <b>blind ablation</b> makes no objective-success claim. The list below is the
+        version history — every version can be read, diffed against its parent, and traced to its
+        diagnosis. You can also fork a version by hand or request a rewrite in the prompt box.
       </span>
       <button
         className="rs-modal-x"
@@ -209,7 +214,11 @@ export function RewardsTab({
     setDraftParentVersion(null);
   }, [selectedVersion]);
 
-  const isRunning = project.status === "running";
+  // §Ship 37: NOT `project.status === "running"` — the backend's
+  // `_compute_status` never returns that value, so this lock was dead and
+  // manual edits stayed enabled for the whole of a sculpt run. See
+  // `hasActiveRun`.
+  const isRunning = hasActiveRun(runs.data);
   const isDrafting = draftSource !== null;
   const editsLockedByStageScope = isStageScope;
   const latestVersion = list.data && list.data.length > 0
@@ -287,6 +296,7 @@ export function RewardsTab({
             {detail.data && !isDrafting && (
               <ReadOnlyPane
                 slug={slug}
+                project={project}
                 detail={detail.data}
                 canEdit={!isRunning && !editsLockedByStageScope}
                 stageScope={effectiveScope}
@@ -584,15 +594,17 @@ function LockBanner({ note }: { note: string }) {
 
 // ── Read-only pane ────────────────────────────────────────────────────
 function ReadOnlyPane({
-  slug, detail, canEdit, stageScope, onNewHumanEdit,
+  slug, project, detail, canEdit, stageScope, onNewHumanEdit,
 }: {
   slug: string;
+  project: ProjectDetail;
   detail: RewardVersionDetail;
   canEdit: boolean;
   stageScope: string | null;
   onNewHumanEdit: () => void;
 }) {
   const [diffMode, setDiffMode] = useState(false);
+  const draft = useBehaviorDraft(slug);
   const parentVersion = detail.version > 0 ? detail.version - 1 : null;
   const parent = useReward(diffMode && parentVersion !== null ? slug : undefined, parentVersion ?? undefined, stageScope);
 
@@ -645,6 +657,37 @@ function ReadOnlyPane({
       )}
 
       <SpecPanel detail={detail} />
+
+      {/* Per-mode authoring. Seeded with the attached clip when the reward
+          already names one, but shown either way: authoring a per-mode reward
+          is what you do BEFORE there is a tracking reward, so gating it on
+          one would hide the feature exactly when it is wanted. */}
+      {/* Anchored: this panel sits below a 420px editor and two other
+          panels, so arriving on the tab leaves it off-screen. The Behavior
+          flow's "author a reward per mode" step scrolls to this id. */}
+      <div id="mode-reward-panel">
+      <ModeRewardPanel
+        slug={slug}
+        // Three sources, most specific first. A promoted per-mode reward has
+        // no `composition` block — that key belongs to the flat tracking
+        // reward — so without the draft the panel could not re-open on its
+        // own output and made the user search a 6015-clip library by hand.
+        clipId={
+          (detail.spec.composition?.type === "reference_tracking_residual"
+            ? detail.spec.composition.reference_clip_id ?? undefined
+            : undefined)
+          ?? draft.data?.reference_clip_id
+        }
+        // Was hardcoded "g1": on a Go1 project this offered G1 motion, the
+        // attach succeeded, and training failed with a seed error.
+        robot={referenceRobotForProject(project)}
+        goal={resolveModeAuthoringGoal({
+          draftGoal: draft.data?.behavior_goal,
+          projectDescription: project.description,
+          rewardDescription: detail.spec.description,
+        })}
+      />
+      </div>
     </>
   );
 }

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from backend.services.reward_store import (
     _extract_reward_spec,
+    _tracking_immutable_hash,
     _validate_manual_tracking_edit,
 )
 from sculptor.refs.track import generate_tracking_residual_reward_source
@@ -70,9 +71,45 @@ def _tracking_clip() -> dict:
     }
 
 
+def test_backend_current_writer_uses_canonical_reference_transparent_selector(
+    tmp_path: Path,
+) -> None:
+    """Every UI launch writer must preserve the same conditioned surface."""
+    import importlib.util
+
+    from backend.services.reward_store import _write_current_reexport
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    selected = rewards / "v2.py"
+    selected.write_text(
+        "REWARD_SPEC = {'reference_clock': {'schema': 1}}\n"
+        "def compute_reward(s, a, n, i): return 0.0, {}\n"
+        "def reference_clock_batched(step_count, device): return step_count\n"
+        "def reference_target_index_batched(step_count, device): "
+        "return step_count + 1\n",
+        encoding="utf-8",
+    )
+
+    _write_current_reexport(rewards, selected)
+    spec = importlib.util.spec_from_file_location(
+        "backend_current_writer_regression", str(rewards / "current.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.SCULPTOR_REWARD_SELECTOR["filename"] == "v2.py"
+    assert module.reference_clock_batched is module._mod.reference_clock_batched
+    assert (
+        module.reference_target_index_batched
+        is module._mod.reference_target_index_batched
+    )
+
+
 def test_manual_tracking_guard_allows_residual_hooks_only() -> None:
     parent_source = generate_tracking_residual_reward_source(
-        clip=_tracking_clip(), clip_id="clip-a",
+        clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",
     )
     child_source = parent_source.replace(
         "    return 0.0\n\n\ndef compute_reward",
@@ -88,7 +125,7 @@ def test_manual_tracking_guard_allows_residual_hooks_only() -> None:
 
 def test_manual_tracking_guard_rejects_composition_drift() -> None:
     parent_source = generate_tracking_residual_reward_source(
-        clip=_tracking_clip(), clip_id="clip-a",
+        clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",
     )
     child_source = parent_source.replace("_TRACKING_WEIGHT = 1.0", "_TRACKING_WEIGHT = 0.1")
     parent_spec, _ = _extract_reward_spec(parent_source)
@@ -97,6 +134,27 @@ def test_manual_tracking_guard_rejects_composition_drift() -> None:
         parent_source, parent_spec, child_source, child_spec,
     )
     assert any("immutable" in violation for violation in violations)
+
+
+def test_manual_tracking_guard_uses_core_clock_authority() -> None:
+    from sculptor.edit import reference_tracking_backbone_sha256
+
+    parent_source = generate_tracking_residual_reward_source(
+        clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",
+    )
+    changed_clock = parent_source.replace(
+        "def reference_clock_batched(info, like):\n",
+        "def reference_clock_batched(info, like):\n"
+        "    raise RuntimeError('changed clock')\n",
+        1,
+    )
+
+    assert _tracking_immutable_hash(parent_source) == (
+        reference_tracking_backbone_sha256(parent_source)
+    )
+    assert _tracking_immutable_hash(changed_clock) != (
+        _tracking_immutable_hash(parent_source)
+    )
 
 
 # ── list + detail ─────────────────────────────────────────────────────

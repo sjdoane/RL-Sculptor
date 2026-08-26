@@ -22,6 +22,8 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,15 +35,31 @@ def _fake_run_with_cleanup_factory(captured: dict):
     """Return a `_run_with_cleanup` stub that records the cmd and returns
     a well-formed CompletedProcess-lookalike so `MjlabAdapter.train`'s
     post-checks (ckpt exists, metrics parseable) can pass."""
-    class _FakeCompleted:
-        returncode = 0
-        stdout = '{"status": "ok"}'
-        stderr = ""
-
     def fake_run(cmd, env=None, timeout=None):  # noqa
         captured["cmd"] = cmd
         captured["env"] = env
-        return _FakeCompleted()
+        stdout = '{"status": "ok"}'
+        if "--load-pretrained-policy" in cmd:
+            source = Path(cmd[cmd.index("--load-pretrained-policy") + 1]).resolve()
+            mode = cmd[cmd.index("--pretrained-load-role") + 1]
+            payload = {
+                "type": "warm_start_loaded",
+                "source": str(source),
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "load_cfg_keys": (
+                    ["actor"] if mode == "actor_only" else ["actor", "critic"]
+                ),
+            }
+            stdout += "\n[SCULPT-EVENT] " + json.dumps(payload)
+
+        class _FakeCompleted:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, output: str) -> None:
+                self.stdout = output
+
+        return _FakeCompleted(stdout)
 
     return fake_run
 
@@ -52,6 +70,33 @@ def _prep_output_dir(tmp_path: Path) -> Path:
     (out / "checkpoint.pt").write_bytes(b"stub")
     (out / "metrics.json").write_text('{"status": "ok"}')
     return out
+
+
+def _reward_file(tmp_path: Path, name: str = "v0.py") -> Path:
+    reward = tmp_path / name
+    reward.write_text("reward = 1\n", encoding="utf-8")
+    return reward
+
+
+def _write_train_input_receipt(
+    *, adapter, iter_dir: Path, reward: Path, iteration: int,
+    steps: int, seed: int, init_policy: Path | None = None,
+) -> None:
+    from sculptor.run_manifests import (
+        build_train_input_manifest,
+        write_json_atomic,
+    )
+
+    manifest = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        reward_module_path=reward,
+        steps=steps,
+        seed=seed,
+        init_policy_path=init_policy,
+        init_policy_mode="actor_critic",
+    )
+    write_json_atomic(iter_dir / "train_request_manifest.json", manifest)
 
 
 # ── 1. MjlabAdapter.train CLI construction ───────────────────────────
@@ -134,6 +179,75 @@ def test_mjlab_train_raises_on_missing_init_policy(tmp_path: Path):
             )
 
 
+def test_warm_start_receipt_requires_exact_source_digest_and_role(
+    tmp_path: Path,
+) -> None:
+    from sculptor.adapters.mjlab import _require_warm_start_loaded
+
+    source = tmp_path / "checkpoint.pt"
+    source.write_bytes(b"exact-policy")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload = {
+        "type": "warm_start_loaded",
+        "source": str(source.resolve()),
+        "source_sha256": digest,
+        "load_cfg_keys": ["actor"],
+    }
+    receipt = _require_warm_start_loaded(
+        "noise\n[SCULPT-EVENT] " + json.dumps(payload),
+        expected_source=source,
+        expected_sha256=digest,
+        expected_mode="actor_only",
+    )
+    assert receipt == payload
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "exactly one"),
+        ("duplicate", "exactly one"),
+        ("source", "source path mismatch"),
+        ("digest", "source digest mismatch"),
+        ("role", "role mismatch"),
+    ],
+)
+def test_warm_start_receipt_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    from sculptor.adapters.mjlab import _require_warm_start_loaded
+
+    source = tmp_path / "checkpoint.pt"
+    source.write_bytes(b"exact-policy")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload = {
+        "type": "warm_start_loaded",
+        "source": str(source.resolve()),
+        "source_sha256": digest,
+        "load_cfg_keys": ["actor", "critic"],
+    }
+    lines: list[str] = []
+    if mutation != "missing":
+        if mutation == "source":
+            payload["source"] = str(tmp_path / "other.pt")
+        elif mutation == "digest":
+            payload["source_sha256"] = "0" * 64
+        elif mutation == "role":
+            payload["load_cfg_keys"] = ["actor"]
+        lines.append("[SCULPT-EVENT] " + json.dumps(payload))
+        if mutation == "duplicate":
+            lines.append("[SCULPT-EVENT] " + json.dumps(payload))
+    with pytest.raises(RuntimeError, match=message):
+        _require_warm_start_loaded(
+            "\n".join(lines),
+            expected_source=source,
+            expected_sha256=digest,
+            expected_mode="actor_critic",
+        )
+
+
 # ── 2. _train_or_resume introspection + event emission ───────────────
 def _make_sculpt_adapter_with_kwarg(captured: dict):
     """Adapter whose train() declares init_policy_path → kwarg MUST reach it."""
@@ -183,10 +297,11 @@ def test_train_or_resume_forwards_init_policy_path_to_supporting_adapter(
     iter_dir.mkdir()
     init_ckpt = tmp_path / "init.pt"
     init_ckpt.write_bytes(b"stub")
+    reward = _reward_file(tmp_path)
 
     _train_or_resume(
         adapter=adapter, iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=init_ckpt,
     )
     assert captured["init_policy_path"] == init_ckpt
@@ -213,12 +328,17 @@ def test_train_or_resume_prefers_latest_valid_partial_policy(
     os.utime(logs / "model_50.pt", ns=(3_000_000_000, 3_000_000_000))
     previous_iter = tmp_path / "iter_2.pt"
     previous_iter.write_bytes(b"stub")
+    reward = _reward_file(tmp_path, "v3.py")
+    _write_train_input_receipt(
+        adapter=adapter, iter_dir=iter_dir, reward=reward, iteration=3,
+        steps=750, seed=45, init_policy=previous_iter,
+    )
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
 
     sculpt_mod._train_or_resume(
         adapter=adapter, iter_index=3, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v3.py", steps=750, seed=45,
+        reward_module_path=reward, steps=750, seed=45,
         init_policy_path=previous_iter,
     )
 
@@ -246,10 +366,15 @@ def test_train_or_resume_skips_corrupt_newest_partial_policy(
     logs.mkdir(parents=True)
     torch.save({"model": "valid"}, logs / "model_100.pt")
     (logs / "model_150.pt").write_bytes(b"torn")
+    reward = _reward_file(tmp_path, "v1.py")
+    _write_train_input_receipt(
+        adapter=adapter, iter_dir=iter_dir, reward=reward, iteration=1,
+        steps=200, seed=43,
+    )
 
     _train_or_resume(
         adapter=adapter, iter_index=1, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v1.py", steps=200, seed=43,
+        reward_module_path=reward, steps=200, seed=43,
     )
 
     assert captured["init_policy_path"] == logs / "model_100.pt"
@@ -308,10 +433,11 @@ def test_train_or_resume_drops_init_policy_path_for_unsupported_adapter(
     iter_dir.mkdir()
     init_ckpt = tmp_path / "init.pt"
     init_ckpt.write_bytes(b"stub")
+    reward = _reward_file(tmp_path)
 
     sculpt_mod._train_or_resume(
         adapter=adapter, iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=init_ckpt,
     )
     assert captured.get("called") is True
@@ -328,26 +454,31 @@ def test_train_or_resume_emits_warm_start_skipped_when_local_ckpt_wins(
     resume path), `_train_or_resume` reuses it. When the caller ALSO
     passed init_policy_path, we emit warm_start_skipped so Ship-16's
     orchestrator can tell what actually ran."""
-    import torch
     from sculptor import sculpt as sculpt_mod
 
     iter_dir = tmp_path / "iter_0"
     iter_dir.mkdir()
-    torch.save({"model": "ok"}, iter_dir / "checkpoint.pt")
-
-    class _NoCallAdapter:
-        def train(self, **_kw):  # pragma: no cover — must not be called
-            raise AssertionError("resume path must not call adapter.train")
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
 
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
 
     init_ckpt = tmp_path / "init.pt"
     init_ckpt.write_bytes(b"stub")
+    reward = _reward_file(tmp_path)
+
+    # First execution earns the input + completion receipts.
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
+        init_policy_path=init_ckpt,
+    )
+    events.clear()
 
     sculpt_mod._train_or_resume(
-        adapter=_NoCallAdapter(), iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=init_ckpt,
     )
     skipped = [e for e in events if e.get("type") == "warm_start_skipped"]
@@ -362,23 +493,27 @@ def test_train_or_resume_no_warm_start_event_when_init_policy_none(
     """Regression guard: the warm_start_skipped event is ONLY emitted
     when the caller requested warm-start. Plain resume without init
     stays silent."""
-    import torch
     from sculptor import sculpt as sculpt_mod
 
     iter_dir = tmp_path / "iter_0"
     iter_dir.mkdir()
-    torch.save({"model": "ok"}, iter_dir / "checkpoint.pt")
-
-    class _NoCallAdapter:
-        def train(self, **_kw):  # pragma: no cover
-            raise AssertionError
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
 
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
+    reward = _reward_file(tmp_path)
 
     sculpt_mod._train_or_resume(
-        adapter=_NoCallAdapter(), iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
+        init_policy_path=None,
+    )
+    events.clear()
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=None,
     )
     skipped = [e for e in events if e.get("type") == "warm_start_skipped"]
@@ -570,11 +705,12 @@ def test_train_or_resume_forwards_kwarg_to_adapter_with_var_kwarg(
         iter_dir.mkdir()
         init_ckpt = tmp_path / "init.pt"
         init_ckpt.write_bytes(b"stub")
+        reward = _reward_file(tmp_path)
 
         sculpt_mod._train_or_resume(
             adapter=_KwargsAdapter(),
             iter_index=0, iter_dir=iter_dir,
-            reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+            reward_module_path=reward, steps=10, seed=0,
             init_policy_path=init_ckpt,
         )
     finally:
@@ -666,7 +802,10 @@ def test_ship15_warm_start_event_shape():
     import inspect
     from sculptor.adapters import _mjlab_runner as runner_mod
 
-    src = inspect.getsource(runner_mod._cmd_train)
+    src = (
+        inspect.getsource(runner_mod._cmd_train)
+        + inspect.getsource(runner_mod._warm_start_loaded_receipt)
+    )
     # Event type.
     assert '"type": "warm_start_loaded"' in src or "'type': 'warm_start_loaded'" in src
     # Expected payload keys.
@@ -674,3 +813,286 @@ def test_ship15_warm_start_event_shape():
         assert f'"{key}"' in src, (
             f"warm_start_loaded event must include {key!r} field"
         )
+
+
+def test_named_warm_start_outranks_a_partial_from_an_interrupted_attempt(
+    tmp_path: Path, monkeypatch,
+):
+    """Stopping a run to pick a different policy must actually pick it.
+
+    Recovery treats a `model_*.pt` in the iter's own logs as strictly closer
+    to the interrupted phase, which is right for a crash. It is wrong when
+    the operator stopped the run BECAUSE that policy was going wrong and
+    named a different one to restart from — reinstating it silently makes
+    the UI's "Warm-start checkpoint" field look broken.
+    """
+    import torch
+    from sculptor import sculpt as sculpt_mod
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_4"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "the policy we stopped"}, logs / "model_450.pt")
+    chosen = tmp_path / "iter_1.pt"
+    chosen.write_bytes(b"stub")
+    reward = _reward_file(tmp_path, "v4.py")
+    events: list[dict] = []
+    monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=4, iter_dir=iter_dir,
+        reward_module_path=reward, steps=1500, seed=46,
+        init_policy_path=chosen, warm_start_explicit=True,
+    )
+
+    assert captured["init_policy_path"] == chosen
+    assert [e for e in events if e.get("type") == "partial_train_ignored"] == [{
+        "type": "partial_train_ignored",
+        "iter": 4,
+        "checkpoint": str(logs / "model_450.pt"),
+        "reason": "input_manifest_mismatch",
+    }]
+    assert not [e for e in events
+                if e.get("type") == "partial_train_recovered"]
+
+
+def test_an_inferred_warm_start_still_yields_to_a_partial(
+    tmp_path: Path, monkeypatch,
+):
+    """Crash recovery is unchanged when nobody named a starting policy.
+
+    `sculpt_run` fills `init_ckpt` itself when resuming across reward-version
+    gaps. That guess carries no intent, so the partial — trained under the
+    exact current reward/seed/world tuple — must still win.
+    """
+    import torch
+    from sculptor import sculpt as sculpt_mod
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_4"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "partial"}, logs / "model_450.pt")
+    inferred = tmp_path / "iter_3.pt"
+    inferred.write_bytes(b"stub")
+    reward = _reward_file(tmp_path, "v4.py")
+    _write_train_input_receipt(
+        adapter=adapter, iter_dir=iter_dir, reward=reward, iteration=4,
+        steps=1500, seed=46, init_policy=inferred,
+    )
+    monkeypatch.setattr(sculpt_mod, "_emit_event", lambda _e: None)
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=4, iter_dir=iter_dir,
+        reward_module_path=reward, steps=1500, seed=46,
+        init_policy_path=inferred, warm_start_explicit=False,
+    )
+
+    assert captured["init_policy_path"] == logs / "model_450.pt"
+
+
+def test_configured_init_std_reads_the_tasks_fresh_policy_noise():
+    """The ceiling comes from the task cfg, not a constant."""
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    def cfg(distribution_cfg):
+        actor = type("Actor", (), {"distribution_cfg": distribution_cfg})()
+        return type("RlCfg", (), {"actor": actor})()
+
+    assert runner_mod._configured_init_std(
+        cfg({"class_name": "GaussianDistribution", "init_std": 1.0,
+             "std_type": "scalar"})) == 1.0
+    assert runner_mod._configured_init_std(cfg({"init_std": 0.4})) == 0.4
+    # A deterministic / non-Gaussian actor has no exploration std to bound.
+    assert runner_mod._configured_init_std(cfg(None)) is None
+    assert runner_mod._configured_init_std(cfg({})) is None
+    assert runner_mod._configured_init_std(cfg({"init_std": "wat"})) is None
+    assert runner_mod._configured_init_std(cfg({"init_std": 0.0})) is None
+    assert runner_mod._configured_init_std(type("RlCfg", (), {})()) is None
+
+
+@pytest.mark.parametrize("std_type", ["scalar", "log"])
+def test_warm_start_noise_is_clamped_to_the_fresh_init_value(std_type):
+    """Inherited exploration noise above fresh-init is drift, not knowledge.
+
+    Measured on platform-ascent-showcase, the action-noise std ratcheted
+    1.05 -> 1.39 -> 1.71 across three chained warm starts against an
+    `init_std` of 1.0. mjlab's `action_rate_l2` penalty grows as 2*sigma^2,
+    so by the third the inherited noise alone cost more per step than the
+    whole task reward paid.
+    """
+    import torch
+    from rsl_rl.modules.distribution import GaussianDistribution
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    dist = GaussianDistribution(29, init_std=1.708, std_type=std_type)
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": dist})()})()})()
+
+    got = runner_mod._clamp_warm_started_noise(runner, 1.0)
+
+    assert got is not None
+    assert got["std_before"] == pytest.approx(1.708, abs=1e-4)
+    assert got["std_after"] == pytest.approx(1.0, abs=1e-4)
+    assert got["ceiling"] == 1.0
+    param = (dist.std_param if std_type == "scalar"
+             else dist.log_std_param.exp())
+    assert torch.allclose(param.detach(), torch.ones(29), atol=1e-4)
+
+
+@pytest.mark.parametrize("std_type", ["scalar", "log"])
+def test_a_policy_quieter_than_fresh_init_keeps_its_precision(std_type):
+    """The bound is one-directional — converged precision is real learning."""
+    from rsl_rl.modules.distribution import GaussianDistribution
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    dist = GaussianDistribution(29, init_std=0.25, std_type=std_type)
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": dist})()})()})()
+
+    assert runner_mod._clamp_warm_started_noise(runner, 1.0) is None
+    param = (dist.std_param if std_type == "scalar"
+             else dist.log_std_param.exp())
+    assert float(param.detach().mean()) == pytest.approx(0.25, abs=1e-4)
+
+
+def test_clamping_noise_leaves_a_non_gaussian_policy_alone():
+    """No std parameter to bound is not an error."""
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": object()})()})()})()
+    assert runner_mod._clamp_warm_started_noise(runner, 1.0) is None
+    assert runner_mod._clamp_warm_started_noise(object(), 1.0) is None
+
+
+def test_clamped_noise_stays_trainable():
+    """The clamp must not detach the parameter from the optimizer."""
+    import torch
+    from rsl_rl.modules.distribution import GaussianDistribution
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    dist = GaussianDistribution(4, init_std=1.7, std_type="scalar")
+    runner = type("R", (), {"alg": type("A", (), {
+        "actor": type("Act", (), {"distribution": dist})()})()})()
+    runner_mod._clamp_warm_started_noise(runner, 1.0)
+
+    assert dist.std_param.requires_grad
+    assert isinstance(dist.std_param, torch.nn.Parameter)
+    dist.update(torch.zeros(2, 4))
+    dist.log_prob(torch.zeros(2, 4)).sum().backward()
+    assert dist.std_param.grad is not None
+    assert torch.isfinite(dist.std_param.grad).all()
+
+
+def _vitals_logger():
+    """A stand-in shaped like rsl_rl's `Logger` (rewbuffer / lenbuffer /
+    ep_extras, and a `log` taking action_std as its 5th variadic arg)."""
+    import torch
+
+    class Logger:
+        def __init__(self):
+            self.rewbuffer = [100.0, 120.0]
+            self.lenbuffer = [200.0, 240.0]
+            self.ep_extras = [{
+                "Episode_Reward/sculptor_primary": torch.tensor([15.0, 17.0]),
+                "Episode_Reward/action_rate_l2": torch.tensor([-26.0, -27.0]),
+                "Episode_Reward/upright": 0.5,
+                "Episode_Termination/fell_over": torch.tensor([2.0]),
+            }]
+            self.calls = []
+
+        def log(self, it, start_it, total_it, *a, **kw):
+            self.calls.append((it, a, kw))
+
+    runner = type("R", (), {})()
+    runner.logger = Logger()
+    return runner
+
+
+def _emitted(capsys) -> list[dict]:
+    import json as _json
+    return [_json.loads(ln[len("[SCULPT-EVENT]"):])
+            for ln in capsys.readouterr().out.splitlines()
+            if ln.startswith("[SCULPT-EVENT]")]
+
+
+def test_learning_vitals_report_what_pays_and_what_costs(capsys):
+    """The pair that decides whether a policy should bother trying.
+
+    Both failures diagnosed on platform-ascent-showcase were an action-rate
+    penalty quietly outgrowing the task reward. Visible in one line here;
+    previously only in an hour of unstructured console text.
+    """
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = _vitals_logger()
+    assert runner_mod._install_learning_vitals(runner, 1500) is True
+    runner.logger.log(186, 0, 1500, 0.1, 0.2, {}, 1e-3,
+                      torch.full((29,), 1.37), None)
+
+    (ev,) = _emitted(capsys)
+    assert ev["type"] == "learning_vitals"
+    assert (ev["rl_iter"], ev["rl_total"]) == (186, 1500)
+    assert ev["mean_reward"] == pytest.approx(110.0)
+    assert ev["mean_ep_len"] == pytest.approx(220.0)
+    assert ev["action_std"] == pytest.approx(1.37, abs=1e-4)
+    assert ev["top_reward"] == {"term": "sculptor_primary", "value": 16.0}
+    assert ev["top_penalty"] == {"term": "action_rate_l2", "value": -26.5}
+    # Reporting on the run must never replace the run's own logging.
+    assert runner.logger.calls[0][0] == 186
+
+
+def test_learning_vitals_never_break_the_run_they_report_on(capsys):
+    """A telemetry failure costs telemetry, not training."""
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    class Broken:
+        rewbuffer, lenbuffer = [1.0], [2.0]
+        def __init__(self): self.calls = []
+        @property
+        def ep_extras(self): raise RuntimeError("boom")
+        def log(self, *a, **kw): self.calls.append(a)
+
+    runner = type("R", (), {})()
+    runner.logger = Broken()
+    assert runner_mod._install_learning_vitals(runner, 10) is True
+    runner.logger.log(1, 0, 10, 0.1, 0.2, {}, 1e-3, torch.full((4,), 0.5), None)
+
+    assert runner.logger.calls, "the wrapped call must still happen"
+    assert _emitted(capsys) == []
+    # A runner with no logger is a supported shape, not an error.
+    assert runner_mod._install_learning_vitals(object(), 10) is False
+
+
+def test_learning_vitals_survive_a_log_signature_change(capsys):
+    """Losing one field beats losing the event."""
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = _vitals_logger()
+    runner_mod._install_learning_vitals(runner, 10)
+    runner.logger.log(3, 0, 10)  # no action_std at all
+
+    (ev,) = _emitted(capsys)
+    assert ev["action_std"] is None
+    assert ev["mean_reward"] == pytest.approx(110.0)
+    assert ev["top_penalty"]["term"] == "action_rate_l2"
+
+
+def test_learning_vitals_ignore_non_reward_extras(capsys):
+    """`Episode_Termination/*` is not a reward component."""
+    import torch
+    from sculptor.adapters import _mjlab_runner as runner_mod
+
+    runner = _vitals_logger()
+    runner_mod._install_learning_vitals(runner, 10)
+    runner.logger.log(1, 0, 10, 0.1, 0.2, {}, 1e-3, torch.full((4,), 0.9), None)
+
+    (ev,) = _emitted(capsys)
+    assert "fell_over" not in (ev["top_reward"]["term"], ev["top_penalty"]["term"])

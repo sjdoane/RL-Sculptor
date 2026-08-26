@@ -32,7 +32,7 @@ from backend.models.kg import (
 )
 from backend.models.project import ProblemDetail
 from backend.services import kg_store
-from backend.services.job_manager import Job, JobManager
+from backend.services.job_manager import JobManager
 from backend.services.project_store import BusyError, ProjectStore
 
 
@@ -103,7 +103,10 @@ def list_papers(
 @router.get(
     "/projects/{slug}/kg/papers/{arxiv_id}",
     response_model=PaperDetail,
-    responses={404: {"model": ProblemDetail}},
+    responses={
+        404: {"model": ProblemDetail},
+        500: {"model": ProblemDetail},
+    },
 )
 def get_paper(
     slug: str, arxiv_id: str, store: ProjectStore = Depends(get_store)
@@ -114,7 +117,15 @@ def get_paper(
             status.HTTP_404_NOT_FOUND, "project not found",
             detail=f"no project with slug {slug!r}", type_="/problems/not-found",
         )
-    detail = kg_store.get_paper_detail(project_dir, arxiv_id)
+    try:
+        detail = kg_store.get_paper_detail(project_dir, arxiv_id)
+    except kg_store.KGIntegrityError as exc:
+        return _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "knowledge-graph integrity error",
+            detail=str(exc),
+            type_="/problems/kg-integrity",
+        )
     if detail is None:
         return _problem(
             status.HTTP_404_NOT_FOUND, "paper not found",
@@ -581,3 +592,52 @@ def kg_heal_stubs(
             "total": len(results),
         },
     }
+
+
+# ── lexical index over paper bodies ─────────────────────────────────────
+@router.post(
+    "/projects/{slug}/kg/index-fulltext",
+    responses={
+        200: {"description": "Index counts."},
+        404: {"model": ProblemDetail},
+        500: {"model": ProblemDetail},
+    },
+)
+def kg_index_fulltext(
+    slug: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Index every Paper's stored body for lexical retrieval.
+
+    Paper search ranks on `title + abstract + rationale` only, so a paper
+    that answers a question in its body but never says so in its abstract
+    could not be retrieved — and extraction only ever summarizes the
+    first ~28K chars of each paper into the graph. This builds the recall
+    path over the rest.
+
+    Local and fast (no network, no LLM), unlike `heal-stubs`. Safe to
+    re-run; re-indexing a paper replaces its row. Response:
+    `{"indexed": n, "missing": n, "skipped": n}`.
+    """
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            type_="/problems/not-found",
+        )
+    try:
+        from sculptor.kg.ingest import backfill_full_text_index
+        from sculptor.kg.store import SculptorKG
+
+        db = kg_store.project_kg_db_path(project_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with SculptorKG(db) as kg:
+            counts = backfill_full_text_index(store=kg)
+    except Exception as e:  # noqa: BLE001
+        return _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "index-fulltext failed",
+            detail=f"{type(e).__name__}: {e}",
+            type_="/problems/preview-failed",
+        )
+    return counts

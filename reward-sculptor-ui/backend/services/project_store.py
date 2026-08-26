@@ -209,6 +209,7 @@ class ProjectStore:
         status = _compute_status(project_dir, metadata, n_iters)
 
         library_slug = None
+        reference_robot = None
         ready_to_train = True
         adapter_unavailable = False
         robot_source = metadata.get("robot_source") or {}
@@ -222,6 +223,18 @@ class ProjectStore:
             if robot_source.get("adapter_unavailable"):
                 adapter_unavailable = True
                 ready_to_train = False
+
+        try:
+            from backend.services.project_robot import (
+                resolve_project_reference_robot,
+            )
+
+            reference_robot = resolve_project_reference_robot(project_dir)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # Detail reads remain available for incomplete/legacy projects;
+            # launch and attach boundaries use the same resolver and fail
+            # closed when this field is unresolved or contradictory.
+            reference_robot = None
 
         migration_warning = _compute_migration_warning(adapter_class)
 
@@ -238,6 +251,7 @@ class ProjectStore:
             adapter_config=adapter_config,
             ready_to_train=ready_to_train,
             library_slug=library_slug,
+            reference_robot=reference_robot,
             adapter_unavailable=adapter_unavailable,
             migration_warning=migration_warning,
         )
@@ -265,6 +279,7 @@ class ProjectStore:
                     # the parsed config; surface the card-facing bits.
                     adapter_class=detail.adapter_class,
                     library_slug=detail.library_slug,
+                    reference_robot=detail.reference_robot,
                     num_envs=num_envs if isinstance(num_envs, int) else None,
                     device=device if isinstance(device, str) else None,
                 )
@@ -288,6 +303,47 @@ class ProjectStore:
             raise FileNotFoundError(f"no metadata for {slug!r}")
         meta["robot_source"] = robot_source
         self._write_metadata(slug, meta)
+
+    #: What the user is currently building, carried across the steps that
+    #: build it. Composing a motion, authoring per-mode rewards for it and
+    #: launching a run that trains it were three disconnected screens: the
+    #: composed clip id existed only in whichever dialog had just produced
+    #: it, so the same id had to be re-found by hand in the ~6000-clip
+    #: library twice. This is deliberately a draft, not configuration — it
+    #: records intent, and every step still reads the authoritative artifact
+    #: (the selection file, the reward chain, the run params) for truth.
+    _DRAFT_FIELDS = ("behavior_goal", "reference_clip_id", "reference_robot",
+                     "mode_reward_filename")
+
+    def read_behavior_draft(self, slug: str) -> dict:
+        meta = self._read_metadata(slug) or {}
+        draft = meta.get("behavior_draft")
+        if not isinstance(draft, dict):
+            return {}
+        return {k: draft[k] for k in self._DRAFT_FIELDS if k in draft}
+
+    def write_behavior_draft(self, slug: str, patch: dict) -> dict:
+        """Merge `patch` into the draft. A field set to None is cleared.
+
+        Merge rather than replace: the steps that write here run at
+        different times and each knows only its own field.
+        """
+        meta = self._read_metadata(slug)
+        if meta is None:
+            raise FileNotFoundError(f"no metadata for {slug!r}")
+        draft = meta.get("behavior_draft")
+        draft = dict(draft) if isinstance(draft, dict) else {}
+        for key in self._DRAFT_FIELDS:
+            if key not in patch:
+                continue
+            value = patch[key]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                draft.pop(key, None)
+            else:
+                draft[key] = value.strip() if isinstance(value, str) else value
+        meta["behavior_draft"] = draft
+        self._write_metadata(slug, meta)
+        return draft
 
     def read_env_id(self, slug: str) -> Optional[str]:
         _, cfg = _parse_adapter(self._project_dir(slug) / "config.toml")

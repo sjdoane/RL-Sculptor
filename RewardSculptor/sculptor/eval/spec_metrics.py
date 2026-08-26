@@ -42,6 +42,7 @@ Design rules (several are audit findings from real recordings):
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -1313,4 +1314,13 @@ def make_spec_fitness_fn(spec_name: str) -> Callable[[Any], float]:
     # `metric_observables=getattr(fitness_fn, "metric_observables", None)`).
     _fitness.metric_observables = metric_observables(spec_name)  # type: ignore[attr-defined]
     _fitness.spec_name = spec_name  # type: ignore[attr-defined]
+    _fitness.metric_id = spec_name  # type: ignore[attr-defined]
+    _fitness.metric_version = None  # type: ignore[attr-defined]
+    _fitness.metric_source = "built_in"  # type: ignore[attr-defined]
+    try:
+        _fitness.metric_sha256 = hashlib.sha256(  # type: ignore[attr-defined]
+            Path(__file__).read_bytes()
+        ).hexdigest()
+    except OSError:
+        _fitness.metric_sha256 = None  # type: ignore[attr-defined]
     return _fitness

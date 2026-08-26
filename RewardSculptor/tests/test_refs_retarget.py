@@ -289,6 +289,11 @@ def test_retarget_and_register_writes_clip_and_provenance(tmp_path: Path, monkey
     assert prov["source"]["kind"] == "retarget"
     assert prov["license"] == "MIT"
     assert prov["tier"] == "K"
+    assert prov["content_sha256"] == library.content_sha256(
+        lc.clip_path.read_bytes())
+    assert prov["source_content_sha256"] == library.content_sha256(
+        src.read_bytes())
+    assert prov["qc"]["duration_s"] == pytest.approx(19 / 30, abs=1e-4)
 
     rows = library.rebuild_index(root=lib_root)
     assert len(rows) == 1
@@ -330,10 +335,11 @@ def test_attach_role_resolution_qc_persists_summary(tmp_path: Path):
         "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
     }
     d = library.clip_dir("g1", "clip1", root=root)
-    save_clip(d / library.CLIP_FILENAME, clip)
+    clip_path = save_clip(d / library.CLIP_FILENAME, clip)
     prov = library.make_provenance(
         clip_id="clip1", robot="g1", source={"kind": "test"},
-        license="MIT", attribution="x", content_sha256_="0" * 64)
+        license="MIT", attribution="x",
+        content_sha256_=library.content_sha256(clip_path.read_bytes()))
     library.write_provenance("g1", "clip1", prov, root=root)
 
     summary = attach_role_resolution_qc(
@@ -358,10 +364,11 @@ def test_attach_role_resolution_qc_reports_missing_role(tmp_path: Path):
         "joint_names": ["left_hip_pitch_joint"],
     }
     d = library.clip_dir("g1", "clip1", root=root)
-    save_clip(d / library.CLIP_FILENAME, clip)
+    clip_path = save_clip(d / library.CLIP_FILENAME, clip)
     prov = library.make_provenance(
         clip_id="clip1", robot="g1", source={"kind": "test"},
-        license="MIT", attribution="x", content_sha256_="0" * 64)
+        license="MIT", attribution="x",
+        content_sha256_=library.content_sha256(clip_path.read_bytes()))
     library.write_provenance("g1", "clip1", prov, root=root)
 
     summary = attach_role_resolution_qc(

@@ -1,18 +1,55 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
 import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
-import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
+import { StartingPointPickerDialog } from "@/components/StartingPointPickerDialog";
+import { Banner, Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
 import { courseBreakdownText } from "@/components/WorldTab";
+import { useBehaviorDraft, useSaveBehaviorDraft } from "@/hooks/useBehaviorDraft";
+import { referenceRobotForProject } from "@/lib/referenceRobot";
+import {
+  hasExactTierDReceipt,
+  referenceExecutionReceiptLines,
+} from "@/lib/referenceAdmission";
+import {
+  interruptedSnapshotReadinessIssue,
+  resolveBundleMotionUpdate,
+  startingPointRunFields,
+  type MotionSelection,
+} from "@/lib/startingPoint";
+import {
+  clearNewRunPlanDraft,
+  saveNewRunPlanDraft,
+  takeNewRunPlanDraft,
+  type NewRunPlanDraft,
+  type NewRunProfile as RunProfile,
+  type NewRunRenderSize as RenderSize,
+} from "@/lib/newRunDraft";
 import { useSystemInfo } from "@/hooks/useDashboard";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
 import { useWorldSelection, useWorldValidation } from "@/hooks/useWorlds";
-import { ApiError } from "@/lib/api";
-import type { ProjectDetail } from "@/lib/types";
+import {
+  ApiError,
+  getProjectSettings,
+  getReference,
+  listModeRewards,
+  listPolicies,
+  listStartingSkills,
+} from "@/lib/api";
+import type {
+  ProjectDetail,
+  StartingPointSelection,
+  WorldEventProgram,
+} from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
+import {
+  WORLD_ROBOT_MISMATCH_TITLE,
+  worldRobotMismatchBlocker,
+} from "@/lib/worldLaunch";
 
 
 // ── Per-adapter wall-clock model (S8 / §7.7) ─────────────────────────
@@ -32,31 +69,20 @@ const LEGACY_SECONDS_PER_CYCLE: Record<string, number> = {
 
 const MAX_BEHAVIOR_GOAL_LENGTH = 500;
 
-function referenceRobotForProject(project: ProjectDetail): string {
-  const hints = [
-    project.adapter_config?.reference_robot,
-    project.library_slug,
-    project.adapter_config?.robot,
-    project.adapter_config?.task_id,
-    project.env_id,
-  ];
-  for (const raw of hints) {
-    if (typeof raw !== "string" || !raw.trim()) continue;
-    const tokens = raw.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-    for (const token of [...tokens].reverse()) {
-      // Asset-family suffixes such as "29dof" carry morphology detail but
-      // are not library namespaces; prefer the preceding embodiment token.
-      if (/^\d+$/.test(token) || /^\d+dof$/.test(token)) continue;
-      if (["mjlab", "velocity", "flat", "unitree", "booster"].includes(token)) {
-        continue;
-      }
-      return token;
-    }
-  }
-  // Unknown embodiments fail closed with an empty picker instead of silently
-  // borrowing another robot's motion namespace.
-  return "unassigned";
-}
+const SCRATCH_STARTING_POINT: StartingPointSelection = {
+  kind: "scratch",
+  warm_start_iteration: null,
+  warm_start_snapshot: null,
+  warm_start_snapshot_display: null,
+  starting_skill_id: null,
+  initialization_mode: null,
+  reference_clip_id: null,
+  reference_robot: null,
+  import_manifest_digest: null,
+  compatibility_contract_provenance_status: null,
+  acknowledge_legacy_reconstructed_initialization: false,
+  policy_contract_migration: null,
+};
 
 const MJLAB_TIMING: Record<string, {
   fixedSeconds: number;
@@ -88,6 +114,34 @@ function humanizeSeconds(sec: number): string {
   if (min < 90) return `${min.toFixed(min < 5 ? 1 : 0)} min`;
   const hr = min / 60;
   return `${hr.toFixed(hr < 10 ? 1 : 0)} h`;
+}
+
+function humanizeContractTerm(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+export function persistClearedReference(
+  persist: (draft: {
+    reference_clip_id: null;
+    reference_robot: null;
+  }) => void,
+) {
+  persist({ reference_clip_id: null, reference_robot: null });
+}
+
+export function startingSkillManifestIssue(
+  selection: StartingPointSelection,
+): string | null {
+  if (selection.kind !== "shared_skill") return null;
+  if (!selection.starting_skill_id || !selection.initialization_mode) {
+    return "Choose an imported skill and an initialization mode."
+  }
+  if (!/^[a-f0-9]{64}$/.test(selection.import_manifest_digest ?? "")) {
+    return "This legacy import has no immutable manifest. Open Starting policy "
+      + "and re-import the original .rskill bundle; re-selecting this record "
+      + "cannot repair it."
+  }
+  return null;
 }
 
 function formatEta(seconds: number): { label: string; finishAt: string } {
@@ -131,6 +185,174 @@ function ReadinessCell({
   );
 }
 
+export function PolicyInterfaceMigrationNotice({
+  startingPoint,
+  eventProgram,
+  hasReference,
+}: {
+  startingPoint: StartingPointSelection;
+  eventProgram: WorldEventProgram | undefined;
+  hasReference: boolean;
+}) {
+  const policyTransfer = startingPoint.kind === "project_checkpoint"
+    || (
+      startingPoint.kind === "shared_skill"
+      && (
+        startingPoint.initialization_mode === "actor_only"
+        || startingPoint.initialization_mode === "actor_critic"
+      )
+    );
+  if ((!eventProgram && !hasReference) || !policyTransfer) return null;
+
+  const interruptedSnapshot = startingPoint.kind === "project_checkpoint"
+    && startingPoint.warm_start_snapshot != null;
+  const migration = startingPoint.kind === "shared_skill"
+    ? startingPoint.policy_contract_migration ?? null
+    : null;
+  const interfaceAdditions = [
+    eventProgram
+      ? `${eventProgram.observation_extension.width}-wide one-hot event phase (${eventProgram.observation_extension.term})`
+      : null,
+    hasReference
+      ? "one normalized reference playback phase (reference_phase)"
+      : null,
+  ].filter((value): value is string => value != null);
+  const inheritedRoles = startingPoint.kind === "shared_skill"
+    && startingPoint.initialization_mode === "actor_only"
+    ? "the inherited actor; the target critic starts fresh"
+    : "the inherited actor and critic";
+  return (
+    <div
+      aria-label={migration
+        ? "Warm-start policy interface migration"
+        : "Warm-start policy interface admission"}
+    >
+      <Banner kind="info" icon="git-branch">
+        <div style={{ fontSize: 11.5, lineHeight: 1.5 }}>
+          <strong>
+            {migration
+              ? "Policy interface migration · reverified at launch"
+              : interruptedSnapshot
+                ? "Interrupted snapshot admission · reverified at launch"
+              : "Policy interface admission · verified at launch"}
+          </strong>
+          <div style={{ marginTop: 3 }}>
+            This run requires <strong>{interfaceAdditions.join(" and ")}</strong>.
+            {migration ? (
+              <>
+                {" "}The verified import receipt declares these as added policy
+                inputs: every added actor and critic input column starts at
+                zero, and its normalization state starts with mean 0 and
+                variance 1.
+              </>
+            ) : (
+              <>
+                {" "}No interface extension is assumed before launch. If the
+                backend admits an exact supported extension, only then are its
+                added columns zero-initialized with normalization mean 0 and
+                variance 1.
+              </>
+            )}
+            {" "}Optimizer state and training counters are reset.
+          </div>
+          {interruptedSnapshot ? (
+            <div style={{ marginTop: 4 }}>
+              The selected periodic PPO save has a server-attested recovery
+              receipt, but remains unevaluated. Launch rechecks the opaque
+              receipt id, receipt digest, exact checkpoint SHA-256, target
+              policy contract, and tensor load. Initialization is earned only
+              by the backend's verified initialization receipt after the actor
+              and critic load succeeds.
+            </div>
+          ) : startingPoint.kind === "project_checkpoint" ? (
+            <div style={{ marginTop: 4 }}>
+              A direct project checkpoint has no import preflight receipt.
+              Launch must prove either an exact target contract or the exact
+              zero-initialized event-phase, reference-clock, or combined
+              migration required by this run. Contract and tensor verification
+              happens when launch begins; any other interface fails closed.
+            </div>
+          ) : migration ? (
+            <div style={{ marginTop: 4 }}>
+              Verified import migration type:{" "}
+              <code className="mono">{migration.type}</code>. The immutable
+              compatibility receipt declares schema {migration.from_schema} →{" "}
+              {migration.to_schema}; the zero-initialized extension applies to{" "}
+              {inheritedRoles}.
+              {" "}Launch still revalidates the current project contract and
+              exact weights.
+              {migration.extensions && migration.extensions.length > 0 && (
+                <> Combined extensions: {migration.extensions.map((extension) => (
+                  <code className="mono" key={extension.type} style={{ marginLeft: 4 }}>
+                    {extension.type}
+                  </code>
+                ))}.</>
+              )}
+            </div>
+          ) : (
+            <div style={{ marginTop: 4 }}>
+              The selected import receipt does not declare a migration type.
+              Launch must prove an exact target policy interface or refuse the
+              run; this notice does not infer a migration.
+            </div>
+          )}
+        </div>
+      </Banner>
+    </div>
+  );
+}
+
+export interface ExactLaunchReceiptSection {
+  title: string;
+  summary: string;
+  details: string[];
+}
+
+/** One deliberately collapsed preflight receipt. The surrounding flow stays
+ * researcher-readable; exact identities and contract fields live here. */
+export function ExactLaunchReceipt({
+  sections,
+}: {
+  sections: ExactLaunchReceiptSection[];
+}) {
+  return (
+    <details
+      aria-label="Exact launch receipt"
+      style={{
+        border: "1px solid var(--hairline)",
+        borderRadius: "var(--radius-md)",
+        background: "var(--surface-strong)",
+        padding: "10px 12px",
+      }}
+    >
+      <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 650 }}>
+        Exact launch receipt
+        <span style={{ marginLeft: 7, color: "var(--rs-muted)", fontSize: 10.5, fontWeight: 450 }}>
+          immutable inputs reviewed again at launch
+        </span>
+      </summary>
+      <div style={{ display: "grid", gap: 9, marginTop: 10 }}>
+        {sections.map((section) => (
+          <section key={section.title} aria-label={`${section.title} receipt`}>
+            <div className="rs-eyebrow">{section.title}</div>
+            <div style={{ marginTop: 2, fontSize: 11.5, lineHeight: 1.4 }}>
+              {section.summary}
+            </div>
+            {section.details.length > 0 && (
+              <ul
+                className="mono"
+                style={{ margin: "4px 0 0", paddingLeft: 18, color: "var(--rs-muted)", fontSize: 10.25, lineHeight: 1.5 }}
+              >
+                {section.details.map((detail) => <li key={detail}>{detail}</li>)}
+              </ul>
+            )}
+          </section>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 
 // ── Per-adapter defaults (M7 Phase 4) ─────────────────────────────────
 //
@@ -146,6 +368,15 @@ function ReadinessCell({
 //   - mjlab cartpole: 15 outer × 500 iters   = ~30 s/cycle GPU
 //   - mjlab Go1:     12 outer × 1000 iters   = ~90 s/cycle GPU
 //   - mjlab G1:       8 outer × 1500 iters   = ~3 min/cycle GPU
+// `String(undefined)` is the string "undefined", which is truthy, so the
+// `|| "cuda:0"` fallbacks below never fired for an mjlab project whose
+// adapter_config has no explicit device. The dialog then prefilled the literal
+// "undefined" and the launch 422'd on an unparseable device.
+function adapterDevice(project: ProjectDetail): string {
+  const d = project.adapter_config?.device;
+  return typeof d === "string" && d.trim() ? d.trim() : "";
+}
+
 function pickAdapterDefaults(project: ProjectDetail): {
   kind: "gym_sb3" | "mjlab_cartpole" | "mjlab_go1" | "mjlab_g1" | "mjlab_other";
   iterations: number;
@@ -175,7 +406,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
       iterations: 15,
       training_iterations: 500,
       num_envs: Number(project.adapter_config?.num_envs) || 1024,
-      device: String(project.adapter_config?.device) || "cuda:0",
+      device: adapterDevice(project) || "cuda:0",
       training_label: "rsl_rl iters / cycle",
     };
   }
@@ -185,7 +416,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
       iterations: 12,
       training_iterations: 1000,
       num_envs: Number(project.adapter_config?.num_envs) || 2048,
-      device: String(project.adapter_config?.device) || "cuda:0",
+      device: adapterDevice(project) || "cuda:0",
       training_label: "rsl_rl iters / cycle",
     };
   }
@@ -195,7 +426,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
       iterations: 8,
       training_iterations: 1500,
       num_envs: Number(project.adapter_config?.num_envs) || 2048,
-      device: String(project.adapter_config?.device) || "cuda:0",
+      device: adapterDevice(project) || "cuda:0",
       training_label: "rsl_rl iters / cycle",
     };
   }
@@ -205,12 +436,10 @@ function pickAdapterDefaults(project: ProjectDetail): {
     iterations: 10,
     training_iterations: 1000,
     num_envs: Number(project.adapter_config?.num_envs) || 1024,
-    device: String(project.adapter_config?.device) || "cuda:0",
+    device: adapterDevice(project) || "cuda:0",
     training_label: "rsl_rl iters / cycle",
   };
 }
-
-type RunProfile = "custom" | "pipeline" | "rehearsal" | "overnight";
 
 function profileBudget(
   profile: Exclude<RunProfile, "custom">,
@@ -276,8 +505,9 @@ export function NewRunDialog({
   const isMjlab = defaults.kind.startsWith("mjlab");
 
   const [behavior, setBehavior] = useState("");
-  const [profile, setProfile] = useState<RunProfile>("custom");
-  type RenderSize = "default" | "1920x1080" | "960x540" | "320x240";
+  // A first-time click should prove the pipeline, not silently commit the
+  // adapter's research-sized budget (8 x 1500 PPO updates for G1).
+  const [profile, setProfile] = useState<RunProfile>("pipeline");
   const [iterations, setIterations] = useState(defaults.iterations);
   const [trainingIters, setTrainingIters] = useState<number | "">(
     defaults.training_iterations,
@@ -292,13 +522,12 @@ export function NewRunDialog({
   // Recovery-only: reject mutable diagnosis drafts and restore the reward/env
   // refs from selection_current.json before the subprocess starts.
   const [resumeExactTuple, setResumeExactTuple] = useState(false);
-  // Policy-only recovery: explicitly select a completed iteration checkpoint
-  // without changing reward/environment inputs or objective-metric authority.
-  const [warmStartIteration, setWarmStartIteration] = useState<number | "">("");
+  const [startingPoint, setStartingPoint] = useState<StartingPointSelection>(
+    SCRATCH_STARTING_POINT,
+  );
+  const [startingPointOpen, setStartingPointOpen] = useState(false);
   const [allowDefaultWorld, setAllowDefaultWorld] = useState(false);
-  const [allowRobotMismatch, setAllowRobotMismatch] = useState(false);
   const [validatingLaunch, setValidatingLaunch] = useState(false);
-  const [expandKg, setExpandKg] = useState(false);
   // §Ship-7: rollout-video + RL knobs. Empty string = "leave blank →
   // use runner/config default".
   const [maxEpisodeSteps, setMaxEpisodeSteps] = useState<number | "">("");
@@ -313,18 +542,28 @@ export function NewRunDialog({
   // §Ship 34/35: objective fitness. null = blind loop. A built-in spec
   // name OR a generated-metric ref ("gen:<id>").
   const [fitnessMetric, setFitnessMetric] = useState<string | null>(null);
+  // A live run without an objective cannot distinguish impressive-looking
+  // motion from task success. Keep the escape hatch for ablations, but make
+  // that experimental choice explicit instead of silently defaulting it.
+  const [allowBlindFitness, setAllowBlindFitness] = useState(false);
   const [fitnessMode, setFitnessMode] = useState<"observe" | "steer">("steer");
   // §Ship 48: patience for the fitness-plateau early stop (the LIVE early
   // stop on a steered run; the sculpt-lib default is 2, which truncated the
   // g1-kick-v3 run at iter 4). Default 4 here so a hard exploratory skill
   // gets room to escape a local optimum; "" → sculpt default.
   const [fitnessPatience, setFitnessPatience] = useState<number | "">(4);
-  const [referenceClipId, setReferenceClipId] = useState<string | null>(null);
+  const [motion, setMotion] = useState<MotionSelection | null>(null);
   const [referencePickerOpen, setReferencePickerOpen] = useState(false);
-  const referenceRobot = useMemo(
+  const [draftRestoreNotice, setDraftRestoreNotice] = useState<{
+    kind: "restored" | "rejected";
+    message: string;
+  } | null>(null);
+  const projectReferenceRobot = useMemo(
     () => referenceRobotForProject(project),
     [project],
   );
+  const referenceClipId = motion?.clipId ?? null;
+  const selectedReferenceRobot = motion?.robot ?? projectReferenceRobot;
   const launch = useLaunchRun(slug);
   // §env-authoring: the authored world this run will train under (404 →
   // undefined for legacy projects; the atomic selection file drives the
@@ -334,6 +573,69 @@ export function NewRunDialog({
     open ? slug : undefined,
     !!worldSel.data,
   );
+  // What this project is building, shared with compose and per-mode reward.
+  const draft = useBehaviorDraft(open ? slug : undefined);
+  // Draft persistence is intentionally live: choosing a motion writes the
+  // reference back immediately so it survives the authoring workflow.  That
+  // query update must not look like a fresh dialog open and reset the user's
+  // selected run profile, objective, or overrides.
+  const initializedOpenSlug = useRef<string | null>(null);
+  // The persistent `[iteration]` defaults this dialog's Advanced tab
+  // overrides. Disclosed there so the user can see which value wins.
+  const projectSettings = useQuery({
+    queryKey: ["project-settings", slug],
+    queryFn: () => getProjectSettings(slug),
+    enabled: open && tab === "advanced",
+    staleTime: 30_000,
+  });
+  const checkpoints = useQuery({
+    queryKey: ["policies", slug],
+    queryFn: () => listPolicies(slug),
+    enabled: open && (
+      startingPointOpen || startingPoint.kind === "project_checkpoint"
+    ),
+    staleTime: 10_000,
+  });
+  const startingSkills = useQuery({
+    queryKey: ["starting-skills", slug],
+    queryFn: () => listStartingSkills(slug),
+    enabled: open && startingPoint.kind === "shared_skill",
+    staleTime: 10_000,
+  });
+  const saveDraft = useSaveBehaviorDraft(slug);
+  // A tracking-first run binds its generated reward to the authored world
+  // atomically, so `sculpt` refuses to start without a promoted selection.
+  // Block at the button rather than letting the run die in the subprocess.
+  const referenceNeedsWorld =
+    !!referenceClipId && worldSel.isFetched && !worldSel.data?.selection;
+  const referenceDetail = useQuery({
+    queryKey: ["reference-detail", motion?.robot, motion?.clipId],
+    queryFn: () => getReference(motion!.robot, motion!.clipId),
+    enabled: open && motion != null,
+    retry: false,
+    staleTime: 10_000,
+  });
+  // The per-mode reward the chain actually holds, if any. Needed here because
+  // picking a motion and promoting a per-mode reward are two ways to install
+  // a reference, and the dialog has to say which one this run will use.
+  const modeReward = useQuery({
+    queryKey: ["modeRewards", slug],
+    queryFn: () => listModeRewards(slug),
+    enabled: open,
+    retry: false,
+    staleTime: 10_000,
+  }).data?.promoted ?? null;
+  const promotedModeMatches = !!referenceClipId
+    && modeReward?.clip_id === referenceClipId
+    && modeReward?.reference_robot === selectedReferenceRobot;
+  const promotedModeCurrent = promotedModeMatches
+    && modeReward?.context_current === true;
+  const dynamicsAdmission = referenceDetail.data?.dynamics_admission ?? null;
+  const exactDynamicsReady = hasExactTierDReceipt(referenceDetail.data);
+  const referenceInspectionRequested = dryRun && referenceClipId != null;
+  const tierKInspection = referenceInspectionRequested
+    && referenceDetail.isSuccess
+    && !exactDynamicsReady;
   const systemInfo = useSystemInfo();
   const gpuInfo = useSystemGpu();
   // §Ship 35: per-project generated metrics + the generate action.
@@ -346,6 +648,46 @@ export function NewRunDialog({
   // valid one (1 = single-shot-with-retry). Applies to BOTH the Generate button and
   // the generate-at-launch path. Each candidate is a ~1-2 min LLM call.
   const [metricCandidates, setMetricCandidates] = useState<number>(1);
+  const draftContext = useMemo(() => ({
+    slug,
+    projectDir: project.project_dir,
+    adapterClass: project.adapter_class,
+  }), [slug, project.project_dir, project.adapter_class]);
+  const currentRunPlanDraft = (): NewRunPlanDraft => ({
+    tab,
+    behavior,
+    profile,
+    iterations,
+    trainingIters,
+    numEnvs,
+    device,
+    noKg,
+    dryRun,
+    interactive,
+    resumeExactTuple,
+    startingPoint,
+    allowDefaultWorld,
+    maxEpisodeSteps,
+    playbackSpeed,
+    rolloutEpisodes,
+    seed,
+    renderEnvIndex,
+    renderSize,
+    autoAdjustPhysics,
+    fitnessMetric,
+    allowBlindFitness,
+    fitnessMode,
+    fitnessPatience,
+    motion,
+    metricCandidates,
+    calibrateAgainst,
+  });
+  const openWorldWithRunPlan = () => {
+    if (!onOpenWorld) return;
+    saveNewRunPlanDraft(draftContext, currentRunPlanDraft());
+    setOpen(false);
+    onOpenWorld();
+  };
   const genMetrics = (projectMetrics.data ?? []).filter((m) => m.accepted);
   const selectedGen = fitnessMetric?.startsWith("gen:")
     ? genMetrics.find((m) => `gen:${m.id}` === fitnessMetric) ?? null
@@ -402,25 +744,112 @@ export function NewRunDialog({
   const isLongRun = etaSeconds >= 30 * 60; // 30 min
   const hasPriorIters = project.n_iterations_completed > 0;
 
-  // Pre-fill behavior from sidecar description; reset advanced fields
-  // when the adapter changes (defaults drift with the project).
+  // Pre-fill behavior from the project's behavior draft (falling back to the
+  // sidecar description); reset advanced fields when the adapter changes
+  // (defaults drift with the project).
+  //
+  // The draft is why the goal and the motion prior survive between launches.
+  // Before it, both were cleared on every open — so the documented flow was
+  // literally "re-paste the goal and re-attach the motion prior; the dialog
+  // remembers neither", including immediately after composing the clip in a
+  // dialog two clicks away.
   useEffect(() => {
-    if (open) {
-      setBehavior((current) => current || project.description || "");
-      setIterations(defaults.iterations);
-      setTrainingIters(defaults.training_iterations);
-      setNumEnvs(defaults.num_envs);
+    if (!open) {
+      initializedOpenSlug.current = null;
+      return;
+    }
+    // Wait for the initial draft read so the first open can restore its goal
+    // and motion. Subsequent draft writes during the same open session are
+    // persistence acknowledgements, not instructions to reinitialize the UI.
+    if (draft.isLoading || initializedOpenSlug.current === slug) return;
+    initializedOpenSlug.current = slug;
+    const saved = takeNewRunPlanDraft(draftContext);
+    if (saved.status === "restored") {
+      const restored = saved.draft;
+      setTab(restored.tab);
+      setBehavior(restored.behavior);
+      setProfile(restored.profile);
+      setIterations(restored.iterations);
+      setTrainingIters(restored.trainingIters);
+      setNumEnvs(restored.numEnvs);
+      setDevice(restored.device);
+      setNoKg(restored.noKg);
+      setDryRun(restored.dryRun);
+      setInteractive(restored.interactive);
+      setResumeExactTuple(restored.resumeExactTuple);
+      setStartingPoint(restored.startingPoint);
+      setAllowDefaultWorld(restored.allowDefaultWorld);
+      setMaxEpisodeSteps(restored.maxEpisodeSteps);
+      setPlaybackSpeed(restored.playbackSpeed);
+      setRolloutEpisodes(restored.rolloutEpisodes);
+      setSeed(restored.seed);
+      setRenderEnvIndex(restored.renderEnvIndex);
+      setRenderSize(restored.renderSize);
+      setAutoAdjustPhysics(restored.autoAdjustPhysics);
+      setFitnessMetric(restored.fitnessMetric);
+      setAllowBlindFitness(restored.allowBlindFitness);
+      setFitnessMode(restored.fitnessMode);
+      setFitnessPatience(restored.fitnessPatience);
+      setMotion(restored.motion);
+      setMetricCandidates(restored.metricCandidates);
+      setCalibrateAgainst(restored.calibrateAgainst);
+      setStartingPointOpen(false);
+      setReferencePickerOpen(false);
+      setDraftRestoreNotice({
+        kind: "restored",
+        message: "Restored the complete run plan saved before opening the environment editor.",
+      });
+      return;
+    }
+    setDraftRestoreNotice(saved.status === "rejected" ? {
+      kind: "rejected",
+      message: saved.reason,
+    } : null);
+    {
+      setBehavior((current) =>
+        current || draft.data?.behavior_goal || project.description || "");
+      const firstProof = profileBudget("pipeline", defaults);
+      setIterations(firstProof.iterations);
+      setTrainingIters(firstProof.trainingIters);
+      setNumEnvs(firstProof.numEnvs);
       setDevice(defaults.device);
-      setProfile("custom");
+      setProfile("pipeline");
+      setDryRun(firstProof.dryRun);
+      setInteractive(firstProof.interactive);
+      setMaxEpisodeSteps(firstProof.maxEpisodeSteps);
+      setRolloutEpisodes(firstProof.rolloutEpisodes);
+      setRenderSize(firstProof.renderSize);
+      setSeed(42);
       setResumeExactTuple(false);
-      setWarmStartIteration("");
+      setStartingPoint(SCRATCH_STARTING_POINT);
+      setStartingPointOpen(false);
       setAllowDefaultWorld(false);
-      setAllowRobotMismatch(false);
-      setReferenceClipId(null);
+      // Only carry a draft clip that belongs to this project's embodiment;
+      // a clip from another robot's namespace would fail at launch.
+      setMotion(
+        draft.data?.reference_clip_id
+        && (!draft.data.reference_robot
+            || draft.data.reference_robot === projectReferenceRobot)
+          ? {
+              clipId: draft.data.reference_clip_id,
+              robot: draft.data.reference_robot ?? projectReferenceRobot,
+              source: "draft",
+            }
+          : null,
+      );
       setReferencePickerOpen(false);
       setRenderEnvIndex(0);
     }
-  }, [open, project.description, defaults]);
+  }, [
+    open,
+    slug,
+    project.description,
+    defaults,
+    draft.data,
+    draft.isLoading,
+    projectReferenceRobot,
+    draftContext,
+  ]);
 
   const applyProfile = (next: Exclude<RunProfile, "custom">) => {
     const budget = profileBudget(next, defaults);
@@ -501,12 +930,10 @@ export function NewRunDialog({
       });
       return;
     }
-    if (
-      worldSel.data?.shared_summary.robot_matches_project === false
-      && !allowRobotMismatch
-    ) {
-      toast.error("Authored-world robot differs from the project", {
-        description: "Re-author for the project robot, or explicitly confirm the mismatch.",
+    const worldRobotBlocker = worldRobotMismatchBlocker(worldSel.data);
+    if (worldRobotBlocker) {
+      toast.error(WORLD_ROBOT_MISMATCH_TITLE, {
+        description: worldRobotBlocker,
       });
       return;
     }
@@ -528,12 +955,16 @@ export function NewRunDialog({
       iterations,
       no_kg: noKg,
       dry_run: dryRun,
+      // A live blind run is a deliberate ablation, never an omitted default.
+      // Persist the explicit choice so direct API replay and the run receipt
+      // carry the same authority as this toggle.
+      acknowledge_blind_fitness:
+        !dryRun && fitnessMetric === null && allowBlindFitness,
       training_iterations:
         typeof trainingIters === "number" ? trainingIters : null,
       num_envs_override:
         isMjlab && typeof numEnvs === "number" ? numEnvs : null,
       device_override: isMjlab ? device : null,
-      expand_kg: expandKg,
       // §Ship-7: only forward when set; null = runner / config default.
       max_episode_steps:
         typeof maxEpisodeSteps === "number" ? maxEpisodeSteps : null,
@@ -571,13 +1002,20 @@ export function NewRunDialog({
       // their newly generated drafts, while recovery can reject them in favor
       // of the last promoted atomic tuple.
       resume_exact_tuple: resumeExactTuple,
-      warm_start_iteration:
-        typeof warmStartIteration === "number" ? warmStartIteration : null,
+      ...startingPointRunFields(startingPoint),
       reference_clip_id: referenceClipId,
-      reference_robot: referenceClipId ? referenceRobot : null,
+      reference_robot: referenceClipId ? selectedReferenceRobot : null,
     };
     launch.mutate(body, {
       onSuccess: (r) => {
+        // Remember what was actually launched, so the next open starts from
+        // it instead of from a blank box.
+        saveDraft.mutate({
+          behavior_goal: behavior.trim() || null,
+          reference_clip_id: referenceClipId,
+          reference_robot: referenceClipId ? selectedReferenceRobot : null,
+        });
+        clearNewRunPlanDraft(slug);
         setOpen(false);
         onLaunched(r.run_id);
         toast.success("Sculpt run launched", {
@@ -618,7 +1056,278 @@ export function NewRunDialog({
     && gpuInfo.data?.mjlab_available === true
     && gpuInfo.data?.rsl_rl_available === true
   );
-  const worldReady = !!worldSel.data && worldValidation.data?.ok === true;
+  // A Tier-K reference check returns after immutable contract/reference
+  // verification. It never starts sculptor or touches the training runtime.
+  const runtimeReady = referenceInspectionRequested || gpuReady;
+  const worldRobotBlocker = worldRobotMismatchBlocker(worldSel.data);
+  const worldIntegrityReady = (
+    !!worldSel.data && worldValidation.data?.ok === true
+  );
+  const worldLaunchReady = (
+    (worldIntegrityReady && !worldRobotBlocker)
+    || (!worldSel.data && allowDefaultWorld)
+  );
+  const selectedProjectPolicy = startingPoint.kind === "project_checkpoint"
+    && startingPoint.warm_start_iteration != null
+    ? checkpoints.data?.find(
+        (policy) => policy.iter_index === startingPoint.warm_start_iteration,
+      ) ?? null
+    : null;
+  const projectPolicyDigestReady = startingPoint.kind !== "project_checkpoint"
+    || startingPoint.warm_start_snapshot != null
+    || (
+      selectedProjectPolicy != null
+      && /^[a-f0-9]{64}$/.test(selectedProjectPolicy.checkpoint_sha256)
+    );
+  // The readiness cards and the primary action must describe the same
+  // authority. Previously a card could say "blocked" while Launch remained
+  // clickable and deferred the same refusal to a toast or subprocess.
+  const launchBlockers = [
+    behavior.trim().length < 4 ? "Describe the behavior first." : null,
+    !apiReady
+      ? "Configure the Anthropic API key, or choose Quick validation."
+      : null,
+    !runtimeReady
+      ? "The selected GPU adapter is not ready on this machine."
+      : null,
+    worldRobotBlocker,
+    !worldLaunchReady
+      ? "Choose a training environment or confirm the project default scene."
+      : null,
+    interruptedSnapshotReadinessIssue(startingPoint),
+    startingPoint.kind === "project_checkpoint"
+      && startingPoint.warm_start_snapshot == null
+      && checkpoints.isLoading
+      ? "Verifying the selected project checkpoint's immutable digest…"
+      : null,
+    startingPoint.kind === "project_checkpoint"
+      && startingPoint.warm_start_snapshot == null
+      && !checkpoints.isLoading
+      && !projectPolicyDigestReady
+      ? "Re-select the project checkpoint so its exact SHA-256 can be pinned before launch."
+      : null,
+    startingPoint.kind === "shared_skill"
+      && projectReferenceRobot === "unassigned"
+      ? "Select a project robot before using an imported starting point."
+      : null,
+    startingSkillManifestIssue(startingPoint),
+    startingPoint.kind === "shared_skill"
+      && startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed"
+      && !startingPoint.acknowledge_legacy_reconstructed_initialization
+      ? "Acknowledge the historical compatibility-contract reconstruction before launch."
+      : null,
+    !dryRun && fitnessMetric === null && !allowBlindFitness
+      ? "Choose an objective fitness metric, or explicitly acknowledge a blind ablation."
+      : null,
+    referenceNeedsWorld
+      ? "A starting motion requires a promoted training environment."
+      : null,
+    referenceClipId && modeReward && !promotedModeMatches
+      ? "The active reward is bound to a different reference motion. Promote a reward for this exact robot and clip before launch."
+      : null,
+    promotedModeMatches && !promotedModeCurrent
+      ? "The promoted phase reward belongs to an older reference or project context. Regenerate and promote it first."
+      : null,
+    referenceClipId && referenceDetail.isLoading
+      ? "Verifying the motion's Tier-D tracking certificate…"
+      : null,
+    referenceClipId && referenceDetail.isError
+      ? "The selected motion could not be loaded and its evidence cannot be verified."
+      : null,
+    referenceClipId && !dryRun && !referenceDetail.isLoading
+      && !referenceDetail.isError && !exactDynamicsReady
+      ? dynamicsAdmission?.admitted === true
+        ? "Live training requires the complete exact Tier-D artifact, certificate, and rollout receipt. Refresh or recertify this motion."
+        : "Live training requires a verified Tier-D tracking certificate. Use Pipeline check for this Tier-K candidate or certify it first."
+      : null,
+  ].filter((value): value is string => Boolean(value));
+  const launchBlocker = launchBlockers[0] ?? null;
+  const startingPointTitle = startingPoint.kind === "scratch"
+    ? "New policy"
+    : startingPoint.kind === "project_checkpoint"
+      ? startingPoint.warm_start_snapshot
+        ? `Interrupted snapshot · cycle ${startingPoint.warm_start_snapshot_display?.iteration ?? "—"} / PPO ${startingPoint.warm_start_snapshot_display?.ppo_step ?? "—"}`
+        : `Project checkpoint · iteration ${startingPoint.warm_start_iteration ?? "—"}`
+      : `Imported skill · ${startingPoint.starting_skill_id ?? "—"}`;
+  const startingPointDetail = startingPoint.kind === "scratch"
+    ? "Initialize new actor and critic networks. Add a motion below if you want reference-guided exploration."
+    : startingPoint.kind === "project_checkpoint"
+      ? startingPoint.warm_start_snapshot
+        ? `Unevaluated interrupted save · actor + critic transfer · optimizer/counters reset · SHA ${startingPoint.warm_start_snapshot.checkpoint_sha256.slice(0, 10)}…`
+        : "Transfer this project's actor and critic into a fresh training run; optimizer state and counters reset."
+      : startingSkillManifestIssue(startingPoint)
+        ?? `${(startingPoint.initialization_mode ?? "unselected").replaceAll("_", " ")} · ${startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed" ? startingPoint.acknowledge_legacy_reconstructed_initialization ? "legacy-reconstructed contract acknowledged" : "legacy-reconstructed contract awaiting acknowledgement" : "origin-persisted contract"} · manifest-pinned import receipt · ${startingPoint.import_manifest_digest!.slice(0, 10)}…`;
+
+  const selectedStartingSkill = startingPoint.kind === "shared_skill"
+    ? startingSkills.data?.skills.find(
+        (receipt) => receipt.skill.skill_id === startingPoint.starting_skill_id,
+      ) ?? null
+    : null;
+  const policyReceiptSection: ExactLaunchReceiptSection = (() => {
+    if (startingPoint.kind === "scratch") {
+      return {
+        title: "Policy",
+        summary: "Fresh actor and critic; no inherited policy bytes.",
+        details: ["requested roles: none", "optimizer resume: false"],
+      };
+    }
+    if (startingPoint.kind === "project_checkpoint") {
+      const snapshot = startingPoint.warm_start_snapshot;
+      return {
+        title: "Policy",
+        summary: "Project-local actor and critic transfer; exact load is observed after launch.",
+        details: [
+          snapshot
+            ? `snapshot id: ${snapshot.snapshot_id}`
+            : `iteration: ${startingPoint.warm_start_iteration ?? "unselected"}`,
+          snapshot
+            ? `checkpoint sha256: ${snapshot.checkpoint_sha256}`
+            : selectedProjectPolicy
+              ? `checkpoint file: iter_${selectedProjectPolicy.iter_index}/${selectedProjectPolicy.checkpoint}; sha256 ${selectedProjectPolicy.checkpoint_sha256}`
+              : "checkpoint bytes and sha256: unavailable; launch is blocked",
+          "requested roles: actor, critic",
+          snapshot
+            ? "trust: server-attested interrupted snapshot"
+            : "trust: verified local project artifact",
+          "optimizer resume: false",
+        ],
+      };
+    }
+    const skill = selectedStartingSkill?.skill;
+    const trust = selectedStartingSkill?.trust;
+    const requestedRoles = startingPoint.initialization_mode === "actor_only"
+      ? "actor"
+      : startingPoint.initialization_mode === "reference_only"
+        ? "none (reference only)"
+        : "actor, critic";
+    return {
+      title: "Policy",
+      summary: `Imported ${startingPoint.starting_skill_id ?? "unselected skill"}; ${requestedRoles} requested.`,
+      details: [
+        `manifest sha256: ${startingPoint.import_manifest_digest ?? trust?.manifest_digest ?? "loading immutable receipt"}`,
+        `checkpoint sha256: ${trust?.checkpoint_sha256 ?? skill?.checkpoint_sha256 ?? "loading immutable receipt"}`,
+        `compound identity sha256: ${skill?.identity_digest ?? "not supplied by receipt"}`,
+        `tensor signature sha256: ${trust?.tensor_signature_sha256 ?? skill?.tensor_signature_sha256 ?? "not supplied by receipt"}`,
+        `trust: ${trust?.status ?? skill?.trust_status ?? "loading immutable receipt"}; tensor contract verified: ${String(trust?.tensor_contract_verified ?? skill?.tensor_contract_verified ?? false)}`,
+        "exact compatibility and tensor load are reverified at launch",
+        "optimizer resume: false",
+      ],
+    };
+  })();
+  const scope = dynamicsAdmission?.certification_scope ?? null;
+  const referenceReceiptSection: ExactLaunchReceiptSection = referenceClipId
+    ? {
+        title: "Reference",
+        summary: `${selectedReferenceRobot}/${referenceClipId} · ${exactDynamicsReady ? "Tier-D tracking admitted" : tierKInspection ? "Tier-K inspection only" : "admission pending or blocked"}.`,
+        details: [
+          `clip sha256: ${referenceDetail.data?.artifact_identity?.clip_sha256 ?? dynamicsAdmission?.clip_sha256 ?? "loading exact receipt"}`,
+          `certificate sha256: ${dynamicsAdmission?.certificate_digest ?? "not admitted"}`,
+          `rollout sha256: ${dynamicsAdmission?.rollout_sha256 ?? "not admitted"}`,
+          ...referenceExecutionReceiptLines(referenceDetail.data),
+          `scope claim: ${scope?.claim ?? "not admitted"}`,
+          `gated evidence: ${scope?.gated_evidence.join(", ") ?? "not admitted"}`,
+          `measured only: ${scope?.measured_only.join(", ") ?? "not admitted"}`,
+          `not certified: ${scope?.not_certified.join(", ") ?? "not admitted"}`,
+        ],
+      }
+    : {
+        title: "Reference",
+        summary: "No reference motion requested.",
+        details: [],
+      };
+  const worldRefs = Object.entries(worldSel.data?.selection.refs ?? {})
+    .sort(([left], [right]) => left.localeCompare(right));
+  const worldReceiptSection: ExactLaunchReceiptSection = worldSel.data
+    ? {
+        title: "Training environment",
+        summary: `Promoted selection v${worldSel.data.selection.selection_version}; ${worldValidation.data?.ok ? "tuple verified" : "verification pending"}.`,
+        details: [
+          `tuple sha256: ${worldSel.data.selection.tuple_hash}`,
+          ...worldRefs.map(([name, ref]) => (
+            `${name}: ${ref.kind} ${ref.version}; sha256 ${ref.sha256}; path ${ref.path}`
+          )),
+        ],
+      }
+    : {
+        title: "Training environment",
+        summary: allowDefaultWorld
+          ? "Project default scene explicitly requested."
+          : "No environment is currently authorized for launch.",
+        details: ["No immutable authored-world tuple is available preflight."],
+      };
+  const effectiveFitnessMode = steerLocked || isLaunchGen ? "observe" : fitnessMode;
+  const objectiveReceiptSection: ExactLaunchReceiptSection = fitnessMetric == null
+    ? {
+        title: "Objective fitness",
+        summary: dryRun
+          ? "Pipeline check is unscored and non-certifying; live training still requires an objective or an acknowledged blind ablation."
+          : allowBlindFitness
+            ? "Blind ablation acknowledged; rewards train, but no independent objective judges progress."
+            : "No objective selected; live training remains blocked.",
+        details: ["fitness metric: null", "fitness authority: none"],
+      }
+    : isLaunchGen
+      ? {
+          title: "Objective fitness",
+          summary: "A generated metric will be created at launch with observe-only authority.",
+          details: [
+            "fitness metric: generate-at-launch",
+            "effective authority: observe",
+            `candidate count: ${metricCandidates}`,
+          ],
+        }
+      : selectedGen
+        ? {
+            title: "Objective fitness",
+            summary: `Generated metric ${selectedGen.id}; ${selectedGen.calibrated ? "calibrated" : "uncalibrated"}.`,
+            details: [
+              `metric id: ${selectedGen.id}`,
+              `metric source: ${selectedGen.source ?? "project artifact"}`,
+              `effective authority: ${effectiveFitnessMode}`,
+              `calibration target: ${selectedGen.calibration?.builtin ?? "none"}`,
+              `calibration spearman: ${selectedGen.calibration?.spearman ?? "not recorded"}`,
+            ],
+          }
+        : {
+            title: "Objective fitness",
+            summary: `Built-in ground-truth metric ${fitnessMetric}.`,
+            details: [
+              `metric id: ${fitnessMetric}`,
+              "metric source: built-in objective",
+              `effective authority: ${effectiveFitnessMode}`,
+            ],
+          };
+  const migration = startingPoint.policy_contract_migration ?? null;
+  const interfaceReceiptSection: ExactLaunchReceiptSection = {
+    title: "Policy interface",
+    summary: startingPoint.kind === "scratch"
+      ? "Target interface is initialized from scratch."
+      : migration
+        ? `Preflight admits ${migration.type}; launch revalidates it exactly.`
+        : "No migration is inferred preflight; launch must prove an exact target contract or an exact supported migration.",
+    details: migration
+      ? [
+          `schema: ${migration.from_schema} -> ${migration.to_schema}`,
+          `extension width: ${migration.extension_width}`,
+          `extensions: ${migration.extensions?.map((item) => item.type).join(", ") ?? migration.type}`,
+          `reference clock sha256: ${migration.reference_clock_sha256 ?? migration.extensions?.find((item) => item.reference_clock_sha256)?.reference_clock_sha256 ?? "not used"}`,
+          "new input columns: zero initialized",
+          "new normalization state: mean 0, variance 1",
+          "optimizer resume: false",
+        ]
+      : [
+          `event phase input: ${worldSel.data?.event_program ? "required" : "not required"}`,
+          `reference clock input: ${referenceClipId ? "required" : "not required"}`,
+          "optimizer resume: false",
+        ],
+  };
+  const launchReceiptSections = [
+    policyReceiptSection,
+    referenceReceiptSection,
+    worldReceiptSection,
+    objectiveReceiptSection,
+    interfaceReceiptSection,
+  ];
 
   return (
     <>
@@ -627,7 +1336,7 @@ export function NewRunDialog({
       <Btn kind={triggerKind} size="sm" icon="play" onClick={() => { genMetric.reset(); setOpen(true); }}>{triggerLabel}</Btn>
       {open && (
         <Modal
-          title="Launch a sculpt run"
+          title="Train this behavior"
           subtitle={
             isMjlab ? (
               <>GPU adapter (<code className="mono">{defaults.kind}</code>) · defaults sized for RTX 5070 Laptop (8 GiB VRAM)</>
@@ -640,17 +1349,46 @@ export function NewRunDialog({
           footer={
             <>
               <Btn kind="quiet" onClick={() => setOpen(false)} disabled={launchBusy}>Cancel</Btn>
-              <Btn kind="primary" icon={launchBusy ? "loader" : "play"} onClick={() => void submit()} disabled={launchBusy}>
-                {validatingLaunch ? "Verifying world…" : launch.isPending ? "Launching…" : "Launch"}
+              <Btn
+                kind="primary"
+                icon={launchBusy ? "loader" : "play"}
+                onClick={() => void submit()}
+                disabled={launchBusy || launchBlocker !== null}
+                title={launchBlocker ?? undefined}
+              >
+                {validatingLaunch
+                  ? referenceInspectionRequested
+                    ? "Verifying candidate…"
+                    : "Verifying environment…"
+                  : launch.isPending
+                    ? referenceInspectionRequested
+                      ? "Inspecting…"
+                      : dryRun ? "Checking…" : "Starting…"
+                    : referenceInspectionRequested
+                      ? "Inspect candidate"
+                      : dryRun ? "Run pipeline check" : "Start training"}
               </Btn>
             </>
           }
         >
+          {draftRestoreNotice && (
+            <Banner
+              kind={draftRestoreNotice.kind === "rejected" ? "err" : "info"}
+              icon={draftRestoreNotice.kind === "rejected" ? "alert-triangle" : "check-circle"}
+            >
+              <strong>
+                {draftRestoreNotice.kind === "rejected"
+                  ? "Saved run plan was not restored. "
+                  : "Run plan restored. "}
+              </strong>
+              {draftRestoreNotice.message}
+            </Banner>
+          )}
           <div style={{ display: "grid", gap: 8 }}>
             <div className="rs-eyebrow">Run plan</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(165px, 1fr))", gap: 8 }}>
               {([
-                ["pipeline", "Pipeline check", "~50 s · stubbed LLM · no GPU commitment"],
+                ["pipeline", "Pipeline check", "brief GPU smoke; Tier-K motions are inspect-only"],
                 ["rehearsal", "Live rehearsal", "2 real cycles · pauses for feedback"],
                 ["overnight", "Overnight showcase", "4 real cycles · auto · call-ready evidence"],
               ] as const).map(([value, label, description]) => (
@@ -683,7 +1421,7 @@ export function NewRunDialog({
 
           <div
             style={{
-              display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(165px, 1fr))",
               gap: 1, overflow: "hidden", borderRadius: "var(--radius-md)",
               border: "1px solid var(--hairline)", background: "var(--hairline)",
             }}
@@ -695,18 +1433,42 @@ export function NewRunDialog({
             />
             <ReadinessCell
               icon="cpu" label="Training runtime"
-              state={gpuReady ? "ready" : gpuInfo.isLoading ? "checking" : "blocked"}
-              detail={!isMjlab ? "CPU adapter ready" : gpuReady ? `${device} · mjlab + rsl_rl ready` : "CUDA/mjlab preflight failed"}
+              state={runtimeReady ? "ready" : gpuInfo.isLoading ? "checking" : "blocked"}
+              detail={referenceInspectionRequested
+                ? "not invoked · reference inspection is CPU/data-only"
+                : !isMjlab ? "CPU adapter ready" : gpuReady ? `${device} · mjlab + rsl_rl ready` : "CUDA/mjlab preflight failed"}
             />
             <ReadinessCell
               icon="globe" label="Authored world"
-              state={worldReady ? "ready" : worldValidation.isLoading ? "checking" : worldSel.data ? "blocked" : "attention"}
-              detail={worldReady
+              state={worldRobotBlocker
+                ? "blocked"
+                : worldIntegrityReady
+                  ? "ready"
+                  : worldValidation.isLoading
+                    ? "checking"
+                    : worldSel.data
+                      ? "blocked"
+                      : "attention"}
+              detail={worldRobotBlocker
+                ? worldRobotBlocker
+                : worldIntegrityReady
                 ? `v${worldSel.data!.selection.selection_version} · tuple verified`
                 : worldSel.data ? "integrity verification required" : "project default unless authored"}
             />
           </div>
           {/* ETA estimate + resume-warning (S8 / §7.7) */}
+          {launchBlocker && (
+            <Banner kind="warn" icon="alert-triangle">
+              <div>
+                <strong>Before launch ({launchBlockers.length}):</strong>
+                <ul style={{ margin: "5px 0 0", paddingLeft: 18 }}>
+                  {launchBlockers.map((blocker) => (
+                    <li key={blocker}>{blocker}</li>
+                  ))}
+                </ul>
+              </div>
+            </Banner>
+          )}
           <div
             style={{
               display: "flex", flexDirection: "column", gap: 6,
@@ -771,18 +1533,32 @@ export function NewRunDialog({
               {worldSel.data.shared_summary.robot_matches_project === false && (
                 <div style={{ fontSize: 11, lineHeight: 1.45, color: "var(--st-amber-fg)" }}>
                   <div>
-                    This world&apos;s robot differs from the project robot
-                    ({worldSel.data.shared_summary.project_capability_id}) — the run
-                    trains the authored world&apos;s robot.
+                    <strong>Training blocked.</strong> This world targets{" "}
+                    <code className="mono">
+                      {worldSel.data.shared_summary.robot}
+                    </code>
+                    , but the project targets{" "}
+                    <code className="mono">
+                      {worldSel.data.shared_summary.project_capability_id}
+                    </code>
+                    . Re-author this training environment for the project robot
+                    before launching.
                   </div>
-                  <label style={{ display: "flex", gap: 7, alignItems: "center", marginTop: 6, cursor: "pointer" }}>
-                    <input
-                      type="checkbox"
-                      checked={allowRobotMismatch}
-                      onChange={(event) => setAllowRobotMismatch(event.target.checked)}
-                    />
-                    I intend to train the authored world&apos;s robot.
-                  </label>
+                </div>
+              )}
+              {onOpenWorld && (
+                <div style={{ marginTop: 4 }}>
+                  <Btn
+                    kind="ghost"
+                    size="sm"
+                    icon="globe"
+                    onClick={openWorldWithRunPlan}
+                  >
+                    Change environment
+                  </Btn>
+                  <span style={{ marginLeft: 8, fontSize: 10.5 }}>
+                    Your current run-plan draft remains available when you reopen New Run.
+                  </span>
                 </div>
               )}
             </div>
@@ -808,7 +1584,7 @@ export function NewRunDialog({
               {onOpenWorld && (
                 <Btn
                   kind="ghost" size="sm" icon="globe"
-                  onClick={() => { setOpen(false); onOpenWorld(); }}
+                  onClick={openWorldWithRunPlan}
                 >
                   Author world
                 </Btn>
@@ -844,6 +1620,113 @@ export function NewRunDialog({
               </Field>
               <div
                 style={{
+                  display: "grid", gap: 7, padding: "11px 12px",
+                  border: "1px solid var(--hairline)",
+                  borderRadius: "var(--radius-md)",
+                  background: "var(--surface-strong)",
+                }}
+              >
+                <div style={{ fontSize: 12.5, fontWeight: 650 }}>
+                  How will success be measured?
+                </div>
+                <div className="rs-select">
+                  <select
+                    value={fitnessMetric ?? "none"}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      const selected = value === "none" ? null : value;
+                      setFitnessMetric(selected);
+                      if (selected !== null) setAllowBlindFitness(false);
+                    }}
+                    disabled={launchBusy || genMetric.isPending}
+                    aria-label="Primary objective fitness metric"
+                  >
+                    <option value="none">No metric (blind ablation)</option>
+                    <option value="generate-at-launch">
+                      Generate from this goal at launch
+                    </option>
+                    <optgroup label="Built-in ground truth">
+                      {SPEC_METRIC_NAMES.map((metric) => (
+                        <option key={metric} value={metric}>{metric}</option>
+                      ))}
+                    </optgroup>
+                    {genMetrics.length > 0 && (
+                      <optgroup label="Generated for this project">
+                        {genMetrics.map((metric) => (
+                          <option key={metric.id} value={`gen:${metric.id}`}>
+                            {metric.id}{metric.calibrated
+                              ? " · calibrated"
+                              : " · observe-only"}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                  </select>
+                </div>
+                <div className="rs-sub" style={{ fontSize: 10.8, lineHeight: 1.45 }}>
+                  Reward terms train the policy; this independent metric judges
+                  progress. Generated metrics remain observe-only until their
+                  calibration earns steering authority.
+                </div>
+                {fitnessMetric === null && (
+                  <ToggleRow
+                    on={allowBlindFitness}
+                    onChange={setAllowBlindFitness}
+                    label="Acknowledge blind fitness ablation"
+                    title="No independent objective"
+                    desc="Allow live training with reward diagnostics only; this run cannot use a metric to steer selection or certify success."
+                  />
+                )}
+              </div>
+              <button
+                type="button"
+                aria-label="Choose policy or skill starting point"
+                onClick={() => setStartingPointOpen(true)}
+                disabled={launchBusy}
+                style={{
+                  display: "flex", alignItems: "center", gap: 11,
+                  width: "100%", padding: "11px 12px", textAlign: "left",
+                  border: "1px solid var(--hairline)",
+                  borderRadius: "var(--radius-md)",
+                  background: startingPoint.kind === "scratch"
+                    ? "var(--surface-strong)"
+                    : "color-mix(in srgb, var(--rs-primary) 5%, var(--surface-strong))",
+                  color: "var(--ink)", font: "inherit", cursor: "pointer",
+                }}
+              >
+                <span
+                  style={{
+                    width: 30, height: 30, flex: "0 0 30px",
+                    display: "grid", placeItems: "center",
+                    borderRadius: "var(--radius-sm)",
+                    background: "var(--canvas-soft)",
+                    color: startingPoint.kind === "scratch" ? "var(--rs-muted)" : "var(--rs-primary)",
+                  }}
+                >
+                  <Icon name={startingPoint.kind === "scratch" ? "sparkles" : "package"} size={15} />
+                </span>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: "block", fontSize: 10.5, color: "var(--rs-muted)", textTransform: "uppercase", letterSpacing: ".05em" }}>
+                    Starting policy
+                  </span>
+                  <span style={{ display: "block", marginTop: 2, fontSize: 12.5, fontWeight: 650 }}>
+                    {startingPointTitle}
+                  </span>
+                  <span style={{ display: "block", marginTop: 3, fontSize: 10.8, lineHeight: 1.45, color: "var(--rs-muted)" }}>
+                    {startingPointDetail}
+                  </span>
+                </span>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--rs-primary)", fontSize: 11.5, fontWeight: 650 }}>
+                  Change <Icon name="chevron-right" size={14} />
+                </span>
+              </button>
+              <PolicyInterfaceMigrationNotice
+                startingPoint={startingPoint}
+                eventProgram={worldSel.data?.event_program}
+                hasReference={referenceClipId != null}
+              />
+              <div
+                style={{
                   display: "flex", alignItems: "center", gap: 11,
                   border: "1px solid var(--hairline)",
                   borderRadius: "var(--radius-md)",
@@ -866,7 +1749,7 @@ export function NewRunDialog({
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 12.5, fontWeight: 650 }}>
-                    {referenceClipId ? "Motion prior attached" : "Pre-existing motion (optional)"}
+                    {referenceClipId ? "Starting motion attached" : "Starting motion (optional)"}
                   </div>
                   <div
                     style={{
@@ -875,14 +1758,126 @@ export function NewRunDialog({
                     }}
                   >
                     {referenceClipId
-                      ? <><code className="mono">{referenceRobot}/{referenceClipId}</code> becomes the immutable tracking base; this goal can only add a bounded task residual.</>
+                      ? promotedModeCurrent
+                        ? <>Your promoted <code className="mono">v{modeReward!.version}.py</code> is bound to this exact clip and project context across {modeReward!.modes.length} authored modes. {modeReward!.tracking_enabled ? "Its tracking backbone remains active." : "It contains task-only phase terms; no tracking backbone is claimed."}</>
+                        : <><code className="mono">{selectedReferenceRobot}/{referenceClipId}</code> becomes the immutable tracking base; this goal can only add a bounded task residual.</>
                       : "Choose a retargeted clip to preserve its gait or pose sequence while the authored world and route RSI teach the novel task."}
                   </div>
+                  {referenceClipId && (
+                    <div
+                      style={{
+                        display: "flex", flexWrap: "wrap", alignItems: "center",
+                        gap: 6, marginTop: 6, fontSize: 10.5,
+                        color: referenceDetail.isError
+                          ? "var(--st-rose)"
+                          : exactDynamicsReady
+                            ? "var(--st-emerald)"
+                            : "var(--st-amber)",
+                      }}
+                    >
+                      <span className={`rs-badge ${referenceDetail.isError ? "rose" : exactDynamicsReady ? "emerald" : "amber"}`}>
+                        {referenceDetail.isLoading
+                          ? "checking tracking evidence"
+                          : referenceDetail.isError
+                            ? "tracking evidence unavailable"
+                          : exactDynamicsReady
+                            ? "Tier D tracking verified"
+                            : dynamicsAdmission?.admitted
+                              ? "Tier D evidence incomplete"
+                            : `Tier ${dynamicsAdmission?.tier ?? "K"} candidate`}
+                      </span>
+                      <span>
+                        {referenceDetail.isError
+                          ? "The selected motion could not be loaded; inspection and training remain blocked."
+                          : exactDynamicsReady
+                          ? `certificate ${dynamicsAdmission?.certificate_digest?.slice(0, 10)}…`
+                          : dynamicsAdmission?.admitted
+                            ? "Exact artifact/certificate/rollout receipt is incomplete."
+                          : dryRun
+                            ? "Inspects clip bytes, provenance, and launch contracts only — no training, rollout, or checkpoint."
+                            : "Certify with the external tracker before live training."}
+                      </span>
+                    </div>
+                  )}
+                  {referenceClipId && exactDynamicsReady && (
+                    <div
+                      aria-label="Tier-D certification scope"
+                      style={{ marginTop: 5, fontSize: 10.5, lineHeight: 1.45, color: "var(--rs-muted)" }}
+                    >
+                      <div>Claim: {dynamicsAdmission?.certification_scope?.claim}</div>
+                      <div>
+                        Gated evidence: {dynamicsAdmission?.certification_scope?.gated_evidence
+                          .map(humanizeContractTerm).join(", ")}.
+                      </div>
+                      <div>
+                        Measured, not gated: {dynamicsAdmission?.certification_scope?.measured_only
+                          .map(humanizeContractTerm).join(", ")}.
+                      </div>
+                      <div>
+                        Not certified: {dynamicsAdmission?.certification_scope?.not_certified
+                          .map(humanizeContractTerm).join(", ")}.
+                      </div>
+                    </div>
+                  )}
+                  {promotedModeMatches && !promotedModeCurrent && (
+                    <div style={{ marginTop: 6, fontSize: 10.8, lineHeight: 1.45, color: "var(--st-rose)" }}>
+                      The promoted phase reward is stale for the current clip bytes,
+                      world/task selection, or execution manifest. Regenerate and
+                      promote it before launch.
+                      {modeReward?.promotion_blocker
+                        ? ` ${modeReward.promotion_blocker}.`
+                        : ""}
+                    </div>
+                  )}
+                  {/* rewards/current.py is the launch authority. A different
+                      selected clip cannot silently replace or bypass it. */}
+                  {referenceClipId && modeReward
+                    && !promotedModeMatches && (
+                    <div
+                      style={{
+                        marginTop: 6, fontSize: 10.8, lineHeight: 1.45,
+                        color: "var(--st-amber)",
+                      }}
+                    >
+                      This project's promoted <code className="mono">
+                      v{modeReward.version}.py</code> is a per-mode reward for{" "}
+                      <code className="mono">
+                        {modeReward.reference_robot}/{modeReward.clip_id}
+                      </code>.
+                      Launch is blocked because the active reward and selected
+                      motion disagree. Promote a reward for <code className="mono">
+                        {selectedReferenceRobot}/{referenceClipId}
+                      </code> so the readiness warning and launch action use the
+                      same exact authority.
+                    </div>
+                  )}
+                  {/* A tracking-first run binds its generated reward to the
+                      authored world atomically and refuses to start without a
+                      promoted selection. That refusal used to happen inside
+                      the subprocess, so the run "launched" and then died. */}
+                  {referenceClipId && worldSel.isFetched && !worldSel.data?.selection && (
+                    <div
+                      style={{
+                        marginTop: 6, fontSize: 10.8, lineHeight: 1.45,
+                        color: "var(--st-amber)",
+                      }}
+                    >
+                      This project has no promoted environment, and a starting motion
+                      requires one — the tracking reward is bound to the world
+                      atomically. Author and promote a world first, or clear
+                      the motion to launch without it.
+                    </div>
+                  )}
                 </div>
                 {referenceClipId && (
                   <Btn
                     kind="ghost" size="xs" icon="x"
-                    onClick={() => setReferenceClipId(null)}
+                    onClick={() => {
+                      setMotion(null);
+                      persistClearedReference((draftUpdate) => {
+                        saveDraft.mutate(draftUpdate);
+                      });
+                    }}
                     disabled={launchBusy}
                   >
                     Clear
@@ -895,13 +1890,17 @@ export function NewRunDialog({
                   onClick={() => setReferencePickerOpen(true)}
                   disabled={launchBusy}
                 >
-                  {referenceClipId ? "Change" : "Choose motion"}
+                    {referenceClipId ? "Change" : "Choose starting motion"}
                 </Btn>
               </div>
               <ToggleRow
                 on={dryRun} onChange={(value) => { setDryRun(value); setProfile("custom"); }} label="Dry run"
-                title={<><code className="mono">--dry-run</code> · smoke-test the pipeline</>}
-                desc="training steps capped at 1000, LLM calls stubbed — ~50 s total"
+                title={tierKInspection
+                  ? <>Tier-K inspection · no training process</>
+                  : <><code className="mono">--dry-run</code> · smoke-test the pipeline</>}
+                desc={tierKInspection
+                  ? "verifies immutable clip/provenance and launch contracts; publishes no policy"
+                  : "training steps capped at 1000, LLM calls stubbed — ~50 s total"}
               />
               <ToggleRow
                 on={interactive} onChange={(value) => { setInteractive(value); setProfile("custom"); }} label="Pause for my feedback each iteration"
@@ -911,6 +1910,61 @@ export function NewRunDialog({
             </>
           ) : (
             <>
+              {/* The same knobs appear under three names in three places, and
+                  nothing said which one wins. Settings (gear icon) edits the
+                  persistent `[iteration]` block in config.toml; this tab
+                  overrides it for one run only; project creation seeds it.
+                  Show the stored value beside every field that has one so
+                  "am I changing the default or just this run" is answerable
+                  without leaving the dialog. */}
+              <div
+                style={{
+                  border: "1px solid var(--hairline)",
+                  borderRadius: "var(--radius-md)",
+                  padding: "10px 12px",
+                  background: "var(--surface-strong)",
+                  fontSize: 11, lineHeight: 1.5,
+                }}
+              >
+                <div className="rs-flex rs-gap-8" style={{ alignItems: "center" }}>
+                  <Icon name="info" size={13} color="var(--rs-muted)" />
+                  <strong style={{ fontSize: 11.5 }}>
+                    These override the project defaults, for this run only
+                  </strong>
+                </div>
+                <div className="rs-sub" style={{ marginTop: 4 }}>
+                  Persistent defaults live in <code className="mono">config.toml</code>
+                  {" "}under <code className="mono">[iteration]</code> and are edited
+                  from the gear icon in the project header. A field left blank
+                  here falls back to that value; a field with a number in it
+                  wins for this launch and is not saved back.
+                  {projectSettings.data && (
+                    <>
+                      {" "}Stored now:{" "}
+                      <code className="mono">
+                        steps_per_iter={String(
+                          projectSettings.data.iteration?.steps_per_iter ?? "unset")}
+                      </code>,{" "}
+                      <code className="mono">
+                        max_episode_steps={String(
+                          projectSettings.data.iteration?.max_episode_steps ?? "unset")}
+                      </code>,{" "}
+                      <code className="mono">
+                        rollout_episodes={String(
+                          projectSettings.data.iteration?.rollout_episodes ?? "unset")}
+                      </code>.
+                    </>
+                  )}
+                </div>
+                <div className="rs-sub" style={{ marginTop: 6 }}>
+                  <strong>Note:</strong> the field this dialog calls
+                  {" "}<code className="mono">training_iterations</code> is the same
+                  flag Settings calls <code className="mono">steps_per_iter</code>.
+                  Its unit depends on the adapter — rsl_rl policy-update
+                  iterations on mjlab, environment steps on gym_sb3 — which is
+                  why the two screens show different sensible ranges for it.
+                </div>
+              </div>
               {hasPriorIters && worldSel.data && (
                 <ToggleRow
                   on={resumeExactTuple}
@@ -919,41 +1973,6 @@ export function NewRunDialog({
                   title={<>Recovery mode · restore selection v{worldSel.data.selection.selection_version} before training</>}
                   desc="Reject unpromoted reward/environment drafts and resume from the exact hash-verified atomic tuple."
                 />
-              )}
-              {hasPriorIters && (
-                <div
-                  style={{
-                    border: "1px solid var(--hairline)",
-                    borderRadius: "var(--radius-md)",
-                    padding: 13,
-                    background: "var(--surface-strong)",
-                  }}
-                >
-                  <Field
-                    label="Warm-start checkpoint (optional)"
-                    htmlFor="run-warm-start-iteration"
-                  >
-                    {numField(
-                      warmStartIteration,
-                      (value) => {
-                        setWarmStartIteration(value);
-                        setProfile("custom");
-                      },
-                      {
-                        id: "run-warm-start-iteration",
-                        min: 0,
-                        max: 999999,
-                        placeholder: "Iteration, e.g. 22",
-                      },
-                    )}
-                    <p className="rs-hintline">
-                      Explicit policy recovery only: loads actor + critic from{" "}
-                      <code className="mono">runs/iter_N/checkpoint</code>. The
-                      selected reward, world tuple, and objective-metric mode do
-                      not change.
-                    </p>
-                  </Field>
-                </div>
               )}
               <div className="rs-row2">
                 <Field label="Sculpt iters (outer)" htmlFor="run-iters">
@@ -964,15 +1983,39 @@ export function NewRunDialog({
                 </Field>
                 <Field label={defaults.training_label} htmlFor="run-trainiters">
                   {numField(trainingIters, setTrainingIters, { id: "run-trainiters", min: 100, max: 200000 })}
-                  <p className="rs-hintline">Inner-loop budget per cycle. Blank → config.toml.</p>
+                  {/* Same knob, two names. Settings calls it `steps_per_iter`
+                      and this tab sends `training_iterations`; naming them
+                      differently in the two places that set them is what made
+                      it impossible to tell whether they were one control or
+                      two competing ones. Name the alias and show the stored
+                      value the blank field falls back to. */}
+                  <p className="rs-hintline">
+                    Inner-loop budget per cycle — this is{" "}
+                    <code className="mono">steps_per_iter</code> in Settings
+                    {projectSettings.data?.iteration?.steps_per_iter != null && (
+                      <> (currently{" "}
+                        <b>{String(projectSettings.data.iteration.steps_per_iter)}</b>)</>
+                    )}
+                    . Blank falls back to it.
+                  </p>
                 </Field>
               </div>
 
               {isMjlab && (
                 <div className="rs-row2">
                   <Field label="num_envs (override)" htmlFor="run-numenvs">
-                    {numField(numEnvs, setNumEnvs, { id: "run-numenvs", min: 1, max: 8192 })}
-                    <p className="rs-hintline">Drop if OOM. Halve + snap to power-of-two is safe.</p>
+                    {numField(numEnvs, setNumEnvs, {
+                      id: "run-numenvs", min: 1, max: 8192,
+                      placeholder: String(defaults.num_envs),
+                    })}
+                    {/* Blank used to mean an invisible project default, and on
+                        an authored world that default can be one the physics
+                        cannot build — the run then dies seconds in, before the
+                        first training step. Name the number that will be used. */}
+                    <p className="rs-hintline">
+                      Blank uses the project's <b>{defaults.num_envs}</b>. Drop it if the run
+                      dies allocating — halve and snap to a power of two.
+                    </p>
                   </Field>
                   <Field label="device" htmlFor="run-device">
                     <input
@@ -1071,7 +2114,12 @@ export function NewRunDialog({
                   <div className="rs-select">
                     <select
                       value={fitnessMetric ?? "none"}
-                      onChange={(e) => { const v = e.target.value; setFitnessMetric(v === "none" ? null : v); }}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        const selected = v === "none" ? null : v;
+                        setFitnessMetric(selected);
+                        if (selected !== null) setAllowBlindFitness(false);
+                      }}
                       disabled={launch.isPending || genMetric.isPending}
                       aria-label="Objective fitness metric"
                     >
@@ -1096,6 +2144,17 @@ export function NewRunDialog({
                   {/* §best-of-N: sample N candidate metrics and keep the most-
                       discriminating valid one (offline selection). Applies to BOTH
                       the Generate button and the generate-at-launch path. */}
+                  {fitnessMetric === null && (
+                    <div style={{ flexBasis: "100%" }}>
+                      <ToggleRow
+                        on={allowBlindFitness}
+                        onChange={setAllowBlindFitness}
+                        label="Acknowledge blind fitness ablation"
+                        title="Blind ablation"
+                        desc="Allow a live run with reward diagnostics only; no objective metric may steer selection or certify success."
+                      />
+                    </div>
+                  )}
                   <div
                     className="rs-select"
                     title="Sample N candidate metrics and keep the most-discriminating valid one. Each candidate is a ~1-2 min LLM call."
@@ -1258,11 +2317,13 @@ export function NewRunDialog({
                   </div>
                 )}
 
-                <ToggleRow
-                  on={expandKg} onChange={setExpandKg} label="Expand knowledge graph"
-                  title={<><code className="mono">--expand-kg</code> · auto-research thin topics</>}
-                  desc="Claude researches thin topics before Stage-2 diagnose (Phase 2)"
-                />
+                {/* "Expand knowledge graph" used to live here, labelled
+                    `--expand-kg`. That flag does not exist in the CLI: the
+                    backend accepts the field and stores it on the job, and
+                    nothing ever reads it. A toggle that cannot change the run
+                    is worse than no toggle, so it is gone rather than
+                    disabled. Research a topic explicitly from the Knowledge
+                    tab instead. */}
                 <ToggleRow
                   on={noKg} onChange={setNoKg} label="No knowledge graph"
                   title={<><code className="mono">--no-kg</code> · ablation</>}
@@ -1271,6 +2332,7 @@ export function NewRunDialog({
               </div>
             </>
           )}
+          <ExactLaunchReceipt sections={launchReceiptSections} />
         </Modal>
       )}
       {referencePickerOpen && (
@@ -1278,9 +2340,61 @@ export function NewRunDialog({
           slug={slug}
           currentClipId={referenceClipId}
           initialQuery={behavior}
-          robot={referenceRobot}
-          onPick={({ clipId }) => setReferenceClipId(clipId)}
+          robot={projectReferenceRobot}
+          onPick={({ clipId, robot }) => {
+            setMotion({ clipId, robot, source: "library" });
+            // Persist immediately, not only on launch: composing a motion and
+            // then closing the dialog to author its per-mode rewards is the
+            // documented order, and the clip has to survive that.
+            saveDraft.mutate({ reference_clip_id: clipId,
+                               reference_robot: robot });
+          }}
           onClose={() => setReferencePickerOpen(false)}
+        />
+      )}
+      {startingPointOpen && (
+        <StartingPointPickerDialog
+          slug={slug}
+          projectRobot={projectReferenceRobot}
+          projectTaskId={typeof project.adapter_config?.task_id === "string"
+            ? project.adapter_config.task_id
+            : null}
+          checkpoints={checkpoints.data ?? []}
+          checkpointsLoading={checkpoints.isLoading}
+          value={startingPoint}
+          onChange={(next) => {
+            setStartingPoint(next);
+            const motionUpdate = resolveBundleMotionUpdate(
+              next, projectReferenceRobot, motion,
+            );
+            if (motionUpdate.kind === "attach") {
+              setMotion(motionUpdate.motion);
+              saveDraft.mutate({
+                reference_clip_id: motionUpdate.motion.clipId,
+                reference_robot: motionUpdate.motion.robot,
+              });
+            } else if (motionUpdate.kind === "clear") {
+              // A new bundle selection is authoritative over a prior
+              // auto-attached bundle motion. Clear stale selection by exact
+              // (robot, clip_id) identity; a library-picked motion remains
+              // independent and is never cleared here.
+              setMotion(null);
+              saveDraft.mutate({
+                reference_clip_id: null,
+                reference_robot: null,
+              });
+            }
+            if (
+              next.reference_clip_id
+              && next.reference_robot
+              && next.reference_robot !== projectReferenceRobot
+            ) {
+              toast.warning("Bundled motion was not attached", {
+                description: `The bundle targets ${next.reference_robot}; this project uses ${projectReferenceRobot}. Retarget and certify it first.`,
+              });
+            }
+          }}
+          onClose={() => setStartingPointOpen(false)}
         />
       )}
     </>

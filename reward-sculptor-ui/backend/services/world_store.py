@@ -497,8 +497,9 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
         breakdown[kind] = breakdown.get(kind, 0) + 1
     world_robot = (shared.get("robot") or {}).get("capability_id")
     project_capability = project_capability_id(project_dir)
-    return {
-        "selection": selected.to_dict(),
+    selection_receipt = selected.to_dict()
+    payload = {
+        "selection": selection_receipt,
         "world_meta": world.get("meta", {}),
         "task_meta": task.get("meta", {}),
         "shared_summary": {
@@ -521,6 +522,87 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
         ],
         "clarifications": _clarification_summary(
             bundle.get("clarifications") or {}),
+    }
+    event_program = _event_program_summary(task, selection_receipt)
+    if event_program is not None:
+        payload["event_program"] = event_program
+    return payload
+
+
+def _event_program_summary(
+    task: Mapping[str, Any],
+    selection_receipt: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project the admitted linear event program for researcher display.
+
+    The selected TaskSpec remains the authority.  This adapter deliberately
+    copies its exact transition predicates and pins them back to the immutable
+    task artifact/selection tuple; it does not infer a program from a task
+    name, prompt, or goal shape.  Legacy tasks therefore keep the old response
+    shape with no ``event_program`` key.
+    """
+    shared = task.get("shared")
+    if not isinstance(shared, Mapping):
+        return None
+    event_sequence = shared.get("event_sequence")
+    if not isinstance(event_sequence, Mapping):
+        return None
+    phases = event_sequence.get("phases")
+    if not isinstance(phases, list) or len(phases) != 3:
+        return None
+    if not all(isinstance(phase, Mapping) for phase in phases):
+        return None
+
+    route, jump, hold = phases
+    route_until = route.get("until")
+    jump_until = jump.get("until")
+    if not isinstance(route_until, Mapping) \
+            or not isinstance(jump_until, Mapping):
+        return None
+    minimum_hold_s = hold.get("minimum_hold_s")
+    task_ref = (selection_receipt.get("refs") or {}).get("task")
+    return {
+        "id": event_sequence.get("id"),
+        "ordered_phase_ids": [phase.get("id") for phase in phases],
+        "transition_spec": [
+            {
+                "from": route.get("id"),
+                "to": jump.get("id"),
+                "when": dict(route_until),
+            },
+            {
+                "from": jump.get("id"),
+                "to": hold.get("id"),
+                "when": dict(jump_until),
+            },
+            {
+                "from": hold.get("id"),
+                "to": "terminal",
+                "when": {
+                    "event": "minimum_hold_elapsed",
+                    "minimum_hold_s": minimum_hold_s,
+                },
+            },
+        ],
+        "minimum_air_time_s": jump_until.get("min_air_time_s"),
+        "minimum_height_delta_m": jump_until.get("min_height_delta_m"),
+        "support_selectors": jump_until.get("support_contacts"),
+        "terminal_hold_duration_s": minimum_hold_s,
+        "episode_length_s": (shared.get("termination") or {}).get(
+            "episode_length_s"),
+        "train_only_phase_sampling": (task.get("train") or {}).get(
+            "event_phase_sampling"),
+        "evaluation_start_phase": route.get("id"),
+        "observation_extension": {
+            "term": "authored_event_phase",
+            "encoding": "one_hot",
+            "width": 3,
+        },
+        "provenance": {
+            "selection_version": selection_receipt.get("selection_version"),
+            "selection_tuple_hash": selection_receipt.get("tuple_hash"),
+            "task_artifact": task_ref,
+        },
     }
 
 
@@ -583,11 +665,92 @@ def validate(project_dir: Path) -> dict[str, Any]:
     errors.extend(
         f"TaskSpec: {e}"
         for e in validate_task_spec(bundle["task"], world=bundle["world"]))
+    shared = bundle["world"].get("shared") or {}
+    world_robot = (shared.get("robot") or {}).get("capability_id")
+    project_robot = project_capability_id(project_dir)
     return {
         "ok": not errors,
         "selection_version": selected.selection_version,
         "tuple_hash": selected.tuple_hash,
         "errors": errors,
+        "robot_matches_project": (
+            None if project_robot is None else world_robot == project_robot
+        ),
+        "world_robot": world_robot,
+        "project_robot": project_robot,
+    }
+
+
+def training_preflight(project_dir: Path) -> dict[str, Any] | None:
+    """Re-attest the promoted world and its robot before training.
+
+    The authored world is an executable training input, so integrity alone is
+    insufficient: its robot must also be the robot configured by the project.
+    Keep this as the single backend authority used both when the HTTP request
+    is admitted and again by the queued worker immediately before spawn.
+
+    ``None`` means the project has no promoted authored world and therefore
+    retains the existing built-in-scene behavior.
+    """
+    selection_path = Path(project_dir) / "env" / "selection_current.json"
+    if not selection_path.is_file():
+        return None
+
+    # Derive integrity, tuple identity, and robot compatibility from the same
+    # loaded bundle. One snapshot cannot mix hashes from one promotion with
+    # robot metadata from a concurrent promotion.
+    return dict(validate(project_dir))
+
+
+def immutable_training_receipt(
+    project_dir: Path,
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Bind one verified training preflight to its immutable selection file.
+
+    ``selection_current.json`` is only an authoring pointer. A queued or
+    subprocess-backed run must carry the corresponding ``selection_vN.json``
+    path and its byte digest so a later promotion cannot change the experiment
+    between admission and core initialization.
+    """
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    report = training_preflight(project_dir) if report is None else report
+    if report is None:
+        return None
+    if not isinstance(report, dict) or not bool(report.get("ok")):
+        raise ValueError("authored world preflight is not verified")
+    version = report.get("selection_version")
+    tuple_hash = report.get("tuple_hash")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("authored world selection_version is invalid")
+    if (
+        not isinstance(tuple_hash, str)
+        or len(tuple_hash) != 64
+        or any(char not in "0123456789abcdef" for char in tuple_hash)
+    ):
+        raise ValueError("authored world tuple_hash is invalid")
+
+    store = WorldArtifactStore(project_dir)
+    selection_path = store.env_dir / f"selection_v{version}.json"
+    selection = store.read_selection(selection_path)
+    if selection is None:
+        raise ValueError("immutable authored world selection is missing")
+    if (
+        selection.selection_version != version
+        or selection.tuple_hash != tuple_hash
+    ):
+        raise ValueError(
+            "immutable authored world selection differs from preflight"
+        )
+    return {
+        "selection_version": version,
+        "selection_path": str(selection_path.resolve()),
+        "selection_sha256": file_sha256(selection_path),
+        "tuple_hash": tuple_hash,
+        "world_robot": report.get("world_robot"),
+        "project_robot": report.get("project_robot"),
     }
 
 

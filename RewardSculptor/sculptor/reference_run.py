@@ -28,11 +28,158 @@ from sculptor.adapters.base import _import_reward_module
 from sculptor.edit import apply_prompt_edit
 from sculptor.reference import load_clip
 from sculptor.refs import library
-from sculptor.refs.track import generate_tracking_residual_reward_source
+from sculptor.refs.track import (
+    REFERENCE_TARGET_SAMPLING,
+    generate_tracking_residual_reward_source,
+)
+
+
+REFERENCE_INPUT_HASH_SCHEMA = "reference-guided-input-v3"
 
 
 class ReferenceRunError(RuntimeError):
     """The selected reference cannot safely seed an ordinary run."""
+
+
+def require_exact_reference_tracking_backbone(
+    *,
+    reward_source: str,
+    clip_id: str,
+    robot: str,
+) -> str:
+    """Re-derive the live motion prior from exact clip bytes, fail closed.
+
+    Returns the frozen-backbone digest recorded in the launch receipt.  Mode
+    rewards carry their own target tables and AST receipt; flat residual
+    rewards are compared to a deterministic regeneration from the retained
+    clip.  Only task-residual/mode bodies remain author-editable.
+    """
+    from sculptor.edit import reference_tracking_backbone_sha256
+    from sculptor.mode_rewards import (
+        mode_tracking_backbone_contract_from_source,
+        reward_spec_from_source,
+    )
+
+    spec = reward_spec_from_source(reward_source)
+    if spec.get("tracking_enabled"):
+        try:
+            observed = mode_tracking_backbone_contract_from_source(
+                reward_source
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReferenceRunError(
+                f"active mode tracking backbone is invalid: {exc}"
+            ) from exc
+        stored = spec.get("tracking_backbone")
+        if not isinstance(stored, dict) or stored != observed:
+            raise ReferenceRunError(
+                "active mode reward target tables, kernels, or reference "
+                "clock differ from its frozen tracking-backbone receipt"
+            )
+        return str(observed["frozen_ast_sha256"])
+
+    composition = spec.get("composition")
+    if (
+        not isinstance(composition, dict)
+        or composition.get("type") != "reference_tracking_residual"
+    ):
+        raise ReferenceRunError(
+            "active reference reward has no supported immutable tracking "
+            "backbone"
+        )
+    if (
+        composition.get("reference_clip_id") != clip_id
+        or composition.get("reference_robot") != robot
+    ):
+        raise ReferenceRunError(
+            "active flat tracking backbone identifies a different robot/clip"
+        )
+    clip, _provenance, _clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id,
+        robot=robot,
+    )
+    expected_source = generate_tracking_residual_reward_source(
+        clip=clip,
+        clip_id=clip_id,
+        robot=robot,
+        version="launch-backbone-check",
+    )
+    expected = reference_tracking_backbone_sha256(expected_source)
+    observed = reference_tracking_backbone_sha256(reward_source)
+    if expected is None or observed is None or observed != expected:
+        raise ReferenceRunError(
+            "active flat reward changed an immutable reference target, "
+            "kernel, clock function, or composition constant"
+        )
+    return observed
+
+
+def resolve_reference_clock_for_run(
+    project_dir: Path,
+    *,
+    clip_id: str,
+    robot: str,
+) -> dict[str, Any]:
+    """Resolve the exact clock the selected run reward will expose.
+
+    An already-promoted reference reward is authoritative because the normal
+    run reuses it.  Otherwise the normal path deterministically builds the
+    tracking-residual base from the exact library clip, so deriving its
+    ``REWARD_SPEC`` here produces the same immutable target/clock descriptor
+    without importing or executing generated reward code.
+    """
+    from sculptor.reference_authority import (
+        resolve_active_reference_authority,
+    )
+    from sculptor.reference_clock import reference_clock_from_reward_source
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    authority = resolve_active_reference_authority(project_dir / "rewards")
+    if authority is not None:
+        if (
+            authority.reference_clip_id != clip_id
+            or authority.reference_robot != robot
+        ):
+            raise ReferenceRunError(
+                "active reference reward disagrees with the selected "
+                f"motion {robot}/{clip_id}"
+            )
+        try:
+            source = Path(authority.reward_path).read_text(encoding="utf-8")
+            clock = reference_clock_from_reward_source(source)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ReferenceRunError(
+                "active reference reward has no valid immutable reference "
+                "clock; regenerate and promote it before launch"
+            ) from exc
+        if clock is None:
+            raise ReferenceRunError(
+                "active reference reward has no immutable reference clock; "
+                "regenerate and promote it before launch"
+            )
+        return clock
+
+    clip, _provenance, _clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id,
+        robot=robot,
+    )
+    source = generate_tracking_residual_reward_source(
+        clip=clip,
+        clip_id=clip_id,
+        robot=robot,
+        version="prequeue-contract",
+    )
+    try:
+        clock = reference_clock_from_reward_source(source)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - invariant guard
+        raise ReferenceRunError(
+            "deterministic reference reward produced an invalid clock"
+        ) from exc
+    if clock is None:  # pragma: no cover - invariant guard
+        raise ReferenceRunError(
+            "deterministic reference reward omitted its reference clock"
+        )
+    return clock
 
 
 @dataclass(frozen=True)
@@ -47,14 +194,6 @@ class ReferenceRewardBuild:
     task_residual_authored: bool
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def load_exact_reference_motion(
     *, clip_id: str, robot: str,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
@@ -65,15 +204,22 @@ def load_exact_reference_motion(
     registered into the target robot's namespace, preserving the retarget
     provenance the library already records.
     """
-    clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
-    provenance_path = (
-        library.clip_dir(robot, clip_id) / library.PROVENANCE_FILENAME
-    )
-    if not clip_path.is_file() or not provenance_path.is_file():
+    try:
+        provenance_bytes, clip_bytes, _preview_bytes = (
+            library.capture_reference_artifact_snapshot(robot, clip_id)
+        )
+    except (OSError, TypeError, ValueError) as exc:
         raise ReferenceRunError(
             f"reference motion {robot}/{clip_id} is incomplete or missing"
-        )
-    provenance = library.read_provenance(robot, clip_id)
+        ) from exc
+    try:
+        provenance = json.loads(provenance_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceRunError(
+            "reference provenance is not valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(provenance, dict):
+        raise ReferenceRunError("reference provenance must be a JSON object")
     if provenance.get("clip_id") != clip_id or provenance.get("robot") != robot:
         raise ReferenceRunError(
             "reference provenance does not match the selected "
@@ -84,7 +230,28 @@ def load_exact_reference_motion(
         raise ReferenceRunError(
             "reference provenance is invalid: " + "; ".join(errors)
         )
-    return load_clip(clip_path), provenance, _sha256_file(clip_path)
+    clip_sha256 = hashlib.sha256(clip_bytes).hexdigest()
+    if provenance.get("content_sha256") != clip_sha256:
+        raise ReferenceRunError(
+            "reference provenance content_sha256 does not match the exact "
+            "captured clip.npz bytes"
+        )
+
+    # Decode only the already-hashed snapshot.  Loading the public path again
+    # here would reopen a check/use race: the bytes rewarded by the run could
+    # differ from the bytes whose digest and provenance were admitted above.
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="rs_reference_snapshot_"
+        ) as raw_tmp:
+            snapshot = Path(raw_tmp) / library.CLIP_FILENAME
+            snapshot.write_bytes(clip_bytes)
+            clip = load_clip(snapshot)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ReferenceRunError(
+            "captured reference clip is invalid or cannot be decoded"
+        ) from exc
+    return clip, provenance, clip_sha256
 
 
 def build_reference_guided_reward(
@@ -110,6 +277,7 @@ def build_reference_guided_reward(
     base_source = generate_tracking_residual_reward_source(
         clip=clip,
         clip_id=clip_id,
+        robot=robot,
         version=reward_version,
     )
 
@@ -176,6 +344,8 @@ def reference_input_hash(
 ) -> str:
     """Stable identity for idempotent UI resume of the same motion+goal."""
     payload = {
+        "schema": REFERENCE_INPUT_HASH_SCHEMA,
+        "target_sampling": REFERENCE_TARGET_SAMPLING,
         "clip_id": clip_id,
         "robot": robot,
         "clip_sha256": clip_sha256,

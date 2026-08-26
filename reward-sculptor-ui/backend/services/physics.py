@@ -56,6 +56,10 @@ class MjcfSummary:
     # a "Re-materialize" button — silent fallback to empty fields was
     # the Phase 5 bug that hid the missing-assets symptom.
     parse_error: Optional[str] = None
+    # The rates TRAINING actually runs at, plus advisory findings. Distinct
+    # from `timestep` above, which is only what the MJCF compiles to — see
+    # `resolve_timing`. None when the task can't be resolved (never a guess).
+    timing: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +72,7 @@ class MjcfSummary:
             "actuators": self.actuators or [],
             "geoms": self.geoms or [],
             "parse_error": self.parse_error,
+            "timing": self.timing,
         }
 
 
@@ -221,6 +226,62 @@ def _read_metadata(project_dir: Path) -> Optional[dict[str, Any]]:
         return None
 
 
+# ── timing ───────────────────────────────────────────────────────────
+def _adapter_task_id(project_dir: Path) -> Optional[str]:
+    """The project's mjlab task id from config.toml, or None."""
+    import tomllib
+
+    try:
+        with (project_dir / "config.toml").open("rb") as f:
+            cfg = tomllib.load(f)
+    except Exception:  # noqa: BLE001 — no config is a normal state
+        return None
+    adapter_cfg = (cfg.get("adapter") or {}).get("config") or {}
+    tid = adapter_cfg.get("task_id") or adapter_cfg.get("env_id")
+    return str(tid) if isinstance(tid, str) and tid else None
+
+
+def resolve_timing(
+    project_dir: Path, mjcf_timestep: Optional[float]
+) -> Optional[dict[str, Any]]:
+    """The physics/control rates TRAINING runs at, for the Physics tab.
+
+    Two distinct numbers were being conflated, invisibly:
+
+      * `mjcf_timestep` — what the robot XML compiles to. The Unitree G1
+        declares no `<option timestep=...>`, so it compiles at MuJoCo's 0.002 s
+        default and the tab reported **500 Hz**.
+      * the task's `MujocoCfg.timestep` — what mjlab actually sets, 0.005 s,
+        i.e. **200 Hz**. A 2.5x discrepancy the UI never showed.
+
+    `mjcf_overridden` marks that case so the panel can say which number is
+    real. The control rate (physics x decimation) was not surfaced anywhere at
+    all; it is the rate that has to match hardware on deployment.
+
+    Returns None when the task can't be resolved — "unknown" is honest, a
+    default would re-introduce the same guessing this exists to remove.
+    """
+    try:
+        from sculptor.refs.timing import timing_for_task, validate_timing
+    except Exception:  # noqa: BLE001 — sculptor optional in some deployments
+        return None
+
+    task_id = _adapter_task_id(project_dir)
+    timing = timing_for_task(task_id) if task_id else None
+    if timing is None:
+        return None
+
+    payload: dict[str, Any] = timing.to_dict()
+    payload["task_id"] = task_id
+    payload["mjcf_timestep"] = mjcf_timestep
+    payload["mjcf_overridden"] = bool(
+        mjcf_timestep is not None
+        and abs(float(mjcf_timestep) - timing.physics_dt) > 1e-9
+    )
+    payload["findings"] = validate_timing(timing)
+    return payload
+
+
 # ── load + summarize ─────────────────────────────────────────────────
 def load_mjcf(project_dir: Path) -> Optional[MjcfLoadResult]:
     """Read the project's active MJCF + build a summary for the UI.
@@ -235,6 +296,7 @@ def load_mjcf(project_dir: Path) -> Optional[MjcfLoadResult]:
 
     xml_source = path.read_text(encoding="utf-8", errors="replace")
     summary = _summarize_mjcf(path)
+    summary.timing = resolve_timing(project_dir, summary.timestep)
     materialized = (
         kind == "upload"
         or path.is_relative_to(project_dir)

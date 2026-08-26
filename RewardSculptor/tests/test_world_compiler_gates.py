@@ -15,10 +15,12 @@ from mjlab.scene import Scene, SceneCfg
 
 from sculptor.world.compiler import (
     ResolvedEvaluation,
+    WorldCompileError,
     _clearance_adjusted_waypoint_points,
     _horizon_aware_terminal_brake_radius,
     _horizon_aware_waypoint_cruise,
     _install_task_observations,
+    _reconcile_task_termination,
     _reconcile_waypoint_course,
     apply_world_selection,
     compile_task_runtime,
@@ -28,11 +30,33 @@ from sculptor.world.compiler import (
     reset_robot_along_waypoint_route,
 )
 from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
-from sculptor.world.gates import run_admission_gates
+from sculptor.world.gates import estimate_budget, run_admission_gates
+from sculptor.world.observation_geometry import inclusive_grid_sample_count
 from sculptor.world.capabilities import (
-    build_robot_entity_cfg,
+    build_base_robot_entity_cfg,
     resolve_robot_capability,
 )
+
+
+def test_authored_task_episode_horizon_is_applied_fail_closed() -> None:
+    manifest = SimpleNamespace(task_shared={
+        "termination": {"episode_length_s": 24.0},
+    })
+    env_cfg = SimpleNamespace(episode_length_s=20.0)
+
+    assert _reconcile_task_termination(env_cfg, manifest) == (
+        "termination:episode_length_s→24 (authoritative TaskSpec)",
+    )
+    assert env_cfg.episode_length_s == 24.0
+    # Reconciliation is idempotent and an undeclared horizon is a no-op.
+    assert _reconcile_task_termination(env_cfg, manifest) == ()
+    assert _reconcile_task_termination(
+        env_cfg, SimpleNamespace(task_shared={"termination": {}})) == ()
+
+    with pytest.raises(
+        WorldCompileError, match="cannot apply the authored episode horizon"
+    ):
+        _reconcile_task_termination(SimpleNamespace(), manifest)
 
 
 def _world(*, generated: bool = False, robot: str = "unitree_g1:base") -> dict:
@@ -156,6 +180,53 @@ def test_generated_compilation_is_deterministic_and_robot_agnostic() -> None:
     assert sensor.secondary_policy == "first"
     assert sensor.secondary.entity == "ball"
     assert arm.robot.capability_id == "yam:parallel_gripper"
+
+
+@pytest.mark.parametrize(
+    ("generated", "height_scan", "expected_rays"),
+    [
+        (False, True, 54),
+        (True, "auto", 54),
+        (False, "auto", 0),
+        (True, False, 0),
+    ],
+)
+def test_budget_uses_compiler_inclusive_height_scan_grid(
+    generated: bool,
+    height_scan: object,
+    expected_rays: int,
+) -> None:
+    world = _world(generated=generated)
+    task = _task(height_scan=height_scan)
+    estimate = estimate_budget(
+        world,
+        task,
+    )
+
+    assert estimate["rays"] == expected_rays
+    runtime = compile_task_runtime(
+        world,
+        task,
+        resolve_robot_capability("unitree_g1:base"),
+    )
+    sensor = next((
+        item for item in runtime.sensor_cfgs
+        if item.name == "authored_height_scan"
+    ), None)
+    if expected_rays:
+        assert sensor is not None
+        assert inclusive_grid_sample_count(
+            sensor.pattern.size,
+            sensor.pattern.resolution,
+        ) == expected_rays
+    else:
+        assert sensor is None
+
+
+def test_inclusive_grid_sample_count_fails_closed_on_fractional_intervals() -> None:
+    assert inclusive_grid_sample_count((1.6, 1.0), 0.2) == 54
+    assert inclusive_grid_sample_count((0.4, 0.4), 0.2) == 9
+    assert inclusive_grid_sample_count((1.55, 1.0), 0.2) is None
 
 
 def test_authored_task_observations_reach_actor_and_critic() -> None:
@@ -317,6 +388,9 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
             },
         },
     )
+    # Missing route semantics is the immutable legacy contract: forbidden
+    # objects continue to receive planar avoid-around command clearance.
+    assert "route_semantics" not in manifest.objects["box"]
 
     points, notes = _clearance_adjusted_waypoint_points(
         manifest, ["waypoint", "finish"], robot)
@@ -817,6 +891,418 @@ def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
     assert torch.linalg.norm(term.command[1]) > 0
 
 
+def test_event_command_requires_support_air_support_before_hold() -> None:
+    """No-contact reset prefixes cannot masquerade as a completed jump."""
+    import torch
+
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5), heading=None,
+    )
+    env_cfg = SimpleNamespace(
+        events={},
+        commands={"twist": SimpleNamespace(
+            ranges=ranges, entity_name="robot", debug_vis=False,
+        )},
+        curriculum={},
+    )
+    event = {
+        "id": "route_jump_hold",
+        "phases": [
+            {"id": "route", "until": {"event": "goal_complete"}},
+            {"id": "jump", "until": {
+                "event": "bilateral_support_cycle",
+                "support_contacts": [
+                    ["robot:left_foot", "world:terrain"],
+                    ["robot:right_foot", "world:terrain"],
+                ],
+                "min_air_time_s": 0.06,
+                "min_height_delta_m": 0.18,
+            }},
+            {"id": "hold", "terminal": True, "minimum_hold_s": 2.0},
+        ],
+    }
+    manifest = SimpleNamespace(
+        task_shared={
+            "goal": {
+                "type": "waypoint_sequence", "waypoints": ["finish"],
+                "success": {"tolerance_m": 0.2, "hold_s": 0.0},
+            },
+            "event_sequence": event,
+            "termination": {"episode_length_s": 24.0},
+        },
+        course=(),
+        zones={
+            "finish": {
+                "kind": "disk", "center_m": [1.0, 0.0], "radius_m": 0.2,
+            },
+        },
+    )
+    _reconcile_waypoint_course(
+        env_cfg,
+        manifest,
+        train=False,
+        task_train={},
+    )
+    cfg = env_cfg.commands["twist"]
+    names = cfg.event_support_sensor_names
+
+    robot = SimpleNamespace(data=SimpleNamespace(
+        root_link_pos_w=torch.tensor([[0.0, 0.0, 0.8]]),
+        root_link_lin_vel_w=torch.zeros((1, 3)),
+        root_link_lin_vel_b=torch.zeros((1, 3)),
+        root_link_ang_vel_b=torch.zeros((1, 3)),
+        heading_w=torch.zeros(1),
+    ))
+
+    class FakeScene(dict):
+        pass
+
+    scene = FakeScene({
+        "robot": robot,
+        names[0]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([True]))),
+        names[1]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([True]))),
+    })
+    scene.env_origins = torch.zeros((1, 3))
+    env = SimpleNamespace(
+        num_envs=1, device="cpu", scene=scene, step_dt=0.02,
+    )
+    term = cfg.build(env)
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([1.0, 0.0])
+    term._update_command()
+    assert term.event_phase.item() == 1
+    assert term._event_support_seen.item()
+    assert term.event_support_contacts.tolist() == [[True, True]]
+    assert not term.is_standing_env.item()
+
+    # One or two staggered liftoff frames are ordinary sensor/takeoff
+    # asynchrony, not evidence of a one-foot jump.
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    robot.data.root_link_lin_vel_w[0, 2] = 1.2
+    for _ in range(2):
+        term._update_command()
+    scene[names[1]].data.found[:] = False
+    for _ in range(3):
+        term._update_command()
+    assert term.event_phase.item() == 1
+    assert term._event_flight_seen.item()
+    assert term.event_phase_height_delta.item() == pytest.approx(0.25)
+    assert term.event_phase_vertical_velocity.item() == pytest.approx(1.2)
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    term._update_command()
+    assert term.event_phase.item() == 2
+    assert term.is_standing_env.item()
+    assert not term.event_sequence_violation.item()
+
+    # A JUMP-phase RSI can begin with sensors transiently reporting no contact.
+    # That prefix must not arm flight before support has first been observed.
+    env._sculptor_waypoint_start_index = torch.tensor([1])
+    env._sculptor_event_phase_start = torch.tensor([1])
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    fresh = cfg.build(env)
+    for _ in range(4):
+        fresh._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    fresh._update_command()
+    assert fresh.event_phase.item() == 1
+    assert fresh._event_support_seen.item()
+    assert not fresh._event_flight_seen.item()
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.10
+    for _ in range(3):
+        fresh._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    fresh._update_command()
+    assert fresh.event_phase.item() == 1
+    assert not fresh._event_flight_seen.item()
+    assert fresh._event_max_height_delta.item() == 0.0
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.30
+    for _ in range(3):
+        fresh._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    fresh._update_command()
+    assert fresh.event_phase.item() == 2
+
+    # Route completion can occur while crouched.  A supported stand-up may
+    # exceed the apex threshold, but a subsequent low flight must be measured
+    # from the last bilateral-support takeoff height and cannot enter HOLD.
+    env._sculptor_event_phase_start = torch.tensor([1])
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    supported_rise = cfg.build(env)
+    supported_rise._update_command()
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    supported_rise._update_command()
+    assert supported_rise._event_max_height_delta.item() == 0.0
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.12
+    for _ in range(3):
+        supported_rise._update_command()
+    assert supported_rise._event_flight_seen.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    supported_rise._update_command()
+    assert supported_rise.event_phase.item() == 1
+    assert supported_rise._event_max_height_delta.item() == 0.0
+
+    # Apex and airtime are conjunctive evidence from one continuous flight.
+    # A brief high hop followed by a long shallow hop cannot splice the two.
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    disjoint = cfg.build(env)
+    disjoint._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        disjoint._update_command()
+    assert not disjoint._event_flight_seen.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    disjoint._update_command()
+    assert disjoint._event_max_height_delta.item() == 0.0
+
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.90
+    for _ in range(3):
+        disjoint._update_command()
+    assert disjoint._event_flight_seen.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    disjoint._update_command()
+    assert disjoint.event_phase.item() == 1
+    assert disjoint._event_max_height_delta.item() == 0.0
+
+    # An asymmetric contact is also a continuity break.  Sensor skew may be
+    # too brief to count as a one-foot jump, but it cannot join airtime/apex
+    # evidence from the bilateral-air intervals on either side.
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    asymmetric_break = cfg.build(env)
+    asymmetric_break._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        asymmetric_break._update_command()
+    scene[names[0]].data.found[:] = True
+    asymmetric_break._update_command()
+    assert not asymmetric_break._event_flight_seen.item()
+    assert asymmetric_break._event_max_height_delta.item() == 0.0
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.90
+    for _ in range(3):
+        asymmetric_break._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.80
+    asymmetric_break._update_command()
+    assert asymmetric_break.event_phase.item() == 1
+    assert not asymmetric_break.event_sequence_violation.item()
+
+    # A persistent, apex-qualified asymmetric attempt is a real one-foot hop
+    # and permanently invalidates this episode even if a later bilateral
+    # flight/landing would otherwise satisfy the phase latch.
+    env._sculptor_event_phase_start = torch.tensor([1])
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    one_foot = cfg.build(env)
+    one_foot._update_command()
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(3):
+        one_foot._update_command()
+    assert one_foot.event_sequence_violation.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    for _ in range(3):
+        one_foot._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    one_foot._update_command()
+    assert one_foot.event_phase.item() == 1
+
+    # Bilateral flight followed by a sustained unilateral touchdown/rehop is
+    # still a one-foot violation. One or two skew frames remain tolerated,
+    # but three evidence-qualified frames cannot later enter HOLD.
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    postflight_one_foot = cfg.build(env)
+    postflight_one_foot._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(3):
+        postflight_one_foot._update_command()
+    assert postflight_one_foot._event_flight_seen.item()
+    scene[names[0]].data.found[:] = True
+    for _ in range(3):
+        postflight_one_foot._update_command()
+    assert postflight_one_foot.event_sequence_violation.item()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    postflight_one_foot._update_command()
+    assert postflight_one_foot.event_phase.item() == 1
+
+    # A flight blip before raw route completion is ignored; an early hop with
+    # the admitted duration and apex is latched and cannot later earn HOLD.
+    env._sculptor_waypoint_start_index = torch.tensor([0])
+    env._sculptor_event_phase_start = torch.tensor([0])
+    robot.data.root_link_pos_w[0] = torch.tensor([0.0, 0.0, 0.8])
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    early = cfg.build(env)
+    early._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.82
+    early._update_command()
+    assert not early.event_sequence_violation.item()
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        early._update_command()
+    assert early.event_sequence_violation.item()
+
+    # Likewise, an apex-qualified second bilateral flight after landing makes
+    # the one-shot HOLD invalid; a single contact flicker would not.
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    for _ in range(2):
+        term._update_command()
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 0.82
+    term._update_command()
+    assert not term.event_sequence_violation.item()
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(2):
+        term._update_command()
+    assert term.event_sequence_violation.item()
+    assert term.event_phase.item() == 2
+    assert not term.is_standing_env.item()
+
+    env._sculptor_event_phase_start = torch.tensor([2])
+    for sensor_name in names:
+        scene[sensor_name].data.found[:] = True
+    robot.data.root_link_pos_w[0, 2] = 0.8
+    repeat_one_foot = cfg.build(env)
+    repeat_one_foot._update_command()
+    scene[names[0]].data.found[:] = False
+    robot.data.root_link_pos_w[0, 2] = 1.05
+    for _ in range(3):
+        repeat_one_foot._update_command()
+    assert repeat_one_foot.event_sequence_violation.item()
+    assert not repeat_one_foot.is_standing_env.item()
+
+
+def test_route_only_rsi_preserves_legacy_random_stream() -> None:
+    import torch
+
+    num_envs = 5
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            raise AssertionError("midroute_probability=0 must not write state")
+
+    class FakeScene(dict):
+        pass
+
+    scene = FakeScene(robot=FakeRobot())
+    scene.env_origins = torch.zeros((num_envs, 3))
+    env = SimpleNamespace(num_envs=num_envs, device="cpu", scene=scene)
+    kwargs = {
+        "waypoints_m": ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        "midroute_probability": 0.0,
+        "approach_distance_m": (0.2, 0.4),
+        "lateral_jitter_m": 0.0,
+    }
+
+    torch.manual_seed(123)
+    torch.rand(num_envs)  # the legacy use_midroute draw
+    expected_next = torch.rand(1)
+    torch.manual_seed(123)
+    reset_robot_along_waypoint_route(env, None, **kwargs)
+    actual_next = torch.rand(1)
+
+    torch.testing.assert_close(actual_next, expected_next)
+    assert torch.all(env._sculptor_event_phase_start == 0)
+
+
+def test_event_phase_rsi_is_train_only_and_uses_terminal_start() -> None:
+    import torch
+
+    num_envs = 4
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            self.written = root_state.clone()
+            self.written_ids = env_ids.clone()
+
+    class FakeScene(dict):
+        pass
+
+    robot = FakeRobot()
+    scene = FakeScene(robot=robot)
+    scene.env_origins = torch.zeros((num_envs, 3))
+    env = SimpleNamespace(num_envs=num_envs, device="cpu", scene=scene)
+    waypoints = ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0))
+
+    reset_robot_along_waypoint_route(
+        env,
+        None,
+        waypoints_m=waypoints,
+        midroute_probability=0.0,
+        approach_distance_m=(0.2, 0.4),
+        lateral_jitter_m=0.0,
+        event_phase_sampling=(0.0, 1.0, 0.0),
+    )
+
+    assert torch.all(env._sculptor_event_phase_start == 1)
+    assert torch.all(env._sculptor_waypoint_start_index == len(waypoints))
+    torch.testing.assert_close(
+        robot.written[:, :2],
+        torch.tensor(waypoints[-1][:2]).expand(num_envs, -1),
+    )
+
+
 def test_materialized_terrain_replays_exact_heightfield(tmp_path: Path) -> None:
     root = tmp_path / "eval_assets"
     compiled = compile_world(
@@ -849,6 +1335,119 @@ def test_admission_green_path_stamps_manifest() -> None:
     assert compiled.resolved_eval.admission["ok"] is True
     rebuilt = ResolvedEvaluation.from_dict(compiled.resolved_eval.to_dict())
     assert rebuilt.manifest_hash == compiled.resolved_eval.manifest_hash
+
+
+def test_compact_low_rail_profile_compiles_and_passes_admission() -> None:
+    """Thin separated rails must not be rejected by spherical overlap bounds."""
+    from sculptor.world.author import author_environment
+
+    draft = author_environment(
+        "Build a compact low-rail course with four low rails. Perform four "
+        "distinct support-cycle hops without touching them, then hold in the "
+        "finish for 2 seconds.",
+        robot_capability_id="unitree_g1:base",
+    )
+
+    report, compiled = run_admission_gates(
+        draft.world_spec,
+        draft.task_spec,
+        settle_steps=5,
+    )
+
+    assert report.ok, [
+        violation.to_dict() for violation in report.violations
+    ]
+    assert compiled is not None
+    assert list(compiled.resolved_eval.objects) == [
+        "rail_01", "rail_02", "rail_03", "rail_04",
+    ]
+    assert compiled.resolved_eval.task_shared["termination"] == {
+        "fall": "capability_default",
+        "out_of_bounds_m": 12.0,
+        "success_ends_episode": False,
+        "episode_length_s": 8.0,
+    }
+    assert compiled.resolved_eval.task_shared["observations"] == {
+        "proprioception": True,
+        "height_scan": True,
+        "object_relative": [],
+        "region_relative": [
+            "waypoint_01", "waypoint_02", "waypoint_03", "waypoint_04",
+            "finish",
+        ],
+    }
+
+    # A rail remains a literal forbidden-contact object, but its explicit
+    # traverse-over semantic prevents the planar clearance controller from
+    # rewriting this straight hopping course into a slalom.  Predicate disks
+    # and command targets therefore share the exact authored centers.
+    robot = resolve_robot_capability("unitree_g1:base")
+    waypoints = compiled.resolved_eval.task_shared["goal"]["waypoints"]
+    command_points, notes = _clearance_adjusted_waypoint_points(
+        compiled.resolved_eval, waypoints, robot,
+    )
+    expected_points = (
+        (0.65, 0.0, 0.0),
+        (1.15, 0.0, 0.0),
+        (1.65, 0.0, 0.0),
+        (2.15, 0.0, 0.0),
+        (2.55, 0.0, 0.0),
+    )
+    assert command_points == expected_points
+    assert notes == ()
+
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0),
+        lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5),
+        heading=None,
+    )
+    env_cfg = SimpleNamespace(
+        events={},
+        commands={"twist": SimpleNamespace(
+            ranges=ranges,
+            entity_name="robot",
+            debug_vis=False,
+        )},
+        curriculum={},
+    )
+    _reconcile_waypoint_course(
+        env_cfg,
+        compiled.resolved_eval,
+        train=True,
+        robot=robot,
+    )
+    routed = env_cfg.commands["twist"]
+    assert routed.predicate_waypoints_m == expected_points
+    assert routed.waypoints_m == expected_points
+    assert routed.clearance_shifts_m == ((0.0, 0.0, 0.0),) * 5
+    assert routed.clearance_staging_shifts_m == ((0.0, 0.0, 0.0),) * 5
+    assert routed.clearance_traversal_shifts_m == ((0.0, 0.0, 0.0),) * 5
+    assert routed.cruise_speed_mps == pytest.approx(0.8)
+
+
+def test_axis_aligned_box_gate_still_rejects_real_rail_overlap() -> None:
+    from sculptor.world.author import author_environment
+    from sculptor.world.gates import _placement_gate
+
+    draft = author_environment(
+        "Build a compact low-rail course with four low rails.",
+        robot_capability_id="unitree_g1:base",
+    )
+    world = copy.deepcopy(draft.world_spec)
+    world["shared"]["objects"]["rail_02"]["nominal"]["pose"][
+        "position_m"
+    ][0] = 0.39
+
+    result = _placement_gate(world, draft.task_spec, None)
+
+    assert not result.ok
+    overlap = [
+        violation for violation in result.violations
+        if violation.code == "object_overlap"
+    ]
+    assert len(overlap) == 1
+    assert "rail_01|rail_02" in overlap[0].path
 
 
 def test_admission_returns_independent_budget_placement_and_reach_violations() -> None:
@@ -891,6 +1490,11 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
         world, task, materialize_dir=store.env_dir / "eval_assets",
         settle_steps=20)
     assert report.ok and compiled is not None
+    assert compiled.resolved_eval.installed_base_robot_asset_hash
+    assert (
+        compiled.resolved_eval.installed_base_robot_asset_hash
+        != compiled.resolved_eval.robot_asset_hash
+    )
 
     rewards = project / "rewards"
     rewards.mkdir(parents=True)
@@ -915,11 +1519,17 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
     immutable = store.env_dir / f"selection_v{selection.selection_version}.json"
 
     base = SceneCfg(num_envs=1, entities={
-        "robot": build_robot_entity_cfg(resolve_robot_capability(
+        "robot": build_base_robot_entity_cfg(resolve_robot_capability(
             "unitree_g1:base")),
     })
-    bundle = apply_world_selection(base, immutable, train=False)
+    env_cfg = SimpleNamespace(scene=base, episode_length_s=20.0)
+    bundle = apply_world_selection(env_cfg, immutable, train=False)
     assert bundle.tuple_hash == selection.tuple_hash
+    assert env_cfg.episode_length_s == 10.0
+    assert (
+        bundle.runtime_robot_asset_hash
+        == compiled.resolved_eval.robot_asset_hash
+    )
     cfg_type, _ = materialized_terrain_types()
     assert isinstance(base.terrain, cfg_type)
     replay = Scene(base, device="cpu")
@@ -988,7 +1598,17 @@ def test_authored_plane_removes_only_generator_dependent_curriculum(
     assert env_cfg.scene.terrain.terrain_generator is None
     assert "terrain_levels" not in env_cfg.curriculum
     assert "command_vel" in env_cfg.curriculum
+    # The constraint budget is raised first: even this rough task's own
+    # njmax=1500 / nconmax=35 are sized for ITS scene, not for the authored
+    # course now standing in front of the robot.
     assert bundle.runtime_adjustments == (
+        "termination:episode_length_s→10 (authoritative TaskSpec)",
+        (
+            "constraint budget for authored scene: njmax 1500→1536, "
+            "nconmax 35→512 (task defaults are sized for the task's own "
+            "scene; overflow drops contact rows silently and ends in NaN "
+            "observations)"
+        ),
         "curriculum:terrain_levels→removed(no live terrain generator)",
         (
             "physical scene alignment → object 'ball' → "
@@ -1071,3 +1691,491 @@ def test_resolved_evaluation_with_admission_round_trips_course():
     assert payload["course"][0]["primitive_id"] == "b__platform"
     again = stamped.with_admission({"ok": False}).to_dict()
     assert again["course"] == payload["course"]
+
+
+# ── constraint budget for authored scenes ─────────────────────────────
+def _sim_cfg(njmax, nconmax):
+    """Minimal stand-in for mjlab's SimulationCfg — only the two knobs."""
+    return SimpleNamespace(sim=SimpleNamespace(njmax=njmax, nconmax=nconmax))
+
+
+def test_authored_scene_raises_flat_plane_constraint_budget():
+    """The bug this closes: mjlab's G1 flat config pins njmax=300 for a bare
+    plane. An authored box course overflows it on ~100% of steps, mjwarp drops
+    contact rows silently, and training dies on NaN observations ~18 learning
+    iterations later."""
+    from sculptor.world.compiler import (
+        AUTHORED_WORLD_NCONMAX, AUTHORED_WORLD_NJMAX,
+        _reconcile_constraint_budget,
+    )
+
+    cfg = _sim_cfg(300, None)
+    notes = _reconcile_constraint_budget(cfg)
+
+    assert cfg.sim.njmax == AUTHORED_WORLD_NJMAX
+    assert cfg.sim.nconmax == AUTHORED_WORLD_NCONMAX
+    assert notes and "njmax 300→" in notes[0]
+    # nconmax=None is mjwarp's heuristic, which measured WORSE than the pinned
+    # default here — it must read as unset, not as "already big enough".
+    assert "nconmax heuristic→" in notes[0]
+
+
+def test_constraint_budget_never_shrinks_a_larger_task_default():
+    """A task asking for more than the floor knows something about its own
+    scene that we do not; lowering it would recreate the overflow the other
+    way round."""
+    from sculptor.world.compiler import _reconcile_constraint_budget
+
+    cfg = _sim_cfg(9000, 4000)
+    assert _reconcile_constraint_budget(cfg) == ()
+    assert (cfg.sim.njmax, cfg.sim.nconmax) == (9000, 4000)
+
+
+def test_constraint_budget_is_a_no_op_without_the_knobs():
+    """gym_sb3 and friends have no sim cfg — must not raise."""
+    from sculptor.world.compiler import _reconcile_constraint_budget
+
+    assert _reconcile_constraint_budget(SimpleNamespace()) == ()
+    assert _reconcile_constraint_budget(SimpleNamespace(sim=SimpleNamespace())) == ()
+
+
+# ── env grid pitch vs. authored course footprint ──────────────────────
+def _course_world(
+    *lengths_m: float, generated: bool = False, lead_gap_m: float = 0.0,
+) -> dict:
+    """A world whose linear course is a run of platforms of the given lengths
+    laid end to end, optionally starting `lead_gap_m` in front of the origin
+    (a real authored course leaves the robot room to accelerate)."""
+    world = _world(generated=generated)
+    course = []
+    if lead_gap_m:
+        course.append({
+            "id": "approach", "element": "gap",
+            "nominal": {"length_m": lead_gap_m, "width_m": 1.2, "depth_m": 0.0},
+            "variations": [],
+        })
+    for index, length in enumerate(lengths_m, start=1):
+        course.append({
+            "id": f"box_{index:02d}", "element": "platform",
+            "nominal": {"length_m": length, "width_m": 1.2, "height_m": 0.3},
+            "variations": [],
+        })
+    world["shared"]["obstacles"]["course"] = course
+    world["shared"]["objects"] = {}
+    return world
+
+
+def _scene_cfg(env_spacing: float, *, terrain=None):
+    """Minimal stand-in for mjlab's SceneCfg — only the pitch and terrain."""
+    return SimpleNamespace(
+        scene=SimpleNamespace(env_spacing=env_spacing, terrain=terrain))
+
+
+def test_env_spacing_widens_to_clear_the_authored_course():
+    """The bug this closes: mjlab shares one model across parallel envs and
+    separates them by a 2.0 m grid pitch sized for a bare robot. An authored
+    course reaching several metres forward of the origin gets repeated at every
+    origin, so each robot spawns INSIDE a neighbour's boxes. Physics keeps
+    stepping and per-env observations look ordinary — the only symptom is a
+    rollout video full of interpenetrating boxes."""
+    from sculptor.world.compiler import (
+        AUTHORED_COURSE_CLEARANCE_M, _reconcile_env_spacing, authored_footprint_m,
+    )
+
+    world = _course_world(1.0, 1.1, 1.2)
+    span_x, span_y = authored_footprint_m(world)
+    cfg = _scene_cfg(2.0)
+
+    notes = _reconcile_env_spacing(cfg, world)
+
+    assert cfg.scene.env_spacing == pytest.approx(
+        span_x + AUTHORED_COURSE_CLEARANCE_M)
+    assert cfg.scene.env_spacing > span_x > 2.0
+    assert notes and "env_spacing 2→" in notes[0]
+    assert "spawn" in notes[0].lower() or "neighbouring" in notes[0]
+    assert span_y < span_x  # the run is long in x, narrow in y
+
+
+def test_env_spacing_measures_from_the_origin_not_the_first_box():
+    """The robot spawns at the origin, so the span that must fit the pitch runs
+    origin→far edge. Measuring first-box→last-box would under-report by the
+    approach gap and leave the spawn inside a neighbour's geometry."""
+    from sculptor.world.compiler import authored_footprint_m, resolve_course
+
+    world = _course_world(1.0, 1.0, lead_gap_m=0.8)
+    course = resolve_course(world)
+    first_to_last = (
+        max(p.position_m[0] + p.size_m[0] / 2 for p in course)
+        - min(p.position_m[0] - p.size_m[0] / 2 for p in course))
+    span_x, _ = authored_footprint_m(world)
+
+    # The 0.8 m approach gap is part of what has to clear the neighbour.
+    assert span_x == pytest.approx(first_to_last + 0.8)
+    assert span_x > first_to_last
+    assert span_x == pytest.approx(
+        max(p.position_m[0] + p.size_m[0] / 2 for p in course))
+
+
+def test_env_spacing_never_narrows_a_wider_task_default():
+    """A task that already spreads its envs further apart knows something about
+    its own scene; narrowing the pitch would create the overlap we are here to
+    remove."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    cfg = _scene_cfg(50.0)
+    assert _reconcile_env_spacing(cfg, _course_world(1.0, 1.0)) == ()
+    assert cfg.scene.env_spacing == 50.0
+
+
+def test_env_spacing_is_a_no_op_without_an_authored_course():
+    """A bare-robot world has no geometry to clear — the task's own pitch is
+    the right one and must be left alone."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    world = _world()
+    world["shared"]["objects"] = {}
+    cfg = _scene_cfg(2.0)
+    assert _reconcile_env_spacing(cfg, world) == ()
+    assert cfg.scene.env_spacing == 2.0
+
+
+def test_env_spacing_is_a_no_op_without_the_knob():
+    """Non-mjlab adapters have no scene cfg — must not raise."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    world = _course_world(1.0)
+    assert _reconcile_env_spacing(SimpleNamespace(), world) == ()
+    assert _reconcile_env_spacing(
+        SimpleNamespace(scene=SimpleNamespace()), world) == ()
+
+
+def _object_only_world(*objects: tuple[str, dict]) -> dict:
+    world = _world()
+    world["shared"]["obstacles"]["course"] = []
+    world["shared"]["objects"] = dict(objects)
+    return world
+
+
+def _box_object(
+    *, position_m: tuple[float, float, float],
+    size_m: tuple[float, float, float],
+    quaternion_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+) -> dict:
+    return {
+        "shape": "box",
+        "fixed": True,
+        "nominal": {
+            "pose": {
+                "position_m": list(position_m),
+                "quaternion_wxyz": list(quaternion_wxyz),
+            },
+            "size_m": list(size_m),
+            "mass_kg": 1.0,
+            "friction": 0.8,
+            "restitution": 0.0,
+        },
+        "variations": [],
+    }
+
+
+def test_env_spacing_includes_a_centered_wide_object_extent():
+    """Object centres alone report a zero footprint for this exact failure."""
+    from sculptor.world.compiler import (
+        AUTHORED_COURSE_CLEARANCE_M,
+        _reconcile_env_spacing,
+        authored_footprint_m,
+    )
+
+    world = _object_only_world((
+        "wide_bar",
+        _box_object(position_m=(0.0, 0.0, 0.5), size_m=(10.0, 1.0, 1.0)),
+    ))
+    assert authored_footprint_m(world) == pytest.approx((10.0, 1.0))
+
+    cfg = _scene_cfg(2.0)
+    _reconcile_env_spacing(cfg, world)
+    assert cfg.scene.env_spacing == pytest.approx(
+        10.0 + AUTHORED_COURSE_CLEARANCE_M,
+    )
+
+
+def test_env_spacing_uses_rotated_object_aabb():
+    from sculptor.world.compiler import authored_footprint_m
+
+    half_sqrt_two = 2.0 ** -0.5
+    world = _object_only_world((
+        "rotated_bar",
+        _box_object(
+            position_m=(0.0, 0.0, 0.5),
+            size_m=(10.0, 1.0, 1.0),
+            quaternion_wxyz=(half_sqrt_two, 0.0, 0.0, half_sqrt_two),
+        ),
+    ))
+    assert authored_footprint_m(world) == pytest.approx((1.0, 10.0))
+
+
+def test_object_only_slalom_pitch_clears_the_far_box_edge():
+    from sculptor.world.compiler import (
+        AUTHORED_COURSE_CLEARANCE_M,
+        _reconcile_env_spacing,
+        authored_footprint_m,
+    )
+
+    objects = tuple(
+        (
+            f"box_{index}",
+            _box_object(
+                position_m=(x, side, 0.375),
+                size_m=(0.45, 0.45, 0.75),
+            ),
+        )
+        for index, (x, side) in enumerate(
+            ((2.0, 0.85), (3.5, -0.85), (5.0, 0.85), (6.5, -0.85)),
+            start=1,
+        )
+    )
+    world = _object_only_world(*objects)
+    span_x, span_y = authored_footprint_m(world)
+    assert span_x == pytest.approx(6.725)
+    assert span_y == pytest.approx(2.15)
+
+    cfg = _scene_cfg(2.0)
+    _reconcile_env_spacing(cfg, world)
+    assert cfg.scene.env_spacing == pytest.approx(
+        span_x + AUTHORED_COURSE_CLEARANCE_M,
+    )
+
+
+def test_generator_terrain_rejects_a_course_larger_than_its_tile():
+    """Generator terrains take env origins from terrain tiles and ignore
+    env_spacing, so an oversized course cannot be fixed by widening the pitch.
+    Reaching the GPU anyway would reproduce the same silent interpenetration —
+    refuse instead of pretending the scene is valid."""
+    from sculptor.world.compiler import WorldCompileError, _reconcile_env_spacing
+
+    terrain = SimpleNamespace(
+        terrain_type="generator",
+        terrain_generator=SimpleNamespace(size=(4.0, 4.0)))
+    cfg = _scene_cfg(2.0, terrain=terrain)
+
+    with pytest.raises(WorldCompileError, match="does not fit inside one terrain tile"):
+        _reconcile_env_spacing(cfg, _course_world(2.0, 2.0, 2.0))
+
+
+def test_generator_terrain_accepts_a_course_inside_its_tile():
+    """The pitch is the tile's, not ours — a course that fits needs no note."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    terrain = SimpleNamespace(
+        terrain_type="generator",
+        terrain_generator=SimpleNamespace(size=(40.0, 40.0)))
+    cfg = _scene_cfg(2.0, terrain=terrain)
+
+    assert _reconcile_env_spacing(cfg, _course_world(1.0, 1.0)) == ()
+    assert cfg.scene.env_spacing == 2.0
+
+
+@pytest.mark.parametrize("spacing", [2.0, 2.5, 3.0, 4.0])
+def test_reconciled_pitch_leaves_every_spawn_outside_every_neighbour(spacing):
+    """The property that actually matters: after reconciliation, no repeat of
+    the course at ±k·pitch may contain the origin where the robot spawns."""
+    from sculptor.world.compiler import (
+        _reconcile_env_spacing, resolve_course,
+    )
+
+    world = _course_world(1.0, 1.1, 1.2, 1.3)
+    cfg = _scene_cfg(spacing)
+    _reconcile_env_spacing(cfg, world)
+    pitch = cfg.scene.env_spacing
+
+    boxes = [(p.position_m[0] - p.size_m[0] / 2, p.position_m[0] + p.size_m[0] / 2)
+             for p in resolve_course(world)]
+    for k in list(range(-6, 0)) + list(range(1, 7)):
+        for x0, x1 in boxes:
+            assert not (x0 + k * pitch <= 0.0 <= x1 + k * pitch), (
+                f"neighbour at {k * pitch:+.2f} m still swallows the spawn")
+
+
+def test_constraint_budget_honors_env_overrides(monkeypatch):
+    from sculptor.world.compiler import _reconcile_constraint_budget
+
+    monkeypatch.setenv("RS_WORLD_NJMAX", "4096")
+    monkeypatch.setenv("RS_WORLD_NCONMAX", "2048")
+    cfg = _sim_cfg(300, 64)
+    _reconcile_constraint_budget(cfg)
+    assert (cfg.sim.njmax, cfg.sim.nconmax) == (4096, 2048)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "not-a-number", "0", "-5"])
+def test_constraint_budget_ignores_garbage_overrides(monkeypatch, bad):
+    """A typo'd env var must fall back to the measured floor, not disable the
+    fix or allocate zero rows."""
+    from sculptor.world.compiler import (
+        AUTHORED_WORLD_NJMAX, _reconcile_constraint_budget,
+    )
+
+    monkeypatch.setenv("RS_WORLD_NJMAX", bad)
+    cfg = _sim_cfg(300, 64)
+    _reconcile_constraint_budget(cfg)
+    assert cfg.sim.njmax == AUTHORED_WORLD_NJMAX
+
+
+def test_constraint_budget_floor_exceeds_measured_peak():
+    """Guards the constant against a future edit that trims it below what the
+    box course actually needs. Measured peak was 625 rows/world at
+    num_envs=1024 under random actions."""
+    from sculptor.world.compiler import (
+        AUTHORED_WORLD_NCONMAX, AUTHORED_WORLD_NJMAX,
+    )
+
+    MEASURED_PEAK_NEFC = 625
+    assert AUTHORED_WORLD_NJMAX >= 2 * MEASURED_PEAK_NEFC
+    assert AUTHORED_WORLD_NCONMAX >= 256
+
+
+# ── route RSI must land the robot ON the course, not inside it ─────────
+def _reset_env(num_envs: int = 16):
+    """Fake env + robot for the route-RSI event, standing height 0.8 m."""
+    import torch
+
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+        written = None
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            self.written = root_state.clone()
+
+    class FakeScene(dict):
+        pass
+
+    robot = FakeRobot()
+    scene = FakeScene(robot=robot)
+    scene.env_origins = torch.zeros((num_envs, 3), dtype=torch.float32)
+    return SimpleNamespace(num_envs=num_envs, device="cpu", scene=scene), robot
+
+
+def test_surface_height_reads_the_top_of_the_box_underfoot():
+    """(x_min, x_max, y_min, y_max, top_z) rows; off the boxes the surface is
+    the plane, and overlapping boxes resolve to the highest."""
+    import torch
+
+    from sculptor.world.compiler import _surface_height_at
+
+    boxes = ((0.0, 1.0, -0.6, 0.6, 0.25), (0.5, 2.0, -0.6, 0.6, 0.40))
+    xy = torch.tensor([[0.2, 0.0], [0.7, 0.0], [1.5, 0.0], [5.0, 0.0],
+                       [0.2, 2.0]])
+    got = _surface_height_at(xy, boxes)
+
+    assert got.tolist() == pytest.approx([0.25, 0.40, 0.40, 0.0, 0.0])
+    assert _surface_height_at(xy, ()).tolist() == [0.0] * 5
+
+
+def test_route_rsi_stands_the_robot_on_the_platform_not_inside_it():
+    """The bug this closes: the event rewrote x and y and left z at the
+    flat-ground standing height, so every reset onto a platform drove the
+    robot's shins through the box by the box's own height. MuJoCo resolves the
+    interpenetration by pushing rather than erroring and the height observation
+    still reads plausibly, so nothing downstream notices."""
+    import torch
+
+    from sculptor.world.compiler import reset_robot_along_waypoint_route
+
+    # Three platforms of increasing height, waypoints at their centres.
+    boxes = ((1.5, 2.5, -0.6, 0.6, 0.20),
+             (3.0, 4.0, -0.6, 0.6, 0.35),
+             (4.5, 5.5, -0.6, 0.6, 0.50))
+    waypoints = ((2.0, 0.0, 0.10), (3.5, 0.0, 0.175), (5.0, 0.0, 0.25))
+
+    env, robot = _reset_env()
+    torch.manual_seed(11)
+    reset_robot_along_waypoint_route(
+        env, None, waypoints_m=waypoints, midroute_probability=1.0,
+        approach_distance_m=(0.05, 0.15), lateral_jitter_m=0.05,
+        support_boxes_m=boxes)
+
+    from sculptor.world.compiler import _surface_height_at
+    surface = _surface_height_at(robot.written[:, :2], boxes)
+    clearance = robot.written[:, 2] - surface
+    # Every robot stands its full default height above whatever is underfoot.
+    assert torch.allclose(clearance, torch.full_like(clearance, 0.8), atol=1e-5)
+    assert torch.any(surface > 0.0), "fixture must place some resets on a box"
+
+
+def test_route_rsi_leaves_plane_resets_at_the_default_height():
+    """A route point over open ground must not be lifted — the fix has to be
+    the surface under the robot, not a blanket offset."""
+    import torch
+
+    from sculptor.world.compiler import reset_robot_along_waypoint_route
+
+    waypoints = ((2.0, 0.0, 0.0), (3.5, 0.0, 0.0), (5.0, 0.0, 0.0))
+    env, robot = _reset_env()
+    torch.manual_seed(11)
+    reset_robot_along_waypoint_route(
+        env, None, waypoints_m=waypoints, midroute_probability=1.0,
+        approach_distance_m=(0.05, 0.15), lateral_jitter_m=0.05,
+        support_boxes_m=((10.0, 11.0, -0.6, 0.6, 0.5),))  # far from the route
+
+    assert torch.allclose(
+        robot.written[:, 2], torch.full((env.num_envs,), 0.8), atol=1e-6)
+
+
+def test_route_rsi_without_support_boxes_still_runs():
+    """Older callers pass no course; the event must keep working (at the
+    default height) rather than raise."""
+    import torch
+
+    from sculptor.world.compiler import reset_robot_along_waypoint_route
+
+    env, robot = _reset_env()
+    torch.manual_seed(3)
+    reset_robot_along_waypoint_route(
+        env, None, waypoints_m=((2.0, 0.0, 0.0), (3.5, 0.0, 0.0)),
+        midroute_probability=1.0, approach_distance_m=(0.25, 0.55),
+        lateral_jitter_m=0.12)
+
+    assert robot.written is not None
+    assert torch.allclose(
+        robot.written[:, 2], torch.full((env.num_envs,), 0.8), atol=1e-6)
+
+
+def test_installed_route_rsi_carries_the_course_geometry():
+    """The wiring, not just the function: the event as installed must receive
+    the platform tops, or the fix above never runs in a real training job."""
+    from sculptor.world.compiler import _reconcile_waypoint_course, resolve_course
+
+    world = _course_world(1.0, 1.1, 1.2, lead_gap_m=0.8)
+    course = resolve_course(world)
+    events: dict = {}
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5), heading=None)
+    env_cfg = SimpleNamespace(
+        events=events,
+        commands={"twist": SimpleNamespace(
+            ranges=ranges, entity_name="robot", debug_vis=False)},
+        curriculum={})
+    manifest = SimpleNamespace(
+        course=course,
+        task_shared={"goal": {
+            "type": "waypoint_sequence", "waypoints": "auto",
+            "success": {"tolerance_m": 0.2, "hold_s": 0.0},
+        }},
+        zones={})
+
+    _reconcile_waypoint_course(env_cfg, manifest, train=True, robot=None)
+
+    term = events.get("world_route_state_initialization")
+    assert term is not None, "route RSI was not installed"
+    boxes = term.params["support_boxes_m"]
+    assert len(boxes) == len(course)
+    for (x0, x1, y0, y1, top), primitive in zip(boxes, course):
+        assert top == pytest.approx(
+            primitive.position_m[2] + primitive.size_m[2] / 2)
+        assert x1 - x0 == pytest.approx(primitive.size_m[0])
+        assert y1 - y0 == pytest.approx(primitive.size_m[1])
