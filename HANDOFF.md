@@ -14,6 +14,151 @@ Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 
 Current git branch: `ship-20-ux-revamp` (do NOT work on `main`). Keep committing to this branch.
 
+## Latest implementation slice — evidence-authority audit fixes (2026-08-25)
+
+The comprehensive pre-OGMP audit found several cases where retained bytes,
+process progress, and researcher-facing labels carried more authority than the
+evidence justified. This slice closes those blockers. It was implemented
+uncommitted to preserve user-owned dirty work; the user then authorized the
+remaining-P1 closure below and committing, so the slice is now committed in
+four coherent sub-slices (core, backend, frontend, docs).
+
+- Reference target identity now includes the executed joint-position and
+  joint-velocity tables, sampling rule, phase mode, and terminal
+  zero-velocity hold. The frozen flat runtime digest includes the clock and
+  target-dispatch helpers. Actor and critic observation groups are both
+  required, and rollout rechecks the checkpoint policy-contract sidecar.
+  Ordinary reference loading hashes and decodes one captured byte snapshot.
+- Random-frame trajectory RSI is execution-disabled. The historical consumer
+  sampled a physical frame without applying the same per-environment offset to
+  actor, critic, reward, and clock; recognizing the schema is not permission to
+  launch that inconsistent path.
+- Train and rollout reuse is bound to exact request, effective-input, and
+  completion manifests. Schema-3 iteration completion re-verifies those
+  manifests, the current reward/initialization bytes, checkpoint, rollout, and
+  any precommitted objective-evaluation seed batch. An incomplete batch records
+  every seed failure but cannot complete or advance resume.
+- Every live worker must prove its exact ordered iteration plan. User early
+  stop is accepted only after the server re-reads and hashes its own
+  `stop: true` control sidecar. A successful exit is insufficient: completion
+  also requires a durable terminal receipt that re-verifies every schema-3
+  iteration. Restart reconciliation no longer lets an older success mask later
+  failed evidence, and the UI no longer infers completion from a later
+  `iter_started` event.
+- Reports select a policy only through canonical selection plus independent
+  objective authority. Their receipts bind the selected checkpoint, artifact
+  tuple, reward bytes, evidence, Markdown, video, and full input snapshot;
+  stale reports are visibly retained but their copy/download/video actions are
+  withheld. Deployment-qualified export fails closed, while a separately
+  labeled raw reproducibility download remains available with explicit
+  `not_certified` authority. Export snapshots and verifies exact bytes before
+  atomic publication.
+- The world grid includes conservative rotated authored-object extents. The
+  offline physical-scene audit now detects replicated cross-environment
+  geometry overlap and robot intrusion, so retained iter 36 is rejected rather
+  than green. Iter 13 remains rejected for its 9.899 m frame error.
+- Robot uploads use bounded streaming reads and bounded data-only archive
+  admission. They reject traversal, duplicate/case-colliding members, links,
+  executable/code members, bombs, XML includes/plugins/entities/external
+  paths, OBJ material loaders, and DAE external loaders before MuJoCo parses
+  the model.
+- Live MJLab launches have a backend CUDA/MJLab/RSL-RL/VRAM preflight; Tier-K
+  inspection remains CPU/data-only. MuJoCo arena exhaustion is classified
+  separately from GPU OOM. UI launch/readiness authority, raw-vs-qualified
+  export copy, project-lifecycle labels, reference identity, tabs, and recovery
+  remedies now match the backend contracts.
+
+Two mismatched local G1 provenance records were migrated to their exact
+retained clip hashes without changing clip bytes. They remain Tier K. The
+scientific boundary, research context, gap analysis, demo runbook, and Lokesh
+meeting brief now describe the same privileged-state displaced-object recovery
+experiment and correct OGMP/P-OGMP attribution. No GPU run, Tier-D
+certification, simulator rollout, or learned-behavior result was produced by
+this slice; software verification must not be presented as research evidence.
+
+Final consolidated verification for this uncommitted working tree:
+
+- core CPU suite: **3,166 passed, 1 optional-JAX skip, 7 GPU tests
+  deselected** in 224.22 s;
+- backend suite: **894 passed** in 188.81 s;
+- frontend suite: **135 passed** across 20 files in 6.93 s;
+- the browser-discovered dry-run receipt wording regression was corrected,
+  then its focused file remained **15/15 passed** and the production build was
+  rerun successfully;
+- TypeScript project compilation and Vite production build passed; both Python
+  production trees passed `compileall`; `git diff --check` passed; and every
+  changed production Python file passed Ruff with only the repository's
+  unchanged historical `edit.py` E402 import placement excluded. A broader
+  fatal-rule scan also reports the unchanged namespace-cleanup pattern in
+  `sculptor/__init__.py`; do not describe repository-wide Ruff as clean.
+- live browser QA on the retained weave-and-stop project confirmed neutral
+  lifecycle labels, invalid-scene and legacy-only evidence labels, stale-report
+  action withholding, raw-vs-qualified export language, a 409 qualified-export
+  refusal with exact blockers, aligned dry-run receipt/action authority,
+  keyboard tab navigation, and no console errors.
+
+The temporary backend/frontend servers were stopped afterward. No GPU
+training, simulator rollout, Tier-D certification, or new research result was
+produced by this slice.
+
+### Same-day follow-up — remaining audit P1s closed, wave committed (2026-08-25)
+
+After the audit report, the user authorized fixing the remaining open P1s and
+committing. Four closures, each with executed (not historical) verification:
+
+- **Live knowledge-graph purge.** The production store at
+  `~/.local/share/sculptor/kg/graph.db` contained a fabricated test subgraph
+  written on 2026-08-24 by two backend lineage tests that built a
+  `RunLineageSession` without `RS_KG_PATH`: three `lineage-project`
+  run/iteration nodes, a fixture world tuple, two fixture software
+  environments, a 16-frame fixture motion, and six edges — including the
+  store's ONLY `TRACKS` edge, carrying placeholder Tier-D hashes
+  (`7777…`/`8888…`/`9999…`). Every fixture endpoint was verified to have zero
+  non-fabricated edge references before deletion; the purge ran in one
+  transaction (nodes 2,884 → 2,877; edges 3,096 → 3,090; `TRACKS` count now
+  honestly 0; placeholder-hash edges 0). A pre-purge byte backup sits beside
+  the store as `graph.db.pre-purge-20260825.bak` — delete it once comfortable.
+- **Suite-wide KG isolation.** `backend/tests/conftest.py` gained an autouse
+  `_isolate_knowledge_graph` fixture pinning `RS_KG_PATH` into each test's
+  tmp dir (previously isolation was opt-in via `tmp_projects_root`), plus a
+  canary test that fails the suite if any backend test can resolve the shared
+  default store. Executed proof: the full backend suite run with no manual
+  isolation left the live store byte-identical (same mtime and size).
+- **Corrupt-rollout fail-closed.** `np.load` on a truncated
+  `trajectory.npz` raises `zipfile.BadZipFile`, which escaped the same-lane
+  evaluator's except tuple and turned the whole project's
+  `GET /projects/{slug}/policies` into an unhandled 500 (executed audit
+  repro). `BadZipFile`/`LargeZipFile` are now handled and such an iteration
+  reduces to an `unavailable` acceptance receipt with a reason, which
+  `_objective_proof_decision` maps to an honest `incomplete` — never a crash,
+  never a silent pass.
+- **Receipt-first same-lane authority.** New
+  `load_or_evaluate_iteration_acceptance` serves a persisted, self-verifying
+  `physical_acceptance_receipt.json` (schema + recomputed `receipt_sha256`
+  must match) before recomputing, and the policies route engages same-lane
+  authority when EITHER the precommitted contract OR a persisted receipt
+  exists. Deleting the contract after a failed verdict can no longer silently
+  revert pass authority to aggregated route/contact/hold components; a
+  tampered receipt with its contract also missing fails closed to
+  `unavailable`. Documented residual boundary: deleting BOTH files before any
+  evaluation ever runs still leaves no trace — closing that requires the
+  launch-side producer pinning the contract digest into worker-written
+  evidence, which does not exist yet. Four regression tests cover the new
+  semantics (corrupt archive, contract-deletion survival, tampered receipt,
+  terminal-receipt reuse without re-evaluation).
+
+Commit gates executed for the exact committed tree: core CPU suite
+**3,166 passed, 1 optional-JAX skip, 7 GPU-marked deselected** (242.6 s);
+backend suite **899 passed** (200.6 s) with the live KG verified
+byte-identical before/after; frontend **135 passed across 20 files** with a
+clean `tsc` check. The combined wave (audit fix implementation plus this P1
+closure) is committed in four coherent slices — core, backend, frontend,
+docs — on `ship-20-ux-revamp`. Audit coordination files
+(`AUDIT_COLLABORATION.md`, the two agent outboxes), `meeting-briefs/`, and
+`tmp/` remain deliberately uncommitted. Still open: the same-lane launch-side
+producer above, and the §12 research decisions (Tier-D evidence campaign,
+E4 rerun as a matched comparison).
+
 ## Latest completed slice — SONIC notes and reviewed KG receipt (2026-08-24)
 
 Sam's handwritten SONIC notes and arXiv v4 have been reconciled into
@@ -207,7 +352,7 @@ Six commits landed on `ship-20-ux-revamp`, all tested (full library suite `2186 
 | `862c902` feat(world) | Authored `train.variations` are now consumed as per-episode mjlab reset events (object mass/friction, course platform heights). Multi-env-correct. |
 | `43c970a` feat(world) | Prompt-driven course counts ("4 boxes" → 4) + ball (`sphere`) / soccer-goal (`frame`) objects. |
 | `5e535ce` feat(world) | Hybrid LLM world author (`RS_WORLD_LLM_AUTHOR=1`): LLM proposes a full world spec, the existing validators gate it, offline templates are the fallback; deterministic capture/replay so the draft-hash contract holds. |
-| `d2662f7` feat(train) | Full physics domain randomization (mass, CoM, PD gains, motor strength, joint damping/armature, friction) applied at the world-independent chokepoint (`_apply_env_spec`) so it reaches **every mission stage and run**, always-on by default; + DeepMimic phase-RSI reset with joint-velocity init. Actuator-type + entity-name guarded (cartpole GPU smoke-train passes). |
+| `d2662f7` feat(train) | Full physics domain randomization (mass, CoM, PD gains, motor strength, joint damping/armature, friction) applied at the world-independent chokepoint (`_apply_env_spec`) so it reaches **every mission stage and run**, always-on by default. Historical note: this commit also added random-frame trajectory RSI with joint-velocity initialization, but the current worker execution-disables that path because reset state and policy/reward phase were not synchronized. Actuator-type + entity-name guarded (historical cartpole GPU smoke-train passed). |
 
 Two supporting docs:
 - `docs/RESEARCH_DIRECTION.md` — the full, research-validated future-direction analysis (from a lab meeting with a robotics PhD, Lokesh). **Read it — it is the "why" behind Tasks 1–4 below.**

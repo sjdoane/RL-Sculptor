@@ -1,6 +1,6 @@
 # RewardSculptor before OGMP: the current scientific boundary
 
-**Meeting-ready snapshot:** 2026-08-24
+**Meeting-ready snapshot:** 2026-08-25
 
 **Scope:** one fixed reference trajectory, before modes or an oracle are
 treated as part of the method.
@@ -29,10 +29,10 @@ integrate SONIC, or solve a difficult G1 motion from a reference.
 | Component | What is implemented | Scientific boundary |
 |---|---|---|
 | Reference data plane | The library accepts bounded robot-scoped motion data and verifies immutable bytes, provenance, and root-frame evidence. It can retarget, crop, segment, and compose clips. | Ingestion is not launch compatibility. Exact ordered joints, cadence, target robot/runtime, and dynamics evidence must be earned later at Tier D and launch. Composition remains kinematic. |
-| Single-reference runtime | One exact target schedule is played from elapsed episode time and held at its final target. Actor and critic each receive one scalar `reference_phase`. | The policy does not receive target joints, a future reference horizon, a reference token, or state-dependent phase correction from this mechanism. |
-| Training objective | A frozen backbone tracks ordered joint position and root height, plus projected gravity/orientation when available. PPO trains with a capped editable task residual. Native world command, contact, safety, and curriculum terms may also supervise the task. | The agent cannot edit the reference tables, clock, or tracking kernels. Joint velocity is audited but is not a backbone tracking term. |
+| Single-reference runtime | One exact joint-position/joint-velocity, root-height, and projected-gravity/orientation target schedule is played from elapsed episode time and held at an explicitly identified terminal target. Actor and critic each receive the same scalar `reference_phase`; the checkpoint sidecar binds both observation contracts to the clock and world. | The policy does not receive target joints, a future reference horizon, a reference token, or state-dependent phase correction from this mechanism. |
+| Training objective | A frozen backbone tracks ordered joint position and velocity, root height, and projected gravity/orientation when available. PPO trains with a capped editable task residual. Native world command, contact, safety, and curriculum terms may also supervise the task. | The agent cannot edit the reference tables, clock, tracking targets, or tracking kernels. Old target/runtime receipts are invalid after the complete target and clock identities were corrected. |
 | Starting point and world | Starting policy weights, reference bytes, and training world are selected independently and pinned. Compatible data-only actor/critic weights can initialize training. | This is parameter initialization, not arbitrary uploaded controller execution, SONIC execution, or exact optimizer resume. |
-| Variation and reset hooks | Typed physics randomization, task observations, contacts, and reset curricula exist. Consumer plumbing exists for full random-frame reference state initialization. | The selected-reference producer does not populate the full joint-position/velocity reset trajectories, so that DeepMimic-style path is not active end to end. |
+| Variation and reset hooks | Typed physics randomization, task observations, contacts, and reset curricula exist. The schema recognizes full random-frame reference state initialization. | Random-frame trajectory RSI is execution-disabled: the worker rejects it until one per-environment sampled offset synchronizes the reset state, policy clock, target lookup, and reward. Route-aware RSI is a separate active curriculum. |
 | Evaluation loop | Content-addressed lineage, fail-closed launch checks, independent objective metrics, trajectory/contact/fall/posture/scene evidence, video, diagnosis, and bounded keep/revert iteration exist. | These establish identity and expose failure. They do not prove that the learning method is effective. |
 
 The components and contracts are regression-tested. The live G1
@@ -77,9 +77,9 @@ task-space recovery; held-out multi-seed generalization; and hardware proof.
 | Evidence | What happened | Correct interpretation |
 |---|---|---|
 | Reward-only tuck jump, first five iterations | Objective success stayed `0.0`. An alive bonus produced standing; the next reward was farmed while supine with raised feet; selection by generated mean return reverted to standing. | Temporal specification, exploration coverage, and selection by an independent objective all matter. This does not prove that any one reference method solves jumping. |
-| Historical reward-only box weave | Iter 36 reported `64/64` own-course routes and two strict holds, but it predated the world-grid fix. Neighboring copies of the course overlapped, while the audit checked only intended per-environment boxes. | It is pre-fix diagnostic history, not physical acceptance or method evidence. No post-fix rerun restored the claim. |
+| Historical reward-only box weave | Iter 36 reported `64/64` own-course routes and two strict holds, but it predated the world-grid fix. Neighboring copies of the course overlapped, while the audit checked only intended per-environment boxes. The current offline scene audit now detects the overlap/intrusion in the retained rollout. | It is pre-fix diagnostic history, not physical acceptance or method evidence. No post-fix rerun restored the claim. |
 | First completed four-rail Tier-D attempt | Joint MAE was `0.114937 rad`, root-Z RMSE `0.060565 m`, and duration coverage `0.996491`, but its static-baseline ratio was `0.862787` against the required `<=0.80`. The prominent leg moved while much of the support leg stayed near a safer static pose. | Average error can hide failure to perform the defining motion. Do not relax the gate to manufacture admission. |
-| Original matched campaign | On `go1_trot`, the only clean, discriminating early benchmark, final IQM favored Eureka (`0.955`) over mission (`0.113`). Major later loop fixes have not been rerun in that full comparison. | RewardSculptor's advantage over reward-search baselines is still a hypothesis. |
+| Incomplete early comparison | Retained `go1_trot` point estimates favored Eureka (`0.955`) over mission (`0.113`), but only seeds 1000 and 1017 are shared and both corresponding mission jobs scored zero after training errors. The arms do not form a completed matched campaign. | Preserve the point estimates as diagnostic history, not as a method comparison. RewardSculptor's advantage over reward-search baselines is still a hypothesis. |
 
 The local receipts are retained in
 [`RL_SCULPTOR_AUDIT.md`](internal/RL_SCULPTOR_AUDIT.md),

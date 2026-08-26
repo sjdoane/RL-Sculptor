@@ -1269,10 +1269,10 @@ intentional: they separate paper knowledge from executable product capability.
   release](https://nvlabs.github.io/GR00T-WholeBodyControl/); repository audit
   pinned to commit
   [`a0732b642c0333077e127a2f56ab0014c196bca4`](https://github.com/NVlabs/GR00T-WholeBodyControl/commit/a0732b642c0333077e127a2f56ab0014c196bca4).
-- Bogdanovic et al., [Oracle Guided Multi-mode Policies for Agile and
+- Krishna, Sobanbabu, and Nguyen, [Oracle Guided Multi-mode Policies for Agile and
   Versatile Robot Control, arXiv v3](https://arxiv.org/html/2403.04205v3),
   2024.
-- Bogdanovic et al., [Preferenced Oracle Guided Multi-mode Policies for
+- Ravichandar, Krishna, Sobanbabu, and Nguyen, [Preferenced Oracle Guided Multi-mode Policies for
   Dynamic Bipedal Loco-Manipulation](https://arxiv.org/abs/2410.01030), 2024.
 - [Visual Whole-Body Control for Legged Loco-Manipulation](https://arxiv.org/abs/2403.16967),
   2024.

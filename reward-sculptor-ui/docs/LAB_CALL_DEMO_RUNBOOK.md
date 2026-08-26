@@ -1,6 +1,6 @@
 # RewardSculptor research-lab demo runbook
 
-This runbook is current as of 2026-08-17. The workflow is entirely in the UI
+This runbook is current as of 2026-08-25. The workflow is entirely in the UI
 after starting the local app.
 
 > **Active scope:** the current handoff is the CPU/UI research starting-point,
@@ -17,7 +17,7 @@ after starting the local app.
   iteration into a fresh optimizer/run.
 - **Imported skill** accepts only a strict data-only `.rskill` and shows an
   admission receipt before it can be selected. The normal RewardSculptor
-  `.zip` is a separate trusted deployment package and cannot be uploaded.
+  `.zip` is a separate raw reproducibility archive and cannot be uploaded.
 
 Policy and motion are separate choices. After choosing a starting policy,
 choose or remove **Starting motion** independently. The active project world
@@ -53,9 +53,10 @@ transfers, not full optimizer resumes.
 
 Create a portable transfer with
 `sculpt export --portable --robot <slug> --config <project>/config.toml`.
-Use `sculpt export --config ...` without `--portable` only for the trusted
-deployment ZIP containing the raw checkpoint, inference code, and deployment
-formats.
+Use `sculpt export --config ...` without `--portable` for a raw reproducibility
+ZIP containing the checkpoint, evidence, inference skeleton, and best-effort
+interchange formats. Its manifest records deployment qualification separately;
+downloadability is not task success, hardware safety, or sim-to-real proof.
 
 ### Mode evidence and paper scope
 
@@ -83,21 +84,23 @@ physical acceptance conjunction later in this runbook.
 The full researcher contract and a G1 parkour-evolution experiment are in
 [`docs/STARTING_POINT_RESEARCH_WORKFLOW.md`](../../docs/STARTING_POINT_RESEARCH_WORKFLOW.md).
 
-> **Authored-world evidence correction (2026-08-24):** every course rollout
+> **Authored-world evidence correction (verified 2026-08-25):** every course rollout
 > recorded before environment-grid pitch reconciliation used the simulator's
 > default 2.0 m environment spacing even though the authored course footprint
 > was larger. Neighboring replicated courses therefore overlapped. Treat all
 > pre-fix route, contact, and video figures as diagnostic only, including the
-> former iter 36 acceptance below. The old contact audit covered the intended
-> course objects, not every overlapping neighbor. No fresh post-fix rollout has
-> yet passed the complete physical acceptance conjunction.
+> former iter 36 acceptance below. The current offline scene audit checks
+> cross-environment fixed-object overlap and robot intrusion and rejects the
+> retained iter 36 evidence. No fresh post-fix rollout has yet passed the
+> complete physical acceptance conjunction.
 
 > **Evidence correction:** iter 13 is not valid physical slalom evidence.
 > Its policy followed a route expressed in the robot's local environment
 > frame, while the four rendered collision boxes remained in unshifted global
 > coordinates. The measured physical-scene error is 9.90 m for every box.
-> Results now marks that policy **Invalid evidence — physical scene mismatch**
-> and disables export. Do not present the old video as weaving.
+> Results now marks that policy **Invalid evidence — physical scene mismatch**,
+> and policy publication/export fails closed on the same authority. Do not
+> present the old video as weaving.
 
 ## What is fixed
 
@@ -112,6 +115,10 @@ Five committed slices address the failure rather than reinterpreting it:
   Training episodes are split between the real course entrance and positions
   just before later waypoints, facing the next target. Evaluation remains
   frozen and always starts from its authored reset.
+- Random-frame reference-trajectory RSI is a different path. Its schema remains
+  recognizable, but execution is disabled until one sampled per-environment
+  phase offset drives the reset state, actor/critic clock, target lookup, and
+  reward together.
 - `55865b8` adds the fail-closed Results audit that exposed and invalidated the
   historical rollout.
 - `3d92602` adds **Pre-existing motion** to **New run**. A selected
@@ -398,7 +405,9 @@ instead of trusting a plausible video or local-coordinate metric.
 - Corrected rollout physical-scene audit is aligned.
 - Forbidden-contact channels are false throughout the selected rollout.
 - Selected video passes every acceptance item.
-- Results export is enabled only for valid evidence.
+- The deployment-qualified Results export is enabled only for valid evidence.
+  The separately labeled raw reproducibility download remains available for
+  inspection and recovery and carries an explicit `not_certified` receipt.
 - Keep the verified project open before the call.
 
 ## Current authoritative correction after iter 18
@@ -1611,7 +1620,7 @@ acknowledgement, or selected mode must block before subprocess creation.
 
 ## Fresh-project continuation: slalom prior to one finish jump (2026-08-18)
 
-Use project `g1-slalom-jump-lab`, not the accepted showcase project. The goal
+Use project `g1-slalom-jump-lab`, not the historical showcase project. The goal
 is a visible continuation experiment: initialize actor+critic from the attested
 iter-38 slalom policy, complete the four-box route, perform exactly one
 bilateral jump at the finish with at least three air frames and `0.18 m` apex
