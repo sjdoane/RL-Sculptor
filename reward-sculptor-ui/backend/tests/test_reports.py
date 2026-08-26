@@ -9,6 +9,100 @@ from pathlib import Path
 
 import numpy as np
 from fastapi.testclient import TestClient
+from sculptor.run_manifests import (
+    build_completion_manifest,
+    build_rollout_input_manifest,
+    build_train_input_manifest,
+    manifest_sha256,
+    write_json_atomic,
+)
+from sculptor.sculpt import _write_iteration_completion_marker
+
+
+class _ReceiptAdapter:
+    env_id = "report-route-test"
+    robot = "unit"
+    control_dt = 0.02
+
+
+def _attest_iteration(project_dir: Path, iteration: int) -> None:
+    iter_dir = project_dir / "runs" / f"iter_{iteration}"
+    rollout_dir = iter_dir / "rollout"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = iter_dir / "checkpoint.pt"
+    checkpoint.write_bytes(f"checkpoint:{iteration}".encode())
+    for path, content in (
+        (rollout_dir / "rollout.mp4", b"immutable-rollout"),
+        (rollout_dir / "trajectory.npz", b"immutable-trajectory"),
+    ):
+        if not path.is_file():
+            path.write_bytes(content)
+    behavior = rollout_dir / "behavior.json"
+    if not behavior.is_file():
+        behavior.write_text("{}", encoding="utf-8")
+    reward = project_dir / "rewards" / "v0.py"
+    adapter = _ReceiptAdapter()
+    request = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        reward_module_path=reward,
+        steps=100,
+        seed=iteration,
+        init_policy_path=None,
+        init_policy_mode="actor_critic",
+    )
+    train_input = {
+        **request,
+        "request_manifest_sha256": manifest_sha256(request),
+        "effective_initialization": {
+            "mode": None,
+            "policy": None,
+            "forwarded_to_adapter": False,
+        },
+    }
+    rollout_input = build_rollout_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        checkpoint_path=checkpoint,
+        reward_module_path=reward,
+        n_episodes=1,
+        seed=iteration,
+        max_episode_steps=None,
+        playback_speed=None,
+        render_every=None,
+        fps=None,
+        render_width=None,
+        render_height=None,
+        render_env_index=None,
+    )
+    write_json_atomic(iter_dir / "train_request_manifest.json", request)
+    write_json_atomic(iter_dir / "train_input_manifest.json", train_input)
+    write_json_atomic(
+        iter_dir / "train_completion_manifest.json",
+        build_completion_manifest(train_input, [checkpoint]),
+    )
+    write_json_atomic(
+        rollout_dir / "rollout_input_manifest.json", rollout_input,
+    )
+    write_json_atomic(
+        rollout_dir / "rollout_completion_manifest.json",
+        build_completion_manifest(
+            rollout_input,
+            [
+                rollout_dir / "rollout.mp4",
+                rollout_dir / "trajectory.npz",
+                behavior,
+            ],
+        ),
+    )
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=iteration,
+        checkpoint_path=checkpoint,
+        reward_version_before=0,
+        reward_version_after=None,
+        world_selection_hash=None,
+    )
 
 
 def _make_project_with_library(client: TestClient, name: str = "Reports") -> str:
@@ -97,9 +191,12 @@ def test_actuator_limits_with_rollout(
     rd = tmp_projects_root / slug / "runs" / "iter_0" / "rollout"
     rd.mkdir(parents=True, exist_ok=True)
     T, E = 12, 4
-    jv = np.zeros((T, E, 2)); jt = np.zeros((T, E, 2))
-    jv[..., 0] = 10.0; jt[..., 0] = 100.0     # knee 10/20=50%, 100/139≈72%
-    jv[..., 1] = 5.0; jt[..., 1] = 20.0
+    jv = np.zeros((T, E, 2))
+    jt = np.zeros((T, E, 2))
+    jv[..., 0] = 10.0
+    jt[..., 0] = 100.0  # knee 10/20=50%, 100/139≈72%
+    jv[..., 1] = 5.0
+    jt[..., 1] = 20.0
     np.savez(rd / "trajectory.npz", joint_vel=jv, joint_torque=jt,
              projected_gravity_b=np.zeros((T, E, 3)))
     (rd / "mjcf_limits.json").write_text(
@@ -146,7 +243,7 @@ def test_final_report_404_with_some_iters_cites_count(
     accurate count so the UI can say 'you have N iters; click build'."""
     slug = _make_project_with_library(client, "SomeIters")
     project_dir = tmp_projects_root / slug
-    # Fake a few completed iters by dropping `diagnosis.json` files.
+    # Plant fully phase-attested schema-3 completions.
     runs_dir = project_dir / "runs"
     runs_dir.mkdir(exist_ok=True)
     for i in range(3):
@@ -155,6 +252,7 @@ def test_final_report_404_with_some_iters_cites_count(
         (iter_dir / "diagnosis.json").write_text(
             json.dumps({"failure_modes": [], "confidence": 0.5})
         )
+        _attest_iteration(project_dir, i)
 
     r = client.get(f"/projects/{slug}/reports/final_report.md")
     assert r.status_code == 404
@@ -163,6 +261,20 @@ def test_final_report_404_with_some_iters_cites_count(
     detail = body.get("detail", "")
     assert "3 completed iter" in detail
     assert "POST" in detail or "/reports/build" in detail
+
+
+def test_final_report_does_not_count_diagnosis_only_directories(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "DiagnosisIsNotCompletion")
+    iter_dir = tmp_projects_root / slug / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "diagnosis.json").write_text("{}", encoding="utf-8")
+
+    response = client.get(f"/projects/{slug}/reports/final_report.md")
+
+    assert response.status_code == 404
+    assert response.json()["n_completed_iters"] == 0
 
 
 def test_final_report_404_unchanged_when_project_missing(
@@ -192,6 +304,8 @@ def test_final_report_200_when_file_exists(
     r = client.get(f"/projects/{slug}/reports/final_report.md")
     assert r.status_code == 200
     assert "final report" in r.text.lower()
+    assert r.headers["x-rewardsculptor-report-state"] == "stale"
+    assert "stale retained report" in r.text.lower()
 
 
 # ── §chunk C1: mission-aware report build / sources / mission routes ──
@@ -224,6 +338,7 @@ def _write_mission_on_disk(
                 "failure_modes": [], "proposed_edits": [],
                 "confidence": 0.5, "behavior_goal": name,
             }))
+            _attest_iteration(stage_dir, it)
         (stage_dir / "reports").mkdir(exist_ok=True)
         (stage_dir / "reports" / "metric_history.json").write_text(json.dumps({
             "primary_metric": "mean_return", "history": metric_history,
@@ -382,13 +497,16 @@ def test_report_sources_lists_project_runs_and_missions(
     r = client.get(f"/projects/{slug}/reports/sources")
     assert r.status_code == 200
     body = r.json()
-    assert body["project_runs"] == {"n_iters": 0, "has_report": False}
+    assert body["project_runs"]["n_iters"] == 0
+    assert body["project_runs"]["has_report"] is False
+    assert body["project_runs"]["report_state"]["state"] == "missing"
     assert body["missions"] == []
 
     # Add two project-level iters + a final_report.md.
     runs_dir = project_dir / "runs"
     for i in range(2):
         (runs_dir / f"iter_{i}").mkdir(parents=True)
+        _attest_iteration(project_dir, i)
     (project_dir / "reports").mkdir(exist_ok=True)
     (project_dir / "reports" / "final_report.md").write_text("# done")
 
@@ -403,11 +521,15 @@ def test_report_sources_lists_project_runs_and_missions(
     r = client.get(f"/projects/{slug}/reports/sources")
     assert r.status_code == 200
     body = r.json()
-    assert body["project_runs"] == {"n_iters": 2, "has_report": True}
+    assert body["project_runs"]["n_iters"] == 2
+    assert body["project_runs"]["has_report"] is True
+    assert body["project_runs"]["report_state"]["state"] == "stale"
     by_slug = {m["mission_slug"]: m for m in body["missions"]}
     assert by_slug["done-mission"]["has_report"] is True
+    assert by_slug["done-mission"]["report_state"]["state"] == "current"
     assert by_slug["done-mission"]["goal"] == "do a complex multi-stage behavior"
     assert by_slug["pending-mission"]["has_report"] is False
+    assert by_slug["pending-mission"]["report_state"]["state"] == "missing"
     assert "lifecycle" in by_slug["done-mission"]
 
 

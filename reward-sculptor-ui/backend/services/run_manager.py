@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tomllib
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Optional
 
@@ -806,6 +807,41 @@ def read_control_file(path: Path) -> dict[str, Any]:
     return {"mode": "auto", "resume_token": 0, "feedback": None, "stop": False}
 
 
+def _read_user_stop_authorization(
+    control_path: Path, *, run_id: str,
+) -> dict[str, Any]:
+    """Re-read and bind the exact server sidecar authorizing a user stop."""
+    path = Path(control_path)
+    if (
+        path.name != f"_control_{run_id}.json"
+        or path.is_symlink()
+        or not path.is_file()
+    ):
+        raise ValueError("user stop control sidecar is missing or linked")
+    raw = path.read_bytes()
+    if not raw or len(raw) > 1024 * 1024:
+        raise ValueError("user stop control sidecar has invalid size")
+    try:
+        data = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("user stop control sidecar is not valid JSON") from exc
+    if not isinstance(data, dict) or data.get("stop") is not True:
+        raise ValueError("user stop control sidecar does not authorize stop=true")
+    resume_token = data.get("resume_token", 0)
+    if type(resume_token) is not int or resume_token < 0:
+        raise ValueError("user stop control sidecar has invalid resume_token")
+    return {
+        "schema": 1,
+        "authority": "server_control_sidecar_stop",
+        "run_id": run_id,
+        "control_file": path.name,
+        "control_sha256": hashlib.sha256(raw).hexdigest(),
+        "control_bytes": len(raw),
+        "resume_token": resume_token,
+        "stop": True,
+    }
+
+
 def _restore_promoted_training_inputs(project_dir: Path) -> dict[str, Any]:
     """Restore mutable training pointers from the promoted atomic tuple.
 
@@ -1017,6 +1053,11 @@ def run_sculpt_job(
             raise RuntimeError(
                 "reference clip and robot identity diverged after admission"
             )
+        if reference_clip_id is not None and no_kg:
+            raise RuntimeError(
+                "reference-guided training cannot disable lineage; the "
+                "sculpt subprocess was not started"
+            )
         if reference_clip_id is not None and reference_robot is not None:
             from sculptor.reference_authority import (
                 resolve_active_reference_authority,
@@ -1042,12 +1083,24 @@ def run_sculpt_job(
                     "active reference reward changed after route admission; "
                     "the sculpt subprocess was not started"
                 )
-            runtime_reference_clock = await asyncio.to_thread(
-                resolve_reference_clock_for_run,
-                project_dir,
-                clip_id=str(reference_clip_id),
-                robot=str(reference_robot),
-            )
+            try:
+                runtime_reference_clock = await asyncio.to_thread(
+                    resolve_reference_clock_for_run,
+                    project_dir,
+                    clip_id=str(reference_clip_id),
+                    robot=str(reference_robot),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                job.emit({
+                    "type": "reference_feasibility_integrity_failed",
+                    "source": "worker_launch",
+                    "reason": "reference_reverification_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "reference motion changed after admission; the sculpt "
+                    "subprocess was not started"
+                ) from exc
             if runtime_reference_clock != expected_reference_clock:
                 raise RuntimeError(
                     "reference clock changed after route admission; the "
@@ -2672,6 +2725,44 @@ def run_sculpt_job(
         else:
             expected_core_world_pin = None
 
+        # Bind the exact resume-derived outer-iteration plan before the worker
+        # exists. The worker must echo this plan and complete it in order; the
+        # cumulative metric-history file is never lifecycle authority.
+        from backend.services.run_lifecycle import RunLifecycleSession
+        from sculptor.sculpt import _find_resume_start_iteration
+
+        rewards_path = project_dir / "rewards"
+        requested_start_iter = (
+            _find_resume_start_iteration(
+                rewards_path, project_dir / "runs"
+            )
+            if rewards_path.is_dir()
+            else 0
+        )
+        requested_iteration_plan = tuple(
+            range(requested_start_iter, requested_start_iter + iterations)
+        )
+        lifecycle = RunLifecycleSession(
+            run_id=job.job_id,
+            expected_iterations=requested_iteration_plan,
+            allowed_early_stop_sources=(
+                ("fitness", "goodhart_onset")
+                if (
+                    resolved_fitness_metric is not None
+                    and final_fitness_mode == "steer"
+                )
+                else ()
+            ),
+        )
+        job.params["requested_iteration_plan"] = list(
+            requested_iteration_plan
+        )
+        job.emit({
+            "type": "iteration_plan_bound",
+            "source": "worker_launch",
+            "requested": list(requested_iteration_plan),
+        })
+
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
@@ -2784,6 +2875,40 @@ def run_sculpt_job(
             nonlocal starting_policy_initialization_emitted
             nonlocal verified_authored_world_pin
             nonlocal authored_world_pin_error
+
+            if (
+                event.get("type") == "early_stop"
+                and event.get("source") == "user"
+            ):
+                try:
+                    user_stop_authorization = _read_user_stop_authorization(
+                        control_path, run_id=job.job_id,
+                    )
+                    lifecycle.authorize_user_stop(user_stop_authorization)
+                except Exception as exc:  # noqa: BLE001 - reject forged stop
+                    job.emit({
+                        "type": "user_stop_authorization_rejected",
+                        "source": "worker_stdout",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                else:
+                    job.params["user_stop_authorization"] = (
+                        user_stop_authorization
+                    )
+                    job.emit({
+                        "type": "user_stop_authorization_verified",
+                        "source": "worker_stdout",
+                        "receipt": user_stop_authorization,
+                    })
+            try:
+                lifecycle.observe_event(event)
+            except Exception as exc:  # noqa: BLE001 - fail closed after drain
+                job.emit({
+                    "type": "run_lifecycle_observation_rejected",
+                    "source": "worker_stdout",
+                    "phase": str(event.get("type") or "unknown"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
 
             def emit_verified_policy_initialization(
                 observed: dict[str, Any],
@@ -3004,6 +3129,28 @@ def run_sculpt_job(
         metric_history = _read_metric_history(project_dir)
         iterations_run = len(metric_history)
         strict_reference_lineage = launch_tierd_receipt is not None
+        lifecycle_proof: dict[str, Any] | None = None
+        lifecycle_proof_failure: str | None = None
+        if rc == 0:
+            try:
+                lifecycle_proof = lifecycle.finalize_proof()
+            except Exception as exc:  # noqa: BLE001 - fail closed below
+                lifecycle_proof_failure = f"{type(exc).__name__}: {exc}"
+                job.emit({
+                    "type": "run_lifecycle_proof_rejected",
+                    "source": "worker_completion",
+                    "error": lifecycle_proof_failure,
+                })
+            else:
+                job.params["run_lifecycle_proof"] = lifecycle_proof
+                iterations_run = len(
+                    lifecycle_proof["iteration_plan"]["completed"]
+                )
+                job.emit({
+                    "type": "run_lifecycle_proof_verified",
+                    "source": "worker_completion",
+                    "proof": lifecycle_proof,
+                })
         lineage_proof_failure: str | None = None
         if (
             starting_skill_load_failure is None
@@ -3052,11 +3199,90 @@ def run_sculpt_job(
                 "reason": "starting_skill_load_unproven",
                 "detail": starting_skill_load_failure,
             })
+        terminal_receipt_failure: str | None = None
+        prospective_success = (
+            rc == 0
+            and starting_skill_load_failure is None
+            and authored_world_pin_failure is None
+            and lifecycle_proof_failure is None
+            and lineage_proof_failure is None
+            and lifecycle_proof is not None
+        )
+        if prospective_success:
+            try:
+                from backend.services.iteration_completion import (
+                    attested_completion_receipt,
+                )
+                from backend.services.run_lifecycle import (
+                    build_terminal_run_receipt,
+                    verify_terminal_run_receipt,
+                    write_terminal_run_receipt,
+                )
+
+                completed_indices = lifecycle_proof["iteration_plan"][
+                    "completed"
+                ]
+                iteration_receipts: list[dict[str, Any]] = []
+                for index in completed_indices:
+                    completion_receipt = attested_completion_receipt(
+                        project_dir / "runs" / f"iter_{index}"
+                    )
+                    if completion_receipt is None:
+                        raise ValueError(
+                            f"iter_{index} lacks a reverified schema-3 "
+                            "completion receipt"
+                        )
+                    iteration_receipts.append(completion_receipt)
+                terminal_receipt = build_terminal_run_receipt(
+                    project_slug=str(job.project_slug or project_dir.name),
+                    lifecycle_proof=lifecycle_proof,
+                    iteration_receipts=iteration_receipts,
+                    started_at=(
+                        job.started_at.isoformat()
+                        if job.started_at is not None
+                        else None
+                    ),
+                    completed_at=datetime.now(tz=timezone.utc).isoformat(),
+                )
+                terminal_receipt_path = write_terminal_run_receipt(
+                    project_dir, terminal_receipt,
+                )
+                verified_terminal_receipt = verify_terminal_run_receipt(
+                    project_dir,
+                    terminal_receipt_path,
+                    project_slug=str(
+                        job.project_slug or project_dir.name
+                    ),
+                )
+                if verified_terminal_receipt != terminal_receipt:
+                    raise ValueError(
+                        "persisted terminal receipt did not reverify exactly"
+                    )
+            except Exception as exc:  # noqa: BLE001 - fail closed below
+                terminal_receipt_failure = f"{type(exc).__name__}: {exc}"
+                job.emit({
+                    "type": "run_terminal_receipt_unavailable",
+                    "source": "worker_completion",
+                    "error": terminal_receipt_failure,
+                })
+            else:
+                job.params["run_terminal_receipt"] = terminal_receipt
+                job.params["run_terminal_receipt_path"] = str(
+                    terminal_receipt_path
+                )
+                job.emit({
+                    "type": "run_terminal_receipt_verified",
+                    "source": "worker_completion",
+                    "path": str(terminal_receipt_path),
+                    "receipt_sha256": terminal_receipt["receipt_sha256"],
+                })
         if (
             rc == 0
             and starting_skill_load_failure is None
             and authored_world_pin_failure is None
+            and lifecycle_proof_failure is None
             and lineage_proof_failure is None
+            and terminal_receipt_failure is None
         ):
             job.emit({
                 "type": "run_completed",
@@ -3121,6 +3347,67 @@ def run_sculpt_job(
                 ],
                 "error_problem_type": (
                     "/problems/starting-skill-load-unproven"
+                ),
+                "error_action": None,
+            })
+        elif lifecycle_proof_failure is not None:
+            friendly = "run iteration lifecycle was not proven complete"
+            job.status = "errored"
+            job.error = friendly
+            job.params["error_classification"] = {
+                "kind": "run_lifecycle_unproven",
+                "title": friendly,
+                "detail": lifecycle_proof_failure,
+                "suggestions": [
+                    "Inspect run_started, iter_started, iter_completed, and "
+                    "early_stop events.",
+                    "Relaunch only after the exact requested iteration plan "
+                    "can be proven.",
+                ],
+                "problem_type": "/problems/run-lifecycle-unproven",
+                "action": None,
+            }
+            job.emit({
+                "type": "run_errored",
+                "return_code": rc,
+                "iterations_run": iterations_run,
+                "error": friendly,
+                "error_kind": "run_lifecycle_unproven",
+                "error_detail": lifecycle_proof_failure,
+                "error_suggestions": job.params["error_classification"][
+                    "suggestions"
+                ],
+                "error_problem_type": "/problems/run-lifecycle-unproven",
+                "error_action": None,
+            })
+        elif terminal_receipt_failure is not None:
+            friendly = "run terminal receipt was not proven durable"
+            job.status = "errored"
+            job.error = friendly
+            job.params["error_classification"] = {
+                "kind": "run_terminal_receipt_unproven",
+                "title": friendly,
+                "detail": terminal_receipt_failure,
+                "suggestions": [
+                    "Inspect the schema-3 iteration receipts and filesystem.",
+                    "Relaunch only after the terminal receipt can be written "
+                    "and reverified.",
+                ],
+                "problem_type": "/problems/run-terminal-receipt-unproven",
+                "action": None,
+            }
+            job.emit({
+                "type": "run_errored",
+                "return_code": rc,
+                "iterations_run": iterations_run,
+                "error": friendly,
+                "error_kind": "run_terminal_receipt_unproven",
+                "error_detail": terminal_receipt_failure,
+                "error_suggestions": job.params["error_classification"][
+                    "suggestions"
+                ],
+                "error_problem_type": (
+                    "/problems/run-terminal-receipt-unproven"
                 ),
                 "error_action": None,
             })
@@ -3693,6 +3980,22 @@ def _read_metric_history(project_dir: Path) -> list[Optional[float]]:
 
 
 # ── iteration summary from events ─────────────────────────────────────
+def _job_runs_dir(job: Job) -> Path | None:
+    """Resolve the server-written runs directory for receipt verification."""
+    for key in ("log_file", "control_file"):
+        raw_path = job.params.get(key)
+        if isinstance(raw_path, str) and raw_path:
+            parent = Path(raw_path).parent
+            if parent.name == "runs":
+                return parent
+    raw_receipt_path = job.params.get("run_terminal_receipt_path")
+    if isinstance(raw_receipt_path, str) and raw_receipt_path:
+        receipt_parent = Path(raw_receipt_path).parent
+        if receipt_parent.name == "_run_receipts":
+            return receipt_parent.parent
+    return None
+
+
 def _iter_events(job: Job) -> list[dict[str, Any]]:
     """Fold the job's event log into a per-iteration summary. Used both
     by REST detail responses and by the final `result` dict on job
@@ -3877,24 +4180,44 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 "rejected": list(ev.get("rejected") or []),
             }
 
-    # §fix: a sequential sculpt loop runs ONE iter at a time, so only the
-    # highest-started iter can still be running. A LOWER iter still marked
-    # "running" lost its `iter_completed` (a dropped stdout line, or a
-    # crash-then-resume) — the loop demonstrably advanced past it, so reconcile
-    # it to "completed" rather than stranding a stale RUNNING card. The current
-    # (highest-started) iter keeps its event-derived status. Defense-in-depth
-    # alongside the watcher pre-seed: `completed` is otherwise STRICTLY
-    # stdout-`iter_completed`-driven with no artifact fallback.
+    # A later iter_started is contradictory evidence when a prior completion
+    # event was lost; it is not completion evidence. Admit the lower slot only
+    # from an exact lifecycle proof or a fully reverified schema-3 iteration
+    # receipt. Otherwise surface it as errored/unknown rather than claiming a
+    # scientifically completed iteration.
     # An event timestamp is optional metadata, not proof that the iteration
     # started.  Use the explicit lifecycle event so terminal reconciliation
     # also works for durable/replayed logs whose ``iter_started`` record did
     # not carry ``ts``.
     started_idxs = sorted(started_iter_indices)
     if started_idxs:
+        from backend.services.iteration_completion import (
+            attested_completion_receipt,
+        )
+        from backend.services.run_lifecycle import (
+            verified_lifecycle_completed_iterations,
+        )
+
+        proof_indices = verified_lifecycle_completed_iterations(
+            job.params.get("run_lifecycle_proof"), run_id=job.job_id,
+        )
+        verified_indices = set(proof_indices or ())
+        runs_dir = _job_runs_dir(job)
         max_started = max(started_idxs)
         for i, s in by_iter.items():
             if i < max_started and s["status"] == "running":
-                s["status"] = "completed"
+                receipt_verified = (
+                    runs_dir is not None
+                    and attested_completion_receipt(
+                        runs_dir / f"iter_{i}"
+                    )
+                    is not None
+                )
+                s["status"] = (
+                    "completed"
+                    if i in verified_indices or receipt_verified
+                    else "errored"
+                )
         terminal_slot = by_iter[max_started]
         if terminal_slot["status"] == "running" and job.status in {
             "errored", "stopped",

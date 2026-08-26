@@ -64,6 +64,17 @@ def _configure_g1_project(client: TestClient, slug: str) -> Path:
     return Path(detail.project_dir)
 
 
+def _stub_live_mjlab_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep route tests unrelated to hardware on a CPU-only seam."""
+    from backend.routes import runs as runs_routes
+
+    monkeypatch.setattr(
+        runs_routes,
+        "_live_mjlab_launch_preflight_problem",
+        lambda **_kwargs: None,
+    )
+
+
 def _stub_immutable_world_receipt(
     monkeypatch: pytest.MonkeyPatch,
     world_store,
@@ -554,6 +565,8 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
     )
     assert no_world.status_code == 412, no_world.text
     assert no_world.json()["title"] == "a reference motion needs an authored world"
+    assert "atomically — so" in no_world.json()["detail"]
+    assert "â€" not in no_world.json()["detail"]
 
     # Without a motion prior the same project launches normally — the gate is
     # scoped to the tracking-first path, not to runs in general.
@@ -663,6 +676,36 @@ def test_tier_k_reference_is_dry_run_only_and_receipt_says_kinematic(
         kind="sculpt_run", project_slug=slug,
     ) == []
 
+    lineage_disabled = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "inspect without lineage",
+            "iterations": 1,
+            "dry_run": True,
+            "no_kg": True,
+            "reference_clip_id": "kinematic_seed",
+            "reference_robot": "g1",
+        },
+    )
+    assert lineage_disabled.status_code == 412, lineage_disabled.text
+    assert (
+        lineage_disabled.json()["type"]
+        == "/problems/reference-lineage-required"
+    )
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+    from backend.routes import runs as runs_routes
+
+    monkeypatch.setattr(
+        runs_routes,
+        "_live_mjlab_launch_preflight_problem",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Tier-K dry-run inspection probed live readiness")
+        ),
+    )
+
     smoke = client.post(
         f"/projects/{slug}/runs",
         json={
@@ -687,6 +730,126 @@ def test_tier_k_reference_is_dry_run_only_and_receipt_says_kinematic(
     assert attestation["rollout_sha256"] is None
 
 
+@pytest.mark.parametrize(
+    ("readiness", "problem_type"),
+    [
+        (
+            {
+                "mjlab_available": False,
+                "rsl_rl_available": True,
+                "torch_available": True,
+                "cuda_available": True,
+            },
+            "/problems/mjlab-missing",
+        ),
+        (
+            {
+                "mjlab_available": True,
+                "rsl_rl_available": False,
+                "torch_available": True,
+                "cuda_available": True,
+            },
+            "/problems/rsl-rl-missing",
+        ),
+        (
+            {
+                "mjlab_available": True,
+                "rsl_rl_available": True,
+                "torch_available": True,
+                "cuda_available": False,
+            },
+            "/problems/gpu-required",
+        ),
+    ],
+)
+def test_live_mjlab_launch_rejects_unready_backend_before_queue(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    readiness: dict,
+    problem_type: str,
+) -> None:
+    from backend.routes import runs as runs_routes
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, f"Unready {problem_type}")
+    _configure_g1_project(client, slug)
+    monkeypatch.setattr(
+        runs_routes.sculptor_bridge,
+        "gpu_info",
+        lambda: dict(readiness),
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "train only when backend hardware is ready",
+            "iterations": 1,
+            "acknowledge_blind_fitness": True,
+        },
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == problem_type
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+
+def test_live_mjlab_launch_fails_closed_when_vram_preflight_errors(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.routes import runs as runs_routes
+    from backend.services import preflight
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "Unavailable GPU Preflight")
+    project_dir = _configure_g1_project(client, slug)
+    client.app.state.project_store.set_adapter_section(
+        slug,
+        "sculptor.adapters.mjlab.MjlabAdapter",
+        {
+            "task_id": "Mjlab-Velocity-Flat-Unitree-G1",
+            "num_envs": 16,
+            "device": "cuda:0",
+        },
+    )
+    assert project_dir.is_dir()
+    monkeypatch.setattr(
+        runs_routes.sculptor_bridge,
+        "gpu_info",
+        lambda: {
+            "mjlab_available": True,
+            "rsl_rl_available": True,
+            "torch_available": True,
+            "cuda_available": True,
+        },
+    )
+    monkeypatch.setattr(
+        preflight,
+        "check_mjlab_preflight",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("telemetry unavailable")
+        ),
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "train only with a verified GPU budget",
+            "iterations": 1,
+            "acknowledge_blind_fitness": True,
+        },
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/gpu-preflight-unavailable"
+    assert "telemetry unavailable" in response.json()["detail"]
+    assert client.app.state.job_manager.list(
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+
 def test_tier_d_reference_receipt_pins_exact_clip_and_rollout_digests(
     client: TestClient,
     tmp_path: Path,
@@ -700,6 +863,7 @@ def test_tier_d_reference_receipt_pins_exact_clip_and_rollout_digests(
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
     slug = _make_project_with_library(client, "TierDAdmission")
     project_dir = _configure_g1_project(client, slug)
+    _stub_live_mjlab_readiness(monkeypatch)
     certified_policy_contract = (
         policy_contract_module.build_project_policy_contract(project_dir)
     )
@@ -775,6 +939,7 @@ def test_active_reference_reward_cannot_bypass_tierd_when_picker_is_empty(
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
     slug = _make_project_with_library(client, "ActiveReferenceAuthority")
     project_dir = _configure_g1_project(client, slug)
+    _stub_live_mjlab_readiness(monkeypatch)
     certified_policy_contract = (
         policy_contract_module.build_project_policy_contract(project_dir)
     )
@@ -1984,7 +2149,6 @@ def test_run_worker_rejects_reference_digest_drift_before_subprocess(
         tmp_path, robot="g1", clip_id="drift_seed", tier_d=False,
     )
     clip_path = library.clip_dir("g1", "drift_seed") / library.CLIP_FILENAME
-    clip_path.write_bytes(clip_path.read_bytes() + b"queue-time-drift")
     project_dir = tmp_path / "reference-drift"
     project_dir.mkdir()
     from sculptor.reference_run import resolve_reference_clock_for_run
@@ -1992,6 +2156,10 @@ def test_run_worker_rejects_reference_digest_drift_before_subprocess(
     reference_clock = resolve_reference_clock_for_run(
         project_dir, clip_id="drift_seed", robot="g1",
     )
+    # Resolve every launch receipt first, then simulate bytes changing while
+    # the admitted job is queued.  The resolver itself now correctly rejects
+    # already-corrupt provenance, which is a different (earlier) boundary.
+    clip_path.write_bytes(clip_path.read_bytes() + b"queue-time-drift")
     runner = run_manager.run_sculpt_job(
         project_dir=project_dir,
         run_params={

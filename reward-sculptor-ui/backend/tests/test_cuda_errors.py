@@ -26,6 +26,22 @@ def test_oom_variants() -> None:
         assert classify(text).kind == "oom", f"miss: {text!r}"
 
 
+def test_mujoco_host_arena_errors_are_not_reported_as_gpu_oom() -> None:
+    for text in (
+        "FatalError: mj_stackAlloc: out of memory, stack overflow",
+        "Insufficient arena memory for the number of constraints generated. "
+        "Increase arena memory allocation above 67108864 bytes.",
+        "Too many contacts. The arena memory is full, increase arena memory "
+        "allocation.(ncon = 9001)",
+    ):
+        result = classify(text, current_num_envs=4096)
+        assert result.kind == "mujoco_arena_exhausted"
+        assert result.problem_type == "/problems/mujoco-arena-exhausted"
+        assert result.suggested_num_envs is None
+        assert "not a CUDA VRAM failure" in result.detail
+        assert all("close other gpu" not in item.lower() for item in result.suggestions)
+
+
 def test_driver_version_detected() -> None:
     msg = "CUDA driver version is insufficient for CUDA runtime version"
     r = classify(msg)

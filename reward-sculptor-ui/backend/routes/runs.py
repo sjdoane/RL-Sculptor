@@ -46,9 +46,13 @@ from backend.routes.missions import (
     _extract_objective_fitness,
     _read_fitness_and_naturalness,
 )
-from backend.services import mission_store, world_store
+from backend.services import mission_store, sculptor_bridge, world_store
 from backend.services.job_manager import Job, JobManager
 from backend.services.iteration_completion import is_completed_iteration
+from backend.services.run_lifecycle import (
+    TERMINAL_RECEIPTS_DIR,
+    verify_terminal_run_receipt,
+)
 from backend.services.physical_scene_audit import (
     audit_physical_scene_alignment,
 )
@@ -93,6 +97,9 @@ _SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 router = APIRouter(tags=["runs"])
 
 
+_MJLAB_ADAPTER = "sculptor.adapters.mjlab.MjlabAdapter"
+
+
 # ── DI ─────────────────────────────────────────────────────────────────
 def get_store(request: Request) -> ProjectStore:
     return request.app.state.project_store
@@ -128,6 +135,128 @@ def _sha256_path(path: Path, *, chunk_size: int = 1 << 20) -> str:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _live_mjlab_launch_preflight_problem(
+    *,
+    project_dir: Path,
+    adapter_config: dict[str, Any],
+    body: RunParams,
+) -> JSONResponse | None:
+    """Return a fail-closed launch problem for an unready live mjlab run.
+
+    This boundary is deliberately called only for live runs.  In particular,
+    Tier-K reference inspection is a CPU/data-only contract check and must not
+    import torch, query CUDA, import a simulator, or allocate a device merely
+    because the project's configured adapter is mjlab.
+    """
+    try:
+        info = sculptor_bridge.gpu_info()
+    except Exception as exc:  # noqa: BLE001 - direct API must fail closed
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "GPU readiness could not be verified",
+            detail=f"{type(exc).__name__}: {exc}",
+            type_="/problems/gpu-preflight-unavailable",
+        )
+    if not bool(info.get("mjlab_available")):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab is unavailable",
+            detail=(
+                "live mjlab training requires the backend environment to "
+                "resolve the mjlab package before the run can be queued"
+            ),
+            type_="/problems/mjlab-missing",
+        )
+    if not bool(info.get("rsl_rl_available")):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "rsl_rl is unavailable",
+            detail=(
+                "live mjlab training requires the backend environment to "
+                "resolve the rsl_rl package before the run can be queued"
+            ),
+            type_="/problems/rsl-rl-missing",
+        )
+    if not bool(info.get("torch_available")) or not bool(
+        info.get("cuda_available")
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab requires an available CUDA runtime",
+            detail=(
+                "live mjlab training requires torch with CUDA available in "
+                "the backend environment"
+            ),
+            type_="/problems/gpu-required",
+        )
+
+    raw_device = body.device_override or adapter_config.get("device") or "cuda:0"
+    device = str(raw_device)
+    if device != "cuda" and not re.fullmatch(r"cuda:[0-9]+", device):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "live mjlab training requires a CUDA device",
+            detail=(
+                f"the effective device is {device!r}; choose cuda or cuda:N "
+                "before launching live training"
+            ),
+            type_="/problems/gpu-required",
+        )
+
+    raw_task_id = adapter_config.get("task_id")
+    if not isinstance(raw_task_id, str) or not raw_task_id.strip():
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab task configuration is unavailable",
+            detail="the project adapter has no non-empty task_id",
+            type_="/problems/mjlab-config",
+        )
+    raw_num_envs = (
+        body.num_envs_override
+        if body.num_envs_override is not None
+        else adapter_config.get("num_envs", 2048)
+    )
+    if type(raw_num_envs) is not int or raw_num_envs <= 0:
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "mjlab environment count is unavailable",
+            detail=f"the effective num_envs value is invalid: {raw_num_envs!r}",
+            type_="/problems/mjlab-config",
+        )
+
+    try:
+        from backend.services.preflight import check_mjlab_preflight
+
+        result = check_mjlab_preflight(
+            task_id=raw_task_id,
+            num_envs=raw_num_envs,
+            device=device,
+            project_dir=project_dir,
+            min_gpu_memory_gb=0.0,
+        )
+    except Exception as exc:  # noqa: BLE001 - never queue on unknown readiness
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "GPU readiness could not be verified",
+            detail=f"{type(exc).__name__}: {exc}",
+            type_="/problems/gpu-preflight-unavailable",
+        )
+    if result.ok:
+        return None
+    return _problem(
+        status.HTTP_412_PRECONDITION_FAILED,
+        "device preflight failed",
+        detail=result.reason or "live mjlab device preflight did not pass",
+        type_=result.problem_type or "/problems/device-unavailable",
+        suggested_num_envs=result.suggested_num_envs,
+        free_vram_gb=round(result.free_vram_gb, 2),
+        total_vram_gb=round(result.total_vram_gb, 2),
+        estimated_required_gb=round(result.estimated_required_gb, 2),
+        device_index=result.device_index,
+        device_name=result.device_name,
+    )
 
 
 def _find_run(jobs: JobManager, slug: str, run_id: str) -> Optional[Job]:
@@ -447,6 +576,29 @@ def _project_disk_evaluation_failure(
     return candidates[0][1]
 
 
+def _latest_verified_project_terminal_receipt(
+    project_dir: Path, project_slug: str,
+) -> dict[str, Any] | None:
+    """Return the newest fully reverified backend terminal receipt."""
+    receipts_dir = project_dir / "runs" / TERMINAL_RECEIPTS_DIR
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        return None
+    candidates: list[tuple[Any, dict[str, Any]]] = []
+    for path in receipts_dir.glob("*.json"):
+        receipt = verify_terminal_run_receipt(
+            project_dir, path, project_slug=project_slug,
+        )
+        if receipt is None:
+            continue
+        completed_at = _parse_iso_dt(receipt.get("completed_at"))
+        if completed_at is not None:
+            candidates.append((completed_at, receipt))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    return candidates[0][1]
+
+
 def _synthesize_project_disk_run_row(
     project_dir: Path, project_slug: str, jobs: JobManager,
 ) -> Optional[RunSummary]:
@@ -461,12 +613,12 @@ def _synthesize_project_disk_run_row(
     job's row already reaches these artifacts, and there is no per-run
     partition on disk that would let us row-split honestly.
 
-    Status comes from the LAST iteration's disk state: only validated
-    completion evidence reads "completed". A durable post-training rollout
-    failure reads "evaluation failed"; otherwise an incomplete iteration is
-    reported as interrupted.
-    A run that ended between iterations is indistinguishable from a
-    clean finish on disk, so this is best-effort truth, not history.
+    A new run's durable backend terminal receipt is the primary restart
+    authority and is reverified against every bound schema-3 iteration. Legacy
+    trees may still read completed from their last iteration. A durable
+    post-training rollout failure reads "evaluation failed". Bare partial
+    directories do not fabricate an errored terminal run; they remain
+    discoverable through recovery-snapshot APIs.
     """
     if jobs.list(kind="sculpt_run", project_slug=project_slug):
         return None
@@ -474,12 +626,37 @@ def _synthesize_project_disk_run_row(
     if not pairs:
         return None
 
+    terminal_receipt = _latest_verified_project_terminal_receipt(
+        project_dir, project_slug,
+    )
     completed = sum(1 for _, d in pairs if _iter_looks_completed(d))
     last_iteration, last_dir = pairs[-1]
     evaluation_failure = _project_disk_evaluation_failure(
         project_dir, last_iteration,
     )
-    if _iter_looks_completed(last_dir):
+    requested_count = 0
+    started_at = ended_at = None
+    metric_history = _read_project_metric_history(project_dir)
+    terminal_last_completed: int | None = None
+    has_later_iteration_evidence = False
+    if terminal_receipt is not None:
+        plan = terminal_receipt["lifecycle_proof"]["iteration_plan"]
+        requested = plan["requested"]
+        completed_plan = plan["completed"]
+        terminal_last_completed = completed_plan[-1]
+        has_later_iteration_evidence = (
+            last_iteration > terminal_last_completed
+        )
+        requested_count = len(requested)
+        completed = len(completed_plan)
+        metric_history = [
+            metric_history[index] if index < len(metric_history) else None
+            for index in completed_plan
+        ]
+        started_at = _parse_iso_dt(terminal_receipt.get("started_at"))
+        ended_at = _parse_iso_dt(terminal_receipt.get("completed_at"))
+
+    if terminal_receipt is not None and not has_later_iteration_evidence:
         run_status = "completed"
         error = None
         error_classification = None
@@ -500,10 +677,46 @@ def _synthesize_project_disk_run_row(
             problem_type="/problems/post-training-rollout-failed",
             evidence=evaluation_failure,
         )
-    else:
+        if terminal_receipt is not None:
+            # The verified success receipt predates this failed attempt. Its
+            # completion timestamp must not mask the later terminal evidence.
+            ended_at = None
+    elif terminal_receipt is not None and has_later_iteration_evidence:
+        checkpoint = _find_stage_checkpoint(last_dir)
         run_status = "errored"
-        error = "interrupted"
+        error = "Newer iteration evidence lacks a verified terminal receipt"
+        error_classification = ErrorClassification(
+            kind="interrupted_recovery_available",
+            title=error,
+            detail=(
+                f"The newest verified run ended at iter_"
+                f"{terminal_last_completed}, but iter_{last_iteration} "
+                "contains later evidence without a durable verified run "
+                "completion receipt."
+            ),
+            suggestions=[
+                (
+                    "Continue from the preserved recovery snapshot after "
+                    "checking the interrupted run."
+                    if checkpoint is not None
+                    else "Inspect the later iteration artifacts before "
+                    "relaunching."
+                ),
+            ],
+            problem_type="/problems/run-terminal-receipt-unproven",
+            evidence={
+                "last_verified_iteration": terminal_last_completed,
+                "later_iteration": last_iteration,
+                "checkpoint_preserved": checkpoint is not None,
+            },
+        )
+        ended_at = None
+    elif _iter_looks_completed(last_dir):
+        run_status = "completed"
+        error = None
         error_classification = None
+    else:
+        return None
 
     meta = _load_json_dict(project_dir / "metadata.json") or {}
     goal = str(meta.get("behavior_goal") or "")
@@ -513,23 +726,27 @@ def _synthesize_project_disk_run_row(
     # trained iteration", not one run's wall-clock duration.
     from datetime import datetime as _dt, timezone as _tz
 
-    started_at = ended_at = None
-    try:
-        mtimes = [d.stat().st_mtime for _, d in pairs]
-        started_at = _dt.fromtimestamp(min(mtimes), tz=_tz.utc)
-        ended_at = _dt.fromtimestamp(max(mtimes), tz=_tz.utc)
-    except OSError:
-        pass
+    if started_at is None or ended_at is None:
+        try:
+            mtimes = [d.stat().st_mtime for _, d in pairs]
+            started_at = started_at or _dt.fromtimestamp(
+                min(mtimes), tz=_tz.utc,
+            )
+            ended_at = ended_at or _dt.fromtimestamp(
+                max(mtimes), tz=_tz.utc,
+            )
+        except OSError:
+            pass
 
     return RunSummary(
         run_id=PROJECT_DISK_RUN_ID,
         project_slug=project_slug,
         status=run_status,  # type: ignore[arg-type]
         behavior_goal=goal,
-        iterations_requested=0,  # unknown across runs → UI shows "?"
+        iterations_requested=requested_count,
         iterations_completed=completed,
         current_iter_index=None,
-        primary_metric_history=_read_project_metric_history(project_dir),
+        primary_metric_history=metric_history,
         fitness_history=[],
         started_at=started_at,
         ended_at=ended_at,
@@ -965,7 +1182,7 @@ def launch_run(
                 detail=(
                     "attaching a reference clip makes this a tracking-first "
                     "run, and the generated tracking reward is bound to the "
-                    "authored world atomically â€” so the project needs a "
+                    "authored world atomically — so the project needs a "
                     "promoted world first. Author one from the World tab "
                     "(the default flat scene still needs promoting), or "
                     "launch without a motion prior."
@@ -1266,6 +1483,21 @@ def launch_run(
             ),
             type_="/problems/reference-motion",
         )
+    if (
+        resolved_reference_clip_id
+        and resolved_reference_robot
+        and body.no_kg
+    ):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference-guided runs require lineage",
+            detail=(
+                "reference-conditioned training cannot disable the KG because "
+                "its requested/observed runtime, initialization, world, and "
+                "output lineage must be proven before completion"
+            ),
+            type_="/problems/reference-lineage-required",
+        )
     if resolved_reference_clip_id and resolved_reference_robot:
         # Resolve the exact (embodiment, clip) pair before queuing GPU work.
         # The index is a cache, so provenance + clip bytes remain the
@@ -1398,6 +1630,14 @@ def launch_run(
                 "checkpoint_published": False,
                 "target_robot": target_robot,
             }
+    if not body.dry_run and detail.adapter_class == _MJLAB_ADAPTER:
+        readiness_problem = _live_mjlab_launch_preflight_problem(
+            project_dir=project_dir,
+            adapter_config=detail.adapter_config,
+            body=body,
+        )
+        if readiness_problem is not None:
+            return readiness_problem
     run_params: dict[str, Any] = body.model_dump()
     run_params["initialization_mode"] = (
         selected_mode

@@ -22,7 +22,7 @@ from typing import Optional
 class CudaErrorClass:
     """Result of classify(text)."""
 
-    # kind: "oom" | "driver_version" | "no_cuda" | "reward_contract_mismatch" | "unknown"
+    # kind includes GPU, MuJoCo host-arena, policy, and contract failures.
     kind: str
     title: str
     detail: str
@@ -97,7 +97,35 @@ def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorC
             problem_type="/problems/policy-distribution-instability",
         )
 
-    # 3. OOM — several wordings in the wild.
+    # 3. MuJoCo's per-model host arena / scratch stack. Its messages contain
+    # "out of memory", but this is not CUDA VRAM and lowering num_envs does not
+    # enlarge the failing model's arena. Match before the generic OOM scanner.
+    mujoco_arena_markers = [
+        "mj_stackalloc: out of memory",
+        "insufficient arena memory for the number of constraints generated",
+        "the arena memory is full, increase arena memory allocation",
+    ]
+    if any(marker in needle for marker in mujoco_arena_markers):
+        return CudaErrorClass(
+            kind="mujoco_arena_exhausted",
+            title="MuJoCo host arena exhausted",
+            detail=(
+                "MuJoCo exhausted the CPU-side arena or scratch stack reserved "
+                "for this exact compiled model. This is not a CUDA VRAM failure; "
+                "GPU-memory remedies do not change the per-model arena."
+            ),
+            suggestions=[
+                "Increase the authored MJCF `<size memory=\"…\">` allocation, "
+                "then materialize and validate a new immutable world artifact.",
+                "Reduce simultaneous contacts or constraints in the authored "
+                "scene, then recompile it under a new identity.",
+                "Lowering num_envs can reduce total host RAM, but it does not "
+                "enlarge the arena that produced this error.",
+            ],
+            problem_type="/problems/mujoco-arena-exhausted",
+        )
+
+    # 4. GPU OOM — several wordings in the wild.
     oom_markers = [
         "cuda out of memory",
         "out of memory",
@@ -129,7 +157,7 @@ def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorC
             problem_type="/problems/cuda-oom",
         )
 
-    # 4. Driver / runtime mismatch.
+    # 5. Driver / runtime mismatch.
     if (
         "cuda driver version is insufficient" in needle
         or "the provided ptx was compiled with an unsupported toolchain" in needle
@@ -152,7 +180,7 @@ def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorC
             problem_type="/problems/cuda-driver-too-old",
         )
 
-    # 5. CUDA missing entirely.
+    # 6. CUDA missing entirely.
     no_cuda_markers = [
         "no cuda-capable device",
         "cuda_error_no_device",

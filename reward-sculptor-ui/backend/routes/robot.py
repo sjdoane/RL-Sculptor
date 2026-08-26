@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import io
 import shutil
+import stat
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
+import xml.etree.ElementTree as ET
 
 from fastapi import (
     APIRouter,
@@ -74,13 +76,51 @@ DEFAULT_LIBRARY_SEEDS: list[dict[str, str]] = [
 
 # Shared limits. Tuned per spec: 50 MB combined for URDF uploads.
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+MAX_ZIP_MEMBERS = 1024
 MAX_ZIP_ENTRY_BYTES = 20 * 1024 * 1024
+MAX_ZIP_EXPANDED_BYTES = 100 * 1024 * 1024
 MAX_ZIP_RATIO = 100
 
 # Paths under <project>/
 ROBOT_SUBDIR = Path("uploads") / "robot"
 
 ALLOWED_MODEL_SUFFIXES = {".urdf", ".xml", ".mjcf"}
+ALLOWED_ARCHIVE_SUFFIXES = {
+    ".bmp",
+    ".dae",
+    ".jpeg",
+    ".jpg",
+    ".msh",
+    ".obj",
+    ".ply",
+    ".png",
+    ".skn",
+    ".stl",
+    ".tga",
+}
+
+
+class _UploadTooLarge(Exception):
+    pass
+
+
+async def _read_upload_bounded(upload: UploadFile, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes + 1`` bytes so rejection stays bounded."""
+    if max_bytes < 0:
+        raise _UploadTooLarge
+    admitted = bytearray()
+    while True:
+        read_size = min(
+            UPLOAD_READ_CHUNK_BYTES,
+            max(1, max_bytes - len(admitted) + 1),
+        )
+        chunk = await upload.read(read_size)
+        if not chunk:
+            return bytes(admitted)
+        admitted.extend(chunk)
+        if len(admitted) > max_bytes:
+            raise _UploadTooLarge
 
 
 # ── DI ─────────────────────────────────────────────────────────────────
@@ -264,23 +304,31 @@ async def upload_urdf(
             type_="/problems/validation-error",
         )
 
-    # ── read bytes + size cap ────────────────────────────────────────
-    model_bytes = await model_file.read()
-    total = len(model_bytes)
-    zip_bytes: Optional[bytes] = None
-    if meshes_zip is not None:
-        zip_bytes = await meshes_zip.read()
-        total += len(zip_bytes)
-    if total > MAX_UPLOAD_BYTES:
+    # ── bounded reads + combined size cap ───────────────────────────
+    try:
+        model_bytes = await _read_upload_bounded(model_file, MAX_UPLOAD_BYTES)
+    except _UploadTooLarge:
         return _problem(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             "upload exceeds size cap",
-            detail=(
-                f"combined size {total} B > {MAX_UPLOAD_BYTES} B "
-                f"(50 MB). Split meshes out of the model or compress further."
-            ),
+            detail=f"combined upload exceeds {MAX_UPLOAD_BYTES} B (50 MB)",
             type_="/problems/upload-too-large",
         )
+    total = len(model_bytes)
+    zip_bytes: Optional[bytes] = None
+    if meshes_zip is not None:
+        try:
+            zip_bytes = await _read_upload_bounded(
+                meshes_zip, MAX_UPLOAD_BYTES - total
+            )
+        except _UploadTooLarge:
+            return _problem(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                "upload exceeds size cap",
+                detail=f"combined upload exceeds {MAX_UPLOAD_BYTES} B (50 MB)",
+                type_="/problems/upload-too-large",
+            )
+        total += len(zip_bytes)
     if not model_bytes:
         return _problem(
             status.HTTP_400_BAD_REQUEST,
@@ -296,6 +344,7 @@ async def upload_urdf(
             status.HTTP_409_CONFLICT, "project busy",
             detail=str(e), type_="/problems/state-conflict",
         )
+    staging: Path | None = None
     try:
         project_detail = store.get(slug)
         assert project_detail is not None
@@ -318,25 +367,30 @@ async def upload_urdf(
             except _ZipReject as e:
                 return _problem(
                     status.HTTP_400_BAD_REQUEST,
-                    "zip rejected",
+                    "asset archive rejected",
                     detail=str(e),
-                    type_="/problems/zip-path-traversal",
+                    type_="/problems/unsafe-archive",
                 )
 
         # ── validate parseable ──────────────────────────────────────
         try:
-            summary = preview_renderer.validate_model_file(model_path)
-        except PreviewError as e:
-            # Clean staging on any parse failure.
-            shutil.rmtree(staging, ignore_errors=True)
-            type_ = (
-                "/problems/urdf-unsupported"
-                if e.kind == "urdf_parse"
-                else "/problems/model-parse"
+            summary = preview_renderer.validate_model_file(
+                model_path, asset_root=staging
             )
+        except PreviewError as e:
+            if e.kind == "unsafe_model":
+                type_ = "/problems/unsafe-model"
+                title = "uploaded model is not confined data"
+            else:
+                type_ = (
+                    "/problems/urdf-unsupported"
+                    if e.kind == "urdf_parse"
+                    else "/problems/model-parse"
+                )
+                title = "MuJoCo could not load the uploaded model"
             return _problem(
                 status.HTTP_400_BAD_REQUEST,
-                "MuJoCo could not load the uploaded model",
+                title,
                 detail=str(e),
                 type_=type_,
                 parse_kind=e.kind,
@@ -369,6 +423,8 @@ async def upload_urdf(
         )
         store.invalidate_preview(slug)
     finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
         lock.release()
 
     return _build_robot_response(store, slug)
@@ -498,54 +554,158 @@ class _ZipReject(Exception):
 
 
 def _extract_mesh_zip(zip_bytes: bytes, dest: Path) -> list[str]:
-    """Extract a mesh zip into `dest`. Returns relative paths of extracted
-    files. Raises _ZipReject on any zip-slip, symlink, oversized entry,
-    or pathologic compression ratio."""
+    """Admit and extract a bounded archive containing data-only assets."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile as e:
         raise _ZipReject(f"not a valid zip file: {e}") from e
 
-    dest_resolved = dest.resolve()
-    extracted: list[str] = []
-
-    for info in zf.infolist():
-        name = info.filename
-        if not name or name.endswith("/"):
-            continue  # skip directories
-        # Path-traversal + absolute-path + symlink checks.
-        if name.startswith("/") or ":" in name[:3]:
-            raise _ZipReject(f"absolute path in zip: {name!r}")
-        if any(part == ".." for part in Path(name).parts):
-            raise _ZipReject(f"'..' in zip entry path: {name!r}")
-        # symlink bit: external_attr upper 16 bits store POSIX mode.
-        posix_mode = (info.external_attr >> 16) & 0xFFFF
-        if posix_mode and (posix_mode & 0o170000) == 0o120000:
-            raise _ZipReject(f"symlink entries are not allowed: {name!r}")
-        if info.file_size > MAX_ZIP_ENTRY_BYTES:
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_MEMBERS:
             raise _ZipReject(
-                f"entry {name!r} uncompressed size "
-                f"{info.file_size} > {MAX_ZIP_ENTRY_BYTES}"
-            )
-        if (
-            info.compress_size > 0
-            and info.file_size / max(info.compress_size, 1) > MAX_ZIP_RATIO
-        ):
-            raise _ZipReject(
-                f"entry {name!r} compression ratio "
-                f"{info.file_size / max(info.compress_size, 1):.0f}:1 "
-                f"> {MAX_ZIP_RATIO}:1 — suspected zip bomb"
+                f"archive has {len(infos)} members; limit is {MAX_ZIP_MEMBERS}"
             )
 
-        target = (dest / name).resolve()
-        try:
-            target.relative_to(dest_resolved)
-        except ValueError as e:
+        dest_resolved = dest.resolve()
+        admitted: list[tuple[zipfile.ZipInfo, str, Path]] = []
+        seen: set[str] = set()
+        expanded_total = 0
+        compressed_total = 0
+
+        # Validate the complete central directory before writing any member.
+        for info in infos:
+            raw_name = info.filename
+            if not raw_name or "\x00" in raw_name:
+                raise _ZipReject("archive contains an empty or NUL member name")
+            name = raw_name.replace("\\", "/")
+            posix_mode = (info.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(posix_mode)
+            if file_type == stat.S_IFLNK:
+                raise _ZipReject(f"links are not allowed: {raw_name!r}")
+            if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+                raise _ZipReject(
+                    f"non-regular archive member is not allowed: {raw_name!r}"
+                )
+
+            is_directory = info.is_dir() or name.endswith("/")
+            if is_directory:
+                continue
+            if info.flag_bits & 0x1:
+                raise _ZipReject(f"encrypted members are not allowed: {raw_name!r}")
+            if posix_mode & 0o111:
+                raise _ZipReject(f"executable members are not allowed: {raw_name!r}")
+            if name.startswith("/") or ":" in name:
+                raise _ZipReject(f"absolute or drive path in archive: {raw_name!r}")
+
+            relative = PurePosixPath(name)
+            if any(part in {"", ".", ".."} for part in relative.parts):
+                raise _ZipReject(
+                    f"member path is not a normalized child path: {raw_name!r}"
+                )
+            normalized = relative.as_posix()
+            identity = normalized.casefold()
+            if identity in seen:
+                raise _ZipReject(
+                    f"duplicate member path after normalization: {raw_name!r}"
+                )
+            seen.add(identity)
+
+            suffix = relative.suffix.lower()
+            if suffix not in ALLOWED_ARCHIVE_SUFFIXES:
+                raise _ZipReject(
+                    f"member {raw_name!r} is not an admitted mesh/texture format"
+                )
+            if info.file_size > MAX_ZIP_ENTRY_BYTES:
+                raise _ZipReject(
+                    f"member {raw_name!r} expands to {info.file_size} B; "
+                    f"per-member limit is {MAX_ZIP_ENTRY_BYTES} B"
+                )
+
+            ratio = info.file_size / max(info.compress_size, 1)
+            if ratio > MAX_ZIP_RATIO:
+                raise _ZipReject(
+                    f"member {raw_name!r} compression ratio {ratio:.0f}:1 "
+                    f"exceeds {MAX_ZIP_RATIO}:1"
+                )
+            expanded_total += info.file_size
+            compressed_total += info.compress_size
+            if expanded_total > MAX_ZIP_EXPANDED_BYTES:
+                raise _ZipReject(
+                    f"archive expands to more than {MAX_ZIP_EXPANDED_BYTES} B"
+                )
+
+            target = (dest / Path(*relative.parts)).resolve()
+            try:
+                target.relative_to(dest_resolved)
+            except ValueError as e:
+                raise _ZipReject(
+                    f"member {raw_name!r} resolves outside extraction root"
+                ) from e
+            admitted.append((info, normalized, target))
+
+        aggregate_ratio = expanded_total / max(compressed_total, 1)
+        if aggregate_ratio > MAX_ZIP_RATIO:
             raise _ZipReject(
-                f"zip entry {name!r} resolves outside extraction root"
-            ) from e
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(info) as src, target.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 256)
-        extracted.append(name.replace("\\", "/"))
+                f"archive compression ratio {aggregate_ratio:.0f}:1 "
+                f"exceeds {MAX_ZIP_RATIO}:1"
+            )
+
+        extracted: list[str] = []
+        bytes_written = 0
+        for info, normalized, target in admitted:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, target.open("wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 256)
+                    if not chunk:
+                        break
+                    bytes_written += len(chunk)
+                    if bytes_written > MAX_ZIP_EXPANDED_BYTES:
+                        raise _ZipReject(
+                            "archive exceeded its expanded-byte limit while reading"
+                        )
+                    dst.write(chunk)
+            if target.stat().st_size != info.file_size:
+                raise _ZipReject(
+                    f"member {normalized!r} size changed while extracting"
+                )
+            extracted.append(normalized)
+
+    _reject_secondary_asset_loaders(dest, extracted)
     return extracted
+
+
+def _reject_secondary_asset_loaders(dest: Path, extracted: list[str]) -> None:
+    """Reject data formats that try to load a second, unadmitted dependency."""
+    for relative in extracted:
+        path = dest / relative
+        suffix = path.suffix.lower()
+        if suffix == ".obj":
+            try:
+                lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
+            except UnicodeError as e:
+                raise _ZipReject(f"OBJ asset is not valid UTF-8: {relative!r}") from e
+            for line in lines:
+                if line.lstrip().lower().startswith("mtllib "):
+                    raise _ZipReject(
+                        f"OBJ material-library loading is not allowed: {relative!r}"
+                    )
+        elif suffix == ".dae":
+            payload = path.read_bytes()
+            lowered = payload.lower()
+            if b"<!doctype" in lowered or b"<!entity" in lowered:
+                raise _ZipReject(
+                    f"DAE declarations that can load entities are not allowed: {relative!r}"
+                )
+            try:
+                document = ET.fromstring(payload)
+            except ET.ParseError as e:
+                raise _ZipReject(f"DAE asset is not valid XML: {relative!r}") from e
+            for element in document.iter():
+                tag = str(element.tag).rsplit("}", 1)[-1].lower()
+                value = (element.text or "").strip()
+                if tag == "init_from" and value and not value.startswith("#"):
+                    raise _ZipReject(
+                        f"DAE external asset loading is not allowed: {relative!r}"
+                    )

@@ -17,7 +17,7 @@ import re
 import struct
 import zipfile
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 
 
 _ITER_RE = re.compile(r"^iter_(?P<iteration>[0-9]+)$")
@@ -187,12 +187,12 @@ def _readable_mp4(path: Path) -> bool:
         return False
 
 
-def has_valid_completion_marker(iter_dir: Path) -> bool:
-    """Return whether the runner's durable marker attests this checkpoint.
+def _has_valid_schema2_completion_marker(iter_dir: Path) -> bool:
+    """Return whether a pre-phase-manifest marker pins this checkpoint.
 
-    The core marker's schema/index/state are necessary but not sufficient at
-    an API boundary: its checkpoint disclosure must also resolve to the exact
-    non-empty, non-linked checkpoint retained by this iteration.
+    Schema 2 remains readable only for recovery/backward compatibility.  It is
+    not enough to earn the modern ``attested`` authority because it does not
+    bind train/rollout request, effective input, and output receipts.
     """
     iter_dir = Path(iter_dir)
     iteration = _iteration_index(iter_dir)
@@ -242,6 +242,35 @@ def has_valid_completion_marker(iter_dir: Path) -> bool:
         return False
 
 
+def attested_completion_receipt(
+    iter_dir: Path,
+) -> dict[str, Any] | None:
+    """Return a fully reverified schema-3 completion receipt, or ``None``.
+
+    Importing this pure core helper is CPU/data-only.  It does not import an
+    adapter, simulator, CUDA, or launch a subprocess.
+    """
+    try:
+        from sculptor.run_manifests import verify_iteration_completion_marker
+
+        return verify_iteration_completion_marker(Path(iter_dir))
+    except Exception:  # noqa: BLE001 - API authority always fails closed
+        return None
+
+
+def has_valid_completion_marker(iter_dir: Path) -> bool:
+    """Return whether any recognized checkpoint-bound marker is valid.
+
+    Callers making scientific or deployment claims must use
+    :func:`iteration_completion_authority`; this compatibility predicate also
+    recognizes schema 2 so older retained runs remain recoverable.
+    """
+    return (
+        attested_completion_receipt(iter_dir) is not None
+        or _has_valid_schema2_completion_marker(iter_dir)
+    )
+
+
 def has_full_legacy_completion_evidence(iter_dir: Path) -> bool:
     """Admit a pre-marker iteration only with a complete evidence quartet.
 
@@ -281,8 +310,34 @@ def is_completed_iteration(iter_dir: Path) -> bool:
     )
 
 
+CompletionAuthority = Literal["attested", "legacy_recovery"]
+
+
+def iteration_completion_authority(
+    iter_dir: Path,
+) -> CompletionAuthority | None:
+    """Classify why an iteration is admitted at the API boundary.
+
+    Only a fully revalidated schema-3 marker that binds the exact train and
+    rollout request, input, completion-manifest, and output bytes earns the
+    modern ``attested`` authority.  Schema-2 markers and the legacy evidence
+    quartet remain discoverable for recovery and reproducibility, but they
+    must never inherit a deployment or scientific-success claim.
+    """
+    if attested_completion_receipt(iter_dir) is not None:
+        return "attested"
+    if (
+        _has_valid_schema2_completion_marker(iter_dir)
+        or has_full_legacy_completion_evidence(iter_dir)
+    ):
+        return "legacy_recovery"
+    return None
+
+
 __all__ = [
+    "attested_completion_receipt",
     "has_full_legacy_completion_evidence",
     "has_valid_completion_marker",
     "is_completed_iteration",
+    "iteration_completion_authority",
 ]

@@ -285,7 +285,7 @@ def test_mesh_zip_rejects_path_traversal(client: TestClient) -> None:
         },
     )
     assert r.status_code == 400, r.text
-    assert r.json()["type"] == "/problems/zip-path-traversal"
+    assert r.json()["type"] == "/problems/unsafe-archive"
 
 
 # ── GET /preview ──────────────────────────────────────────────────────

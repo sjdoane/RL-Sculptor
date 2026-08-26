@@ -8,7 +8,7 @@ underlying Job.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal, Optional
+from typing import Any, Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -458,9 +458,24 @@ class PolicySummary(BaseModel):
     checkpoint_sha256: Annotated[
         str, Field(pattern=r"^[a-f0-9]{64}$")
     ]
-    # Server-authoritative completion decision. Evidence coverage below is
-    # descriptive and must never become a second, task-specific deploy gate.
+    # Backward-compatible boolean for consumers that predate the explicit
+    # status below. True means every deployment precondition was verified; a
+    # checkpoint being downloadable or complete never sets it by itself.
     deployable: bool
+    artifact_purpose: Literal["reproducibility"] = "reproducibility"
+    completion_authority: Literal["attested", "legacy_recovery"]
+    deployment_status: Literal["qualified", "not_certified"] = (
+        "not_certified"
+    )
+    deployment_blockers: list[str] = Field(default_factory=list)
+    physical_scene_status: Literal[
+        "aligned", "misaligned", "not_applicable", "unavailable"
+    ] = "unavailable"
+    lineage_status: Literal["verified", "incomplete", "failed"] = (
+        "incomplete"
+    )
+    origin_receipt_sha256: Optional[str] = None
+    reference_clock_sha256: Optional[str] = None
     primary_metric: Optional[float] = None
     fitness: Optional[float] = None
     reward_version: Optional[str] = None
@@ -480,6 +495,10 @@ class PolicySummary(BaseModel):
     route_evidence: Optional[PolicyEvidenceValue] = None
     contact_evidence: Optional[PolicyEvidenceValue] = None
     hold_evidence: Optional[PolicyEvidenceValue] = None
+    # Content-bound reducer receipt for an explicitly precommitted physical
+    # acceptance contract. When present it supersedes independently
+    # aggregated route/contact/hold values as the pass authority.
+    same_lane_acceptance: Optional[dict[str, Any]] = None
     # Conjunctive, fail-closed interpretation of the exact evidence fields
     # above. ``evidence_status=complete`` means only that three values exist;
     # it never means those values met their declared comparisons.

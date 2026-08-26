@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -1888,3 +1889,18 @@ def test_run_manager_binds_session_to_worker_events_and_exit(
     assert calls[1] == "started"
     assert ("event", "warm_start_loaded") in calls
     assert calls[-1] == "outputs"
+
+
+def test_backend_suite_never_resolves_the_real_knowledge_graph() -> None:
+    """Canary for the autouse `_isolate_knowledge_graph` conftest fixture.
+
+    2026-08-25 audit: two tests in this file built a `RunLineageSession`
+    without `RS_KG_PATH`, so full-suite runs wrote fixture nodes — including
+    a fabricated TRACKS edge with placeholder Tier-D hashes — into the real
+    `~/.local/share/sculptor/kg/graph.db`. If this canary fails, backend
+    tests can pollute the developer's production knowledge graph again."""
+    value = os.environ.get("RS_KG_PATH")
+    assert value, "autouse KG isolation fixture must set RS_KG_PATH"
+    resolved = Path(value).expanduser().resolve()
+    shared_default = (Path.home() / ".local" / "share" / "sculptor").resolve()
+    assert not str(resolved).startswith(str(shared_default))

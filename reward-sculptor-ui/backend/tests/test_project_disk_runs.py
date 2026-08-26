@@ -5,8 +5,8 @@ Covers:
     <project_dir>/runs/iter_* exist and no resident sculpt_run job
     covers them; dedups against resident sculpt_run jobs (live AND
     terminal); absent when there are no iter dirs.
-  - status derives from the LAST iteration's disk state (finished
-    marker → completed; bare dir → errored/"interrupted").
+  - status derives from durable terminal evidence; a bare partial directory
+    does not fabricate an errored post-restart run row.
   - GET /projects/{slug}/iterations disk-truth list (metric fallback,
     dict-shaped metric_history.json, rollout/checkpoint flags).
   - GET /projects/{slug}/iterations/{i}/rollout 200 + 404 (missing and
@@ -124,10 +124,7 @@ def test_project_disk_row_interrupted_last_iter(
 
     r = client.get(f"/projects/{slug}/runs")
     rows = [row for row in r.json() if row["run_id"] == "disk:project"]
-    assert len(rows) == 1
-    assert rows[0]["status"] == "errored"
-    assert rows[0]["error"] == "interrupted"
-    assert rows[0]["iterations_completed"] == 1
+    assert rows == []
 
 
 def test_project_disk_row_preserved_checkpoint_is_evaluation_failure(
@@ -179,11 +176,144 @@ def test_project_disk_row_checkpoint_without_failure_proof_is_interrupted(
 
     r = client.get(f"/projects/{slug}/runs")
     rows = [row for row in r.json() if row["run_id"] == "disk:project"]
-    assert len(rows) == 1
-    assert rows[0]["status"] == "errored"
-    assert rows[0]["error"] == "interrupted"
-    assert rows[0]["error_classification"] is None
-    assert rows[0]["iterations_completed"] == 0
+    assert rows == []
+
+
+def test_project_disk_row_reconciles_verified_terminal_receipt(
+    client: TestClient,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.run_lifecycle import (
+        RunLifecycleSession,
+        build_terminal_run_receipt,
+        write_terminal_run_receipt,
+    )
+    from sculptor import run_manifests
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_project_iter(project_dir, 5, with_completion=False)
+    _seed_project_iter(project_dir, 6, with_completion=False)
+    lifecycle = RunLifecycleSession(
+        run_id="job_0123456789abcdef",
+        expected_iterations=(5, 6),
+    )
+    lifecycle.observe_event({
+        "type": "run_started",
+        "iterations": 2,
+        "start_iter": 5,
+        "end_iter": 7,
+    })
+    iteration_receipts = []
+    for index in (5, 6):
+        lifecycle.observe_event({"type": "iter_started", "iter": index})
+        lifecycle.observe_event({"type": "iter_completed", "iter": index})
+        iteration_receipts.append({
+            "schema": 3,
+            "iter_index": index,
+            "marker_sha256": f"{index + 1:064x}",
+        })
+    receipt = build_terminal_run_receipt(
+        project_slug=slug,
+        lifecycle_proof=lifecycle.finalize_proof(),
+        iteration_receipts=iteration_receipts,
+        started_at="2026-08-25T10:00:00+00:00",
+        completed_at="2026-08-25T10:05:00+00:00",
+    )
+    write_terminal_run_receipt(project_dir, receipt)
+    by_index = {
+        entry["iter_index"]: entry for entry in iteration_receipts
+    }
+    monkeypatch.setattr(
+        run_manifests,
+        "verify_iteration_completion_marker",
+        lambda path: by_index.get(int(Path(path).name.removeprefix("iter_"))),
+    )
+
+    rows = client.get(f"/projects/{slug}/runs").json()
+    row = next(row for row in rows if row["run_id"] == "disk:project")
+    assert row["status"] == "completed"
+    assert row["iterations_requested"] == 2
+    assert row["iterations_completed"] == 2
+    assert row["error"] is None
+
+
+def test_later_failed_iteration_overrides_older_success_receipt(
+    client: TestClient,
+    tmp_projects_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services.run_lifecycle import (
+        RunLifecycleSession,
+        build_terminal_run_receipt,
+        write_terminal_run_receipt,
+    )
+    from sculptor import run_manifests
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_project_iter(project_dir, 0, with_completion=False)
+    _seed_project_iter(project_dir, 1, with_completion=False)
+
+    lifecycle = RunLifecycleSession(
+        run_id="job_older_verified_success",
+        expected_iterations=(0,),
+    )
+    lifecycle.observe_event({
+        "type": "run_started",
+        "iterations": 1,
+        "start_iter": 0,
+        "end_iter": 1,
+    })
+    lifecycle.observe_event({"type": "iter_started", "iter": 0})
+    lifecycle.observe_event({"type": "iter_completed", "iter": 0})
+    iteration_receipt = {
+        "schema": 3,
+        "iter_index": 0,
+        "marker_sha256": "1" * 64,
+    }
+    receipt = build_terminal_run_receipt(
+        project_slug=slug,
+        lifecycle_proof=lifecycle.finalize_proof(),
+        iteration_receipts=[iteration_receipt],
+        started_at="2026-08-25T10:00:00+00:00",
+        completed_at="2026-08-25T10:05:00+00:00",
+    )
+    write_terminal_run_receipt(project_dir, receipt)
+    monkeypatch.setattr(
+        run_manifests,
+        "verify_iteration_completion_marker",
+        lambda path: (
+            iteration_receipt
+            if Path(path).name == "iter_0"
+            else None
+        ),
+    )
+    (project_dir / "runs" / "_run_job_laterfailure.log").write_text(
+        "\n".join([
+            '[SCULPT-EVENT] {"type":"iter_started","iter":1}',
+            '[SCULPT-EVENT] {"type":"iter_progress","rl_iter":100,'
+            '"rl_total":100}',
+            '[SCULPT-EVENT] {"type":"rollout_started"}',
+            "RuntimeError: mjlab rollout runner exited 1",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = client.get(f"/projects/{slug}/runs").json()
+    row = next(row for row in rows if row["run_id"] == "disk:project")
+    assert row["status"] == "errored"
+    assert row["error"] == (
+        "Training checkpoint preserved; evaluation failed"
+    )
+    assert row["error_classification"]["kind"] == (
+        "post_training_rollout_failed"
+    )
+    assert row["error_classification"]["evidence"]["iteration"] == 1
+    assert row["iterations_completed"] == 1
+    assert row["iterations_requested"] == 1
 
 
 def test_project_disk_row_metric_history_from_reports(

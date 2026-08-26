@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from backend.services.reward_store import (
     _extract_reward_spec,
+    _tracking_immutable_hash,
     _validate_manual_tracking_edit,
 )
 from sculptor.refs.track import generate_tracking_residual_reward_source
@@ -133,6 +134,27 @@ def test_manual_tracking_guard_rejects_composition_drift() -> None:
         parent_source, parent_spec, child_source, child_spec,
     )
     assert any("immutable" in violation for violation in violations)
+
+
+def test_manual_tracking_guard_uses_core_clock_authority() -> None:
+    from sculptor.edit import reference_tracking_backbone_sha256
+
+    parent_source = generate_tracking_residual_reward_source(
+        clip=_tracking_clip(), clip_id="clip-a", robot="test_robot",
+    )
+    changed_clock = parent_source.replace(
+        "def reference_clock_batched(info, like):\n",
+        "def reference_clock_batched(info, like):\n"
+        "    raise RuntimeError('changed clock')\n",
+        1,
+    )
+
+    assert _tracking_immutable_hash(parent_source) == (
+        reference_tracking_backbone_sha256(parent_source)
+    )
+    assert _tracking_immutable_hash(changed_clock) != (
+        _tracking_immutable_hash(parent_source)
+    )
 
 
 # ── list + detail ─────────────────────────────────────────────────────

@@ -31,12 +31,14 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict
 
 from backend.models.project import ProblemDetail
+from backend.routes.policies import report_selection_authority
 from backend.services import mission_store
+from backend.services.iteration_completion import iteration_completion_authority
 from backend.services.project_store import ProjectStore
 
 
@@ -78,6 +80,30 @@ def _project_dir(store: ProjectStore, slug: str) -> Path | None:
     return Path(d.project_dir) if d else None
 
 
+def _count_attested_iterations(runs_dir: Path) -> int:
+    if runs_dir.is_symlink() or not runs_dir.is_dir():
+        return 0
+    return sum(
+        1 for iter_dir in runs_dir.iterdir()
+        if iter_dir.is_dir() and not iter_dir.is_symlink()
+        and iteration_completion_authority(iter_dir) == "attested"
+    )
+
+
+def _report_state(source_root: Path, *, source_kind: str) -> dict[str, Any]:
+    try:
+        from sculptor.timelapse import inspect_report_state
+
+        return inspect_report_state(source_root, source_kind=source_kind)
+    except Exception as exc:  # noqa: BLE001 - report authority fails closed
+        return {
+            "state": "stale",
+            "reason": f"report receipt could not be verified: {type(exc).__name__}",
+            "claim_status": "unavailable",
+            "selected_iter_index": None,
+        }
+
+
 # ── GET final_report.md ───────────────────────────────────────────────
 @router.get(
     "/projects/{slug}/reports/final_report.md",
@@ -95,11 +121,7 @@ def get_final_report(slug: str, store: ProjectStore = Depends(get_store)) -> Any
         # iters but report never built. Both return 404 but the detail
         # tells the frontend what to surface.
         runs_dir = pd / "runs"
-        n_completed = 0
-        if runs_dir.is_dir():
-            for d in runs_dir.iterdir():
-                if d.is_dir() and (d / "diagnosis.json").is_file():
-                    n_completed += 1
+        n_completed = _count_attested_iterations(runs_dir)
         if n_completed == 0:
             detail = (
                 "No completed sculpt iters yet. Run one before building a "
@@ -117,8 +139,23 @@ def get_final_report(slug: str, store: ProjectStore = Depends(get_store)) -> Any
             type="/problems/not-found",
             n_completed_iters=n_completed,
         )
+    report_state = _report_state(pd, source_kind="project")
+    markdown = path.read_text(encoding="utf-8")
+    if report_state["state"] == "stale":
+        markdown = (
+            "> **STALE RETAINED REPORT — not current evidence.** "
+            f"{report_state.get('reason') or 'Inputs changed.'}\n\n"
+            + markdown
+        )
     return PlainTextResponse(
-        path.read_text(encoding="utf-8"), media_type="text/markdown"
+        markdown,
+        media_type="text/markdown",
+        headers={
+            "X-RewardSculptor-Report-State": str(report_state["state"]),
+            "X-RewardSculptor-Claim-Status": str(
+                report_state.get("claim_status", "unavailable")
+            ),
+        },
     )
 
 
@@ -138,6 +175,14 @@ def get_final_mp4(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
             404, "timelapse not built",
             detail="No final.mp4 yet. Build the report first.",
             type="/problems/not-found",
+        )
+    report_state = _report_state(pd, source_kind="project")
+    if report_state["state"] != "current":
+        return _problem(
+            409,
+            "timelapse report is stale",
+            detail=str(report_state.get("reason") or "report inputs changed"),
+            type="/problems/stale-report",
         )
     return FileResponse(path, media_type="video/mp4")
 
@@ -193,9 +238,7 @@ def get_mission_final_report(
                 runs_dir = stage_dir / "runs"
                 if not runs_dir.is_dir():
                     continue
-                for d in runs_dir.iterdir():
-                    if d.is_dir() and (d / "diagnosis.json").is_file():
-                        n_completed += 1
+                n_completed += _count_attested_iterations(runs_dir)
         if n_completed == 0:
             detail = (
                 "No completed stage iters yet. Run the mission before "
@@ -214,8 +257,23 @@ def get_mission_final_report(
             type="/problems/not-found",
             n_completed_iters=n_completed,
         )
+    report_state = _report_state(md, source_kind="mission")
+    markdown = path.read_text(encoding="utf-8")
+    if report_state["state"] == "stale":
+        markdown = (
+            "> **STALE RETAINED REPORT — not current evidence.** "
+            f"{report_state.get('reason') or 'Inputs changed.'}\n\n"
+            + markdown
+        )
     return PlainTextResponse(
-        path.read_text(encoding="utf-8"), media_type="text/markdown"
+        markdown,
+        media_type="text/markdown",
+        headers={
+            "X-RewardSculptor-Report-State": str(report_state["state"]),
+            "X-RewardSculptor-Claim-Status": str(
+                report_state.get("claim_status", "unavailable")
+            ),
+        },
     )
 
 
@@ -236,6 +294,14 @@ def get_mission_final_mp4(
             404, "timelapse not built",
             detail="No final.mp4 yet. Build the mission report first.",
             type="/problems/not-found",
+        )
+    report_state = _report_state(md, source_kind="mission")
+    if report_state["state"] != "current":
+        return _problem(
+            409,
+            "timelapse report is stale",
+            detail=str(report_state.get("reason") or "report inputs changed"),
+            type="/problems/stale-report",
         )
     return FileResponse(path, media_type="video/mp4")
 
@@ -384,7 +450,7 @@ def build_report(
 
 
 def _build_project_report_response(pd: Path) -> Any:
-    """Legacy project-runs report path, unchanged from before §chunk C1."""
+    """Build a byte-receipted project report with fail-closed claims."""
     config_path = pd / "config.toml"
     if not config_path.is_file():
         return _problem(
@@ -403,9 +469,11 @@ def _build_project_report_response(pd: Path) -> Any:
         )
 
     try:
+        selection_authority = report_selection_authority(pd)
         result = _build_report(
             config_path=config_path,
             out_mp4=pd / "reports" / "final.mp4",
+            selection_authority=selection_authority,
         )
     except Exception as e:  # noqa: BLE001
         return _problem(
@@ -421,6 +489,10 @@ def _build_project_report_response(pd: Path) -> Any:
         "final_mp4_ok": bool(getattr(result, "final_mp4_ok", False)),
         "selected_iter_indices": list(
             getattr(result, "selected_iter_indices", []) or []
+        ),
+        "report_state": _report_state(pd, source_kind="project"),
+        "claim_status": getattr(
+            result, "report_claim_status", "descriptive_only"
         ),
     }
 
@@ -489,6 +561,12 @@ def _build_mission_report_response(pd: Path, slug: str, mission_slug: str) -> An
         "selected_iter_indices": list(
             getattr(result, "selected_iter_indices", []) or []
         ),
+        "report_state": _report_state(
+            mission_dir_path, source_kind="mission"
+        ),
+        "claim_status": getattr(
+            result, "report_claim_status", "descriptive_only"
+        ),
     }
 
 
@@ -508,10 +586,9 @@ def get_report_sources(slug: str, store: ProjectStore = Depends(get_store)) -> A
         return _problem(404, "project not found", type="/problems/not-found")
 
     runs_dir = pd / "runs"
-    n_iters = 0
-    if runs_dir.is_dir():
-        n_iters = sum(1 for d in runs_dir.iterdir() if d.is_dir() and d.name.startswith("iter_"))
-    project_has_report = (pd / "reports" / "final_report.md").is_file()
+    n_iters = _count_attested_iterations(runs_dir)
+    project_report_state = _report_state(pd, source_kind="project")
+    project_has_report = project_report_state["state"] != "missing"
 
     missions: list[dict[str, Any]] = []
     for mission_slug in mission_store.list_mission_slugs(pd):
@@ -519,14 +596,20 @@ def get_report_sources(slug: str, store: ProjectStore = Depends(get_store)) -> A
         summary = mission_store.load_mission_summary(pd, slug, mission_slug)
         if summary is None:
             continue
+        mission_report_state = _report_state(mdir, source_kind="mission")
         missions.append({
             "mission_slug": mission_slug,
             "goal": summary.goal,
             "lifecycle": summary.lifecycle,
-            "has_report": (mdir / "reports" / "final_report.md").is_file(),
+            "has_report": mission_report_state["state"] != "missing",
+            "report_state": mission_report_state,
         })
 
     return {
-        "project_runs": {"n_iters": n_iters, "has_report": project_has_report},
+        "project_runs": {
+            "n_iters": n_iters,
+            "has_report": project_has_report,
+            "report_state": project_report_state,
+        },
         "missions": missions,
     }
