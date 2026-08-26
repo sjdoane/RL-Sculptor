@@ -179,6 +179,8 @@ TIER_D_DONOR_INTERFACE_SCHEMA = (
 TIER_D_DONOR_INTERFACE_FILENAME = "tier_d_interface_contract.json"
 TIER_D_REFERENCE_CADENCE = "generated-target-control-phase-clock-v3"
 REFERENCE_TARGET_SAMPLING = "nearest_frame_endpoint_inclusive"
+REFERENCE_TARGET_IDENTITY_SCHEMA = "reference-tracking-target-v2"
+REFERENCE_TERMINAL_HOLD = "final_pose_zero_joint_velocity"
 TIER_D_RUNTIME_ARTIFACT_SCHEMA = "reward-sculptor-tier-d-runtime-artifacts-v2"
 RUNNER_RUNTIME_ARTIFACT_SCHEMA = "reward-sculptor-runner-artifacts-v2"
 TIER_D_CONTINUATION_SCHEMA = "reward-sculptor-tier-d-continuation-v1"
@@ -1078,15 +1080,17 @@ def build_tierd_execution_contract(
     (
         target_names,
         target_joint_pos,
+        target_joint_vel,
         target_root_z,
         target_gravity,
     ) = _tracking_targets_from_clip(clip, n_phase_targets=n_phase_targets)
     if target_names != reference_joints:
         raise TrackError("Tier-D generated target joint order is inconsistent")
     expected_target_sha = reference_target_sha256(
-        _tracking_reference_target_payload(
+        reference_tracking_target_payload(
             joint_names=target_names,
             target_joint_pos=target_joint_pos,
+            target_joint_vel=target_joint_vel,
             target_root_z=target_root_z,
             target_gravity=target_gravity,
             root_frame=clip_root_frame(clip),
@@ -2026,23 +2030,55 @@ def _format_array_literal(arr: np.ndarray, *, ndigits: int = 5) -> str:
     ) + "\n]"
 
 
-def _tracking_reference_target_payload(
+def reference_tracking_target_payload(
     *,
     joint_names: list[str],
     target_joint_pos: np.ndarray,
+    target_joint_vel: np.ndarray,
     target_root_z: np.ndarray,
     target_gravity: Optional[np.ndarray],
     root_frame: str,
+    phase_mode: str = "hold",
 ) -> dict[str, Any]:
-    """Canonical data-only identity of the embedded Tier-D target tables."""
+    """Canonical versioned identity of every executed tracking target.
+
+    Joint velocity and the post-duration hold rule are execution semantics,
+    not advisory metadata: the flat mission reward scores velocity and swaps
+    its terminal velocity target to zero.  Omitting either let two different
+    reward programs advertise the same ``REFERENCE_TARGET_SHA256``.
+    """
+    if phase_mode not in {"hold", "loop"}:
+        raise ValueError("reference target phase_mode must be hold or loop")
+    joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
+    joint_vel = np.asarray(target_joint_vel, dtype=np.float64)
+    root_z = np.asarray(target_root_z, dtype=np.float64)
+    if joint_pos.ndim != 2 or joint_vel.shape != joint_pos.shape:
+        raise ValueError(
+            "reference joint position/velocity targets must share shape (K, J)"
+        )
+    if root_z.shape != (joint_pos.shape[0],):
+        raise ValueError("reference root-z targets must align with phase rows")
+    gravity = None
+    if target_gravity is not None:
+        gravity = np.asarray(target_gravity, dtype=np.float64)
+        if gravity.shape != (joint_pos.shape[0], 3):
+            raise ValueError(
+                "reference gravity targets must have shape (K, 3)"
+            )
     return {
+        "schema": REFERENCE_TARGET_IDENTITY_SCHEMA,
+        "sampling": REFERENCE_TARGET_SAMPLING,
+        "phase_mode": phase_mode,
+        "terminal_hold": (
+            REFERENCE_TERMINAL_HOLD if phase_mode == "hold" else None
+        ),
         "joint_names": [str(name) for name in joint_names],
-        "joint_pos": np.round(target_joint_pos, 5).tolist(),
-        "root_z": np.round(target_root_z, 5).tolist(),
+        "joint_pos": np.round(joint_pos, 5).tolist(),
+        "joint_vel": np.round(joint_vel, 5).tolist(),
+        "root_z": np.round(root_z, 5).tolist(),
         "root_frame": root_frame,
         "gravity": (
-            np.round(target_gravity, 5).tolist()
-            if target_gravity is not None else None
+            np.round(gravity, 5).tolist() if gravity is not None else None
         ),
     }
 
@@ -2077,7 +2113,9 @@ def _tracking_targets_from_clip(
     clip: dict[str, Any],
     *,
     n_phase_targets: int,
-) -> tuple[list[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[
+    list[str], np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]
+]:
     """Derive the one authoritative set of Tier-D embedded target tables."""
     joint_names = [str(name) for name in (clip.get("joint_names") or [])]
     joint_pos = np.asarray(clip.get("joint_pos"), dtype=np.float64)
@@ -2093,6 +2131,25 @@ def _tracking_targets_from_clip(
     target_joint_pos = downsample_phase_targets(
         joint_pos, n=n_phase_targets,
     )
+    source_joint_vel = clip.get("joint_vel")
+    if source_joint_vel is None:
+        fps = float(clip.get("fps") or 0.0)
+        if joint_pos.shape[0] <= 1:
+            source_joint_vel = np.zeros_like(joint_pos)
+        elif fps > 0.0:
+            source_joint_vel = np.gradient(joint_pos, axis=0) * fps
+        else:
+            raise TrackError(
+                "Tier-D clip without joint_vel requires positive fps"
+            )
+    source_joint_vel = np.asarray(source_joint_vel, dtype=np.float64)
+    if source_joint_vel.shape != joint_pos.shape:
+        raise TrackError(
+            "Tier-D clip joint_vel must align with joint_pos"
+        )
+    target_joint_vel = downsample_phase_targets(
+        source_joint_vel, n=n_phase_targets,
+    )
     target_root_z = downsample_phase_targets(root_z, n=n_phase_targets)
     target_gravity: Optional[np.ndarray] = None
     quat = clip.get("root_quat_wxyz")
@@ -2103,7 +2160,13 @@ def _tracking_targets_from_clip(
         )
         norm = np.linalg.norm(target_gravity, axis=1, keepdims=True)
         target_gravity = target_gravity / np.where(norm > 0.0, norm, 1.0)
-    return joint_names, target_joint_pos, target_root_z, target_gravity
+    return (
+        joint_names,
+        target_joint_pos,
+        target_joint_vel,
+        target_root_z,
+        target_gravity,
+    )
 
 
 def build_tierd_reference_clock(
@@ -2114,13 +2177,14 @@ def build_tierd_reference_clock(
     n_phase_targets: int = N_PHASE_TARGETS,
 ) -> dict[str, Any]:
     """Build the exact clock/target identity a Tier-D tracker must execute."""
-    names, joint_pos, root_z, gravity = _tracking_targets_from_clip(
+    names, joint_pos, joint_vel, root_z, gravity = _tracking_targets_from_clip(
         clip, n_phase_targets=n_phase_targets,
     )
     target_sha = reference_target_sha256(
-        _tracking_reference_target_payload(
+        reference_tracking_target_payload(
             joint_names=names,
             target_joint_pos=joint_pos,
+            target_joint_vel=joint_vel,
             target_root_z=root_z,
             target_gravity=gravity,
             root_frame=clip_root_frame(clip),
@@ -2149,6 +2213,7 @@ def generate_tracking_reward_source(
     target_joint_pos: np.ndarray,
     target_root_z: np.ndarray,
     episode_len_steps: int,
+    target_joint_vel: Optional[np.ndarray] = None,
     duration_s: float = 0.0,
     target_gravity: Optional[np.ndarray] = None,
     joint_err_weight: float = JOINT_ERR_WEIGHT,
@@ -2180,10 +2245,11 @@ def generate_tracking_reward_source(
     the module source itself rather than as a sibling file the reward
     reads at runtime.
 
-    reward = joint_term_scale * exp(-joint_err_weight * mean_joint_err_rad**2)
-           + root_term_scale  * exp(-root_err_weight  * root_z_err_m**2)
-    with an optional lower-mass orientation kernel, normalized back to the
-    historical maximum return. `joint_names` is
+    The joint term is a fixed blend of position and velocity kernels. During
+    a terminal hold the final pose remains the position target and zero joint
+    velocity becomes the velocity target. The root and optional lower-mass
+    orientation kernels are normalized with that blended joint term back to
+    the historical maximum return. `joint_names` is
     the SAME order as `target_joint_pos` columns and is asserted against
     `qpos`'s trailing (actuated-joint) slice length at reward-call time
     via `len(joint_names)` — a project.joint-count mismatch raises inside
@@ -2224,6 +2290,14 @@ def generate_tracking_reward_source(
             f"{target_joint_pos.shape[1]} vs {len(joint_names)}")
     n_phase = target_joint_pos.shape[0]
     n_joints = target_joint_pos.shape[1]
+    if target_joint_vel is None:
+        target_joint_vel = np.zeros_like(target_joint_pos, dtype=np.float64)
+    target_joint_vel = np.asarray(target_joint_vel, dtype=np.float64)
+    if target_joint_vel.shape != target_joint_pos.shape:
+        raise ValueError(
+            "target_joint_vel must match target_joint_pos shape: "
+            f"{target_joint_vel.shape} vs {target_joint_pos.shape}"
+        )
 
     if target_gravity is not None:
         target_gravity = np.asarray(target_gravity, dtype=np.float64)
@@ -2233,6 +2307,7 @@ def generate_tracking_reward_source(
                 f"targets: {target_gravity.shape} vs {(n_phase, 3)}")
 
     joint_pos_literal = _format_array_literal(target_joint_pos)
+    joint_vel_literal = _format_array_literal(target_joint_vel)
     root_z_literal = _format_array_literal(target_root_z)
     names_literal = "[" + ", ".join(repr(str(n)) for n in joint_names) + "]"
     gravity_literal = (
@@ -2262,9 +2337,10 @@ def generate_tracking_reward_source(
         reference_target_sha256,
     )
 
-    rounded_targets = _tracking_reference_target_payload(
+    rounded_targets = reference_tracking_target_payload(
         joint_names=joint_names,
         target_joint_pos=target_joint_pos,
+        target_joint_vel=target_joint_vel,
         target_root_z=target_root_z,
         target_gravity=target_gravity,
         root_frame=root_frame,
@@ -2297,6 +2373,12 @@ from __future__ import annotations
 
 import numpy as np
 
+REFERENCE_TARGET_SHA256 = {target_hash!r}
+REFERENCE_TARGET_IDENTITY_SCHEMA = {REFERENCE_TARGET_IDENTITY_SCHEMA!r}
+REFERENCE_TARGET_SAMPLING = {REFERENCE_TARGET_SAMPLING!r}
+REFERENCE_PHASE_MODE = "hold"
+REFERENCE_TERMINAL_HOLD = {REFERENCE_TERMINAL_HOLD!r}
+
 REWARD_SPEC: dict = {{
     "version": "tierD-track-v2",
     "description": "DeepMimic-style phase-indexed tracking reward for "
@@ -2317,6 +2399,9 @@ REWARD_SPEC: dict = {{
     "root_height_frame": {root_frame!r},
     "hyperparameters": {{
         "joint_err_weight": {joint_err_weight!r},
+        "joint_vel_err_weight": 0.10,
+        "joint_position_share": 0.75,
+        "joint_velocity_share": 0.25,
         "root_err_weight": {root_err_weight!r},
         "orientation_err_weight": {orientation_weight!r},
         "joint_term_scale": {float(joint_term_scale)!r},
@@ -2346,6 +2431,9 @@ EPISODE_LEN_STEPS = {episode_len_steps!r}
 REFERENCE_DURATION_S = {effective_duration_s!r}
 REFERENCE_ROOT_FRAME = {root_frame!r}
 JOINT_ERR_WEIGHT = {joint_err_weight!r}
+JOINT_VEL_ERR_WEIGHT = 0.10
+JOINT_POSITION_SHARE = 0.75
+JOINT_VELOCITY_SHARE = 0.25
 ROOT_ERR_WEIGHT = {root_err_weight!r}
 # 0.0 when the clip carries no root orientation, which makes the orientation
 # term an exact no-op rather than a silently-wrong constant.
@@ -2360,6 +2448,7 @@ ORIENTATION_TERM_COEFFICIENT = {orientation_term_coefficient!r}
 
 # Phase-indexed targets, shape (N_PHASE, N_JOINTS) / (N_PHASE,).
 TARGET_JOINT_POS = np.asarray({joint_pos_literal}, dtype=np.float64).reshape(N_PHASE, N_JOINTS)
+TARGET_JOINT_VEL = np.asarray({joint_vel_literal}, dtype=np.float64).reshape(N_PHASE, N_JOINTS)
 TARGET_ROOT_Z = np.asarray({root_z_literal}, dtype=np.float64)
 # Unit gravity in the body frame, derived from the clip's root_quat_wxyz. Yaw-
 # invariant on purpose: retargeting zeroes root translation, so a heading
@@ -2409,19 +2498,34 @@ def reference_target_index_batched(info, like):
 def compute_reward(state, action, next_state, info):
     del action  # tracking reward does not penalize control effort
     qpos = np.asarray(next_state["qpos"], dtype=np.float64)
-    if qpos.shape[0] < 7 + N_JOINTS:
+    qvel = np.asarray(next_state["qvel"], dtype=np.float64)
+    if qpos.shape[0] < 7 + N_JOINTS or qvel.shape[0] < N_JOINTS:
         raise ValueError(
-            f"qpos too short for {{N_JOINTS}} tracked joints: "
-            f"shape={{qpos.shape}}")
+            f"qpos/qvel too short for {{N_JOINTS}} tracked joints: "
+            f"shapes={{qpos.shape}}/{{qvel.shape}}")
     root_z = float(qpos[2])
     joint_pos = qpos[7:7 + N_JOINTS]
 
     i = _phase_index(info)
     target_joint = TARGET_JOINT_POS[i]
+    target_joint_vel = TARGET_JOINT_VEL[i]
     target_root_z = TARGET_ROOT_Z[i]
 
+    step = int(info.get("episode_length", 0) or 0)
+    step_dt = float(info.get("step_dt", 0.0) or 0.0)
+    terminal_hold = (
+        step * step_dt >= REFERENCE_DURATION_S
+        if step_dt > 0.0 and REFERENCE_DURATION_S > 0.0
+        else EPISODE_LEN_STEPS > 0 and step >= EPISODE_LEN_STEPS
+    )
+    if REFERENCE_PHASE_MODE == "hold" and terminal_hold:
+        target_joint_vel = np.zeros_like(target_joint_vel)
+
     joint_err = joint_pos - target_joint
+    joint_vel = qvel[-N_JOINTS:]
+    joint_vel_err = joint_vel - target_joint_vel
     mean_joint_err_sq = float(np.mean(joint_err ** 2))
+    mean_joint_vel_err_sq = float(np.mean(joint_vel_err ** 2))
     if REFERENCE_ROOT_FRAME == "absolute":
         root_err = root_z - float(target_root_z)
     else:
@@ -2429,7 +2533,13 @@ def compute_reward(state, action, next_state, info):
         actual_delta = float(info.get("base_height_delta", root_z - root0))
         root_err = actual_delta - (float(target_root_z) - root0)
 
-    joint_term = float(np.exp(-JOINT_ERR_WEIGHT * mean_joint_err_sq))
+    joint_pos_term = float(np.exp(-JOINT_ERR_WEIGHT * mean_joint_err_sq))
+    joint_vel_term = float(np.exp(
+        -JOINT_VEL_ERR_WEIGHT * mean_joint_vel_err_sq))
+    joint_term = (
+        JOINT_POSITION_SHARE * joint_pos_term
+        + JOINT_VELOCITY_SHARE * joint_vel_term
+    )
     root_term = float(np.exp(-ROOT_ERR_WEIGHT * (root_err ** 2)))
 
     joint_contribution = JOINT_TERM_COEFFICIENT * joint_term
@@ -2469,22 +2579,46 @@ def compute_reward_batched(state, action, next_state, info):
 
     del state, action
     qpos = next_state["qpos"]
-    if qpos.shape[-1] < N_JOINTS:
+    qvel = next_state["qvel"]
+    if qpos.shape[-1] < N_JOINTS or qvel.shape[-1] < N_JOINTS:
         raise ValueError(
-            f"batched qpos has {{qpos.shape[-1]}} columns, fewer than the "
-            f"{{N_JOINTS}} tracked joints")
+            f"batched qpos/qvel have {{qpos.shape[-1]}}/{{qvel.shape[-1]}} "
+            f"columns, fewer than the {{N_JOINTS}} tracked joints")
     like = qpos[:, 0]
 
     i = reference_target_index_batched(info, like)
 
     target_joint = torch.as_tensor(
         TARGET_JOINT_POS, device=qpos.device, dtype=qpos.dtype)[i]
+    target_joint_vel = torch.as_tensor(
+        TARGET_JOINT_VEL, device=qvel.device, dtype=qvel.dtype)[i]
     target_root = torch.as_tensor(
         TARGET_ROOT_Z, device=qpos.device, dtype=qpos.dtype)[i]
 
+    step = info.get("episode_length", torch.zeros_like(like))
+    step_dt = info.get("step_dt", None)
+    if REFERENCE_PHASE_MODE == "hold":
+        terminal_hold = (
+            step * step_dt >= REFERENCE_DURATION_S
+            if step_dt is not None and REFERENCE_DURATION_S > 0.0
+            else step >= EPISODE_LEN_STEPS
+        )
+        target_joint_vel = torch.where(
+            terminal_hold[:, None],
+            torch.zeros_like(target_joint_vel),
+            target_joint_vel,
+        )
+
     joint_err = qpos[:, -N_JOINTS:] - target_joint
-    joint_term = torch.exp(
+    joint_vel_err = qvel[:, -N_JOINTS:] - target_joint_vel
+    joint_pos_term = torch.exp(
         -JOINT_ERR_WEIGHT * torch.mean(joint_err ** 2, dim=-1))
+    joint_vel_term = torch.exp(
+        -JOINT_VEL_ERR_WEIGHT * torch.mean(joint_vel_err ** 2, dim=-1))
+    joint_term = (
+        JOINT_POSITION_SHARE * joint_pos_term
+        + JOINT_VELOCITY_SHARE * joint_vel_term
+    )
 
     root0 = float(TARGET_ROOT_Z[0])
     base_height = info.get("base_height", torch.zeros_like(like))
@@ -2575,9 +2709,10 @@ def generate_tracking_residual_reward_source(
     # parent→child identity checked after every LLM rewrite.
     root_frame = clip_root_frame(clip)
     target_hash = reference_target_sha256(
-        _tracking_reference_target_payload(
+        reference_tracking_target_payload(
             joint_names=[str(name) for name in meta["joint_names"]],
             target_joint_pos=joint_pos,
+            target_joint_vel=joint_vel,
             target_root_z=root_pos[:, 2],
             target_gravity=gravity,
             root_frame=root_frame,
@@ -2619,7 +2754,9 @@ from __future__ import annotations
 import numpy as np
 
 REFERENCE_TARGET_SHA256 = {target_hash!r}
+REFERENCE_TARGET_IDENTITY_SCHEMA = {REFERENCE_TARGET_IDENTITY_SCHEMA!r}
 REFERENCE_TARGET_SAMPLING = {REFERENCE_TARGET_SAMPLING!r}
+REFERENCE_TERMINAL_HOLD = {REFERENCE_TERMINAL_HOLD!r}
 REFERENCE_JOINT_NAMES = {names_literal}
 REFERENCE_N_PHASES = {n_phase_targets}
 REFERENCE_N_JOINTS = {n_joints}
@@ -2651,6 +2788,9 @@ REWARD_SPEC: dict = {{
         "reference_clip_id": {clip_id!r},
         "reference_robot": {robot!r},
         "reference_target_sha256": {target_hash!r},
+        "reference_target_identity_schema": {REFERENCE_TARGET_IDENTITY_SCHEMA!r},
+        "reference_target_sampling": {REFERENCE_TARGET_SAMPLING!r},
+        "terminal_hold": {REFERENCE_TERMINAL_HOLD!r},
         "tracking_weight": 1.0,
         "residual_max": {float(residual_max)!r},
         "phase_mode": {phase_mode!r},
@@ -3554,6 +3694,7 @@ def _score_tierd_rollout_artifact(
         (
             target_names,
             target_joint_pos,
+            _target_joint_vel,
             target_root_z,
             target_gravity,
         ) = _tracking_targets_from_clip(
@@ -3918,6 +4059,7 @@ def build_track_project(
     (
         target_joint_names,
         target_joint_pos,
+        target_joint_vel,
         target_root_z,
         target_gravity,
     ) = _tracking_targets_from_clip(
@@ -3952,6 +4094,7 @@ def build_track_project(
         robot=robot,
         joint_names=joint_names,
         target_joint_pos=target_joint_pos,
+        target_joint_vel=target_joint_vel,
         target_root_z=target_root_z,
         episode_len_steps=episode_len_steps,
         duration_s=duration_s,
@@ -6006,6 +6149,7 @@ def verify_tierd_certificate(
         (
             target_names,
             target_joint_pos,
+            target_joint_vel,
             target_root_z,
             target_gravity,
         ) = _tracking_targets_from_clip(
@@ -6013,9 +6157,10 @@ def verify_tierd_certificate(
             n_phase_targets=phase_target_count,
         )
         expected_target_sha = reference_target_sha256(
-            _tracking_reference_target_payload(
+            reference_tracking_target_payload(
                 joint_names=target_names,
                 target_joint_pos=target_joint_pos,
+                target_joint_vel=target_joint_vel,
                 target_root_z=target_root_z,
                 target_gravity=target_gravity,
                 root_frame=current_root_frame,

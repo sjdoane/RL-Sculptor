@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -75,6 +76,60 @@ def test_exact_reference_pair_loads_without_fallback(
     assert len(clip_sha) == 64
     with pytest.raises(ReferenceRunError, match="missing"):
         load_exact_reference_motion(clip_id=clip_id, robot="other")
+
+
+def test_exact_reference_load_rejects_stale_digest_before_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor import reference_run
+
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path))
+    clip_id = _register_gait(tmp_path)
+    provenance_path = (
+        library.clip_dir("demo", clip_id, root=tmp_path)
+        / library.PROVENANCE_FILENAME
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["content_sha256"] = "0" * 64
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    decoded = False
+
+    def _must_not_decode(_path):
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("stale bytes reached the decoder")
+
+    monkeypatch.setattr(reference_run, "load_clip", _must_not_decode)
+    with pytest.raises(ReferenceRunError, match="content_sha256"):
+        load_exact_reference_motion(clip_id=clip_id, robot="demo")
+    assert decoded is False
+
+
+def test_exact_reference_load_decodes_the_captured_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path))
+    clip_id = _register_gait(tmp_path)
+    original_capture = library.capture_reference_artifact_snapshot
+    clip_path = (
+        library.clip_dir("demo", clip_id, root=tmp_path)
+        / library.CLIP_FILENAME
+    )
+
+    def _capture_then_swap(robot: str, selected_clip_id: str):
+        snapshot = original_capture(robot, selected_clip_id)
+        clip_path.write_bytes(b"not an npz")
+        return snapshot
+
+    monkeypatch.setattr(
+        library, "capture_reference_artifact_snapshot", _capture_then_swap,
+    )
+    clip, _provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot="demo",
+    )
+
+    assert clip["joint_names"] == ["left_joint", "right_joint"]
+    assert clip_sha256 != hashlib.sha256(clip_path.read_bytes()).hexdigest()
 
 
 def test_dry_run_builds_certified_one_shot_immutable_motion_prior(
@@ -188,8 +243,8 @@ def test_reference_input_hash_binds_goal_and_clip_content() -> None:
     legacy = hashlib.sha256(json.dumps(
         legacy_payload, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    assert REFERENCE_INPUT_HASH_SCHEMA == "reference-guided-input-v2"
-    assert base != legacy, "old endpoint-exclusive cache keys must miss"
+    assert REFERENCE_INPUT_HASH_SCHEMA == "reference-guided-input-v3"
+    assert base != legacy, "old target/runtime cache keys must miss"
 
 
 def test_flat_reference_terminal_target_and_hash_include_final_clip_sample():
@@ -233,6 +288,96 @@ def test_flat_reference_terminal_target_and_hash_include_final_clip_sample():
         original_ns["REFERENCE_TARGET_SHA256"]
         != changed_ns["REFERENCE_TARGET_SHA256"]
     )
+
+
+def test_flat_reference_target_identity_binds_velocity_and_hold_semantics():
+    from sculptor.reference_clock import reference_target_sha256
+    from sculptor.refs.track import (
+        REFERENCE_TARGET_IDENTITY_SCHEMA,
+        generate_tracking_residual_reward_source,
+        reference_tracking_target_payload,
+    )
+
+    clip = {
+        "fps": 20.0,
+        "joint_names": ["left", "right"],
+        "joint_pos": np.zeros((12, 2), dtype=np.float64),
+        "joint_vel": np.zeros((12, 2), dtype=np.float64),
+        "root_pos_z": np.full(12, 0.7, dtype=np.float64),
+    }
+    faster = {**clip, "joint_vel": np.full((12, 2), 3.0)}
+    base_ns: dict = {}
+    faster_ns: dict = {}
+    exec(compile(generate_tracking_residual_reward_source(
+        clip=clip, clip_id="velocity-identity", robot="g1",
+    ), "base_velocity", "exec"), base_ns)  # noqa: S102
+    exec(compile(generate_tracking_residual_reward_source(
+        clip=faster, clip_id="velocity-identity", robot="g1",
+    ), "faster_velocity", "exec"), faster_ns)  # noqa: S102
+
+    assert base_ns["REFERENCE_TARGET_IDENTITY_SCHEMA"] == (
+        REFERENCE_TARGET_IDENTITY_SCHEMA
+    )
+    assert (
+        base_ns["REFERENCE_TARGET_SHA256"]
+        != faster_ns["REFERENCE_TARGET_SHA256"]
+    )
+    common = dict(
+        joint_names=["left", "right"],
+        target_joint_pos=np.zeros((2, 2)),
+        target_joint_vel=np.zeros((2, 2)),
+        target_root_z=np.zeros(2),
+        target_gravity=None,
+        root_frame="origin_relative",
+    )
+    hold_sha = reference_target_sha256(reference_tracking_target_payload(
+        **common, phase_mode="hold",
+    ))
+    loop_sha = reference_target_sha256(reference_tracking_target_payload(
+        **common, phase_mode="loop",
+    ))
+    assert hold_sha != loop_sha
+
+
+def test_flat_runtime_digest_binds_every_executable_authority():
+    from sculptor.edit import (
+        _REFERENCE_KERNEL_FUNCTIONS,
+        reference_tracking_backbone_sha256,
+    )
+    from sculptor.refs.track import generate_tracking_residual_reward_source
+
+    source = generate_tracking_residual_reward_source(
+        clip={
+            "fps": 20.0,
+            "joint_names": ["left", "right"],
+            "joint_pos": np.zeros((12, 2), dtype=np.float64),
+            "root_pos_z": np.full(12, 0.7, dtype=np.float64),
+        },
+        clip_id="runtime-authority",
+        robot="g1",
+    )
+    baseline = reference_tracking_backbone_sha256(source)
+    assert baseline is not None
+    for function_name in _REFERENCE_KERNEL_FUNCTIONS:
+        tree = ast.parse(source)
+        target = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == function_name
+        )
+        target.body = [ast.Raise(
+            exc=ast.Call(
+                func=ast.Name(id="RuntimeError", ctx=ast.Load()),
+                args=[ast.Constant(value="mutated runtime authority")],
+                keywords=[],
+            ),
+            cause=None,
+        )]
+        ast.fix_missing_locations(tree)
+        mutated = ast.unparse(tree)
+        assert reference_tracking_backbone_sha256(mutated) != baseline, (
+            function_name
+        )
 
 
 def test_reference_run_promotes_one_atomic_tuple_and_resumes_idempotently(
@@ -774,7 +919,7 @@ def test_same_named_phase_reward_is_not_reused_after_clip_bytes_change(
     ) / library.CLIP_FILENAME
     clip_path.write_bytes(clip_path.read_bytes() + b"\n")
 
-    with pytest.raises(ValueError, match="clip_sha256"):
+    with pytest.raises(ReferenceRunError, match="content_sha256"):
         _prepare_reference_guided_run(
             adapter=adapter,
             project=project,

@@ -8,6 +8,7 @@ detection, summary table.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import textwrap
 from pathlib import Path
@@ -15,12 +16,25 @@ from pathlib import Path
 import pytest
 
 from sculptor.timelapse import (
+    _canonical_digest,
     _collect_iter_edits,
+    _completion_receipt,
     _describe_behavior,
+    _find_iter_dirs,
+    _report_claim_inputs,
     _select_iter_indices,
     build_mission_report,
     build_report,
+    inspect_report_state,
 )
+from sculptor.run_manifests import (
+    build_completion_manifest,
+    build_rollout_input_manifest,
+    build_train_input_manifest,
+    manifest_sha256,
+    write_json_atomic,
+)
+from sculptor.sculpt import _write_iteration_completion_marker
 
 
 def test_select_iter_indices_edges():
@@ -68,6 +82,121 @@ def test_collect_iter_edits_attributes_delta_to_next_iter(tmp_path: Path):
 
 
 # ── Fixture writer ──────────────────────────────────────────────────────
+class _ReceiptAdapter:
+    env_id = "report-test"
+    robot = "unit"
+    control_dt = 0.02
+
+
+def _attest_iteration(project: Path, iteration: int) -> None:
+    """Write exact schema-3 phase and completion receipts for a fixture."""
+    iter_dir = project / "runs" / f"iter_{iteration}"
+    rollout_dir = iter_dir / "rollout"
+    checkpoint = iter_dir / "checkpoint.pt"
+    if not checkpoint.is_file():
+        checkpoint.write_bytes(f"checkpoint:{iteration}".encode())
+    trajectory = rollout_dir / "trajectory.npz"
+    if not trajectory.is_file():
+        trajectory.write_bytes(f"trajectory:{iteration}".encode())
+    reward = project / "rewards" / f"v{iteration}.py"
+    adapter = _ReceiptAdapter()
+    request = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        reward_module_path=reward,
+        steps=1000,
+        seed=iteration,
+        init_policy_path=None,
+        init_policy_mode="actor_critic",
+    )
+    train_input = {
+        **request,
+        "request_manifest_sha256": manifest_sha256(request),
+        "effective_initialization": {
+            "mode": None,
+            "policy": None,
+            "forwarded_to_adapter": False,
+        },
+    }
+    rollout_input = build_rollout_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        checkpoint_path=checkpoint,
+        reward_module_path=reward,
+        n_episodes=1,
+        seed=iteration,
+        max_episode_steps=None,
+        playback_speed=None,
+        render_every=None,
+        fps=None,
+        render_width=None,
+        render_height=None,
+        render_env_index=None,
+    )
+    write_json_atomic(iter_dir / "train_request_manifest.json", request)
+    write_json_atomic(iter_dir / "train_input_manifest.json", train_input)
+    write_json_atomic(
+        iter_dir / "train_completion_manifest.json",
+        build_completion_manifest(train_input, [checkpoint]),
+    )
+    write_json_atomic(
+        rollout_dir / "rollout_input_manifest.json", rollout_input,
+    )
+    write_json_atomic(
+        rollout_dir / "rollout_completion_manifest.json",
+        build_completion_manifest(
+            rollout_input,
+            [
+                rollout_dir / "rollout.mp4",
+                trajectory,
+                rollout_dir / "behavior.json",
+            ],
+        ),
+    )
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=iteration,
+        checkpoint_path=checkpoint,
+        reward_version_before=iteration,
+        reward_version_after=None,
+        world_selection_hash=None,
+    )
+
+
+def _verified_report_authority(project: Path, selected: int) -> dict:
+    selection_path = project / "reports" / "selection.json"
+    selection_path.write_text(json.dumps({
+        "schema": 1,
+        "selected_iter_index": selected,
+        "selection_source": "objective_criterion",
+        "candidates": [
+            {"iter_index": selected, "selected": True, "criterion_pass": True},
+        ],
+    }), encoding="utf-8")
+    iter_dir = project / "runs" / f"iter_{selected}"
+    completion = _completion_receipt(iter_dir)
+    assert completion is not None
+    claim_inputs = _report_claim_inputs(iter_dir, completion)
+    objective = {"objective_proof_status": "passed"}
+    authority = {
+        "schema": 1,
+        "status": "verified",
+        "selected_iter_index": selected,
+        "selection_source": "objective_criterion",
+        "selection_receipt_sha256": hashlib.sha256(
+            selection_path.read_bytes()
+        ).hexdigest(),
+        "selected_checkpoint_sha256": completion["checkpoint_sha256"],
+        "claim_inputs": claim_inputs,
+        "claim_inputs_sha256": _canonical_digest(claim_inputs),
+        "objective_evidence_receipt": objective,
+        "objective_evidence_sha256": _canonical_digest(objective),
+        "blockers": [],
+    }
+    authority["authority_digest"] = _canonical_digest(authority)
+    return authority
+
+
 def _write_project(tmp_path: Path, *, n_iters: int,
                    metric_history: list[float]) -> Path:
     project = tmp_path / "proj"
@@ -163,6 +292,7 @@ def _write_project_at(project: Path, *, n_iters: int,
         }
         (iter_dir / "diagnosis.json").write_text(
             json.dumps(diag, indent=2), encoding="utf-8")
+        _attest_iteration(project, i)
 
     # metric_history.json
     (project / "reports" / "metric_history.json").write_text(json.dumps({
@@ -237,9 +367,11 @@ def test_build_report_produces_md_and_calls_mp4_builder(tmp_path: Path, monkeypa
     assert "novel_term_0" in md
     # Retired entries with still_active=false are omitted.
     assert "removed_term" not in md.lower()
+    assert result.report_claim_status == "descriptive_only"
+    assert "**Selected**" not in md
 
 
-def test_report_uses_best_completed_policy_and_its_pinned_reward(
+def test_report_uses_canonical_selection_and_its_pinned_reward(
     tmp_path: Path,
 ):
     project = _write_project(
@@ -250,22 +382,22 @@ def test_report_uses_best_completed_policy_and_its_pinned_reward(
     fitness_values = [0.1, 0.2, 0.9, 0.3]
     for i, fitness in enumerate(fitness_values):
         iter_dir = project / "runs" / f"iter_{i}"
-        (iter_dir / "iteration_complete.json").write_text(
-            json.dumps({"state": "completed", "iter": i}),
-            encoding="utf-8",
-        )
         (iter_dir / "fitness.json").write_text(
             json.dumps({"fitness": fitness}),
             encoding="utf-8",
         )
 
-    selected = project / "runs" / "iter_2"
+    selected = project / "runs" / "iter_1"
+    selected_reward_sha = hashlib.sha256(
+        (project / "rewards" / "v1.py").read_bytes()
+    ).hexdigest()
     (selected / "artifact_tuple.json").write_text(
         json.dumps({
             "refs": {
                 "reward": {
                     "path": "rewards/v1.py",
                     "version": "v1",
+                    "sha256": selected_reward_sha,
                 },
             },
         }),
@@ -275,14 +407,119 @@ def test_report_uses_best_completed_policy_and_its_pinned_reward(
     result = build_report(
         config_path=project / "config.toml",
         out_mp4=tmp_path / "final.mp4",
+        selection_authority=_verified_report_authority(project, 1),
     )
     md = result.final_report_md_path.read_text(encoding="utf-8")
 
     assert "**Selected policy reward module**" in md
     assert "rewards/v1.py" in md
     assert "rewards/v4.py" not in md
-    assert "**Selected** (iter 2)" in md
-    assert "+10.0000 → +20.0000" in md
+    assert "**Selected** (iter 1)" in md
+    assert "+10.0000 → +12.0000" in md
+
+
+def test_report_refuses_stale_or_failed_selection_authority(tmp_path: Path):
+    project = _write_project(tmp_path, n_iters=1, metric_history=[10.0])
+    selected = project / "runs" / "iter_0"
+    (selected / "fitness.json").write_text(
+        json.dumps({"fitness": 1.0}), encoding="utf-8",
+    )
+    (selected / "artifact_tuple.json").write_text(
+        json.dumps({
+            "refs": {
+                "reward": {
+                    "path": "rewards/v0.py",
+                    "sha256": hashlib.sha256(
+                        (project / "rewards" / "v0.py").read_bytes()
+                    ).hexdigest(),
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    authority = _verified_report_authority(project, 0)
+    authority["objective_evidence_receipt"] = {
+        "objective_proof_status": "failed",
+    }
+    authority["objective_evidence_sha256"] = _canonical_digest(
+        authority["objective_evidence_receipt"]
+    )
+    authority["authority_digest"] = _canonical_digest({
+        key: value for key, value in authority.items()
+        if key != "authority_digest"
+    })
+
+    result = build_report(
+        config_path=project / "config.toml",
+        out_mp4=tmp_path / "failed-authority.mp4",
+        selection_authority=authority,
+    )
+    markdown = result.final_report_md_path.read_text(encoding="utf-8")
+
+    assert result.report_claim_status == "descriptive_only"
+    assert "**Selected**" not in markdown
+    assert "makes no selected-policy or task-success claim" in markdown
+
+
+def test_report_receipt_detects_changed_video_and_evidence(
+    tmp_path: Path, monkeypatch,
+):
+    project = _write_project(tmp_path, n_iters=1, metric_history=[10.0])
+    iter_dir = project / "runs" / "iter_0"
+    (iter_dir / "rollout" / "rollout.mp4").write_bytes(b"x" * 4096)
+    _attest_iteration(project, 0)
+
+    def _fake_build_mp4(**kwargs):
+        Path(kwargs["out_path"]).write_bytes(b"report-video")
+        return True, ""
+
+    monkeypatch.setattr(
+        "sculptor.timelapse._build_final_mp4", _fake_build_mp4,
+    )
+    result = build_report(
+        config_path=project / "config.toml",
+        out_mp4=project / "reports" / "final.mp4",
+    )
+    assert inspect_report_state(project)["state"] == "current"
+
+    result.final_mp4_path.write_bytes(b"mutated-report-video")
+    assert inspect_report_state(project)["state"] == "stale"
+
+    build_report(
+        config_path=project / "config.toml",
+        out_mp4=project / "reports" / "final.mp4",
+    )
+    assert inspect_report_state(project)["state"] == "current"
+    (iter_dir / "fitness.json").write_text(
+        json.dumps({"fitness": 0.25}), encoding="utf-8",
+    )
+    assert inspect_report_state(project)["state"] == "stale"
+
+
+def test_report_counts_only_attested_iterations(tmp_path: Path):
+    project = _write_project(tmp_path, n_iters=2, metric_history=[1.0, 2.0])
+    incomplete = project / "runs" / "iter_9"
+    incomplete.mkdir()
+    (incomplete / "diagnosis.json").write_text("{}", encoding="utf-8")
+
+    result = build_report(
+        config_path=project / "config.toml",
+        out_mp4=tmp_path / "attested-only.mp4",
+    )
+    markdown = result.final_report_md_path.read_text(encoding="utf-8")
+
+    assert "**Iterations completed**: 2" in markdown
+    assert result.selected_iter_indices == [0, 1]
+
+
+def test_iteration_discovery_rejects_symlinked_directories(tmp_path: Path):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    external = tmp_path / "iter_7"
+    external.mkdir()
+    (runs / "iter_7").symlink_to(external, target_is_directory=True)
+
+    assert _find_iter_dirs(runs) == []
 
 
 def test_build_report_with_valid_mp4s_calls_builder(tmp_path: Path, monkeypatch):
@@ -295,6 +532,7 @@ def test_build_report_with_valid_mp4s_calls_builder(tmp_path: Path, monkeypatch)
     for iter_dir in (project / "runs").iterdir():
         mp4 = iter_dir / "rollout" / "rollout.mp4"
         mp4.write_bytes(b"x" * 4096)
+        _attest_iteration(project, int(iter_dir.name.removeprefix("iter_")))
 
     received: dict = {}
 
@@ -344,6 +582,10 @@ def _write_mission(
         if valid_mp4s:
             for iter_dir in (stage_dir / "runs").iterdir():
                 (iter_dir / "rollout" / "rollout.mp4").write_bytes(b"x" * 4096)
+                _attest_iteration(
+                    stage_dir,
+                    int(iter_dir.name.removeprefix("iter_")),
+                )
         stages.append(Stage(
             name=name,
             goal_text=f"reach the {name} milestone",

@@ -1,15 +1,16 @@
-"""Policy export — self-contained deployment bundles for sim-to-real.
+"""Policy export — byte-pinned reproducibility bundles.
 
-A bundle is a single zip that carries everything needed to reproduce or
-deploy one trained iteration:
+A bundle is a single zip that carries retained policy and experiment artifacts
+for inspection and trusted local reproduction.  Downloadability is not a
+task-success, transfer, hardware-safety, or sim-to-real certification:
 
     policy_<project>_iter<N>.zip
     ├── manifest.json        # schema, provenance, dims, hashes, deployment
     ├── checkpoint.pt|zip    # the raw trained checkpoint, byte-exact
     ├── policy.onnx          # actor network, ONNX (best-effort)
     ├── policy_ts.pt         # actor network, TorchScript (best-effort)
-    ├── inference.py         # runnable hardware skeleton (obs order + action
-    │                        #   formula + rate baked in; 2 robot-SDK seams)
+    ├── inference.py         # illustrative interface skeleton; not a safety
+    │                        #   controller or hardware integration
     ├── reward/
     │   ├── reward_spec.json # REWARD_SPEC snapshot the iter trained under
     │   └── v<n>.py          # exact reward source (when resolvable)
@@ -18,14 +19,13 @@ deploy one trained iteration:
     ├── config.toml          # project config snapshot
     ├── metrics.json         # the iter's training/eval metrics
     ├── run_context.json     # package versions / SHAs / seeds (if recorded)
-    └── DEPLOY.md            # loading recipes + sim→real hardware contract
+    └── DEPLOY.md            # interface notes + explicit certification status
 
-The manifest ``deployment`` block is the sim→real interface contract the raw
-network cannot carry: the joint ORDER the action/obs vectors index (from the
-robot manifest), the action→joint-target formula + per-joint scale + default
-pose, the control rate (sim dt × decimation), and the ordered observation
-layout — all read best-effort from the mjlab task cfg, degrading to the joint
-order + a flag when mjlab is not importable.
+The manifest ``deployment`` block records a best-effort policy interface.  It
+does not prove hardware integration or safety.  A separate
+``deployment_authority`` receipt records whether the exact selection,
+objective, physical-scene, origin tuple/runtime sidecar, and lineage gates
+passed; without that receipt the bundle is explicitly non-certified.
 
 Checkpoint formats understood:
 
@@ -43,7 +43,7 @@ Everything network-related is best-effort by design: the raw checkpoint +
 DEPLOY.md recipe are always present, so a bundle is never useless even
 when torch/onnx/sb3 are missing from the environment doing the export.
 
-This deployment ZIP is intentionally not a portable upload.  Use
+This raw reproducibility ZIP is intentionally not a portable upload.  Use
 ``export_starting_skill_bundle`` (CLI: ``sculptor export --portable``) for the
 closed, data-only ``.rskill`` format accepted at the hostile-upload boundary.
 """
@@ -55,15 +55,19 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO, Optional
 
-EXPORT_SCHEMA_VERSION = 1
-DEPLOYMENT_BUNDLE_KIND = "reward-sculptor-deployment-bundle"
+EXPORT_SCHEMA_VERSION = 2
+REPRODUCIBILITY_BUNDLE_KIND = "reward-sculptor-reproducibility-bundle"
+# Compatibility import for callers that referenced the old constant. New
+# manifests intentionally use the neutral reproducibility kind above.
+DEPLOYMENT_BUNDLE_KIND = REPRODUCIBILITY_BUNDLE_KIND
 PORTABLE_SKILL_SCHEMA_VERSION = 2
 PORTABLE_TRACKER_SKILL_SCHEMA_VERSION = 3
 PORTABLE_SKILL_BUNDLE_KIND = "reward-sculptor-starting-skill"
@@ -86,6 +90,115 @@ class ExportResult:
     bundle_path: Path
     manifest: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
+
+
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _deployment_authority_for_bundle(
+    authority_receipt: dict[str, Any] | None,
+    *,
+    iter_index: int,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Accept only a self-consistent, exact-iteration authority receipt."""
+    fallback = {
+        "schema": 1,
+        "status": "not_certified",
+        "purpose": "reproducibility",
+        "iter_index": iter_index,
+        "checks": {},
+        "blockers": [
+            "no valid server-verified deployment authority receipt was supplied"
+        ],
+    }
+    if not isinstance(authority_receipt, dict):
+        fallback["authority_digest"] = _canonical_digest(fallback)
+        return fallback
+    candidate = json.loads(json.dumps(authority_receipt, allow_nan=False))
+    claimed_digest = candidate.pop("authority_digest", None)
+    checks = candidate.get("checks")
+    origin = checks.get("origin_lineage") if isinstance(checks, dict) else None
+    physical = checks.get("physical_scene") if isinstance(checks, dict) else None
+    blockers = candidate.get("blockers")
+    status = candidate.get("status")
+    valid = (
+        candidate.get("schema") == 1
+        and candidate.get("purpose") == "reproducibility"
+        and candidate.get("iter_index") == iter_index
+        and status in {"qualified", "not_certified"}
+        and isinstance(blockers, list)
+        and all(isinstance(item, str) and item for item in blockers)
+        and isinstance(claimed_digest, str)
+        and claimed_digest == _canonical_digest(candidate)
+    )
+    if status == "qualified":
+        origin_digest = (
+            origin.get("origin_receipt_sha256")
+            if isinstance(origin, dict) else None
+        )
+        unsigned_origin = (
+            {key: value for key, value in origin.items()
+             if key != "origin_receipt_sha256"}
+            if isinstance(origin, dict) else None
+        )
+        required_origin_digests = (
+            "artifact_tuple_sha256",
+            "selection_sha256",
+            "tuple_hash",
+            "checkpoint_sha256",
+            "policy_contract_sidecar_sha256",
+            "policy_contract_sha256",
+            "runtime_artifacts_sha256",
+        )
+        valid = (
+            valid
+            and blockers == []
+            and isinstance(checks, dict)
+            and checks.get("completion") == "attested"
+            and checks.get("canonical_selection") is True
+            and checks.get("objective_proof") == "passed"
+            and isinstance(physical, dict)
+            and physical.get("status") in {"aligned", "not_applicable"}
+            and isinstance(origin, dict)
+            and origin.get("checkpoint_sha256") == checkpoint_sha256
+            and origin.get("iter_index") == iter_index
+            and origin.get("schema") == 1
+            and all(
+                isinstance(origin.get(key), str)
+                and re.fullmatch(r"[0-9a-f]{64}", origin[key]) is not None
+                for key in required_origin_digests
+            )
+            and isinstance(origin_digest, str)
+            and unsigned_origin is not None
+            and origin_digest == _canonical_digest(unsigned_origin)
+            and type(origin.get("reference_conditioned")) is bool
+            and (
+                origin.get("reference_conditioned") is False
+                and origin.get("reference_clock_sha256") is None
+                or origin.get("reference_conditioned") is True
+                and isinstance(origin.get("reference_clock_sha256"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", origin["reference_clock_sha256"]
+                ) is not None
+            )
+        )
+    if not valid:
+        fallback["blockers"] = [
+            "deployment authority receipt is malformed or does not bind the "
+            "exported checkpoint"
+        ]
+        fallback["authority_digest"] = _canonical_digest(fallback)
+        return fallback
+    candidate["authority_digest"] = claimed_digest
+    return candidate
 
 
 # ── discovery ──────────────────────────────────────────────────────────────
@@ -149,22 +262,278 @@ def _find_checkpoint(iter_dir: Path) -> Optional[Path]:
 
 # ── bundle builder ─────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class _CapturedExportFile:
+    """One immutable, server-owned input to a reproducibility ZIP."""
+
+    path: Path
+    archive_name: str
+    sha256: str
+    bytes: int
+
+
+def _source_stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Return the fields that must remain stable throughout one capture."""
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _copy_export_source(
+    source: Path,
+    source_handle: BinaryIO,
+    destination_handle: BinaryIO,
+) -> tuple[str, int]:
+    """Copy and hash one source stream.
+
+    Kept as a small seam so tests can deterministically mutate ``source``
+    before the caller performs its post-copy identity checks.
+    """
+    digest = hashlib.sha256()
+    copied = 0
+    for chunk in iter(lambda: source_handle.read(1 << 20), b""):
+        destination_handle.write(chunk)
+        digest.update(chunk)
+        copied += len(chunk)
+    destination_handle.flush()
+    os.fsync(destination_handle.fileno())
+    return digest.hexdigest(), copied
+
+
+def _safe_export_archive_name(archive_name: str) -> PurePosixPath:
+    candidate = PurePosixPath(archive_name)
+    if (
+        not archive_name
+        or "\\" in archive_name
+        or candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in archive_name.split("/"))
+        or candidate.as_posix() == "manifest.json"
+    ):
+        raise ExportError(f"unsafe export archive member {archive_name!r}")
+    return candidate
+
+
+def _assert_unlinked_source_path(source: Path, admitted_root: Path) -> None:
+    """Reject symlinked or non-directory traversal below an admitted root."""
+    source_absolute = Path(os.path.abspath(source))
+    root_absolute = Path(os.path.abspath(admitted_root))
+    try:
+        relative = source_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ExportError(
+            f"export source escapes its admitted root: {source}"
+        ) from exc
+    try:
+        root_stat = root_absolute.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ExportError(
+                f"export source root is linked or not a directory: "
+                f"{root_absolute}"
+            )
+        cursor = root_absolute
+        for part in relative.parts[:-1]:
+            cursor = cursor / part
+            current = cursor.lstat()
+            if not stat.S_ISDIR(current.st_mode):
+                raise ExportError(
+                    "export source traverses a symlink or non-directory: "
+                    f"{cursor}"
+                )
+    except ExportError:
+        raise
+    except OSError as exc:
+        raise ExportError(
+            f"export source path cannot be verified: {source}"
+        ) from exc
+
+
+def _paths_alias(first: Path, second: Path) -> bool:
+    """Return whether two paths name, or would name, the same output."""
+    try:
+        if first.exists() and second.exists() and first.samefile(second):
+            return True
+    except OSError:
+        pass
+    try:
+        return first.resolve(strict=False) == second.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(first)) == Path(os.path.abspath(second))
+
+
+def _capture_export_source(
+    source: Path,
+    snapshot_root: Path,
+    archive_name: str,
+) -> _CapturedExportFile:
+    """Capture one plain source exactly once into a private temp snapshot.
+
+    The path and open descriptor must name the same regular file before and
+    after streaming. A symlink, special file, replacement, truncation, or
+    in-place mutation therefore aborts the export before publication.
+    """
+    member = _safe_export_archive_name(archive_name)
+    source = Path(source)
+    destination = snapshot_root.joinpath(*member.parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        before_path = source.lstat()
+    except OSError as exc:
+        raise ExportError(
+            f"export source is unavailable: {source} ({type(exc).__name__})"
+        ) from exc
+    if not stat.S_ISREG(before_path.st_mode):
+        raise ExportError(f"export source is not a plain file: {source}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(source, flags)
+        before_fd = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before_fd.st_mode)
+            or _source_stat_identity(before_fd)
+            != _source_stat_identity(before_path)
+        ):
+            raise ExportError(
+                f"export source changed before capture: {source}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as source_handle:
+            with destination.open("xb") as destination_handle:
+                digest, copied = _copy_export_source(
+                    source, source_handle, destination_handle,
+                )
+        after_fd = os.fstat(descriptor)
+        after_path = source.lstat()
+        expected_identity = _source_stat_identity(before_path)
+        if (
+            copied != before_path.st_size
+            or _source_stat_identity(after_fd) != expected_identity
+            or _source_stat_identity(after_path) != expected_identity
+        ):
+            raise ExportError(
+                f"export source changed during capture: {source}"
+            )
+        captured = destination.stat()
+        if (
+            not stat.S_ISREG(captured.st_mode)
+            or captured.st_size != copied
+            or _sha256(destination) != digest
+        ):
+            raise ExportError(
+                f"server-owned export snapshot could not be verified: {source}"
+            )
+        destination.chmod(stat.S_IRUSR)
+        return _CapturedExportFile(
+            path=destination,
+            archive_name=member.as_posix(),
+            sha256=digest,
+            bytes=copied,
+        )
+    except ExportError:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise ExportError(
+            f"export source capture failed for {source}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verify_export_archive(
+    archive_path: Path,
+    expected: dict[str, tuple[str, int]],
+) -> None:
+    """Re-read every published candidate member before atomic promotion."""
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            infos = archive.infolist()
+            if any(info.is_dir() for info in infos):
+                raise ExportError(
+                    "export archive unexpectedly contains a directory entry"
+                )
+            names = [info.filename for info in infos]
+            folded_names = [name.casefold() for name in names]
+            folded_expected = {name.casefold() for name in expected}
+            if (
+                len(folded_names) != len(set(folded_names))
+                or set(names) != set(expected)
+                or set(folded_names) != folded_expected
+            ):
+                raise ExportError(
+                    "export archive members differ from the captured snapshot"
+                )
+            for info in infos:
+                expected_sha256, expected_bytes = expected[info.filename]
+                digest = hashlib.sha256()
+                observed_bytes = 0
+                with archive.open(info, "r") as member:
+                    for chunk in iter(lambda: member.read(1 << 20), b""):
+                        digest.update(chunk)
+                        observed_bytes += len(chunk)
+                if (
+                    observed_bytes != expected_bytes
+                    or digest.hexdigest() != expected_sha256
+                ):
+                    raise ExportError(
+                        "export archive member differs from its manifest: "
+                        f"{info.filename}"
+                    )
+    except ExportError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise ExportError(
+            f"export archive verification failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def export_policy_bundle(
     project_dir: Path | str,
     *,
     iter_index: Optional[int] = None,
     runs_root: Path | str | None = None,
     out_path: Path | str | None = None,
+    authority_receipt: dict[str, Any] | None = None,
 ) -> ExportResult:
-    """Build a self-contained deployment bundle for one trained iteration.
+    """Build a raw reproducibility bundle for one retained iteration.
 
     ``iter_index=None`` picks the latest iteration that has a checkpoint.
     ``runs_root`` defaults to ``<project>/runs`` (mission stages pass their
     own ``.missions/<m>/stages/<s>/runs``). ``out_path`` defaults to
     ``<project>/exports/policy_<project>_iter<N>.zip``.
     """
-    project = Path(project_dir).resolve()
-    root = Path(runs_root).resolve() if runs_root else project / "runs"
+    raw_project = Path(project_dir).expanduser().absolute()
+    if raw_project.is_symlink() or not raw_project.is_dir():
+        raise ExportError(
+            f"project root is linked or not a directory: {raw_project}"
+        )
+    project = raw_project.resolve(strict=True)
+    raw_root = (
+        Path(runs_root).expanduser().absolute()
+        if runs_root is not None else project / "runs"
+    )
+    if raw_root.exists() or raw_root.is_symlink():
+        try:
+            raw_root.relative_to(project)
+        except ValueError:
+            if raw_root.is_symlink() or not raw_root.is_dir():
+                raise ExportError(
+                    f"runs root is linked or not a directory: {raw_root}"
+                )
+        else:
+            _assert_unlinked_source_path(
+                raw_root / "__path_check__", project,
+            )
+    root = raw_root.resolve(strict=False)
 
     avail = list_exportable_iters(root)
     if not avail:
@@ -177,30 +546,102 @@ def export_policy_bundle(
             f"(available: {[r['iter_index'] for r in avail]})")
 
     iter_dir = root / f"iter_{iter_index}"
-    ckpt = _find_checkpoint(iter_dir)
-    assert ckpt is not None  # guaranteed by list_exportable_iters
-    warnings: list[str] = []
+    source_checkpoint = _find_checkpoint(iter_dir)
+    assert source_checkpoint is not None  # guaranteed by inventory above
 
     if out_path is None:
         exports_dir = project / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)
         out = exports_dir / f"policy_{project.name}_iter{iter_index}.zip"
     else:
-        out = Path(out_path)
+        out = Path(out_path).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="rs_export_") as td:
+    # Keep the candidate archive on the destination filesystem so the only
+    # publication step is an atomic os.replace after full ZIP verification.
+    with tempfile.TemporaryDirectory(
+        prefix=".rs_export_", dir=out.parent,
+    ) as td:
         stage = Path(td)
+        snapshot_root = stage / "snapshot"
+        generated_root = stage / "generated"
+        snapshot_root.mkdir()
+        generated_root.mkdir()
+        captured_files: list[_CapturedExportFile] = []
+        captured_names: set[str] = set()
 
-        files: list[tuple[Path, str]] = [(ckpt, ckpt.name)]
+        def capture(source: Path, archive_name: str) -> _CapturedExportFile:
+            member = _safe_export_archive_name(archive_name).as_posix()
+            if member.casefold() in captured_names:
+                raise ExportError(
+                    f"duplicate export archive member {member!r}"
+                )
+            source_absolute = Path(os.path.abspath(source))
+            for admitted_root in (stage, project, root.parent):
+                try:
+                    source_absolute.relative_to(
+                        Path(os.path.abspath(admitted_root))
+                    )
+                except ValueError:
+                    continue
+                _assert_unlinked_source_path(source_absolute, admitted_root)
+                break
+            else:
+                raise ExportError(
+                    f"export source is outside admitted roots: {source}"
+                )
+            if _paths_alias(source_absolute, out):
+                raise ExportError(
+                    "export destination aliases a source artifact: "
+                    f"{source_absolute}"
+                )
+            captured = _capture_export_source(
+                source_absolute, snapshot_root, member,
+            )
+            captured_names.add(member.casefold())
+            captured_files.append(captured)
+            return captured
 
-        # Reward: spec snapshot + exact source when resolvable.
-        reward_spec = _load_json(iter_dir / "reward_spec.json")
-        reward_version = (reward_spec or {}).get("version")
-        if reward_spec is not None:
-            files.append((iter_dir / "reward_spec.json",
-                          "reward/reward_spec.json"))
+        def source_exists(source: Path) -> bool:
+            # Broken symlinks and special files must reach capture() so they
+            # fail closed instead of looking like absent optional evidence.
+            return source.exists() or source.is_symlink()
+
+        checkpoint_capture = capture(
+            source_checkpoint, source_checkpoint.name,
+        )
+        ckpt = checkpoint_capture.path
+        checkpoint_sha256 = checkpoint_capture.sha256
+        deployment_authority = _deployment_authority_for_bundle(
+            authority_receipt,
+            iter_index=iter_index,
+            checkpoint_sha256=checkpoint_sha256,
+        )
+        warnings: list[str] = []
+        if deployment_authority["status"] != "qualified":
+            warnings.append(
+                "NOT DEPLOYMENT CERTIFIED: this is a raw reproducibility "
+                "bundle; "
+                + "; ".join(deployment_authority.get("blockers") or [])
+            )
         else:
+            warnings.append(
+                "Research deployment preconditions passed, but this bundle "
+                "is not a hardware-safety certification; validate limits, "
+                "watchdogs, and emergency-stop behavior on the target system."
+            )
+
+        # Parse only the captured reward spec, then capture the exact source
+        # it names. Mutable project paths are never reopened by the ZIP step.
+        reward_spec_path = iter_dir / "reward_spec.json"
+        reward_spec = None
+        if source_exists(reward_spec_path):
+            reward_spec_capture = capture(
+                reward_spec_path, "reward/reward_spec.json",
+            )
+            reward_spec = _load_json(reward_spec_capture.path)
+        reward_version = (reward_spec or {}).get("version")
+        if reward_spec is None:
             warnings.append("reward_spec.json missing from the iter dir")
         if isinstance(reward_version, str):
             # reward_spec.json is on-disk data — validate before it becomes
@@ -208,8 +649,8 @@ def export_policy_bundle(
             # the project once this is HTTP-triggered).
             if re.fullmatch(r"v\d+", reward_version):
                 cand = project / "rewards" / f"{reward_version}.py"
-                if cand.is_file():
-                    files.append((cand, f"reward/{cand.name}"))
+                if source_exists(cand):
+                    capture(cand, f"reward/{cand.name}")
                 else:
                     warnings.append(
                         f"reward source {cand.name} not found under rewards/")
@@ -223,33 +664,89 @@ def export_policy_bundle(
         env_spec_source = None
         iter_env = iter_dir / "env_spec.json"
         cur_env = project / "env" / "current.json"
-        if iter_env.is_file():
-            files.append((iter_env, "env_spec.json"))
+        if source_exists(iter_env):
+            capture(iter_env, "env_spec.json")
             env_spec_source = "iter_snapshot"
-        elif cur_env.is_file():
-            files.append((cur_env, "env_spec.json"))
+        elif source_exists(cur_env):
+            capture(cur_env, "env_spec.json")
             env_spec_source = "project_current"
             warnings.append(
                 "env_spec.json is the project's CURRENT spec — this run "
                 "predates per-iter env snapshots, so the exact trained "
                 "version is not guaranteed")
 
-        # Project config + iter metrics + reproducibility context.
+        # Project config + iteration evidence. The artifact tuple is parsed
+        # from this exact captured copy below.
+        artifact_tuple_capture: _CapturedExportFile | None = None
+        config_capture: _CapturedExportFile | None = None
         for src, arc in (
             (project / "config.toml", "config.toml"),
             (iter_dir / "metrics.json", "metrics.json"),
             (iter_dir / "run_context.json", "run_context.json"),
+            (iter_dir / "iteration_complete.json", "evidence/iteration_complete.json"),
+            (iter_dir / "artifact_tuple.json", "evidence/artifact_tuple.json"),
+            (iter_dir / "fitness.json", "evidence/fitness.json"),
+            (iter_dir / "rollout" / "behavior.json", "evidence/behavior.json"),
+            (
+                iter_dir / "physical_acceptance_contract.json",
+                "evidence/physical_acceptance_contract.json",
+            ),
+            (
+                iter_dir / "physical_acceptance_receipt.json",
+                "evidence/physical_acceptance_receipt.json",
+            ),
+            (
+                Path(str(source_checkpoint) + ".policy_contract.json"),
+                "evidence/output_policy_contract.json",
+            ),
+            (
+                root.parent / "reports" / "selection.json",
+                "evidence/selection.json",
+            ),
         ):
-            if src.is_file():
-                files.append((src, arc))
+            if source_exists(src):
+                captured = capture(src, arc)
+                if arc == "evidence/artifact_tuple.json":
+                    artifact_tuple_capture = captured
+                elif arc == "config.toml":
+                    config_capture = captured
             elif arc == "config.toml":
                 warnings.append("config.toml missing from the project dir")
 
+        artifact_tuple = (
+            _load_json(artifact_tuple_capture.path)
+            if artifact_tuple_capture is not None else {}
+        ) or {}
+        selection_version = artifact_tuple.get("selection_version")
+        if (
+            type(selection_version) is int
+            and selection_version > 0
+        ):
+            origin_selection = (
+                root.parent / "env" / f"selection_v{selection_version}.json"
+            )
+            if source_exists(origin_selection):
+                capture(
+                    origin_selection,
+                    "evidence/origin_world_selection.json",
+                )
+
         # Neural-net exports (best-effort, never fatal).
+        generated_files: list[tuple[Path, str]] = []
         net_meta: dict[str, Any] = {}
+        captured_config_path = (
+            config_capture.path
+            if config_capture is not None
+            else snapshot_root / "missing-config.toml"
+        )
         if ckpt.suffix == ".pt":
             net_meta = _export_rsl_rl_actor(
-                ckpt, project, stage, files, warnings)
+                ckpt,
+                captured_config_path,
+                generated_root,
+                generated_files,
+                warnings,
+            )
             # The actor reconstruction performs the strict architecture and
             # normalizer checks. Only expose a trainable interchange payload
             # after those checks prove the policy surface is understood; a
@@ -257,86 +754,121 @@ def export_policy_bundle(
             # unknown architecture semantically loadable.
             if "obs_dim" in net_meta and "action_dim" in net_meta:
                 trainable_meta = _export_rsl_rl_safetensors(
-                    ckpt, stage, files, warnings,
+                    ckpt, generated_root, generated_files, warnings,
                 )
                 if trainable_meta:
                     net_meta["trainable_checkpoint"] = trainable_meta
         elif ckpt.suffix == ".zip":
-            net_meta = _export_sb3_actor(ckpt, stage, files, warnings)
+            net_meta = _export_sb3_actor(
+                ckpt, generated_root, generated_files, warnings,
+            )
 
-        # Sim→real hardware contract (joint order, action scale/offset, control
-        # rate, obs layout) — the interface the raw network cannot carry.
-        deployment = _deployment_contract(project, net_meta, warnings)
+        # Best-effort policy interface (joint order, action scale/offset,
+        # control rate, obs layout) — useful metadata, not a safety certificate.
+        deployment = _deployment_contract(
+            captured_config_path, net_meta, warnings,
+        )
         compatibility_contract = None
         compatibility_contract_digest = None
         if net_meta.get("trainable_checkpoint"):
-            try:
-                from sculptor.policy_contract import (
-                    build_project_policy_contract,
-                    contract_fingerprint,
-                )
-
-                compatibility_contract = build_project_policy_contract(
-                    project, observed_network=net_meta,
-                )
-                compatibility_contract_digest = contract_fingerprint(
-                    compatibility_contract,
-                )
-            except Exception as exc:  # noqa: BLE001 — export remains usable
-                warnings.append(
-                    "trainable compatibility contract unavailable "
-                    f"({type(exc).__name__}: {exc}); import will be blocked"
-                )
+            warnings.append(
+                "portable compatibility contract intentionally omitted from "
+                "the raw reproducibility ZIP; use the .rskill export, which "
+                "revalidates the immutable origin tuple and policy sidecar"
+            )
 
         manifest: dict[str, Any] = {
             "schema_version": EXPORT_SCHEMA_VERSION,
-            "kind": DEPLOYMENT_BUNDLE_KIND,
+            "kind": REPRODUCIBILITY_BUNDLE_KIND,
+            "artifact_purpose": "reproducibility",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "sculptor_version": _sculptor_version(),
             "project": project.name,
             "iter_index": iter_index,
             "checkpoint": {
-                "file": ckpt.name,
+                "file": source_checkpoint.name,
                 "format": "rsl_rl" if ckpt.suffix == ".pt" else "sb3",
-                "sha256": _sha256(ckpt),
+                "sha256": checkpoint_sha256,
             },
             "reward_version": reward_version,
             "env_spec_source": env_spec_source,
             "network": net_meta,
             "deployment": deployment,
+            "deployment_status": deployment_authority["status"],
+            "deployment_authority": deployment_authority,
             "compatibility_contract": compatibility_contract,
             "compatibility_contract_digest": compatibility_contract_digest,
             "warnings": warnings,
         }
 
         deploy_md = _render_deploy_md(manifest)
-        (stage / "DEPLOY.md").write_text(deploy_md, encoding="utf-8")
-        files.append((stage / "DEPLOY.md", "DEPLOY.md"))
+        (generated_root / "DEPLOY.md").write_text(
+            deploy_md, encoding="utf-8",
+        )
+        generated_files.append((
+            generated_root / "DEPLOY.md", "DEPLOY.md",
+        ))
 
         # Runnable inference skeleton (obs order + action formula + rate baked
         # in; only the two robot-SDK seams are left for the operator).
-        (stage / "inference.py").write_text(
+        (generated_root / "inference.py").write_text(
             _render_inference_py(manifest), encoding="utf-8")
-        files.append((stage / "inference.py", "inference.py"))
+        generated_files.append((
+            generated_root / "inference.py", "inference.py",
+        ))
 
-        # File table with hashes (manifest lists everything but itself).
+        # Generated products go through the same one-capture path. This also
+        # rejects an unexpected generated symlink or mutation.
+        for generated_path, archive_name in generated_files:
+            capture(generated_path, archive_name)
+
+        # The manifest table is derived only from captured snapshot records.
         manifest["files"] = [
-            {"path": arc, "sha256": _sha256(src), "bytes": src.stat().st_size}
-            for src, arc in files
+            {
+                "path": captured.archive_name,
+                "sha256": captured.sha256,
+                "bytes": captured.bytes,
+            }
+            for captured in captured_files
         ]
 
-        manifest_path = stage / "manifest.json"
+        manifest_path = snapshot_root / "manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True, default=str),
             encoding="utf-8")
+        manifest_sha256 = _sha256(manifest_path)
+        manifest_bytes = manifest_path.stat().st_size
 
-        tmp_zip = stage / "bundle.zip"
-        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(manifest_path, "manifest.json")
-            for src, arc in files:
-                zf.write(src, arc)
-        # Atomic-ish move into place (same-filesystem rename when possible).
-        shutil.move(str(tmp_zip), str(out))
+        pending = stage / "bundle.pending.zip"
+        with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED) as archive:
+            _write_zip_member_verified(
+                archive,
+                manifest_path,
+                "manifest.json",
+                expected_sha256=manifest_sha256,
+                expected_bytes=manifest_bytes,
+                source_label="export manifest snapshot",
+            )
+            for captured in captured_files:
+                _write_zip_member_verified(
+                    archive,
+                    captured.path,
+                    captured.archive_name,
+                    expected_sha256=captured.sha256,
+                    expected_bytes=captured.bytes,
+                    source_label="export artifact snapshot",
+                )
+        expected_members = {
+            "manifest.json": (manifest_sha256, manifest_bytes),
+            **{
+                captured.archive_name: (
+                    captured.sha256, captured.bytes,
+                )
+                for captured in captured_files
+            },
+        }
+        _verify_export_archive(pending, expected_members)
+        os.replace(pending, out)
 
     return ExportResult(bundle_path=out, manifest=manifest, warnings=warnings)
 
@@ -615,7 +1147,7 @@ def export_starting_skill_bundle(
         portable_warnings = [
             "Portable transfer excludes the raw checkpoint, optimizer state, "
             "reward/environment source, Python, ONNX, and TorchScript; use the "
-            "separate deployment ZIP for trusted deployment workflows."
+            "separate raw reproducibility ZIP for trusted local inspection."
         ]
         starting_skill: dict[str, Any] = {
             "name": f"{project.name} iter {source_manifest['iter_index']}",
@@ -1143,6 +1675,7 @@ def export_tierd_tracker_starting_skill_bundle(
                     weights_member,
                     expected_sha256=weights_sha,
                     expected_bytes=weights_size,
+                    source_label="tracker policy weights",
                 )
                 for member_name, payload in contract_payloads.items():
                     archive.writestr(member_name, payload)
@@ -1363,6 +1896,7 @@ def export_reference_starting_skill_bundle(
                 "motion/clip.npz",
                 expected_sha256=actual_clip_sha,
                 expected_bytes=clip_size,
+                source_label="reference clip",
             )
             archive.writestr("motion/provenance.json", provenance_bytes)
         with pending.open("rb") as handle:
@@ -1385,7 +1919,7 @@ def _export_rsl_rl_safetensors(
 ) -> dict[str, Any]:
     """Export the trainable actor/critic maps without Python pickle.
 
-    The raw checkpoint remains in the deployment bundle for local recovery,
+    The raw checkpoint remains in the reproducibility bundle for local recovery,
     but an importer never needs to deserialize it: it consumes this
     safetensors member and constructs a fresh server-owned checkpoint.
     """
@@ -1393,7 +1927,9 @@ def _export_rsl_rl_safetensors(
         import torch
         from safetensors.torch import save_file
     except ImportError:
-        warnings.append("safetensors unavailable — bundle is deployment-only")
+        warnings.append(
+            "safetensors unavailable — only the trusted-local raw bundle is usable"
+        )
         return {}
     try:
         try:
@@ -1485,7 +2021,7 @@ def _export_rsl_rl_safetensors(
 # ── rsl_rl (.pt) actor reconstruction ──────────────────────────────────────
 
 def _export_rsl_rl_actor(
-    ckpt: Path, project: Path, stage: Path,
+    ckpt: Path, config_path: Path, stage: Path,
     files: list[tuple[Path, str]], warnings: list[str],
 ) -> dict[str, Any]:
     """Rebuild the actor MLP from the checkpoint state dict and export it.
@@ -1546,7 +2082,9 @@ def _export_rsl_rl_actor(
     act_dim = layers[-1][2]
     hidden = [out for (_, _, out) in layers[:-1]]
 
-    activation, activation_assumed = _resolve_activation(project, warnings)
+    activation, activation_assumed = _resolve_activation(
+        config_path, warnings,
+    )
     if activation not in _ACTIVATIONS:
         # Never guess: an unmapped activation (lrelu/silu/mish/crelu...)
         # built as ELU would ship a silently wrong policy that even the
@@ -1796,7 +2334,9 @@ def _build_mlp(
     return _Actor(model, norm=norm)
 
 
-def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
+def _resolve_activation(
+    config_path: Path, warnings: list[str],
+) -> tuple[str, bool]:
     """(activation, assumed?) — exact from the mjlab task cfg when possible."""
     task_id = None
     try:
@@ -1804,7 +2344,7 @@ def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
             import tomllib
         except ImportError:  # pragma: no cover - py<3.11
             import tomli as tomllib  # type: ignore[no-redef]
-        with (project / "config.toml").open("rb") as f:
+        with config_path.open("rb") as f:
             cfg = tomllib.load(f)
         task_id = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
     except Exception:  # noqa: BLE001
@@ -1827,14 +2367,14 @@ def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
     return "elu", True
 
 
-def _task_id_from_config(project: Path) -> Optional[str]:
+def _task_id_from_config(config_path: Path) -> Optional[str]:
     """The adapter's mjlab `task_id` from the project config.toml (or None)."""
     try:
         try:
             import tomllib
         except ImportError:  # pragma: no cover - py<3.11
             import tomli as tomllib  # type: ignore[no-redef]
-        with (project / "config.toml").open("rb") as f:
+        with config_path.open("rb") as f:
             cfg = tomllib.load(f)
         tid = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
         return tid if isinstance(tid, str) and tid else None
@@ -1867,12 +2407,13 @@ def _resolve_per_joint(
 
 
 def _deployment_contract(
-    project: Path, net_meta: dict[str, Any], warnings: list[str],
+    config_path: Path, net_meta: dict[str, Any], warnings: list[str],
 ) -> dict[str, Any]:
-    """The sim→real interface contract a hardware controller needs but the raw
-    checkpoint/ONNX cannot carry: the joint ORDER the action/obs vectors index,
-    the action target formula + per-joint scale + default pose, the control
-    rate, and the ordered observation layout.
+    """Best-effort policy-interface metadata the raw network cannot carry.
+
+    The joint order, action formula, control rate, and observation layout are
+    descriptive training context. They do not prove that a target controller
+    consumes the same interface or satisfies a physical safety envelope.
 
     `joint_names` (order) come from the captured robot manifest and are ALWAYS
     present for a known robot. The rest is read best-effort from the mjlab task
@@ -1881,7 +2422,7 @@ def _deployment_contract(
     guess."""
     from sculptor.eval.robot_manifest import robot_joint_names
 
-    task_id = _task_id_from_config(project)
+    task_id = _task_id_from_config(config_path)
     joint_names = robot_joint_names(task_id) if task_id else None
     contract: dict[str, Any] = {
         "task_id": task_id,
@@ -2295,6 +2836,7 @@ def _write_zip_member_verified(
     *,
     expected_sha256: str,
     expected_bytes: int,
+    source_label: str = "source artifact",
 ) -> None:
     """Stream one file into the ZIP and attest the bytes actually written."""
     digest = hashlib.sha256()
@@ -2308,8 +2850,8 @@ def _write_zip_member_verified(
             written += len(chunk)
     if written != expected_bytes or digest.hexdigest() != expected_sha256:
         raise ExportError(
-            "reference clip changed while it was being exported; retry from "
-            "a stable library snapshot"
+            f"{source_label} changed while it was being exported; retry from "
+            "a stable server-owned snapshot"
         )
 
 
@@ -2344,11 +2886,29 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
     obs = net.get("obs_dim", "?")
     act = net.get("action_dim", "?")
     activation = net.get("activation", "elu")
+    authority = manifest.get("deployment_authority") or {}
+    qualified = authority.get("status") == "qualified"
+    authority_heading = (
+        "Research deployment preconditions verified"
+        if qualified else "NOT DEPLOYMENT CERTIFIED"
+    )
+    authority_detail = (
+        "The exact selection, objective, physical-scene, origin-runtime, and "
+        "lineage checks recorded in `manifest.json` passed. This still is not "
+        "a hardware-safety certification."
+        if qualified else
+        "This archive is a raw reproducibility artifact. It does not establish "
+        "task success, transfer validity, physical safety, or sim-to-real "
+        "readiness. See `manifest.json` → `deployment_authority.blockers`."
+    )
     lines = [
-        f"# Policy bundle — {manifest['project']} · iter {manifest['iter_index']}",
+        f"# Policy reproducibility bundle — {manifest['project']} · "
+        f"iter {manifest['iter_index']}",
         "",
         f"Exported by Reward Sculptor {manifest['sculptor_version']} "
         f"on {manifest['created_at']}.",
+        "",
+        f"> **{authority_heading}.** {authority_detail}",
         "",
         "| | |",
         "|---|---|",
@@ -2358,10 +2918,10 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         f"| Reward version | `{manifest.get('reward_version')}` |",
         f"| Env spec source | `{manifest.get('env_spec_source')}` |",
         "",
-        "The network outputs the **mean action** of the Gaussian policy "
-        "(deterministic deployment). Observation layout, scaling, and "
-        "action post-processing must match training — the sim→real contract "
-        "below (and `manifest.json` → `deployment`) captures exactly that.",
+        "The exported inference formats produce the **mean action** of the "
+        "Gaussian policy. The best-effort interface notes below describe "
+        "recorded training metadata; they do not prove a complete target "
+        "controller, sensor pipeline, or safety envelope.",
         "",
     ]
     dep = manifest.get("deployment") or {}
@@ -2370,11 +2930,12 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         act = dep.get("action") or {}
         ctrl = dep.get("control") or {}
         lines += [
-            "## Sim→real hardware contract",
+            "## Recorded policy interface",
             "",
-            "**`inference.py` is a runnable skeleton** with all of this baked "
-            "in — you only fill the two `TODO(hardware)` seams (`read_robot_"
-            "state`, `send_joint_targets`) for your robot's SDK.",
+            "`inference.py` is an illustrative inference skeleton, not a "
+            "hardware controller. Integration also requires independently "
+            "validated state transforms, limits, latency handling, watchdogs, "
+            "fault responses, and emergency-stop behavior.",
             "",
             f"- **Joints ({len(jn)})**, in the order the action/obs vectors "
             f"index (source: {dep.get('joint_order_source')}):",

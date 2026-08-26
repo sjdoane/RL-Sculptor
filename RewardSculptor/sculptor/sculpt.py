@@ -279,6 +279,17 @@ def _find_latest_reward_version(rewards_dir: Path) -> tuple[int, Path]:
 
 _ITERATION_COMPLETE_MARKER = "iteration_complete.json"
 _ITERATION_CHECKPOINT_NAMES = frozenset({"checkpoint.pt", "checkpoint.zip"})
+_REQUIRED_PHASE_MANIFESTS = (
+    "train_request_manifest.json",
+    "train_input_manifest.json",
+    "train_completion_manifest.json",
+    "rollout/rollout_input_manifest.json",
+    "rollout/rollout_completion_manifest.json",
+)
+_OPTIONAL_PHASE_MANIFESTS = (
+    "evaluation_plan.json",
+    "evaluation_results.json",
+)
 
 
 def _is_canonical_iteration_checkpoint(
@@ -325,49 +336,13 @@ def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
     A mere file is not enough: corrupt, copied, or wrong-index markers must
     preserve same-iteration crash recovery rather than silently skipping work.
     """
-    marker = iter_dir / _ITERATION_COMPLETE_MARKER
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    valid_base = (
-        isinstance(payload, dict)
-        and payload.get("schema") in (1, 2)
-        and type(payload.get("iter")) is int
-        and payload.get("iter") == iter_index
-        and payload.get("state") == "completed"
-    )
-    if not valid_base:
-        return False
-    # Schema 1 predates exact-byte receipts. Preserve its historical resume
-    # behavior, while every newly written schema-2 marker must still bind the
-    # checkpoint it claims before work can be skipped.
-    if payload.get("schema") == 1:
-        return True
-    disclosed = payload.get("checkpoint")
-    expected_sha256 = payload.get("checkpoint_sha256")
-    expected_bytes = payload.get("checkpoint_bytes")
-    if (
-        not isinstance(disclosed, str)
-        or not disclosed.strip()
-        or not isinstance(expected_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
-        or type(expected_bytes) is not int
-        or expected_bytes <= 0
-    ):
-        return False
-    checkpoint = Path(disclosed).expanduser()
-    if not checkpoint.is_absolute():
-        checkpoint = iter_dir / checkpoint
-    if not _is_canonical_iteration_checkpoint(iter_dir, checkpoint):
-        return False
-    try:
-        actual_sha256, actual_bytes = _checkpoint_sha256_and_size(checkpoint)
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return (
-        actual_sha256 == expected_sha256
-        and actual_bytes == expected_bytes
+    from sculptor.run_manifests import verify_iteration_completion_marker
+
+    receipt = verify_iteration_completion_marker(iter_dir)
+    return bool(
+        isinstance(receipt, dict)
+        and receipt.get("schema") == 3
+        and receipt.get("iter_index") == iter_index
     )
 
 
@@ -400,8 +375,8 @@ def _write_iteration_completion_marker(
     reward_version_before: int,
     reward_version_after: int | None,
     world_selection_hash: str | None,
-) -> None:
-    """Atomically attest the exact checkpoint of a completed iteration."""
+) -> dict[str, Any]:
+    """Atomically attest the checkpoint and exact phase-manifest bytes."""
     from sculptor.run_context import write_json_atomic
 
     checkpoint_path = Path(checkpoint_path)
@@ -414,21 +389,44 @@ def _write_iteration_completion_marker(
         checkpoint_path
     )
 
-    write_json_atomic(
-        iter_dir / _ITERATION_COMPLETE_MARKER,
-        {
-            "schema": 2,
-            "state": "completed",
-            "iter": int(iter_index),
-            "completed_at": _utc_now_iso(),
-            "checkpoint": str(checkpoint_path.resolve()),
-            "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint_bytes": checkpoint_bytes,
-            "reward_version_before": int(reward_version_before),
-            "reward_version_after": reward_version_after,
-            "world_selection_hash": world_selection_hash,
-        },
-    )
+    phase_manifests: dict[str, dict[str, Any]] = {}
+    manifest_names = list(_REQUIRED_PHASE_MANIFESTS) + [
+        relative
+        for relative in _OPTIONAL_PHASE_MANIFESTS
+        if (iter_dir / relative).is_file()
+    ]
+    for relative in manifest_names:
+        manifest_path = iter_dir / relative
+        try:
+            resolved_manifest = manifest_path.resolve(strict=True)
+            resolved_manifest.relative_to(iter_dir.resolve(strict=True))
+            manifest_sha256, manifest_bytes = _checkpoint_sha256_and_size(
+                resolved_manifest
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"iteration completion requires exact {relative}: {exc}"
+            ) from exc
+        phase_manifests[relative] = {
+            "sha256": manifest_sha256,
+            "bytes": manifest_bytes,
+        }
+
+    payload = {
+        "schema": 3,
+        "state": "completed",
+        "iter": int(iter_index),
+        "completed_at": _utc_now_iso(),
+        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_bytes": checkpoint_bytes,
+        "reward_version_before": int(reward_version_before),
+        "reward_version_after": reward_version_after,
+        "world_selection_hash": world_selection_hash,
+        "phase_manifests": phase_manifests,
+    }
+    write_json_atomic(iter_dir / _ITERATION_COMPLETE_MARKER, payload)
+    return payload
 
 
 def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
@@ -1023,7 +1021,8 @@ def _dry_run_diagnose(
         behavior = _load_json_if_present(iter_dir / "behavior.json")
     evidence = (
         f"Dry-run stub diagnosis. "
-        f"mean_return={metrics.get('metrics', {}).get('mean_return', 'n/a')}, "
+        "environment_default_return="
+        f"{metrics.get('metrics', {}).get('mean_return', 'n/a')}, "
         f"behavior={behavior!r}."
     )
     return Diagnosis(
@@ -1531,13 +1530,14 @@ def _train_or_resume(
     init_policy_mode: str = "actor_critic",
     warm_start_explicit: bool = False,
     pre_train_event: Optional[dict[str, Any]] = None,
+    manifest_context: Optional[dict[str, Any]] = None,
 ):
-    """Skip `adapter.train` when `iter_dir/checkpoint.pt` is already on
-    disk and loads successfully — the expensive phase (≥ 22 min for
-    mjlab) is idempotent given the same reward and seed, so reusing a
-    prior run's artifact saves all that wall-clock when any downstream
-    phase (rollout, diagnose, edit) failed on the previous attempt.
-    Returns a `TrainResult`-compatible object either way.
+    """Resume training only from an exact immutable input receipt.
+
+    A parseable checkpoint by itself is not evidence that it belongs to the
+    requested reward, world, seed, initialization, adapter, or training plan.
+    The input and completion manifests close that relabeling path while keeping
+    exact crash recovery cheap and CPU-only.
 
     §Ship 15: `init_policy_path` is an optional path to a pre-trained
     rsl_rl checkpoint. When set AND the adapter's `train` signature
@@ -1549,11 +1549,67 @@ def _train_or_resume(
     from prior partial attempt" rather than the two silently collapsing.
     """
     from sculptor.adapters.base import TrainResult
+    from sculptor.run_manifests import (
+        build_completion_manifest,
+        build_train_input_manifest,
+        completion_manifest_matches,
+        file_identity,
+        file_identity_matches,
+        input_manifest_matches,
+        manifest_sha256,
+        read_json_object,
+        write_json_atomic,
+    )
+
+    input_manifest = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iter_index,
+        reward_module_path=reward_module_path,
+        steps=steps,
+        seed=seed,
+        init_policy_path=init_policy_path,
+        init_policy_mode=init_policy_mode,
+        context=manifest_context,
+    )
+    request_manifest_path = iter_dir / "train_request_manifest.json"
+    input_manifest_path = iter_dir / "train_input_manifest.json"
+    completion_manifest_path = iter_dir / "train_completion_manifest.json"
+    exact_request = input_manifest_matches(
+        request_manifest_path, input_manifest
+    )
+    effective_manifest = read_json_object(input_manifest_path)
+    effective_initialization = (
+        effective_manifest.get("effective_initialization")
+        if isinstance(effective_manifest, dict)
+        else None
+    )
+    effective_policy = (
+        effective_initialization.get("policy")
+        if isinstance(effective_initialization, dict)
+        else None
+    )
+    effective_manifest_valid = bool(
+        isinstance(effective_manifest, dict)
+        and effective_manifest.get("request_manifest_sha256")
+        == manifest_sha256(input_manifest)
+        and (
+            effective_policy is None
+            or file_identity_matches(effective_policy)
+        )
+    )
 
     # Most adapters save to `checkpoint.pt`; gym_sb3 uses `checkpoint.zip`.
     # Apply the same integrity rule used by cross-iteration resume discovery.
     ckpt = _valid_promoted_policy(iter_dir)
-    if ckpt is not None:
+    exact_completion = bool(
+        ckpt is not None
+        and exact_request
+        and effective_manifest_valid
+        and completion_manifest_matches(
+            completion_manifest_path, effective_manifest, [ckpt]
+        )
+    )
+    if ckpt is not None and exact_completion:
         # Assemble best-effort metrics from prior metrics.json.
         metrics: dict[str, float] = {}
         try:
@@ -1565,8 +1621,9 @@ def _train_or_resume(
         _emit_event({
             "type": "phase_skipped",
             "iter": iter_index, "phase": "train",
-            "reason": "checkpoint already on disk",
+            "reason": "exact input and completion manifests matched",
             "checkpoint": str(ckpt),
+            "input_manifest_sha256": manifest_sha256(effective_manifest),
         })
         # §Ship 15: caller requested warm-start, but iter's own
         # checkpoint already exists on disk — resume path wins.
@@ -1585,6 +1642,19 @@ def _train_or_resume(
             component_means={},
             logs_path=iter_dir / "logs",
         )
+    if ckpt is not None:
+        _emit_event({
+            "type": "phase_resume_rejected",
+            "iter": iter_index,
+            "phase": "train",
+            "reason": (
+                "input_manifest_mismatch"
+                if not exact_request or not effective_manifest_valid
+                else "completion_manifest_mismatch"
+            ),
+            "checkpoint": str(ckpt),
+            "requested_input_manifest_sha256": manifest_sha256(input_manifest),
+        })
 
     # Fresh/recovered training run — no promoted checkpoint or all promoted
     # candidates corrupt. Prefer this iter's newest valid intermediate policy
@@ -1599,7 +1669,18 @@ def _train_or_resume(
     # "Warm-start checkpoint" field look broken, which is what happened on
     # platform-ascent-showcase. `warm_start_explicit` is only ever set for the
     # first iteration of a run, so mid-run crash recovery is unaffected.
-    partial_policy = _latest_valid_partial_policy(iter_dir)
+    partial_policy = (
+        _latest_valid_partial_policy(iter_dir) if exact_request else None
+    )
+    if not exact_request:
+        stale_partial = _latest_valid_partial_policy(iter_dir)
+        if stale_partial is not None:
+            _emit_event({
+                "type": "partial_train_ignored",
+                "iter": iter_index,
+                "checkpoint": str(stale_partial),
+                "reason": "input_manifest_mismatch",
+            })
     if partial_policy is not None and warm_start_explicit:
         _emit_event({
             "type": "partial_train_ignored",
@@ -1638,6 +1719,7 @@ def _train_or_resume(
     # Accept either an explicit named param OR a VAR_KEYWORD param —
     # the former is the preferred contract, the latter is "adapter
     # MIGHT support it, let's try and let the adapter decide."
+    effective_init_forwarded = False
     if init_policy_path is not None:
         import inspect
         sig = inspect.signature(adapter.train)
@@ -1648,6 +1730,7 @@ def _train_or_resume(
         )
         if has_explicit or has_var_kwarg:
             train_kwargs["init_policy_path"] = init_policy_path
+            effective_init_forwarded = True
             if "init_policy_mode" in sig.parameters or has_var_kwarg:
                 train_kwargs["init_policy_mode"] = init_policy_mode
         else:
@@ -1660,7 +1743,39 @@ def _train_or_resume(
             })
     if pre_train_event is not None:
         _emit_event(dict(pre_train_event))
-    return adapter.train(**train_kwargs)
+    # First write wins only for an exact resume. A changed request replaces the
+    # stale input receipt before work begins; the old completion receipt can no
+    # longer match it if this attempt is interrupted.
+    effective_manifest = {
+        **input_manifest,
+        "request_manifest_sha256": manifest_sha256(input_manifest),
+        "effective_initialization": {
+            "mode": init_policy_mode if effective_init_forwarded else None,
+            "policy": (
+                file_identity(init_policy_path)
+                if effective_init_forwarded and init_policy_path is not None
+                else None
+            ),
+            "forwarded_to_adapter": effective_init_forwarded,
+        },
+    }
+    write_json_atomic(request_manifest_path, input_manifest)
+    write_json_atomic(input_manifest_path, effective_manifest)
+    result = adapter.train(**train_kwargs)
+    result_checkpoint = getattr(result, "checkpoint_path", None)
+    if result_checkpoint is not None and Path(result_checkpoint).is_file():
+        completion = build_completion_manifest(
+            effective_manifest, [Path(result_checkpoint)]
+        )
+        write_json_atomic(completion_manifest_path, completion)
+        _emit_event({
+            "type": "phase_manifest_completed",
+            "iter": iter_index,
+            "phase": "train",
+            "input_manifest_sha256": manifest_sha256(effective_manifest),
+            "checkpoint_sha256": completion["outputs"][0]["sha256"],
+        })
+    return result
 
 
 def _rollout_or_resume(
@@ -1675,32 +1790,86 @@ def _rollout_or_resume(
     render_env_index: int | None = None,
     seed: int | None = None,
     reward_module_path: Path | None = None,
+    manifest_context: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Skip `adapter.rollout` when the three artifacts it produces
-    (`rollout.mp4` + `trajectory.npz` + `behavior.json`) are ALL on
-    disk. Partial rollouts re-run cleanly; we don't try to merge.
+    """Resume rollout only when exact inputs and output bytes match.
 
     §Ship-7: video knobs (max_episode_steps / playback_speed / etc.)
     are threaded through adapter.rollout; adapters that don't support
     them (gym_sb3) silently ignore via `**kwargs`.
     """
+    from sculptor.run_manifests import (
+        build_completion_manifest,
+        build_rollout_input_manifest,
+        completion_manifest_matches,
+        input_manifest_matches,
+        manifest_sha256,
+        write_json_atomic,
+    )
+
     required = (
         rollout_dir / "rollout.mp4",
         rollout_dir / "trajectory.npz",
         rollout_dir / "behavior.json",
     )
-    if all(p.is_file() and p.stat().st_size > 0 for p in required):
+    input_manifest = build_rollout_input_manifest(
+        adapter=adapter,
+        iteration=iter_index,
+        checkpoint_path=checkpoint_path,
+        reward_module_path=reward_module_path,
+        n_episodes=n_episodes,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        playback_speed=playback_speed,
+        render_every=render_every,
+        fps=fps,
+        render_width=render_width,
+        render_height=render_height,
+        render_env_index=render_env_index,
+        context=manifest_context,
+    )
+    input_manifest_path = rollout_dir / "rollout_input_manifest.json"
+    completion_manifest_path = rollout_dir / "rollout_completion_manifest.json"
+    outputs_present = all(
+        p.is_file() and p.stat().st_size > 0 for p in required
+    )
+    exact_input = input_manifest_matches(input_manifest_path, input_manifest)
+    exact_completion = bool(
+        outputs_present
+        and exact_input
+        and completion_manifest_matches(
+            completion_manifest_path, input_manifest, required
+        )
+    )
+    if exact_completion:
         _emit_event({
             "type": "phase_skipped",
             "iter": iter_index, "phase": "rollout",
-            "reason": "rollout artifacts already on disk",
+            "reason": "exact input and completion manifests matched",
+            "input_manifest_sha256": manifest_sha256(input_manifest),
         })
         return
+    if outputs_present:
+        _emit_event({
+            "type": "phase_resume_rejected",
+            "iter": iter_index,
+            "phase": "rollout",
+            "reason": (
+                "input_manifest_mismatch"
+                if not exact_input
+                else "completion_manifest_mismatch"
+            ),
+            "requested_input_manifest_sha256": manifest_sha256(input_manifest),
+        })
     # Pass video knobs only to adapters that declare them — older
     # adapter.rollout signatures (gym_sb3) don't accept the new kwargs
     # and would TypeError. Introspect once.
     import inspect
     sig = inspect.signature(adapter.rollout)
+    has_var_kwarg = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in sig.parameters.values()
+    )
     extra: dict[str, Any] = {}
     for name, value in (
         ("max_episode_steps", max_episode_steps),
@@ -1710,19 +1879,49 @@ def _rollout_or_resume(
         ("render_width", render_width),
         ("render_height", render_height),
         ("render_env_index", render_env_index),
-        # §Selection statistics: distinct eval seeds per repeat rollout —
-        # adapters that don't declare `seed` (gym_sb3) silently skip it.
+        # §Selection statistics: distinct eval seeds per repeat rollout.
+        # A requested seed fails closed below if the adapter cannot install it.
         ("seed", seed),
         ("reward_module_path", reward_module_path),
     ):
-        if value is not None and name in sig.parameters:
+        if value is None:
+            continue
+        if name in sig.parameters or has_var_kwarg:
             extra[name] = value
+        elif name == "seed":
+            raise ValueError(
+                "adapter cannot install the requested rollout seed; "
+                "evaluation seed evidence would be false"
+            )
+    # Do not let an adapter that only rewrites a subset accidentally produce a
+    # completion receipt over a mixture of old and new rollout artifacts.
+    for stale_output in (*required, completion_manifest_path):
+        try:
+            if stale_output.is_file() or stale_output.is_symlink():
+                stale_output.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot clear stale rollout artifact {stale_output}: {exc}"
+            ) from exc
+    write_json_atomic(input_manifest_path, input_manifest)
     adapter.rollout(
         checkpoint_path=checkpoint_path,
         output_dir=rollout_dir,
         n_episodes=n_episodes,
         **extra,
     )
+    if all(p.is_file() and p.stat().st_size > 0 for p in required):
+        completion = build_completion_manifest(input_manifest, required)
+        write_json_atomic(completion_manifest_path, completion)
+        _emit_event({
+            "type": "phase_manifest_completed",
+            "iter": iter_index,
+            "phase": "rollout",
+            "input_manifest_sha256": manifest_sha256(input_manifest),
+            "output_sha256": [
+                item["sha256"] for item in completion["outputs"]
+            ],
+        })
 
 
 def _persist_mode_diagnostics(
@@ -2413,6 +2612,69 @@ def _run_one_iter(
         else None
     )
 
+    # Bind every mutable selector available at the outer-loop boundary before
+    # train/rollout so a later pointer move cannot relabel retained outputs.
+    from sculptor.run_manifests import file_identity
+
+    _env_snapshot = iter_dir / "env_spec.json"
+    _run_context_receipt = project / "reports" / "run_context.json"
+    _active_env_path = Path(_active_spec_path) if _active_spec_path else None
+    _run_context = _load_json_if_present(_run_context_receipt)
+    _stable_software_context = {
+        key: _run_context.get(key)
+        for key in (
+            "code_git",
+            "python",
+            "packages",
+            "prompts",
+            "warm_start_policy_contract",
+        )
+        if key in _run_context
+    } or None
+    phase_manifest_context: dict[str, Any] = {
+        "configuration": {
+            "file": file_identity(config_path),
+            "effective": cfg,
+        },
+        "observed_software_context": _stable_software_context,
+        "reward_target": file_identity(Path(reward_path_trained)),
+        "environment": {
+            "version": env_spec_trained,
+            "active": (
+                file_identity(_active_env_path)
+                if _active_env_path is not None and _active_env_path.is_file()
+                else None
+            ),
+            "snapshot": (
+                file_identity(_env_snapshot)
+                if _env_snapshot.is_file()
+                else None
+            ),
+        },
+        "artifact_selection": {
+            "tuple_hash": world_selection_hash,
+            "selection": (
+                file_identity(world_selection_path)
+                if world_selection_path is not None
+                else None
+            ),
+        },
+        "timing_and_runtime": {
+            key: iter_cfg.get(key)
+            for key in (
+                "max_episode_steps",
+                "playback_speed",
+                "render_every",
+                "rollout_fps",
+                "render_width",
+                "render_height",
+                "render_env_index",
+                "rollout_episodes",
+            )
+        },
+        "dry_run": bool(dry_run),
+    }
+
     # §2026-07-04: report the version that actually TRAINS this iter
     # (current.py's target / the revert base), not the disk maximum —
     # the two diverge at run boundaries after best-selection.
@@ -2452,6 +2714,7 @@ def _run_one_iter(
         init_policy_mode=init_policy_mode,
         warm_start_explicit=warm_start_explicit,
         pre_train_event=mode_execution_event,
+        manifest_context=phase_manifest_context,
     )
     # 2. Rollout — use the checkpoint path the adapter actually wrote.
     # Different adapters use different extensions: gym_sb3 writes
@@ -2466,25 +2729,109 @@ def _run_one_iter(
         if train_result is not None and train_result.checkpoint_path is not None
         else iter_dir / "checkpoint.zip"
     )
-    _rollout_or_resume(
-        adapter=adapter,
-        iter_index=iter_index,
-        rollout_dir=rollout_dir,
-        checkpoint_path=checkpoint_path,
-        n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
-        reward_module_path=Path(reward_path_trained),
-        # §Ship-7: rollout video knobs — default None means runner defaults
-        # (500 steps, playback 1x, auto render_every + fps). Each key
-        # overrides independently when set in config.toml or passed via
-        # the `sculpt run` CLI flags.
-        max_episode_steps=iter_cfg.get("max_episode_steps"),
-        playback_speed=iter_cfg.get("playback_speed"),
-        render_every=iter_cfg.get("render_every"),
-        fps=iter_cfg.get("rollout_fps"),
-        render_width=iter_cfg.get("render_width"),
-        render_height=iter_cfg.get("render_height"),
-        render_env_index=iter_cfg.get("render_env_index"),
-    )
+
+    # Objective-evaluation seeds are launch inputs, not incidental loop
+    # counters. Persist the complete requested set before the first rollout so
+    # a failed repeat remains visible and cannot be reported as a smaller K.
+    _eval_seeds = 1
+    if fitness_fn is not None:
+        try:
+            _eval_seeds = max(1, int(iter_cfg.get("eval_seeds", 1) or 1))
+        except Exception:  # noqa: BLE001 -- malformed config keeps one seed
+            _eval_seeds = 1
+    objective_eval_seeds = [
+        10_000 + iter_index * 100 + k for k in range(_eval_seeds)
+    ] if fitness_fn is not None else []
+    evaluation_plan: dict[str, Any] | None = None
+    if objective_eval_seeds:
+        from sculptor.run_manifests import write_json_atomic
+
+        evaluation_plan = {
+            "schema": 1,
+            "iteration": iter_index,
+            "authority": "precommitted_objective_evaluation_seeds",
+            "requested_count": len(objective_eval_seeds),
+            "requested_seeds": objective_eval_seeds,
+            "rollout_episodes_per_seed": int(
+                iter_cfg.get("rollout_episodes", 6)
+            ),
+        }
+        write_json_atomic(
+            iter_dir / "evaluation_plan.json", evaluation_plan
+        )
+        _emit_event({
+            "type": "evaluation_plan_bound",
+            "iter": iter_index,
+            **evaluation_plan,
+        })
+    try:
+        _rollout_or_resume(
+            adapter=adapter,
+            iter_index=iter_index,
+            rollout_dir=rollout_dir,
+            checkpoint_path=checkpoint_path,
+            n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+            reward_module_path=Path(reward_path_trained),
+            manifest_context=phase_manifest_context,
+            # §Ship-7: rollout video knobs — default None means runner defaults
+            # (500 steps, playback 1x, auto render_every + fps). Each key
+            # overrides independently when set in config.toml or passed via
+            # the `sculpt run` CLI flags.
+            max_episode_steps=iter_cfg.get("max_episode_steps"),
+            playback_speed=iter_cfg.get("playback_speed"),
+            render_every=iter_cfg.get("render_every"),
+            fps=iter_cfg.get("rollout_fps"),
+            render_width=iter_cfg.get("render_width"),
+            render_height=iter_cfg.get("render_height"),
+            render_env_index=iter_cfg.get("render_env_index"),
+            seed=(objective_eval_seeds[0] if objective_eval_seeds else None),
+        )
+    except Exception as exc:
+        if evaluation_plan is not None:
+            failed_results = [{
+                "seed": objective_eval_seeds[0],
+                "rollout": "rollout",
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }] + [
+                {
+                    "seed": requested_seed,
+                    "rollout": None,
+                    "status": "not_run",
+                    "error": "the required primary evaluation failed",
+                }
+                for requested_seed in objective_eval_seeds[1:]
+            ]
+            from sculptor.run_manifests import (
+                manifest_sha256,
+                write_json_atomic,
+            )
+
+            failed_receipt = {
+                "schema": 1,
+                "iteration": iter_index,
+                "plan": evaluation_plan,
+                "requested_count": len(objective_eval_seeds),
+                "completed_count": 0,
+                "complete": False,
+                "results": failed_results,
+            }
+            write_json_atomic(
+                iter_dir / "evaluation_results.json",
+                failed_receipt,
+            )
+            _emit_event({
+                "type": "evaluation_batch_completed",
+                "iter": iter_index,
+                "requested_count": len(objective_eval_seeds),
+                "completed_count": 0,
+                "complete": False,
+                "results": failed_results,
+                "evaluation_receipt_sha256": manifest_sha256(
+                    failed_receipt
+                ),
+            })
+        raise
 
     # A promoted phase reward is not fully integrated until its official
     # rollout is joined back to the exact graph/schedule it trained under.
@@ -2515,6 +2862,7 @@ def _run_one_iter(
     extra_eval_dirs: list[Path] = []
     fitness_per_seed: list[float] = []
     progress_per_seed: list[float] = []
+    evaluation_results: list[dict[str, Any]] = []
     if fitness_fn is not None:
         # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
         # fn) to get the FULL component breakdown in one compute; fall back to
@@ -2540,6 +2888,20 @@ def _run_one_iter(
                 f"{type(e).__name__}: {e} — treating as unavailable\n"
             )
             iter_fitness = None
+            evaluation_results.append({
+                "seed": objective_eval_seeds[0],
+                "rollout": "rollout",
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+            })
+        else:
+            evaluation_results.append({
+                "seed": objective_eval_seeds[0],
+                "rollout": "rollout",
+                "status": "succeeded",
+                "fitness": iter_fitness,
+                "progress": iter_progress,
+            })
         # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2): the keep-best
         # decision was previously made on ONE rollout batch — a noisy
         # scalar compared with strict `>`. With `eval_seeds = K > 1` in
@@ -2549,12 +2911,9 @@ def _run_one_iter(
         # the diagnoser's view (keyframes / video / components); extras
         # land in `rollout_eval_<k>/`. Each extra is best-effort: a failed
         # re-roll is skipped, never fatal. Requires the fitness fn's
-        # `detail_dir` accessor (spec + generated metrics both have it).
-        _eval_seeds = 1
-        try:
-            _eval_seeds = max(1, int(iter_cfg.get("eval_seeds", 1) or 1))
-        except Exception:  # noqa: BLE001 — a malformed knob keeps N=1
-            _eval_seeds = 1
+        # `detail_dir` accessor (spec + generated metrics both have it). Every
+        # precommitted seed is required: a failed repeat is recorded and then
+        # aborts this outer iteration below.
         detail_dir_fn = getattr(fitness_fn, "detail_dir", None)
         if (iter_fitness is not None and _eval_seeds > 1
                 and detail_dir_fn is not None):
@@ -2578,27 +2937,115 @@ def _run_one_iter(
                         # Deterministic, disjoint from training seeds
                         # (config seed + iter) and the fresh-eval band
                         # (90k+): reproducible re-rolls, distinct per k.
-                        seed=10_000 + iter_index * 100 + k,
+                        seed=objective_eval_seeds[k],
+                        manifest_context=phase_manifest_context,
                     )
                     d = detail_dir_fn(eval_dir) or {}
-                    fitness_per_seed.append(
-                        float(d.get("spec_score", 0.0) or 0.0))
+                    _seed_fitness = float(
+                        d.get("spec_score", 0.0) or 0.0
+                    )
+                    fitness_per_seed.append(_seed_fitness)
                     pr_k = d.get("progress_score")
-                    progress_per_seed.append(
+                    _seed_progress = (
                         min(1.0, max(0.0, float(pr_k)))
                         if (isinstance(pr_k, (int, float))
                             and not isinstance(pr_k, bool)
                             and math.isfinite(float(pr_k)))
-                        else 0.0)
+                        else 0.0
+                    )
+                    progress_per_seed.append(_seed_progress)
                     extra_eval_dirs.append(eval_dir)
-                except Exception as e:  # noqa: BLE001 — per-seed best-effort
+                    evaluation_results.append({
+                        "seed": objective_eval_seeds[k],
+                        "rollout": eval_dir.name,
+                        "status": "succeeded",
+                        "fitness": _seed_fitness,
+                        "progress": _seed_progress,
+                    })
+                except Exception as e:  # noqa: BLE001 - persist seed failure
                     sys.stderr.write(
                         f"[sculpt] iter {iter_index}: eval seed {k} "
                         f"skipped — {type(e).__name__}: {e}\n")
-            if len(fitness_per_seed) > 1:
+                    evaluation_results.append({
+                        "seed": objective_eval_seeds[k],
+                        "rollout": eval_dir.name,
+                        "status": "failed",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+            if len(evaluation_results) == _eval_seeds and all(
+                item["status"] == "succeeded" for item in evaluation_results
+            ):
                 iter_fitness = _median(fitness_per_seed)
                 if iter_progress is not None:
                     iter_progress = _median(progress_per_seed)
+            elif _eval_seeds > 1:
+                # An incomplete requested batch has no K-seed selection score.
+                # Preserve every per-seed result below, but do not silently use
+                # the median of survivors for diagnosis or keep-best.
+                iter_fitness = None
+                iter_progress = None
+
+        # Bare fitness functions cannot honor K>1 because they expose no
+        # rollout-directory evaluator. Record that contract failure explicitly.
+        if _eval_seeds > 1 and detail_dir_fn is None:
+            for k in range(1, _eval_seeds):
+                evaluation_results.append({
+                    "seed": objective_eval_seeds[k],
+                    "rollout": f"rollout_eval_{k}",
+                    "status": "failed",
+                    "error": "fitness function has no detail_dir evaluator",
+                })
+            iter_fitness = None
+            iter_progress = None
+
+        from sculptor.run_manifests import manifest_sha256, write_json_atomic
+
+        observed_eval_seeds = {
+            int(item["seed"]) for item in evaluation_results
+        }
+        for requested_seed in objective_eval_seeds:
+            if requested_seed not in observed_eval_seeds:
+                evaluation_results.append({
+                    "seed": requested_seed,
+                    "rollout": None,
+                    "status": "not_run",
+                    "error": "an earlier required evaluation failed",
+                })
+        completed_eval = sum(
+            item.get("status") == "succeeded" for item in evaluation_results
+        )
+        evaluation_receipt = {
+            "schema": 1,
+            "iteration": iter_index,
+            "plan": evaluation_plan,
+            "requested_count": _eval_seeds,
+            "completed_count": completed_eval,
+            "complete": (
+                len(evaluation_results) == _eval_seeds
+                and completed_eval == _eval_seeds
+            ),
+            "results": evaluation_results,
+        }
+        write_json_atomic(
+            iter_dir / "evaluation_results.json", evaluation_receipt
+        )
+        _emit_event({
+            "type": "evaluation_batch_completed",
+            "iter": iter_index,
+            "requested_count": _eval_seeds,
+            "completed_count": completed_eval,
+            "complete": evaluation_receipt["complete"],
+            "results": evaluation_results,
+            "evaluation_receipt_sha256": manifest_sha256(
+                evaluation_receipt
+            ),
+        })
+        if not evaluation_receipt["complete"]:
+            raise RuntimeError(
+                "objective evaluation incomplete "
+                f"({completed_eval}/{_eval_seeds} requested seeds "
+                "succeeded); the iteration was not completed"
+            )
         if iter_fitness is not None:
             pf = prior_fitness or {}
             best_so_far = pf.get("best_so_far")
@@ -2635,8 +3082,9 @@ def _run_one_iter(
                 "delta_vs_previous": progress["delta"],
                 "observe_only": bool(fitness_observe_only),
                 # §Selection statistics: null/absent when eval_seeds=1.
-                "eval_seeds": (len(fitness_per_seed)
-                               if len(fitness_per_seed) > 1 else None),
+                "eval_seeds_requested": _eval_seeds,
+                "eval_seeds_completed": completed_eval,
+                "eval_seeds": (_eval_seeds if _eval_seeds > 1 else None),
                 "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
                                      if len(fitness_per_seed) > 1 else None),
                 # §D24 (F4): the same physical sub-component breakdown the
@@ -2762,6 +3210,16 @@ def _run_one_iter(
                 "observe_only": bool(fitness_observe_only),
                 "eval_seeds": (len(fitness_per_seed)
                                if len(fitness_per_seed) > 1 else None),
+                "eval_seeds_requested": _eval_seeds,
+                "eval_seeds_completed": sum(
+                    item.get("status") == "succeeded"
+                    for item in evaluation_results
+                ),
+                "evaluation_complete": all(
+                    item.get("status") == "succeeded"
+                    for item in evaluation_results
+                ),
+                "evaluation_results": evaluation_results,
                 "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
                                      if len(fitness_per_seed) > 1 else None),
                 "components": fitness_components,
@@ -3144,21 +3602,7 @@ def _run_one_iter(
     if primary_metric is not None and isinstance(prev_metric, (int, float)):
         metric_delta = float(primary_metric) - float(prev_metric)
 
-    _emit_event({
-        "type": "iter_completed",
-        "iter": iter_index,
-        "failure_modes": list(diagnosis.failure_modes),
-        "edit_count": edit_count,
-        "primary_metric": primary_metric,
-        "metric_delta": metric_delta,
-        # §2026-07-04: the version that actually trained (mirrors
-        # iter_started) — not the disk maximum.
-        "reward_version_before": (
-            int(_m_trained.group(1)) if _m_trained else latest_n),
-        "reward_version_after": reward_version_after,
-        "paper_refs": sorted(set(applied_paper_refs)),
-    })
-    _write_iteration_completion_marker(
+    completion_payload = _write_iteration_completion_marker(
         iter_dir,
         iter_index=iter_index,
         checkpoint_path=checkpoint_path,
@@ -3168,10 +3612,42 @@ def _run_one_iter(
         reward_version_after=reward_version_after,
         world_selection_hash=world_selection_hash,
     )
+    completion_marker = iter_dir / _ITERATION_COMPLETE_MARKER
+    completion_marker_sha256, _ = _checkpoint_sha256_and_size(
+        completion_marker
+    )
+    _emit_event({
+        "type": "iter_completed",
+        "iter": iter_index,
+        "failure_modes": list(diagnosis.failure_modes),
+        "edit_count": edit_count,
+        "primary_metric": primary_metric,
+        "primary_metric_id": primary_key,
+        "primary_metric_semantics": (
+            "environment_default_return"
+            if primary_key == "mean_return"
+            else "adapter_declared_metric"
+        ),
+        "generated_reward_fitness": iter_fitness,
+        "metric_delta": metric_delta,
+        # §2026-07-04: the version that actually trained (mirrors
+        # iter_started) — not the disk maximum.
+        "reward_version_before": (
+            int(_m_trained.group(1)) if _m_trained else latest_n),
+        "reward_version_after": reward_version_after,
+        "paper_refs": sorted(set(applied_paper_refs)),
+        "iteration_completion": {
+            "marker": str(completion_marker.resolve()),
+            "marker_sha256": completion_marker_sha256,
+            "checkpoint_sha256": completion_payload["checkpoint_sha256"],
+            "phase_manifests": completion_payload["phase_manifests"],
+        },
+    })
     _emit_event({
         "type": "iteration_completion_marked",
         "iter": iter_index,
-        "marker": str(iter_dir / _ITERATION_COMPLETE_MARKER),
+        "marker": str(completion_marker),
+        "marker_sha256": completion_marker_sha256,
     })
 
     # §Ship 48: never-silent env-extension signal. The diagnoser flags edits
@@ -4203,6 +4679,66 @@ def sculpt_run(
                 and _best_out.checkpoint_path is not None
                 and Path(_best_out.checkpoint_path).is_file()):
             _fresh_scores: list[float] = []
+            _fresh_seeds = [90_001 + 131 * _j for _j in range(_fresh_n)]
+            _fresh_results: list[dict[str, Any]] = []
+            from sculptor.run_manifests import file_identity, write_json_atomic
+
+            _fresh_plan = {
+                "schema": 1,
+                "iteration": int(result.best_fitness_iter),
+                "authority": "precommitted_fresh_evaluation_seeds",
+                "requested_count": _fresh_n,
+                "requested_seeds": _fresh_seeds,
+                "rollout_episodes_per_seed": int(
+                    (cfg.get("iteration") or {}).get("rollout_episodes", 6)
+                ),
+                "checkpoint": file_identity(_best_out.checkpoint_path),
+                "reward": (
+                    file_identity(_best_out.reward_path_trained)
+                    if _best_out.reward_path_trained is not None
+                    else None
+                ),
+            }
+            write_json_atomic(
+                _best_out.iter_dir / "fresh_evaluation_plan.json",
+                _fresh_plan,
+            )
+            _emit_event({
+                "type": "fresh_evaluation_plan_bound",
+                "iter": int(result.best_fitness_iter),
+                **_fresh_plan,
+            })
+            _fresh_run_context = _load_json_if_present(
+                project / "reports" / "run_context.json"
+            )
+            _fresh_software_context = {
+                key: _fresh_run_context.get(key)
+                for key in (
+                    "code_git",
+                    "python",
+                    "packages",
+                    "prompts",
+                    "warm_start_policy_contract",
+                )
+                if key in _fresh_run_context
+            } or None
+            _fresh_manifest_context = {
+                "configuration": {
+                    "file": file_identity(config_path),
+                    "effective": cfg,
+                },
+                "observed_software_context": _fresh_software_context,
+                "artifact_selection": {
+                    "tuple_hash": _best_out.world_selection_hash,
+                    "selection": (
+                        file_identity(_best_out.world_selection_path)
+                        if _best_out.world_selection_path is not None
+                        and Path(_best_out.world_selection_path).is_file()
+                        else None
+                    ),
+                },
+                "evaluation_role": "fresh_kept_policy",
+            }
             for _j in range(_fresh_n):
                 _fresh_dir = _best_out.iter_dir / f"rollout_fresh_{_j}"
                 try:
@@ -4221,16 +4757,56 @@ def sculpt_run(
                         ),
                         # Disjoint from training seeds and the in-loop
                         # eval band (10k+): deterministic held-out seeds.
-                        seed=90_001 + 131 * _j,
+                        seed=_fresh_seeds[_j],
+                        manifest_context=_fresh_manifest_context,
                     )
                     _d = _detail_dir_fn(_fresh_dir) or {}
-                    _fresh_scores.append(
-                        float(_d.get("spec_score", 0.0) or 0.0))
+                    _fresh_score = float(
+                        _d.get("spec_score", 0.0) or 0.0
+                    )
+                    _fresh_scores.append(_fresh_score)
+                    _fresh_results.append({
+                        "seed": _fresh_seeds[_j],
+                        "rollout": _fresh_dir.name,
+                        "status": "succeeded",
+                        "fitness": _fresh_score,
+                    })
                 except Exception as e:  # noqa: BLE001 — per-seed best-effort
                     sys.stderr.write(
-                        f"[sculpt] fresh eval seed {_j} skipped — "
+                        f"[sculpt] fresh eval seed {_fresh_seeds[_j]} failed — "
                         f"{type(e).__name__}: {e}\n")
-            if _fresh_scores:
+                    _fresh_results.append({
+                        "seed": _fresh_seeds[_j],
+                        "rollout": _fresh_dir.name,
+                        "status": "failed",
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+            _fresh_complete = (
+                len(_fresh_results) == _fresh_n
+                and all(
+                    item["status"] == "succeeded"
+                    for item in _fresh_results
+                )
+            )
+            _fresh_result_receipt = {
+                "schema": 1,
+                "iteration": int(result.best_fitness_iter),
+                "plan": _fresh_plan,
+                "requested_count": _fresh_n,
+                "completed_count": len(_fresh_scores),
+                "complete": _fresh_complete,
+                "results": _fresh_results,
+            }
+            write_json_atomic(
+                _best_out.iter_dir / "fresh_evaluation_results.json",
+                _fresh_result_receipt,
+            )
+            from sculptor.run_manifests import manifest_sha256
+
+            _fresh_result_sha256 = manifest_sha256(
+                _fresh_result_receipt
+            )
+            if _fresh_complete:
                 result.fresh_fitness_per_seed = _fresh_scores
                 result.best_fitness_fresh = _median(_fresh_scores)
                 _emit_event({
@@ -4238,10 +4814,20 @@ def sculpt_run(
                     "iter": int(result.best_fitness_iter),
                     "fitness_fresh": round(result.best_fitness_fresh, 5),
                     "per_seed": [round(v, 5) for v in _fresh_scores],
+                    "evaluation_receipt_sha256": _fresh_result_sha256,
                     # Side-by-side: the (max-statistic) selected value.
                     "selected_fitness": (
                         round(result.best_fitness, 5)
                         if result.best_fitness is not None else None),
+                })
+            else:
+                _emit_event({
+                    "type": "best_fresh_eval_incomplete",
+                    "iter": int(result.best_fitness_iter),
+                    "requested_count": _fresh_n,
+                    "completed_count": len(_fresh_scores),
+                    "results": _fresh_results,
+                    "evaluation_receipt_sha256": _fresh_result_sha256,
                 })
 
     # §Ship 37: persist run-learnings to the KG case-memory so future

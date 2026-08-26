@@ -72,6 +72,33 @@ def _prep_output_dir(tmp_path: Path) -> Path:
     return out
 
 
+def _reward_file(tmp_path: Path, name: str = "v0.py") -> Path:
+    reward = tmp_path / name
+    reward.write_text("reward = 1\n", encoding="utf-8")
+    return reward
+
+
+def _write_train_input_receipt(
+    *, adapter, iter_dir: Path, reward: Path, iteration: int,
+    steps: int, seed: int, init_policy: Path | None = None,
+) -> None:
+    from sculptor.run_manifests import (
+        build_train_input_manifest,
+        write_json_atomic,
+    )
+
+    manifest = build_train_input_manifest(
+        adapter=adapter,
+        iteration=iteration,
+        reward_module_path=reward,
+        steps=steps,
+        seed=seed,
+        init_policy_path=init_policy,
+        init_policy_mode="actor_critic",
+    )
+    write_json_atomic(iter_dir / "train_request_manifest.json", manifest)
+
+
 # ── 1. MjlabAdapter.train CLI construction ───────────────────────────
 def test_mjlab_train_appends_load_pretrained_policy_flag(tmp_path: Path):
     pytest.importorskip("mjlab")
@@ -270,10 +297,11 @@ def test_train_or_resume_forwards_init_policy_path_to_supporting_adapter(
     iter_dir.mkdir()
     init_ckpt = tmp_path / "init.pt"
     init_ckpt.write_bytes(b"stub")
+    reward = _reward_file(tmp_path)
 
     _train_or_resume(
         adapter=adapter, iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=init_ckpt,
     )
     assert captured["init_policy_path"] == init_ckpt
@@ -300,12 +328,17 @@ def test_train_or_resume_prefers_latest_valid_partial_policy(
     os.utime(logs / "model_50.pt", ns=(3_000_000_000, 3_000_000_000))
     previous_iter = tmp_path / "iter_2.pt"
     previous_iter.write_bytes(b"stub")
+    reward = _reward_file(tmp_path, "v3.py")
+    _write_train_input_receipt(
+        adapter=adapter, iter_dir=iter_dir, reward=reward, iteration=3,
+        steps=750, seed=45, init_policy=previous_iter,
+    )
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
 
     sculpt_mod._train_or_resume(
         adapter=adapter, iter_index=3, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v3.py", steps=750, seed=45,
+        reward_module_path=reward, steps=750, seed=45,
         init_policy_path=previous_iter,
     )
 
@@ -333,10 +366,15 @@ def test_train_or_resume_skips_corrupt_newest_partial_policy(
     logs.mkdir(parents=True)
     torch.save({"model": "valid"}, logs / "model_100.pt")
     (logs / "model_150.pt").write_bytes(b"torn")
+    reward = _reward_file(tmp_path, "v1.py")
+    _write_train_input_receipt(
+        adapter=adapter, iter_dir=iter_dir, reward=reward, iteration=1,
+        steps=200, seed=43,
+    )
 
     _train_or_resume(
         adapter=adapter, iter_index=1, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v1.py", steps=200, seed=43,
+        reward_module_path=reward, steps=200, seed=43,
     )
 
     assert captured["init_policy_path"] == logs / "model_100.pt"
@@ -395,10 +433,11 @@ def test_train_or_resume_drops_init_policy_path_for_unsupported_adapter(
     iter_dir.mkdir()
     init_ckpt = tmp_path / "init.pt"
     init_ckpt.write_bytes(b"stub")
+    reward = _reward_file(tmp_path)
 
     sculpt_mod._train_or_resume(
         adapter=adapter, iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=init_ckpt,
     )
     assert captured.get("called") is True
@@ -415,26 +454,31 @@ def test_train_or_resume_emits_warm_start_skipped_when_local_ckpt_wins(
     resume path), `_train_or_resume` reuses it. When the caller ALSO
     passed init_policy_path, we emit warm_start_skipped so Ship-16's
     orchestrator can tell what actually ran."""
-    import torch
     from sculptor import sculpt as sculpt_mod
 
     iter_dir = tmp_path / "iter_0"
     iter_dir.mkdir()
-    torch.save({"model": "ok"}, iter_dir / "checkpoint.pt")
-
-    class _NoCallAdapter:
-        def train(self, **_kw):  # pragma: no cover — must not be called
-            raise AssertionError("resume path must not call adapter.train")
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
 
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
 
     init_ckpt = tmp_path / "init.pt"
     init_ckpt.write_bytes(b"stub")
+    reward = _reward_file(tmp_path)
+
+    # First execution earns the input + completion receipts.
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
+        init_policy_path=init_ckpt,
+    )
+    events.clear()
 
     sculpt_mod._train_or_resume(
-        adapter=_NoCallAdapter(), iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=init_ckpt,
     )
     skipped = [e for e in events if e.get("type") == "warm_start_skipped"]
@@ -449,23 +493,27 @@ def test_train_or_resume_no_warm_start_event_when_init_policy_none(
     """Regression guard: the warm_start_skipped event is ONLY emitted
     when the caller requested warm-start. Plain resume without init
     stays silent."""
-    import torch
     from sculptor import sculpt as sculpt_mod
 
     iter_dir = tmp_path / "iter_0"
     iter_dir.mkdir()
-    torch.save({"model": "ok"}, iter_dir / "checkpoint.pt")
-
-    class _NoCallAdapter:
-        def train(self, **_kw):  # pragma: no cover
-            raise AssertionError
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
 
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
+    reward = _reward_file(tmp_path)
 
     sculpt_mod._train_or_resume(
-        adapter=_NoCallAdapter(), iter_index=0, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
+        init_policy_path=None,
+    )
+    events.clear()
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=0, iter_dir=iter_dir,
+        reward_module_path=reward, steps=10, seed=0,
         init_policy_path=None,
     )
     skipped = [e for e in events if e.get("type") == "warm_start_skipped"]
@@ -657,11 +705,12 @@ def test_train_or_resume_forwards_kwarg_to_adapter_with_var_kwarg(
         iter_dir.mkdir()
         init_ckpt = tmp_path / "init.pt"
         init_ckpt.write_bytes(b"stub")
+        reward = _reward_file(tmp_path)
 
         sculpt_mod._train_or_resume(
             adapter=_KwargsAdapter(),
             iter_index=0, iter_dir=iter_dir,
-            reward_module_path=tmp_path / "v0.py", steps=10, seed=0,
+            reward_module_path=reward, steps=10, seed=0,
             init_policy_path=init_ckpt,
         )
     finally:
@@ -788,12 +837,13 @@ def test_named_warm_start_outranks_a_partial_from_an_interrupted_attempt(
     torch.save({"model": "the policy we stopped"}, logs / "model_450.pt")
     chosen = tmp_path / "iter_1.pt"
     chosen.write_bytes(b"stub")
+    reward = _reward_file(tmp_path, "v4.py")
     events: list[dict] = []
     monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
 
     sculpt_mod._train_or_resume(
         adapter=adapter, iter_index=4, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v4.py", steps=1500, seed=46,
+        reward_module_path=reward, steps=1500, seed=46,
         init_policy_path=chosen, warm_start_explicit=True,
     )
 
@@ -802,8 +852,7 @@ def test_named_warm_start_outranks_a_partial_from_an_interrupted_attempt(
         "type": "partial_train_ignored",
         "iter": 4,
         "checkpoint": str(logs / "model_450.pt"),
-        "reason": "explicit_warm_start_wins",
-        "warm_start": str(chosen),
+        "reason": "input_manifest_mismatch",
     }]
     assert not [e for e in events
                 if e.get("type") == "partial_train_recovered"]
@@ -829,11 +878,16 @@ def test_an_inferred_warm_start_still_yields_to_a_partial(
     torch.save({"model": "partial"}, logs / "model_450.pt")
     inferred = tmp_path / "iter_3.pt"
     inferred.write_bytes(b"stub")
+    reward = _reward_file(tmp_path, "v4.py")
+    _write_train_input_receipt(
+        adapter=adapter, iter_dir=iter_dir, reward=reward, iteration=4,
+        steps=1500, seed=46, init_policy=inferred,
+    )
     monkeypatch.setattr(sculpt_mod, "_emit_event", lambda _e: None)
 
     sculpt_mod._train_or_resume(
         adapter=adapter, iter_index=4, iter_dir=iter_dir,
-        reward_module_path=tmp_path / "v4.py", steps=1500, seed=46,
+        reward_module_path=reward, steps=1500, seed=46,
         init_policy_path=inferred, warm_start_explicit=False,
     )
 

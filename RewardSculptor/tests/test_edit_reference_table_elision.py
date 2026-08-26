@@ -56,12 +56,24 @@ def _scalar(x):
     return float(x)
 
 
+def reference_clock_scalar(info):
+    return 0.0
+
+
 def _phase_index_scalar(t):
     return 0
 
 
 def _reference_tracking_numpy(obs):
     return 0.0
+
+
+def reference_clock_batched(info, like):
+    return like
+
+
+def reference_target_index_batched(info, like):
+    return like
 
 
 def _phase_index_batched(t):

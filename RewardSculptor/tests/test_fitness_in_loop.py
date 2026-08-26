@@ -702,8 +702,8 @@ def test_median_helper():
 
 
 def test_rollout_or_resume_threads_seed_only_when_declared(tmp_path):
-    """`seed` reaches adapters that declare it; legacy signatures
-    (gym_sb3-shaped) are called without it — no TypeError."""
+    """`seed` reaches capable adapters; an unsupported requested seed fails
+    closed instead of claiming a seed the worker never installed."""
     calls: list = []
 
     class _SeedAdapter:
@@ -717,15 +717,18 @@ def test_rollout_or_resume_threads_seed_only_when_declared(tmp_path):
 
     d1 = tmp_path / "r1"
     d1.mkdir()
+    checkpoint = tmp_path / "ck.pt"
+    checkpoint.write_bytes(b"checkpoint")
     S._rollout_or_resume(
         adapter=_SeedAdapter(), iter_index=0, rollout_dir=d1,
-        checkpoint_path=tmp_path / "ck.pt", n_episodes=2, seed=123)
+        checkpoint_path=checkpoint, n_episodes=2, seed=123)
     d2 = tmp_path / "r2"
     d2.mkdir()
-    S._rollout_or_resume(
-        adapter=_LegacyAdapter(), iter_index=0, rollout_dir=d2,
-        checkpoint_path=tmp_path / "ck.pt", n_episodes=2, seed=123)
-    assert calls == [123, "legacy"]
+    with pytest.raises(ValueError, match="cannot install.*rollout seed"):
+        S._rollout_or_resume(
+            adapter=_LegacyAdapter(), iter_index=0, rollout_dir=d2,
+            checkpoint_path=checkpoint, n_episodes=2, seed=123)
+    assert calls == [123]
 
 
 def _fitness_fn_with_detail_dir(scores: list):
@@ -746,7 +749,12 @@ def test_fresh_seed_reeval_of_kept_best(tmp_path, monkeypatch):
     unbiased median lands in `best_fitness_fresh` beside the selected
     (max-statistic) value. Selection itself is untouched."""
     cfg_path = _make_project(tmp_path)
-    monkeypatch.setattr(S, "load_adapter", lambda _p: object())
+    class _FreshAdapter:
+        def rollout(self, *, output_dir, **_kwargs):
+            for name in ("rollout.mp4", "trajectory.npz", "behavior.json"):
+                (Path(output_dir) / name).write_text("fresh", encoding="utf-8")
+
+    monkeypatch.setattr(S, "load_adapter", lambda _p: _FreshAdapter())
     monkeypatch.setattr("sculptor.run_context.capture_run_context",
                         lambda *a, **k: {}, raising=True)
     monkeypatch.setattr("sculptor.run_context.write_run_context",
@@ -765,12 +773,6 @@ def test_fresh_seed_reeval_of_kept_best(tmp_path, monkeypatch):
         iter_dir.mkdir(parents=True, exist_ok=True)
         ckpt = iter_dir / "checkpoint.pt"
         ckpt.write_text("x", encoding="utf-8")
-        # Pre-bake the fresh-eval rollout artifacts so _rollout_or_resume
-        # SKIPS the adapter call (the adapter here is a bare object()).
-        fresh = iter_dir / "rollout_fresh_0"
-        fresh.mkdir()
-        for name in ("rollout.mp4", "trajectory.npz", "behavior.json"):
-            (fresh / name).write_text("x", encoding="utf-8")
         return S.IterOutcome(
             iter_index=i, iter_dir=iter_dir,
             reward_path_before=rewards_dir / "current.py",

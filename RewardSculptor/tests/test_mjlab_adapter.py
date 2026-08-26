@@ -741,6 +741,97 @@ def test_reference_clock_is_installed_and_executed_for_actor_and_critic() -> Non
         )
 
 
+@pytest.mark.parametrize("present_role", ["actor", "critic"])
+def test_reference_clock_rejects_a_missing_policy_role(
+    present_role: str,
+) -> None:
+    pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import (
+        _install_reference_clock_observation,
+    )
+    from sculptor.reference_clock import build_reference_clock
+
+    reward_module = SimpleNamespace(
+        REWARD_SPEC={
+            "reference_tracking": True,
+            "reference_clock": build_reference_clock(
+                clip_id="hop",
+                robot="g1",
+                target_sha256="a" * 64,
+                phase_mode="hold",
+                phase_duration_s=2.0,
+                n_phase_targets=32,
+            ),
+        },
+        reference_clock_batched=lambda _info, like: like[:, None],
+        reference_target_index_batched=lambda _info, like: like.long(),
+    )
+    env_cfg = SimpleNamespace(observations={
+        present_role: SimpleNamespace(terms={}),
+    })
+
+    with pytest.raises(RuntimeError, match="actor and critic"):
+        _install_reference_clock_observation(env_cfg, reward_module)
+
+
+def test_rollout_policy_contract_sidecar_must_match_exact_interface(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    from sculptor.adapters._mjlab_runner import (
+        _validate_rollout_checkpoint_policy_contract,
+        _write_local_checkpoint_policy_contract,
+    )
+
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"server-owned checkpoint")
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    contract = {
+        "schema": 4,
+        "observations": {
+            "ordered_terms": [{"name": "phase", "shape": [1]}],
+            "critic_ordered_terms": [{"name": "phase", "shape": [1]}],
+        },
+        "reference_clock": {"reference_target_sha256": "a" * 64},
+        "world": {"selection_sha256": "b" * 64},
+    }
+    _write_local_checkpoint_policy_contract(checkpoint, contract)
+
+    receipt = _validate_rollout_checkpoint_policy_contract(
+        checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        expected_contract=contract,
+    )
+    assert receipt["checkpoint_sha256"] == checkpoint_sha256
+
+    changed_critic = copy.deepcopy(contract)
+    changed_critic["observations"]["critic_ordered_terms"][0]["shape"] = [2]
+    with pytest.raises(RuntimeError, match="policy contract differs"):
+        _validate_rollout_checkpoint_policy_contract(
+            checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            expected_contract=changed_critic,
+        )
+
+    changed_world = copy.deepcopy(contract)
+    changed_world["world"]["selection_sha256"] = "c" * 64
+    with pytest.raises(RuntimeError, match="policy contract differs"):
+        _validate_rollout_checkpoint_policy_contract(
+            checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            expected_contract=changed_world,
+        )
+
+    (tmp_path / "checkpoint.pt.policy_contract.json").unlink()
+    with pytest.raises(RuntimeError, match="requires the exact local"):
+        _validate_rollout_checkpoint_policy_contract(
+            checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            expected_contract=contract,
+        )
+
+
 def test_warm_start_loaded_receipt_names_exact_loaded_bytes(tmp_path: Path) -> None:
     from sculptor.adapters._mjlab_runner import _warm_start_loaded_receipt
 

@@ -266,6 +266,18 @@ def _reference_clock_for_clip(
         np.asarray(clip["joint_pos"], dtype=np.float64),
         n=n_phase_targets,
     )
+    source_joint_pos = np.asarray(clip["joint_pos"], dtype=np.float64)
+    source_joint_vel = clip.get("joint_vel")
+    if source_joint_vel is None:
+        source_joint_vel = (
+            np.gradient(source_joint_pos, axis=0) * float(clip["fps"])
+            if source_joint_pos.shape[0] > 1
+            else np.zeros_like(source_joint_pos)
+        )
+    joint_vel = downsample_phase_targets(
+        np.asarray(source_joint_vel, dtype=np.float64),
+        n=n_phase_targets,
+    )
     root_z = downsample_phase_targets(
         np.asarray(clip["root_pos_z"], dtype=np.float64),
         n=n_phase_targets,
@@ -285,6 +297,7 @@ def _reference_clock_for_clip(
         robot=robot,
         joint_names=list(clip["joint_names"]),
         target_joint_pos=joint_pos,
+        target_joint_vel=joint_vel,
         target_root_z=root_z,
         target_gravity=gravity,
         root_frame=str(clip["root_frame"]),
@@ -548,7 +561,10 @@ def test_generate_tracking_reward_source_compiles_and_is_callable():
     assert isinstance(ns["REWARD_SPEC"], dict)
 
     compute_reward = ns["compute_reward"]
-    next_state = {"qpos": np.zeros(7 + 2)}
+    next_state = {
+        "qpos": np.zeros(7 + 2),
+        "qvel": np.zeros(6 + 2),
+    }
     next_state["qpos"][2] = 0.7   # root z matches phase-0 target
     next_state["qpos"][7] = 0.1   # joint 0 matches phase-0 target
     next_state["qpos"][8] = 0.0   # joint 1: target is 0 by default fill
@@ -558,6 +574,59 @@ def test_generate_tracking_reward_source_compiles_and_is_callable():
     assert set(components) == {"joint_tracking", "root_tracking"}
     # Near-perfect match at phase 0 -> both kernels near 1.0.
     assert reward > 1.9
+
+
+def test_tierd_tracking_reward_executes_velocity_and_zero_velocity_hold():
+    """The target digest must describe the schedule the reward consumes."""
+    torch = pytest.importorskip("torch")
+    target_velocity = np.full((2, 1), 2.0, dtype=np.float64)
+    src = generate_tracking_reward_source(
+        clip_id="velocity-execution",
+        robot="g1",
+        joint_names=["knee_joint"],
+        target_joint_pos=np.zeros((2, 1)),
+        target_joint_vel=target_velocity,
+        target_root_z=np.zeros(2),
+        episode_len_steps=50,
+        duration_s=1.0,
+    )
+    ns: dict = {}
+    exec(compile(src, "velocity_execution_reward", "exec"), ns)  # noqa: S102
+
+    def scalar_reward(velocity: float, *, step: int) -> float:
+        reward, _ = ns["compute_reward"](
+            {},
+            None,
+            {
+                "qpos": np.zeros(8),
+                "qvel": np.asarray([velocity]),
+            },
+            {"episode_length": step, "step_dt": 0.02},
+        )
+        return reward
+
+    assert scalar_reward(2.0, step=0) > scalar_reward(0.0, step=0)
+    assert scalar_reward(0.0, step=50) > scalar_reward(2.0, step=50)
+
+    batched, _ = ns["compute_reward_batched"](
+        None,
+        None,
+        {
+            "qpos": torch.zeros((2, 1)),
+            "qvel": torch.tensor([[2.0], [0.0]]),
+        },
+        {
+            "episode_length": torch.tensor([0.0, 50.0]),
+            "step_dt": torch.tensor([0.02, 0.02]),
+        },
+    )
+    assert float(batched[0]) == pytest.approx(
+        scalar_reward(2.0, step=0), abs=1e-6,
+    )
+    assert float(batched[1]) == pytest.approx(
+        scalar_reward(0.0, step=50), abs=1e-6,
+    )
+    assert ns["TARGET_JOINT_VEL"].tolist() == target_velocity.tolist()
 
 
 def test_tracking_reward_scales_gated_joint_signal_in_scalar_and_batch():
@@ -583,6 +652,7 @@ def test_tracking_reward_scales_gated_joint_signal_in_scalar_and_batch():
         None,
         {
             "qpos": np.zeros(8),
+            "qvel": np.zeros(1),
             "projected_gravity_b": np.array([0.0, 0.0, -1.0]),
         },
         {"episode_length": 0},
@@ -592,6 +662,7 @@ def test_tracking_reward_scales_gated_joint_signal_in_scalar_and_batch():
         None,
         {
             "qpos": torch.zeros(3, 1),
+            "qvel": torch.zeros(3, 1),
             "projected_gravity_b": torch.tensor(
                 [[0.0, 0.0, -1.0]] * 3,
             ),
@@ -637,6 +708,7 @@ def test_tracking_reward_prioritizes_motion_without_rescaling_return():
         {}, None,
         {
             "qpos": np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+            "qvel": np.zeros(1),
             "projected_gravity_b": target_gravity[0],
         },
         {"episode_length": 0},
@@ -645,6 +717,7 @@ def test_tracking_reward_prioritizes_motion_without_rescaling_return():
         {}, None,
         {
             "qpos": np.zeros(8),
+            "qvel": np.zeros(1),
             "projected_gravity_b": target_gravity[0],
         },
         {"episode_length": 0},
@@ -653,6 +726,7 @@ def test_tracking_reward_prioritizes_motion_without_rescaling_return():
         {}, None,
         {
             "qpos": np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+            "qvel": np.zeros(1),
             "projected_gravity_b": target_gravity[0],
         },
         {"episode_length": 0},
@@ -675,7 +749,9 @@ def test_tracking_reward_prioritizes_motion_without_rescaling_return():
         no_orientation, "no_orientation_reward", "exec",
     ), no_orientation_ns)  # noqa: S102
     maximum, components = no_orientation_ns["compute_reward"](
-        {}, None, {"qpos": np.zeros(8)}, {"episode_length": 0},
+        {}, None,
+        {"qpos": np.zeros(8), "qvel": np.zeros(1)},
+        {"episode_length": 0},
     )
     assert maximum == pytest.approx(2.0)
     assert sum(components.values()) == pytest.approx(maximum)
@@ -716,7 +792,7 @@ def test_generate_tracking_reward_source_phase_clocks_through_episode():
     compute_reward = ns["compute_reward"]
 
     # At step 6/8 -> phase 0.75 -> index 3 (last phase target = 3.0).
-    next_state = {"qpos": np.zeros(7 + 1)}
+    next_state = {"qpos": np.zeros(7 + 1), "qvel": np.zeros(1)}
     next_state["qpos"][7] = 3.0
     info = {"episode_length": 6}
     reward, _ = compute_reward({}, None, next_state, info)
@@ -747,7 +823,10 @@ def test_generate_tracking_reward_source_raises_on_qpos_too_short():
     ns: dict = {}
     exec(compile(src, "gen_reward", "exec"), ns)  # noqa: S102
     compute_reward = ns["compute_reward"]
-    next_state = {"qpos": np.zeros(5)}  # too short for 3 tracked joints
+    next_state = {
+        "qpos": np.zeros(5),
+        "qvel": np.zeros(2),
+    }  # both are too short for 3 tracked joints
     with pytest.raises(ValueError, match="too short"):
         compute_reward({}, None, next_state, {"episode_length": 0})
 
@@ -4417,8 +4496,14 @@ def test_unnormalized_quaternions_are_normalized_not_rejected():
 def test_orientation_term_rewards_matching_attitude(tmp_path):
     mod = _load_src(_orient_src(np.tile([0.0, 0.0, -1.0], (8, 1))), tmp_path)
     info = {"episode_length": 0, "step_dt": 0.02}
-    upright = {"qpos": np.zeros(11), "projected_gravity_b": np.array([0.0, 0.0, -1.0])}
-    tipped = {"qpos": np.zeros(11), "projected_gravity_b": np.array([1.0, 0.0, 0.0])}
+    upright = {
+        "qpos": np.zeros(11), "qvel": np.zeros(4),
+        "projected_gravity_b": np.array([0.0, 0.0, -1.0]),
+    }
+    tipped = {
+        "qpos": np.zeros(11), "qvel": np.zeros(4),
+        "projected_gravity_b": np.array([1.0, 0.0, 0.0]),
+    }
     _, c_up = mod.compute_reward(None, None, upright, info)
     _, c_tip = mod.compute_reward(None, None, tipped, info)
     assert c_up["orientation_tracking"] == pytest.approx(
@@ -4435,11 +4520,13 @@ def test_scalar_and_batched_orientation_agree(tmp_path):
     grav = np.array([0.30, -0.20, -0.93])
     grav = grav / np.linalg.norm(grav)
     _, c = mod.compute_reward(
-        None, None, {"qpos": np.zeros(11), "projected_gravity_b": grav},
+        None, None,
+        {"qpos": np.zeros(11), "qvel": np.zeros(4),
+         "projected_gravity_b": grav},
         {"episode_length": 0, "step_dt": 0.02})
     _, cb = mod.compute_reward_batched(
         None, None,
-        {"qpos": torch.zeros(3, 4),
+        {"qpos": torch.zeros(3, 4), "qvel": torch.zeros(3, 4),
          "projected_gravity_b": torch.tensor([grav] * 3, dtype=torch.float32)},
         {"episode_length": torch.zeros(3), "step_dt": torch.full((3,), 0.02)})
     assert float(cb["orientation_tracking"].mean()) == pytest.approx(
@@ -4454,7 +4541,8 @@ def test_a_clip_without_orientation_is_unchanged(tmp_path):
     assert mod.ORIENTATION_ERR_WEIGHT == 0.0
     _, c = mod.compute_reward(
         None, None,
-        {"qpos": np.zeros(11), "projected_gravity_b": np.array([1.0, 0.0, 0.0])},
+        {"qpos": np.zeros(11), "qvel": np.zeros(4),
+         "projected_gravity_b": np.array([1.0, 0.0, 0.0])},
         {"episode_length": 0, "step_dt": 0.02})
     assert "orientation_tracking" not in c
 

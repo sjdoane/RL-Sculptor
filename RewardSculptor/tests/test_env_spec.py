@@ -958,50 +958,35 @@ def test_rsi_trajectory_validates_and_is_not_iterable() -> None:
     assert "reset_joint_pos_trajectory" not in es.ITERABLE_TRAIN_KEYS
 
 
-def test_rsi_trajectory_wires_phase_reset_event() -> None:
+def test_rsi_trajectory_fails_closed_until_phase_is_synchronized() -> None:
     spec = {"env_spec_version": 1, "train": {
         "reset_joint_pos_trajectory": [[0.1, 0.2, 0.3], [0.2, 0.3, 0.4]],
         "reset_joint_vel_trajectory": [[0.0, 0.0, 0.0], [1.0, -1.0, 0.5]],
     }}
     assert es.validate_env_spec(spec) == []
     cfg = _fake_cfg_full()
-    _mjlab_runner._apply_env_spec(cfg, spec, train=True, task_id="")
-    ev = cfg.events["reset_robot_joints_to_reference"]
-    assert ev.mode == "reset"
-    assert "joint_pos_traj" in ev.params and "joint_vel_traj" in ev.params
+    with pytest.raises(RuntimeError, match="immutable per-environment phase"):
+        _mjlab_runner._apply_env_spec(cfg, spec, train=True, task_id="")
+    assert "reset_robot_joints_to_reference" not in cfg.events
     # rollout: reference reset is train-only
     cfg2 = _fake_cfg_full()
     _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
     assert "reset_robot_joints_to_reference" not in cfg2.events
 
 
-def test_phase_rsi_reset_samples_pos_and_vel_from_same_frame() -> None:
-    """Each env resets to a RANDOM reference frame, and its joint velocity comes
-    from that SAME frame (not the default zeros the single-target path uses)."""
+def test_phase_rsi_event_rejects_unsynchronized_trajectory() -> None:
     import torch
     from types import SimpleNamespace
 
     pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, -0.5, 0.5], [1.0, -1.0, 1.0]])
     vel = torch.tensor([[0.0, 0.0, 0.0], [2.0, -2.0, 1.0], [4.0, -4.0, 2.0]])
 
-    class _Asset:
-        data = SimpleNamespace(
-            default_joint_vel=torch.zeros(8, 3),
-            soft_joint_pos_limits=torch.tensor([[[-3.0, 3.0]] * 3] * 8))
-
-        def write_joint_state_to_sim(self, jp, jv, env_ids, joint_ids):
-            self.pos, self.vel = jp.clone(), jv.clone()
-
-    asset = _Asset()
-    env = SimpleNamespace(num_envs=8, device="cpu", scene={"robot": asset})
-    torch.manual_seed(3)
-    _mjlab_runner.reset_joints_to_reference(
-        env, None, joint_pos_traj=pos, joint_vel_traj=vel,
-        asset_cfg=SimpleNamespace(name="robot", joint_ids=slice(None)))
-    for r in range(8):
-        match = [k for k in range(3) if torch.allclose(asset.pos[r], pos[k], atol=1e-4)]
-        assert match, asset.pos[r].tolist()
-        assert torch.allclose(asset.vel[r], vel[match[0]], atol=1e-4)
+    with pytest.raises(RuntimeError, match="phase offset"):
+        _mjlab_runner.reset_joints_to_reference(
+            SimpleNamespace(), None,
+            joint_pos_traj=pos,
+            joint_vel_traj=vel,
+        )
 
 
 def test_pd_gains_dr_skipped_on_non_pd_robot() -> None:

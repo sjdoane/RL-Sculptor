@@ -982,8 +982,11 @@ def _current_reward_references(current_module) -> list[dict]:
 
 _REFERENCE_KERNEL_FUNCTIONS = (
     "_scalar",
+    "reference_clock_scalar",
     "_phase_index_scalar",
     "_reference_tracking_numpy",
+    "reference_clock_batched",
+    "reference_target_index_batched",
     "_phase_index_batched",
     "_reference_tracking_batched",
     "compute_reward",
@@ -1264,6 +1267,8 @@ def _validate_reference_tracking_contract(
     for key in (
         "reference_clip_id", "reference_target_sha256", "phase_mode",
         "phase_duration_s", "root_height_frame",
+        "reference_target_identity_schema", "reference_target_sampling",
+        "terminal_hold",
     ):
         if child.get(key) != parent.get(key):
             raise EditValidationError(
@@ -1309,19 +1314,23 @@ def _validate_reference_tracking_contract(
             "attached motion targets exactly")
     try:
         from sculptor.reference_clock import reference_target_sha256
+        from sculptor.refs.track import reference_tracking_target_payload
 
-        targets = {
-            "joint_names": [str(name) for name in mod.REFERENCE_JOINT_NAMES],
-            "joint_pos": np.round(np.asarray(
-                mod.REFERENCE_JOINT_POS, dtype=np.float64), 5).tolist(),
-            "root_z": np.round(np.asarray(
-                mod.REFERENCE_ROOT_Z, dtype=np.float64), 5).tolist(),
-            "root_frame": str(mod.REFERENCE_ROOT_FRAME),
-            "gravity": (
-                np.round(np.asarray(
-                    mod.REFERENCE_GRAVITY, dtype=np.float64), 5).tolist()
-                if mod.REFERENCE_GRAVITY is not None else None),
-        }
+        targets = reference_tracking_target_payload(
+            joint_names=[str(name) for name in mod.REFERENCE_JOINT_NAMES],
+            target_joint_pos=np.asarray(
+                mod.REFERENCE_JOINT_POS, dtype=np.float64),
+            target_joint_vel=np.asarray(
+                mod.REFERENCE_JOINT_VEL, dtype=np.float64),
+            target_root_z=np.asarray(
+                mod.REFERENCE_ROOT_Z, dtype=np.float64),
+            target_gravity=(
+                np.asarray(mod.REFERENCE_GRAVITY, dtype=np.float64)
+                if mod.REFERENCE_GRAVITY is not None else None
+            ),
+            root_frame=str(mod.REFERENCE_ROOT_FRAME),
+            phase_mode=str(mod.REFERENCE_PHASE_MODE),
+        )
     except (AttributeError, TypeError, ValueError) as e:
         raise EditValidationError(
             f"reference target arrays changed or disappeared: {e}") from e

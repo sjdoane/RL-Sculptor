@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -287,7 +288,17 @@ def test_export_bundle_contents_and_manifest(tmp_path):
         "config.toml", "metrics.json", "DEPLOY.md",
     } <= names
 
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
+    assert manifest["artifact_purpose"] == "reproducibility"
+    assert manifest["deployment_status"] == "not_certified"
+    assert manifest["deployment_authority"]["status"] == "not_certified"
+    assert manifest["compatibility_contract"] is None
+    assert manifest["compatibility_contract_digest"] is None
+    assert any(
+        "compatibility contract intentionally omitted" in item
+        for item in res.warnings
+    )
+    assert any("NOT DEPLOYMENT CERTIFIED" in item for item in res.warnings)
     assert manifest["iter_index"] == 0
     assert manifest["reward_version"] == "v1"
     assert manifest["checkpoint"]["format"] == "rsl_rl"
@@ -298,6 +309,121 @@ def test_export_bundle_contents_and_manifest(tmp_path):
     assert net["output"] == "mean_action"
     # every listed file carries a sha256
     assert all(len(f["sha256"]) == 64 for f in manifest["files"])
+
+
+def test_export_rejects_source_replacement_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-size atomic replacement cannot race snapshot capture."""
+    from sculptor import export as export_module
+
+    project = _make_project(tmp_path)
+    checkpoint = project / "runs" / "iter_0" / "checkpoint.pt"
+    output = tmp_path / "published.zip"
+    real_copy = export_module._copy_export_source
+    mutated = False
+
+    def copy_then_replace(source, source_handle, destination_handle):
+        nonlocal mutated
+        copied = real_copy(source, source_handle, destination_handle)
+        if not mutated and Path(source) == checkpoint:
+            replacement = checkpoint.with_name("checkpoint.replacement")
+            replacement.write_bytes(b"x" * checkpoint.stat().st_size)
+            os.replace(replacement, checkpoint)
+            mutated = True
+        return copied
+
+    monkeypatch.setattr(
+        export_module,
+        "_copy_export_source",
+        copy_then_replace,
+    )
+
+    with pytest.raises(ExportError, match="changed during capture"):
+        export_policy_bundle(project, out_path=output)
+
+    assert mutated is True
+    assert not output.exists()
+    assert not list(output.parent.glob(".rs_export_*"))
+
+
+def test_export_rejects_symlinked_iteration_parent(
+    tmp_path: Path,
+) -> None:
+    project = _make_project(tmp_path)
+    iteration = project / "runs" / "iter_0"
+    backing = project / "runs" / "iteration_backing"
+    iteration.rename(backing)
+    iteration.symlink_to(backing, target_is_directory=True)
+    output = tmp_path / "published.zip"
+
+    with pytest.raises(
+        ExportError,
+        match="traverses a symlink or non-directory",
+    ):
+        export_policy_bundle(project, out_path=output)
+
+    assert not output.exists()
+
+
+def test_export_rejects_output_aliasing_source_artifact(
+    tmp_path: Path,
+) -> None:
+    project = _make_project(tmp_path)
+    checkpoint = project / "runs" / "iter_0" / "checkpoint.pt"
+    original_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+
+    with pytest.raises(ExportError, match="destination aliases a source"):
+        export_policy_bundle(project, out_path=checkpoint)
+
+    assert checkpoint.is_file()
+    assert hashlib.sha256(checkpoint.read_bytes()).hexdigest() == original_sha256
+
+
+def test_export_metadata_uses_captured_config_after_source_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sculptor import export as export_module
+
+    project = _make_project(tmp_path)
+    config_path = project / "config.toml"
+    original_config = config_path.read_bytes()
+    real_actor_export = export_module._export_rsl_rl_actor
+
+    def mutate_source_then_export(
+        checkpoint,
+        captured_config,
+        stage,
+        files,
+        warnings,
+    ):
+        config_path.write_text(
+            '[adapter]\nconfig = { task_id = "mutated-live-task" }\n',
+            encoding="utf-8",
+        )
+        return real_actor_export(
+            checkpoint,
+            captured_config,
+            stage,
+            files,
+            warnings,
+        )
+
+    monkeypatch.setattr(
+        export_module,
+        "_export_rsl_rl_actor",
+        mutate_source_then_export,
+    )
+
+    result = export_policy_bundle(project, out_path=tmp_path / "captured.zip")
+
+    assert result.manifest["deployment"]["task_id"] == (
+        "Mjlab-Velocity-Flat-Unitree-Go1"
+    )
+    with zipfile.ZipFile(result.bundle_path) as archive:
+        assert archive.read("config.toml") == original_config
 
 
 def test_portable_starting_skill_is_data_only_and_importable(
@@ -718,10 +844,8 @@ def test_refs_export_skill_cli_uses_exact_identity_and_clear_candidate_copy(
 
 
 def test_deployment_contract_and_inference_script(tmp_path):
-    """The bundle carries a sim→real hardware contract (joint order, control
-    rate, action scale/offset, default pose, obs layout) + a runnable
-    inference.py — everything a hardware controller needs that the raw network
-    cannot express."""
+    """The raw bundle records a best-effort policy interface without turning
+    that metadata or the illustrative inference hooks into certification."""
     project = _make_project(tmp_path)  # real Go1 task_id
     res = export_policy_bundle(project)
     with zipfile.ZipFile(res.bundle_path) as zf:
@@ -750,6 +874,7 @@ def test_deployment_contract_and_inference_script(tmp_path):
     # the inference skeleton is parameterized, not a stub
     assert "read_robot_state" in infer_src and "send_joint_targets" in infer_src
     assert "default_vec + scale_vec * action" in infer_src
+    assert manifest["deployment_status"] == "not_certified"
 
 
 def test_deployment_contract_degrades_without_task_id(tmp_path):
@@ -926,6 +1051,39 @@ def test_deploy_md_mentions_dims_and_recipes(tmp_path):
     assert "torch.jit.load" in md
     assert "mean action" in md
     assert "48" in md and "12" in md
+    assert "NOT DEPLOYMENT CERTIFIED" in md
+    assert "do not prove" in md
+
+
+def test_minimal_self_digested_qualified_receipt_fails_closed(tmp_path):
+    project = _make_project(tmp_path)
+    checkpoint = project / "runs" / "iter_0" / "checkpoint.pt"
+    forged = {
+        "schema": 1,
+        "status": "qualified",
+        "purpose": "reproducibility",
+        "iter_index": 0,
+        "checks": {
+            "origin_lineage": {
+                "checkpoint_sha256": hashlib.sha256(
+                    checkpoint.read_bytes()
+                ).hexdigest(),
+            },
+        },
+        "blockers": [],
+    }
+    forged["authority_digest"] = hashlib.sha256(json.dumps(
+        forged,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode()).hexdigest()
+
+    result = export_policy_bundle(project, authority_receipt=forged)
+
+    assert result.manifest["deployment_status"] == "not_certified"
+    assert "malformed" in result.manifest["deployment_authority"]["blockers"][0]
 
 
 # ── silently-wrong-policy guards (review findings 1-4) ─────────────────────

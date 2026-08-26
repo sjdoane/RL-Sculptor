@@ -1849,6 +1849,103 @@ def test_env_spacing_is_a_no_op_without_the_knob():
         SimpleNamespace(scene=SimpleNamespace()), world) == ()
 
 
+def _object_only_world(*objects: tuple[str, dict]) -> dict:
+    world = _world()
+    world["shared"]["obstacles"]["course"] = []
+    world["shared"]["objects"] = dict(objects)
+    return world
+
+
+def _box_object(
+    *, position_m: tuple[float, float, float],
+    size_m: tuple[float, float, float],
+    quaternion_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+) -> dict:
+    return {
+        "shape": "box",
+        "fixed": True,
+        "nominal": {
+            "pose": {
+                "position_m": list(position_m),
+                "quaternion_wxyz": list(quaternion_wxyz),
+            },
+            "size_m": list(size_m),
+            "mass_kg": 1.0,
+            "friction": 0.8,
+            "restitution": 0.0,
+        },
+        "variations": [],
+    }
+
+
+def test_env_spacing_includes_a_centered_wide_object_extent():
+    """Object centres alone report a zero footprint for this exact failure."""
+    from sculptor.world.compiler import (
+        AUTHORED_COURSE_CLEARANCE_M,
+        _reconcile_env_spacing,
+        authored_footprint_m,
+    )
+
+    world = _object_only_world((
+        "wide_bar",
+        _box_object(position_m=(0.0, 0.0, 0.5), size_m=(10.0, 1.0, 1.0)),
+    ))
+    assert authored_footprint_m(world) == pytest.approx((10.0, 1.0))
+
+    cfg = _scene_cfg(2.0)
+    _reconcile_env_spacing(cfg, world)
+    assert cfg.scene.env_spacing == pytest.approx(
+        10.0 + AUTHORED_COURSE_CLEARANCE_M,
+    )
+
+
+def test_env_spacing_uses_rotated_object_aabb():
+    from sculptor.world.compiler import authored_footprint_m
+
+    half_sqrt_two = 2.0 ** -0.5
+    world = _object_only_world((
+        "rotated_bar",
+        _box_object(
+            position_m=(0.0, 0.0, 0.5),
+            size_m=(10.0, 1.0, 1.0),
+            quaternion_wxyz=(half_sqrt_two, 0.0, 0.0, half_sqrt_two),
+        ),
+    ))
+    assert authored_footprint_m(world) == pytest.approx((1.0, 10.0))
+
+
+def test_object_only_slalom_pitch_clears_the_far_box_edge():
+    from sculptor.world.compiler import (
+        AUTHORED_COURSE_CLEARANCE_M,
+        _reconcile_env_spacing,
+        authored_footprint_m,
+    )
+
+    objects = tuple(
+        (
+            f"box_{index}",
+            _box_object(
+                position_m=(x, side, 0.375),
+                size_m=(0.45, 0.45, 0.75),
+            ),
+        )
+        for index, (x, side) in enumerate(
+            ((2.0, 0.85), (3.5, -0.85), (5.0, 0.85), (6.5, -0.85)),
+            start=1,
+        )
+    )
+    world = _object_only_world(*objects)
+    span_x, span_y = authored_footprint_m(world)
+    assert span_x == pytest.approx(6.725)
+    assert span_y == pytest.approx(2.15)
+
+    cfg = _scene_cfg(2.0)
+    _reconcile_env_spacing(cfg, world)
+    assert cfg.scene.env_spacing == pytest.approx(
+        span_x + AUTHORED_COURSE_CLEARANCE_M,
+    )
+
+
 def test_generator_terrain_rejects_a_course_larger_than_its_tile():
     """Generator terrains take env origins from terrain tiles and ignore
     env_spacing, so an oversized course cannot be fixed by widening the pitch.

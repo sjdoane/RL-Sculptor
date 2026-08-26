@@ -498,14 +498,34 @@ def _install_reference_clock_observation(
     term_class, descriptor = _build_reference_clock_observation_class(
         reward_module
     )
-    installed = 0
-    seen_groups: set[int] = set()
+    role_aliases = {
+        "actor": {"actor", "policy"},
+        "critic": {"critic", "value"},
+    }
+    present_roles: set[str] = set()
+    all_terms: list[dict[str, Any]] = []
     for group_name in ("actor", "critic", "policy", "value"):
         group = observations.get(group_name)
         terms = getattr(group, "terms", None)
-        if not isinstance(terms, dict) or id(terms) in seen_groups:
+        if not isinstance(terms, dict):
             continue
-        seen_groups.add(id(terms))
+        all_terms.append(terms)
+        present_roles.update(
+            role for role, aliases in role_aliases.items()
+            if group_name in aliases
+        )
+    missing_roles = sorted({"actor", "critic"} - present_roles)
+    if missing_roles:
+        raise RuntimeError(
+            "reference-conditioned policy requires actor and critic "
+            f"observation groups; missing {missing_roles}"
+        )
+
+    installed_terms: set[int] = set()
+    for terms in all_terms:
+        if id(terms) in installed_terms:
+            continue
+        installed_terms.add(id(terms))
         if REFERENCE_CLOCK_TERM in terms:
             raise RuntimeError(
                 f"observation term {REFERENCE_CLOCK_TERM!r} already exists"
@@ -513,11 +533,6 @@ def _install_reference_clock_observation(
         terms[REFERENCE_CLOCK_TERM] = ObservationTermCfg(
             func=term_class,
             params={},
-        )
-        installed += 1
-    if installed == 0:
-        raise RuntimeError(
-            "reference-conditioned policy has no actor/critic observations"
         )
     return descriptor
 
@@ -1044,25 +1059,28 @@ def reset_joints_to_reference(
     explicit target vector instead of the standing default + a random
     offset).
 
-    §DeepMimic phase RSI (arXiv 1804.02717): when `joint_pos_traj` ([K, J], K
-    downsampled reference frames) is given INSTEAD of a single `joint_pos_target`,
-    each env samples a random frame k∈[0,K) at reset and initializes from THAT
-    frame — so the batch covers the whole motion manifold, not one posture (the
-    canonical RSI that "enables parallel learning of the motion phases"). When
-    `joint_vel_traj` is also given, the joint VELOCITIES are initialized from the
-    same frame too (a dynamic skill's mid-motion pose is meaningless at rest); the
-    prior single-target path leaves velocity at the default (zeros).
+    Random-frame trajectory RSI is deliberately rejected.  Sampling physical
+    state from frame k while restarting the policy/reward clock at frame zero
+    is not DeepMimic phase RSI.  It remains disabled until one immutable
+    per-environment offset is consumed by reset, actor, critic, and reward.
 
-    `joint_pos_target` / `joint_pos_traj` must already be tensors on `env.device`
-    with one element per joint (J) selected by `asset_cfg` — the caller
-    (`_apply_env_spec`) resolves/validates J against the robot's actual joint
-    count before injecting this event; a mismatch is a clear `ValueError` there,
-    never a silent misassignment here.
+    `joint_pos_target` must already be a tensor with one element per joint (J)
+    selected by `asset_cfg` — the caller (`_apply_env_spec`) resolves/validates
+    J against the robot's actual joint count before injecting this event.  The
+    trajectory parameters are reserved only to produce the explicit failure
+    above; they are not an alternate execution path.
     """
     import torch
 
     from mjlab.managers.scene_entity_config import SceneEntityCfg
     from mjlab.utils.lab_api.math import sample_uniform
+
+    if joint_pos_traj is not None or joint_vel_traj is not None:
+        raise RuntimeError(
+            "random-frame reference trajectory reset is disabled: it does "
+            "not yet install one immutable per-environment phase offset into "
+            "actor, critic, reward target selection, and reset state"
+        )
 
     if asset_cfg is None:
         asset_cfg = SceneEntityCfg("robot")
@@ -1075,18 +1093,8 @@ def reset_joints_to_reference(
     soft_joint_pos_limits = asset.data.soft_joint_pos_limits
 
     joint_vel = default_joint_vel[env_ids][:, asset_cfg.joint_ids].clone()
-    if joint_pos_traj is not None:
-        # Phase RSI: per-env random reference frame.
-        pos_traj = joint_pos_traj.to(device=env.device, dtype=torch.float32)
-        k = int(pos_traj.shape[0])
-        frame = torch.randint(0, max(1, k), (n,), device=env.device)
-        joint_pos = pos_traj[frame].clone()                      # [n, J]
-        if joint_vel_traj is not None:
-            vel_traj = joint_vel_traj.to(device=env.device, dtype=torch.float32)
-            joint_vel = vel_traj[frame].clone()                  # [n, J]
-    else:
-        target = joint_pos_target.to(device=env.device, dtype=torch.float32)
-        joint_pos = target.unsqueeze(0).expand(n, -1).clone()
+    target = joint_pos_target.to(device=env.device, dtype=torch.float32)
+    joint_pos = target.unsqueeze(0).expand(n, -1).clone()
     if joint_pos_noise:
         joint_pos = joint_pos + sample_uniform(
             -float(joint_pos_noise), float(joint_pos_noise),
@@ -2368,22 +2376,26 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     # a silent misassignment): the caller already validated the spec
     # schema-wise, but "does this vector match THIS robot" is a
     # robot-specific check the schema layer cannot make.
-    # §DeepMimic phase RSI (arXiv 1804.02717): a full downsampled reference
-    # TRAJECTORY (reset_joint_pos_trajectory [K][J], + optional _vel_) takes
-    # precedence over the single median posture — the reset event then samples a
-    # random frame per env and initializes joint pos AND vel from it, so the
-    # batch covers the whole motion manifold instead of one pose.
+    # A full trajectory cannot be installed honestly yet.  The historical
+    # implementation sampled frame k for physical state but restarted actor,
+    # critic and reward at phase zero.  Fail before environment construction;
+    # the fixed target remains the only supported reference-posture reset.
     jpt = train_sec.get("reset_joint_pos_target")
     jpt_traj = train_sec.get("reset_joint_pos_trajectory")
     jvt_traj = train_sec.get("reset_joint_vel_trajectory")
     jpt_noise = train_sec.get("reset_joint_pos_noise_rad")
-    if jpt is not None or jpt_traj is not None:
+    if jpt_traj is not None or jvt_traj is not None:
+        raise RuntimeError(
+            "reference trajectory RSI is not an executable training "
+            "capability until reset, actor, critic, and reward share one "
+            "immutable per-environment phase offset; use the fixed "
+            "reset_joint_pos_target path"
+        )
+    if jpt is not None:
         try:
             from sculptor.eval.robot_manifest import robot_joint_names
 
-            # Joint width comes from the trajectory's frames when present, else
-            # the single target.
-            width = len(jpt_traj[0]) if jpt_traj is not None else len(jpt)
+            width = len(jpt)
             canonical = robot_joint_names(task_id)
             if canonical is not None and width != len(canonical):
                 raise ValueError(
@@ -2402,32 +2414,9 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                     "asset_cfg": SceneEntityCfg(
                         _primary_robot_entity(env_cfg), joint_names=(".*",)),
                 }
-                if jpt_traj is not None:
-                    params["joint_pos_traj"] = torch.tensor(
-                        [[float(x) for x in frame] for frame in jpt_traj],
-                        dtype=torch.float32)
-                    # Only carry the velocity trajectory when its shape matches
-                    # (same K frames, same J) — the reset event indexes it with a
-                    # frame sampled from the position traj, so a mismatch would
-                    # crash at reset. A validated spec can't reach here mismatched;
-                    # this is the defensive backstop for an unvalidated caller.
-                    vel_ok = (jvt_traj is not None
-                              and len(jvt_traj) == len(jpt_traj)
-                              and len(jvt_traj[0]) == width)
-                    if vel_ok:
-                        params["joint_vel_traj"] = torch.tensor(
-                            [[float(x) for x in frame] for frame in jvt_traj],
-                            dtype=torch.float32)
-                    elif jvt_traj is not None:
-                        _skip("phase-RSI velocity trajectory", RuntimeError(
-                            "shape mismatch with position trajectory — "
-                            "using default joint velocities"))
-                    label = (f"phase-RSI {len(jpt_traj)} frames×{width} joints"
-                             + (", +vel" if vel_ok else ""))
-                else:
-                    params["joint_pos_target"] = torch.tensor(
-                        [float(x) for x in jpt], dtype=torch.float32)
-                    label = f"{width} joints"
+                params["joint_pos_target"] = torch.tensor(
+                    [float(x) for x in jpt], dtype=torch.float32)
+                label = f"{width} joints"
                 reset["reset_robot_joints_to_reference"] = EventTermCfg(
                     func=reset_joints_to_reference, mode="reset", params=params)
                 applied.append(
@@ -3742,7 +3731,7 @@ def _read_local_checkpoint_policy_contract(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
-            "direct observation-interface warm start requires the exact local "
+            "checkpoint interface validation requires the exact local "
             f"checkpoint policy-contract sidecar at {path}"
         ) from exc
     if not isinstance(payload, dict) or set(payload) != {
@@ -3763,6 +3752,47 @@ def _read_local_checkpoint_policy_contract(
             "checkpoint bytes or contract"
         )
     return contract
+
+
+def _validate_rollout_checkpoint_policy_contract(
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str,
+    expected_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fail before policy load unless checkpoint and rollout interfaces match.
+
+    The expected contract is rebuilt from the rollout's exact project,
+    reference clock, and world selection.  Exact comparison binds both actor
+    and critic ordered observations, normalizers, architecture, action space,
+    control timing, clock, and world tuple; matching width alone is not an
+    admissible substitute.
+    """
+    from sculptor.policy_contract import contract_fingerprint
+
+    observed = _read_local_checkpoint_policy_contract(
+        checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+    expected = dict(expected_contract)
+    expected_sha256 = contract_fingerprint(expected)
+    observed_sha256 = contract_fingerprint(observed)
+    if observed != expected or observed_sha256 != expected_sha256:
+        raise RuntimeError(
+            "rollout checkpoint policy contract differs from the current "
+            "actor/critic observation, reference-clock, world, timing, or "
+            "policy interface"
+        )
+    return {
+        "schema": "reward-sculptor-rollout-policy-contract-v1",
+        "checkpoint_sha256": checkpoint_sha256,
+        "policy_contract_sha256": expected_sha256,
+        "sidecar": str(_policy_contract_sidecar_path(checkpoint)),
+        "sidecar_sha256": _runtime_file_sha256(
+            _policy_contract_sidecar_path(checkpoint),
+            label="rollout checkpoint policy-contract sidecar",
+        ),
+    }
 
 
 def _write_local_checkpoint_policy_contract(
@@ -5459,6 +5489,7 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     )
     rollout_reward_sha256 = None
     rollout_reward_artifact = None
+    reference_clock = None
     rollout_checkpoint_sha256 = _runtime_file_sha256(
         args.checkpoint_path, label="rollout checkpoint",
     )
@@ -5523,6 +5554,36 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                 }, sort_keys=True),
                 flush=True,
             )
+    if reference_clock is not None:
+        from sculptor.policy_contract import build_project_policy_contract
+
+        reward_project_dir = (
+            Path(args.reward_module_path).expanduser().resolve().parent.parent
+        )
+        contract_kwargs: dict[str, Any] = {
+            "reference_clock": reference_clock,
+        }
+        selection_path = Path(
+            getattr(args, "world_selection", "") or ""
+        ).expanduser().resolve()
+        if selection_path.is_file():
+            contract_kwargs["world_selection_path"] = selection_path
+        expected_rollout_contract = build_project_policy_contract(
+            reward_project_dir,
+            **contract_kwargs,
+        )
+        contract_receipt = _validate_rollout_checkpoint_policy_contract(
+            Path(args.checkpoint_path),
+            checkpoint_sha256=rollout_checkpoint_sha256,
+            expected_contract=expected_rollout_contract,
+        )
+        print(
+            "[SCULPT-EVENT] " + json.dumps({
+                "type": "rollout_checkpoint_policy_contract_verified",
+                **contract_receipt,
+            }, sort_keys=True),
+            flush=True,
+        )
     # §D17: stage-FIXED eval-reset override — reference-derived lying
     # start for get-up stages, applied ONLY here (never to training),
     # AFTER the shared-only env-spec above and strictly ADDITIVE to it.

@@ -2523,6 +2523,81 @@ def _reconcile_constraint_budget(env_cfg: Any) -> tuple[str, ...]:
 AUTHORED_COURSE_CLEARANCE_M = 1.0
 
 
+def authored_object_half_extents_xy(
+    resolved: Mapping[str, Any],
+) -> tuple[float, float]:
+    """Conservative world-axis XY half extents for one authored object.
+
+    ``resolve_objects`` retains the exact nominal shape and quaternion used by
+    the runtime entity. The environment grid must account for those bytes, not
+    only for the object's centre: a wide fixture centred at the origin can
+    overlap every neighbouring environment even though all centres are
+    perfectly separated.
+    """
+    nominal = resolved.get("nominal")
+    if not isinstance(nominal, Mapping):
+        return (0.0, 0.0)
+    shape = str(resolved.get("shape", ""))
+    try:
+        if shape == "sphere":
+            radius = max(0.0, float(nominal["radius_m"]))
+            return (radius, radius)
+        if shape == "box":
+            local_half = 0.5 * np.asarray(nominal["size_m"], dtype=np.float64)
+        elif shape in {"cylinder", "capsule"}:
+            radius = max(0.0, float(nominal["radius_m"]))
+            axial_half = 0.5 * max(0.0, float(nominal["height_m"]))
+            if shape == "capsule":
+                axial_half += radius
+            local_half = np.asarray(
+                (radius, radius, axial_half), dtype=np.float64,
+            )
+        elif shape == "frame":
+            opening = np.asarray(nominal["opening_m"], dtype=np.float64)
+            post_radius = max(0.0, float(nominal["post_radius_m"]))
+            depth = max(
+                0.0, float(nominal.get("depth_m", post_radius * 2.0)),
+            )
+            local_half = np.asarray(
+                (
+                    depth / 2.0,
+                    float(opening[0]) / 2.0 + post_radius,
+                    float(opening[1]) / 2.0 + post_radius,
+                ),
+                dtype=np.float64,
+            )
+        else:
+            return (0.0, 0.0)
+        quaternion = np.asarray(
+            resolved.get("quaternion_wxyz", (1.0, 0.0, 0.0, 0.0)),
+            dtype=np.float64,
+        )
+    except (KeyError, TypeError, ValueError):
+        return (0.0, 0.0)
+    if local_half.shape != (3,) or quaternion.shape != (4,):
+        return (0.0, 0.0)
+
+    norm = float(np.linalg.norm(quaternion))
+    if not math.isfinite(norm) or norm <= 1e-12:
+        return (0.0, 0.0)
+    w, x, y, z = (quaternion / norm).tolist()
+    rotation = np.asarray(
+        (
+            (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z),
+             2.0 * (x * z + w * y)),
+            (2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z),
+             2.0 * (y * z - w * x)),
+            (2.0 * (x * z - w * y), 2.0 * (y * z + w * x),
+             1.0 - 2.0 * (x * x + y * y)),
+        ),
+        dtype=np.float64,
+    )
+    world_half = np.abs(rotation[:2, :]) @ local_half
+    if not np.all(np.isfinite(world_half)):
+        return (0.0, 0.0)
+    return (float(world_half[0]), float(world_half[1]))
+
+
 def authored_footprint_m(world: Mapping[str, Any]) -> tuple[float, float]:
     """XY span the authored geometry occupies around one environment origin.
 
@@ -2541,8 +2616,10 @@ def authored_footprint_m(world: Mapping[str, Any]) -> tuple[float, float]:
         pos = resolved.get("position_m")
         if not pos:
             continue
-        xs.append(float(pos[0]))
-        ys.append(float(pos[1]))
+        half_x, half_y = authored_object_half_extents_xy(resolved)
+        px, py = float(pos[0]), float(pos[1])
+        xs += [px - half_x, px + half_x]
+        ys += [py - half_y, py + half_y]
     return (max(xs) - min(xs), max(ys) - min(ys))
 
 

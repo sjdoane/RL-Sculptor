@@ -34,7 +34,7 @@ from sculptor.refs.track import (
 )
 
 
-REFERENCE_INPUT_HASH_SCHEMA = "reference-guided-input-v2"
+REFERENCE_INPUT_HASH_SCHEMA = "reference-guided-input-v3"
 
 
 class ReferenceRunError(RuntimeError):
@@ -194,14 +194,6 @@ class ReferenceRewardBuild:
     task_residual_authored: bool
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def load_exact_reference_motion(
     *, clip_id: str, robot: str,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
@@ -212,15 +204,22 @@ def load_exact_reference_motion(
     registered into the target robot's namespace, preserving the retarget
     provenance the library already records.
     """
-    clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
-    provenance_path = (
-        library.clip_dir(robot, clip_id) / library.PROVENANCE_FILENAME
-    )
-    if not clip_path.is_file() or not provenance_path.is_file():
+    try:
+        provenance_bytes, clip_bytes, _preview_bytes = (
+            library.capture_reference_artifact_snapshot(robot, clip_id)
+        )
+    except (OSError, TypeError, ValueError) as exc:
         raise ReferenceRunError(
             f"reference motion {robot}/{clip_id} is incomplete or missing"
-        )
-    provenance = library.read_provenance(robot, clip_id)
+        ) from exc
+    try:
+        provenance = json.loads(provenance_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceRunError(
+            "reference provenance is not valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(provenance, dict):
+        raise ReferenceRunError("reference provenance must be a JSON object")
     if provenance.get("clip_id") != clip_id or provenance.get("robot") != robot:
         raise ReferenceRunError(
             "reference provenance does not match the selected "
@@ -231,7 +230,28 @@ def load_exact_reference_motion(
         raise ReferenceRunError(
             "reference provenance is invalid: " + "; ".join(errors)
         )
-    return load_clip(clip_path), provenance, _sha256_file(clip_path)
+    clip_sha256 = hashlib.sha256(clip_bytes).hexdigest()
+    if provenance.get("content_sha256") != clip_sha256:
+        raise ReferenceRunError(
+            "reference provenance content_sha256 does not match the exact "
+            "captured clip.npz bytes"
+        )
+
+    # Decode only the already-hashed snapshot.  Loading the public path again
+    # here would reopen a check/use race: the bytes rewarded by the run could
+    # differ from the bytes whose digest and provenance were admitted above.
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="rs_reference_snapshot_"
+        ) as raw_tmp:
+            snapshot = Path(raw_tmp) / library.CLIP_FILENAME
+            snapshot.write_bytes(clip_bytes)
+            clip = load_clip(snapshot)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ReferenceRunError(
+            "captured reference clip is invalid or cannot be decoded"
+        ) from exc
+    return clip, provenance, clip_sha256
 
 
 def build_reference_guided_reward(

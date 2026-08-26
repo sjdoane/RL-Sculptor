@@ -578,7 +578,10 @@ def test_tierd_batched_scores_an_on_target_pose_at_one(tmp_path):
         "episode_length": torch.full((4,), float(step), dtype=torch.float64),
         "base_height": torch.full((4,), z0 + (tz - z0), dtype=torch.float64),
     }
-    total, comp = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
+    qvel = torch.as_tensor(mod.TARGET_JOINT_VEL[i], dtype=torch.float64).repeat(4, 1)
+    total, comp = mod.compute_reward_batched(
+        None, None, {"qpos": qpos, "qvel": qvel}, info,
+    )
     assert float(comp["joint_tracking"][0]) == pytest.approx(
         mod.JOINT_TERM_COEFFICIENT, abs=1e-9)
     assert float(comp["root_tracking"][0]) == pytest.approx(
@@ -604,17 +607,31 @@ def test_tierd_batched_joint_kernel_matches_the_scalar_path(tmp_path):
         "episode_length": torch.full((4,), float(step), dtype=torch.float64),
         "base_height": torch.zeros(4, dtype=torch.float64),
     }
-    _, batched = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
+    qvel = torch.as_tensor(
+        mod.TARGET_JOINT_VEL[i], dtype=torch.float64,
+    ).repeat(4, 1)
+    _, batched = mod.compute_reward_batched(
+        None, None, {"qpos": qpos, "qvel": qvel}, info,
+    )
 
     scalar_qpos = np.zeros(7 + mod.N_JOINTS)
     scalar_qpos[2] = float(mod.TARGET_ROOT_Z[i])
     scalar_qpos[7:] = target + off
+    scalar_qvel = np.asarray(mod.TARGET_JOINT_VEL[i], dtype=np.float64)
     _, scalar = mod.compute_reward(
-        None, None, {"qpos": scalar_qpos}, {"episode_length": int(step)})
+        None, None, {"qpos": scalar_qpos, "qvel": scalar_qvel},
+        {"episode_length": int(step)},
+    )
 
     assert float(batched["joint_tracking"][0]) == pytest.approx(
         scalar["joint_tracking"], abs=1e-12)
-    expected_kernel = float(np.exp(-mod.JOINT_ERR_WEIGHT * off ** 2))
+    expected_position_kernel = float(
+        np.exp(-mod.JOINT_ERR_WEIGHT * off ** 2)
+    )
+    expected_kernel = (
+        mod.JOINT_POSITION_SHARE * expected_position_kernel
+        + mod.JOINT_VELOCITY_SHARE
+    )
     assert float(batched["joint_tracking"][0]) == pytest.approx(
         mod.JOINT_TERM_COEFFICIENT * expected_kernel, abs=1e-12)
 
@@ -635,6 +652,11 @@ def test_tierd_batched_root_uses_a_delta_not_an_absolute_height(tmp_path):
         "episode_length": torch.full((2,), float(step), dtype=torch.float64),
         "base_height_delta": torch.full((2,), tz - z0, dtype=torch.float64),
     }
-    _, comp = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
+    qvel = torch.as_tensor(
+        mod.TARGET_JOINT_VEL[i], dtype=torch.float64,
+    ).repeat(2, 1)
+    _, comp = mod.compute_reward_batched(
+        None, None, {"qpos": qpos, "qvel": qvel}, info,
+    )
     assert float(comp["root_tracking"][0]) == pytest.approx(
         mod.ROOT_TERM_COEFFICIENT, abs=1e-9)
