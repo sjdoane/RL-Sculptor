@@ -18,10 +18,10 @@ import { usePhysics } from "@/hooks/usePhysics";
 import { useProject } from "@/hooks/useProjects";
 import { useRobot } from "@/hooks/useRobot";
 import { useHasActiveRun } from "@/hooks/useRuns";
+import { projectBadgeStatus } from "@/lib/projectStatus";
 import { formatRelative } from "@/lib/utils";
 import type {
   ProjectDetail as ProjectDetailShape,
-  ProjectStatus,
   RobotStateResponse,
   SelectedStage,
 } from "@/lib/types";
@@ -42,6 +42,56 @@ const TABS = [
 ] as const;
 
 type TabValue = (typeof TABS)[number]["value"];
+
+export function ProjectTabList({
+  tab,
+  onSelect,
+}: {
+  tab: TabValue;
+  onSelect: (value: TabValue) => void;
+}) {
+  const moveFocus = (value: TabValue) => {
+    onSelect(value);
+    document.getElementById(`project-tab-${value}`)?.focus();
+  };
+  return (
+    <div
+      className="rs-tabs"
+      role="tablist"
+      aria-label="Project workspace"
+      aria-orientation="horizontal"
+    >
+      {TABS.map((item, index) => (
+        <button
+          key={item.value}
+          id={`project-tab-${item.value}`}
+          role="tab"
+          type="button"
+          aria-selected={tab === item.value}
+          aria-controls={`project-panel-${item.value}`}
+          tabIndex={tab === item.value ? 0 : -1}
+          className={"rs-tab" + (tab === item.value ? " on" : "")}
+          onClick={() => onSelect(item.value)}
+          onKeyDown={(event) => {
+            let nextIndex: number | null = null;
+            if (event.key === "ArrowRight") nextIndex = (index + 1) % TABS.length;
+            if (event.key === "ArrowLeft") {
+              nextIndex = (index - 1 + TABS.length) % TABS.length;
+            }
+            if (event.key === "Home") nextIndex = 0;
+            if (event.key === "End") nextIndex = TABS.length - 1;
+            if (nextIndex === null) return;
+            event.preventDefault();
+            moveFocus(TABS[nextIndex].value);
+          }}
+        >
+          <Icon name={item.icon} size={15} />
+          {item.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 // Old bookmark / in-app values from before the IA rename.
 const LEGACY_TABS: Record<string, TabValue> = {
@@ -180,7 +230,6 @@ export default function ProjectDetail() {
   // Overlay the live signal onto the badge; the other derived states —
   // configured / ready / completed / errored — still come from the project.
   const liveRun = useHasActiveRun(slug);
-  const shownStatus = (s: ProjectStatus): ProjectStatus => (liveRun ? "running" : s);
 
   return (
     <>
@@ -193,7 +242,7 @@ export default function ProjectDetail() {
           <span className="rs-phead-name" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {p?.display_name ?? slug}
           </span>
-          {p && <Badge status={shownStatus(p.status)} big />}
+          {p && <Badge status={projectBadgeStatus(p.status, liveRun)} big />}
         </div>
         <div className="rs-phead-spacer" />
         {p && <ProjectSettingsDialog project={p} />}
@@ -220,25 +269,18 @@ export default function ProjectDetail() {
         <ScrollPad><p className="rs-sub">No project.</p></ScrollPad>
       ) : (
         <>
-          <div className="rs-tabs" role="tablist">
-            {TABS.map((t) => (
-              <button
-                key={t.value}
-                role="tab"
-                aria-selected={tab === t.value}
-                className={"rs-tab" + (tab === t.value ? " on" : "")}
-                onClick={() => setTab(t.value)}
-              >
-                <Icon name={t.icon} size={15} />
-                {t.label}
-              </button>
-            ))}
-          </div>
+          <ProjectTabList tab={tab} onSelect={setTab} />
 
-          {tab !== "training" && <FactsBand project={p} />}
-          {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
+          <div
+            id={`project-panel-${tab}`}
+            role="tabpanel"
+            aria-labelledby={`project-tab-${tab}`}
+            tabIndex={0}
+          >
+            {tab !== "training" && <FactsBand project={p} />}
+            {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
 
-          {tab === "overview" && (
+            {tab === "overview" && (
             <OverviewTab
               slug={slug!}
               project={p}
@@ -247,8 +289,8 @@ export default function ProjectDetail() {
               selectedStage={selectedStage}
               setSelectedStage={setSelectedStage}
             />
-          )}
-          {tab === "rewards" && (
+            )}
+            {tab === "rewards" && (
             <ScrollPad>
               <RewardsTab
                 slug={slug!}
@@ -257,8 +299,8 @@ export default function ProjectDetail() {
                 setSelectedStage={setSelectedStage}
               />
             </ScrollPad>
-          )}
-          {tab === "world" && (
+            )}
+            {tab === "world" && (
             <ScrollPad>
               <WorldTab
                 slug={slug!}
@@ -272,10 +314,10 @@ export default function ProjectDetail() {
                 ) : undefined}
               />
             </ScrollPad>
-          )}
-          {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
-          {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
-          {tab === "training" && (
+            )}
+            {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
+            {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
+            {tab === "training" && (
             <Suspense fallback={<TabFallback />}>
               <RunsTabLazy
                 slug={slug!}
@@ -285,8 +327,8 @@ export default function ProjectDetail() {
                 setSelectedStage={setSelectedStage}
               />
             </Suspense>
-          )}
-          {tab === "results" && (
+            )}
+            {tab === "results" && (
             <Suspense fallback={<TabFallback />}>
               <ReportsTabLazy
                 slug={slug!}
@@ -294,7 +336,8 @@ export default function ProjectDetail() {
                 setSelectedStage={setSelectedStage}
               />
             </Suspense>
-          )}
+            )}
+          </div>
         </>
       )}
     </>
@@ -358,7 +401,10 @@ function OverviewTab({
           <div className="rs-card">
             <div className="rs-card-head"><div className="rs-card-title"><Icon name="info" size={16} />Project facts</div></div>
             <div className="rs-kv">
-              <div className="k">status</div><div className="v"><Badge status={liveRun ? "running" : project.status} /></div>
+              <div className="k">status</div>
+              <div className="v">
+                <Badge status={projectBadgeStatus(project.status, liveRun)} />
+              </div>
               <div className="k">adapter</div><div className="v">{adapterShort(project.adapter_class)}</div>
               {humanizeSlug(project.library_slug) && (<><div className="k">robot</div><div className="v">{humanizeSlug(project.library_slug)}</div></>)}
               {(taskId || project.env_id) && (<><div className="k">task_id</div><div className="v">{taskId ?? project.env_id}</div></>)}

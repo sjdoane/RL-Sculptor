@@ -5,6 +5,7 @@ import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, IconBtn, Modal, Sparkline } from "@/components/rs/primitives";
 import { useRunningSlugs } from "@/hooks/useDashboard";
 import { useDeleteProject, useProjects } from "@/hooks/useProjects";
+import { projectBadgeStatus } from "@/lib/projectStatus";
 import { formatRelative } from "@/lib/utils";
 import type { ProjectSummary } from "@/lib/types";
 
@@ -98,7 +99,11 @@ export default function ProjectList() {
                     <td className="name" style={{ fontFamily: "var(--font-sans)" }}>{p.display_name}</td>
                     {/* §Ship 37: `p.status` is "draft" for every project on
                         this install — see `useRunningSlugs`. */}
-                    <td><Badge status={runningSlugs.has(p.slug) ? "running" : p.status} /></td>
+                    <td>
+                      <Badge status={projectBadgeStatus(
+                        p.status, runningSlugs.has(p.slug),
+                      )} />
+                    </td>
                     <td>{adapterShort(p.adapter_class)}</td>
                     <td style={{ fontFamily: "var(--font-sans)" }}>{humanizeSlug(p.library_slug) || p.env_id || "—"}</td>
                     <td style={{ color: p.primary_metric == null ? "var(--rs-muted)" : "var(--st-amber)" }}>

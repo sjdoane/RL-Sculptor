@@ -13,7 +13,7 @@ import { useProjectIterations } from "@/hooks/useRuns";
 import {
   ApiError,
   getReportsSources,
-  policyExportUrl,
+  policyReproducibilityUrl,
   projectFreshRolloutUrl,
   projectIterRolloutUrl,
   stageCheckpointUrl,
@@ -26,6 +26,7 @@ import { stageLabel } from "@/lib/stageDisplay";
 import type {
   PolicyEvidenceValue,
   PolicySummary,
+  ReportState,
   SelectedStage,
   StageIteration,
   StageSchema,
@@ -37,6 +38,12 @@ type ReportSource =
   | { kind: "mission"; missionSlug: string };
 
 const PROJECT_SOURCE_VALUE = "__project__";
+
+export function reportActionsAreCurrent(
+  reportState: ReportState | null | undefined,
+): boolean {
+  return reportState?.state === "current";
+}
 
 export function canonicalSelectedPolicy(
   policies: PolicySummary[],
@@ -358,6 +365,11 @@ export function ReportsTab({
   const mp4Url = `${base}/final.mp4`;
   const mdUrl = `${base}/final_report.md`;
   const missionList = sources.data?.missions ?? [];
+  const reportState = source.kind === "project"
+    ? sources.data?.project_runs.report_state
+    : missionList.find((mission) => mission.mission_slug === source.missionSlug)
+      ?.report_state;
+  const reportCurrent = reportActionsAreCurrent(reportState);
 
   return (
     <div className="rs-scroll">
@@ -377,18 +389,22 @@ export function ReportsTab({
                   title="Choose which run or mission to report on"
                 >
                   <option value={PROJECT_SOURCE_VALUE}>
-                    Project runs ({sources.data?.project_runs.n_iters ?? 0} iters)
+                    Project runs ({sources.data?.project_runs.n_iters ?? 0} attested iters)
+                    {sources.data?.project_runs.report_state.state === "stale"
+                      ? " · stale" : ""}
                   </option>
                   {missionList.map((m) => (
                     <option key={m.mission_slug} value={m.mission_slug}>
                       Mission: {m.mission_slug}
-                      {m.has_report ? " ✓" : ""}
+                      {m.report_state.state === "current"
+                        ? " ✓"
+                        : m.report_state.state === "stale" ? " · stale" : ""}
                     </option>
                   ))}
                 </select>
               </div>
             )}
-            {hasReport && (
+            {hasReport && reportCurrent && (
               <Btn
                 kind="ghost"
                 icon="copy"
@@ -404,17 +420,41 @@ export function ReportsTab({
                 Copy markdown
               </Btn>
             )}
-            {hasReport && (
+            {hasReport && reportCurrent && (
               <a href={mdUrl} download="final_report.md" className="rs-btn rs-btn-ghost">
                 <Icon name="download" size={15} />
                 Download
               </a>
             )}
             <Btn kind={hasReport ? "ghost" : "primary"} icon="refresh-cw" disabled={build.isPending} onClick={() => build.mutate()}>
-              {build.isPending ? "Building…" : hasReport ? "Rebuild" : "Build report"}
+              {build.isPending
+                ? "Building…"
+                : hasReport ? "Build current report" : "Build report"}
             </Btn>
           </div>
         </div>
+
+        {reportState?.state === "stale" && (
+          <div className="rs-banner warn" style={{ marginBottom: 18 }}>
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">
+              <b>Retained report is stale and is not current evidence.</b>{" "}
+              {reportState.reason ?? "Selection, run, or evidence inputs changed."}{" "}
+              Copy, download, and timelapse actions stay unavailable until a
+              current report is built.
+            </span>
+          </div>
+        )}
+        {reportState?.state === "current"
+          && reportState.claim_status !== "verified" && (
+          <div className="rs-banner info" style={{ marginBottom: 18 }}>
+            <Icon name="info" size={17} />
+            <span className="rs-grow">
+              <b>Descriptive run history only.</b> This current report has no
+              canonical selected-policy or task-success claim.
+            </span>
+          </div>
+        )}
 
         {source.kind === "project" ? (
           <>
@@ -548,10 +588,16 @@ export function ReportsTab({
               <span className="rs-sub" style={{ fontSize: 11.5 }}>
                 Side-by-side timelapse of every stage, stitched into one clip:
               </span>
-              <a href={mp4Url} download="final.mp4" className="rs-btn rs-btn-quiet rs-btn-sm">
-                <Icon name="video" size={13} />final.mp4
-                <Icon name="download" size={13} />
-              </a>
+              {reportCurrent ? (
+                <a href={mp4Url} download="final.mp4" className="rs-btn rs-btn-quiet rs-btn-sm">
+                  <Icon name="video" size={13} />final.mp4
+                  <Icon name="download" size={13} />
+                </a>
+              ) : (
+                <span className="rs-tag" style={{ color: "var(--st-amber)" }}>
+                  stale timelapse withheld
+                </span>
+              )}
             </div>
             <div className="rs-md">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{md.data ?? ""}</ReactMarkdown>
@@ -943,7 +989,7 @@ function StageCheckpointsCard({
                   </span>
                 )}
                 <span style={{ marginLeft: "auto" }} className="rs-flex rs-gap-8" title={
-                  it.has_checkpoint ? "Builds ONNX + TorchScript + reward/env spec + DEPLOY.md…" : undefined
+                  it.has_checkpoint ? "Builds a raw reproducibility archive with the retained checkpoint and evidence receipt" : undefined
                 }>
                   {it.has_rollout && (
                     <a
@@ -961,9 +1007,9 @@ function StageCheckpointsCard({
                       href={stageExportUrl(slug, missionSlug, stageName, it.iter_index)}
                       download
                       className={"rs-btn rs-btn-sm " + (isSelected ? "rs-btn-primary" : "rs-btn-ghost")}
-                      title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md (builds server-side, may take a moment)"
+                      title="Download raw reproducibility artifacts. Availability is not deployment, task-success, or sim-to-real certification."
                     >
-                      <Icon name="package" size={14} />Export bundle (.zip)
+                      <Icon name="package" size={14} />Raw bundle (.zip)
                     </a>
                   )}
                   {it.has_checkpoint && (
@@ -1109,6 +1155,17 @@ export function PolicyEvidenceReceipt({
             ? "Every declared objective comparison passed, the criterion passed, and the worker-authored lane-selection receipt is verified. Aggregate objective channels are not silently attributed to the rendered lane; physical-scene alignment remains a separate required audit."
             : `${proofFailed ? "Objective proof failed" : "Objective proof is incomplete"}: ${blockers.join(", ") || "the server receipt is inconsistent"}. Missing semantics or fields are never inferred from the score, launch settings, or video.`}
         </div>
+        <div
+          style={{
+            fontSize: 11,
+            lineHeight: 1.45,
+            color: policy.deployable ? "var(--st-emerald)" : "var(--st-amber)",
+          }}
+        >
+          {policy.deployable
+            ? `Deployment qualification passed · ${policy.completion_authority} completion · ${policy.physical_scene_status} physical scene · ${policy.lineage_status} origin lineage${policy.reference_clock_sha256 ? " · reference clock bound" : ""}. This is not a hardware-safety certification.`
+            : `Raw reproducibility artifact only — not deployment certified: ${policy.deployment_blockers.join(", ") || "the server receipt is incomplete"}.`}
+        </div>
       </div>
     </details>
   );
@@ -1118,26 +1175,14 @@ function PoliciesCard({ slug }: { slug: string }) {
   const policies = usePolicies(slug);
   const rows = policies.data ?? [];
   const selected = canonicalSelectedPolicy(rows);
-  const selectedIterIndex = selected?.iter_index ?? null;
-  const selectedPhysicalScene = useQuery<PhysicalSceneAudit>({
-    queryKey: [
-      ...qk.project(slug),
-      "iterations",
-      selectedIterIndex,
-      "physical-scene-audit",
-    ],
-    queryFn: () => fetchPhysicalSceneAudit(slug, selectedIterIndex!),
-    enabled: selectedIterIndex != null,
-    staleTime: 30_000,
-  });
   return (
     <div className="rs-card" style={{ marginBottom: 22 }}>
       <div className="rs-card-head">
         <div className="rs-card-title">
-          <Icon name="package" size={16} />Trained policies
+          <Icon name="package" size={16} />Checkpoint artifacts
         </div>
         <span className="rs-sub" style={{ fontSize: 12 }}>
-          self-contained bundles for sim-to-real deployment
+          raw reproducibility downloads · qualification shown separately
         </span>
       </div>
       {policies.isLoading ? (
@@ -1145,15 +1190,13 @@ function PoliciesCard({ slug }: { slug: string }) {
       ) : rows.length === 0 ? (
         <EmptyState
           icon="package"
-          title="No trained checkpoints yet"
-          sub="Each completed training iteration leaves an exportable checkpoint here — bundle it with its reward, env spec, and an ONNX/TorchScript policy in one click."
+          title="No retained checkpoint artifacts yet"
+          sub="Attested iterations appear as raw reproducibility downloads. Recovery-only legacy artifacts remain explicitly non-deployable."
         />
       ) : (
         <div className="rs-card-pad rs-vgap-8">
           {rows.map((p) => {
             const isSelected = selected?.iter_index === p.iter_index;
-            const invalidSelected = isSelected
-              && selectedPhysicalScene.data?.status === "misaligned";
             return (
               <div
                 key={p.iter_index}
@@ -1185,7 +1228,7 @@ function PoliciesCard({ slug }: { slug: string }) {
                     r {p.primary_metric.toFixed(1)}
                   </span>
                 ) : null}
-                {invalidSelected ? (
+                {p.physical_scene_status === "misaligned" ? (
                   <span
                     className="rs-tag"
                     style={{ fontSize: 10, color: "var(--st-rose-fg)" }}
@@ -1199,26 +1242,28 @@ function PoliciesCard({ slug }: { slug: string }) {
                 <span className="rs-sub rs-num" style={{ fontSize: 11 }}>
                   {fmtBytes(p.checkpoint_bytes)}
                 </span>
+                <span
+                  className="rs-tag"
+                  style={{
+                    fontSize: 10,
+                    color: p.deployable ? "var(--st-emerald)" : "var(--st-amber)",
+                  }}
+                >
+                  {p.deployable
+                    ? "deployment preconditions verified"
+                    : p.completion_authority === "legacy_recovery"
+                      ? "legacy recovery only"
+                      : "not deployment certified"}
+                </span>
                 <span style={{ marginLeft: "auto" }}>
-                  {invalidSelected ? (
-                    <span
-                      className="rs-btn rs-btn-quiet rs-btn-sm"
-                      aria-disabled="true"
-                      style={{ cursor: "not-allowed", opacity: 0.55 }}
-                      title="Export disabled: this checkpoint's selected evidence failed physical-scene alignment"
-                    >
-                      <Icon name="alert-triangle" size={14} />Audit failed
-                    </span>
-                  ) : (
-                    <a
-                      href={policyExportUrl(slug, p.iter_index)}
-                      download
-                      className="rs-btn rs-btn-ghost rs-btn-sm"
-                      title="Download a zip with the checkpoint, ONNX/TorchScript policy, reward + env spec snapshots, and a DEPLOY.md recipe"
-                    >
-                      <Icon name="download" size={14} />Export
-                    </a>
-                  )}
+                  <a
+                    href={policyReproducibilityUrl(slug, p.iter_index)}
+                    download
+                    className="rs-btn rs-btn-ghost rs-btn-sm"
+                    title="Download a raw reproducibility zip. The manifest records deployment qualification and blockers; downloadability is not certification."
+                  >
+                    <Icon name="download" size={14} />Download raw bundle
+                  </a>
                 </span>
                 <PolicyEvidenceReceipt
                   policy={p}

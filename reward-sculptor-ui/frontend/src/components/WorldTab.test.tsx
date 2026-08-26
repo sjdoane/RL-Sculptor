@@ -1,9 +1,34 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { expect, test } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 
-import { TaskProgramCard } from "@/components/WorldTab";
+import WorldTab, {
+  TaskProgramCard,
+  worldSelectionLaunchReady,
+} from "@/components/WorldTab";
+import {
+  useEditWorldVariations,
+  useWorldCurriculum,
+  useWorldLineage,
+  useWorldScene,
+  useWorldSelection,
+  useWorldValidation,
+} from "@/hooks/useWorlds";
 import type { WorldEventProgram } from "@/lib/types";
+
+vi.mock("@/hooks/useWorlds", () => ({
+  useEditWorldVariations: vi.fn(),
+  useWorldCurriculum: vi.fn(),
+  useWorldLineage: vi.fn(),
+  useWorldScene: vi.fn(),
+  useWorldSelection: vi.fn(),
+  useWorldValidation: vi.fn(),
+}));
+vi.mock("@/components/AuthorWorldDialog", () => ({
+  default: () => <button>Author world</button>,
+}));
+vi.mock("@/components/WorldEntityInspector", () => ({ default: () => null }));
+vi.mock("@/components/WorldViewer3D", () => ({ default: () => null }));
 
 export const EVENT_PROGRAM: WorldEventProgram = {
   id: "route_jump_hold",
@@ -60,6 +85,29 @@ export const EVENT_PROGRAM: WorldEventProgram = {
   },
 };
 
+beforeEach(() => {
+  vi.mocked(useWorldLineage).mockReturnValue({ data: [] } as never);
+  vi.mocked(useWorldCurriculum).mockReturnValue({ data: undefined } as never);
+  vi.mocked(useWorldScene).mockReturnValue({
+    data: undefined,
+    isLoading: true,
+  } as never);
+  vi.mocked(useEditWorldVariations).mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+  } as never);
+  vi.mocked(useWorldValidation).mockReturnValue({
+    data: {
+      ok: true,
+      errors: [],
+      selection_version: 4,
+      tuple_hash: "a".repeat(64),
+    },
+    refetch: vi.fn(),
+    isFetching: false,
+  } as never);
+});
+
 test("renders the immutable ROUTE to JUMP to HOLD program and evaluation boundary", async () => {
   const user = userEvent.setup();
   render(<TaskProgramCard program={EVENT_PROGRAM} />);
@@ -84,4 +132,49 @@ test("renders the immutable ROUTE to JUMP to HOLD program and evaluation boundar
     && Boolean(element.textContent?.includes('"selection_tuple_hash": "abc123"'))
     && Boolean(element.textContent?.includes('"sha256"'))))
     .toBeInTheDocument();
+});
+
+test("uses robot compatibility and integrity as one launch authority", () => {
+  expect(worldSelectionLaunchReady(true, true)).toBe(true);
+  expect(worldSelectionLaunchReady(true, false)).toBe(false);
+  expect(worldSelectionLaunchReady(false, true)).toBe(false);
+
+  vi.mocked(useWorldSelection).mockReturnValue({
+    isLoading: false,
+    data: {
+      selection: {
+        selection_version: 4,
+        tuple_hash: "a".repeat(64),
+        evaluation_lineage: "eval-lineage",
+        refs: {},
+      },
+      shared_summary: {
+        robot: "g1",
+        project_capability_id: "go1",
+        robot_matches_project: false,
+        terrain_kind: "plane",
+        course_elements: 0,
+        course_breakdown: {},
+        objects: [],
+        zones: [],
+      },
+      goal: {},
+      world_meta: { prompt: "cross the room" },
+      clarifications: { answer_sources: {}, answers: [] },
+      train_variations: [],
+    },
+  } as never);
+
+  render(
+    <WorldTab
+      slug="mismatched-world"
+      launchAction={<button>Launch run</button>}
+    />,
+  );
+
+  expect(screen.getByText(/Training blocked: robot differs/i))
+    .toBeInTheDocument();
+  expect(screen.queryByText("Verified for launch")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Launch run" }))
+    .not.toBeInTheDocument();
 });

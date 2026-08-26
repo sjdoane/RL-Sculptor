@@ -8,6 +8,7 @@ import {
   NewRunDialog,
   PolicyInterfaceMigrationNotice,
   persistClearedReference,
+  startingSkillManifestIssue,
 } from "@/components/NewRunDialog";
 import {
   getBehaviorDraft,
@@ -158,6 +159,14 @@ const evaluatedPolicy: PolicySummary = {
   checkpoint_bytes: 4096,
   checkpoint_sha256: "d".repeat(64),
   deployable: true,
+  artifact_purpose: "reproducibility",
+  completion_authority: "attested",
+  deployment_status: "qualified",
+  deployment_blockers: [],
+  physical_scene_status: "aligned",
+  lineage_status: "verified",
+  origin_receipt_sha256: "f".repeat(64),
+  reference_clock_sha256: null,
   primary_metric: 0.8,
   fitness: 0.9,
   reward_version: "v6",
@@ -170,8 +179,8 @@ const evaluatedPolicy: PolicySummary = {
   route_evidence: null,
   contact_evidence: null,
   hold_evidence: null,
-  objective_proof_status: "incomplete",
-  objective_proof_blockers: ["objective channels missing"],
+  objective_proof_status: "passed",
+  objective_proof_blockers: [],
   lane_evidence_status: "unavailable",
   requested_evidence_env_index: null,
   resolved_evidence_env_index: null,
@@ -494,6 +503,17 @@ test("persists clearing a reference as an explicit null draft", () => {
   }]);
 });
 
+test("gives a repair path when a legacy imported skill has no manifest", () => {
+  expect(startingSkillManifestIssue({
+    ...checkpoint,
+    kind: "shared_skill",
+    warm_start_iteration: null,
+    starting_skill_id: "legacy-policy",
+    initialization_mode: "actor_only",
+    import_manifest_digest: null,
+  })).toMatch(/re-import the original \.rskill bundle.*cannot repair it/i);
+});
+
 test("ties the scratch policy, authored world receipt, and launch authority together", async () => {
   const user = userEvent.setup();
   const onOpenWorld = renderNewRun();
@@ -502,7 +522,10 @@ test("ties the scratch policy, authored world receipt, and launch authority toge
   const goal = await screen.findByPlaceholderText(
     "Run forward as fast as possible without falling.",
   );
-  await waitFor(() => expect(screen.getByRole("button", { name: "Start training" })).toBeEnabled());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Run pipeline check" })).toBeEnabled());
+  expect(screen.getByLabelText("Objective fitness receipt")).toHaveTextContent(
+    /Pipeline check is unscored and non-certifying; live training still requires an objective or an acknowledged blind ablation/i,
+  );
 
   expect(screen.getByLabelText("Policy receipt")).toHaveTextContent(
     /Fresh actor and critic; no inherited policy bytes/i,
@@ -557,7 +580,7 @@ test("pins an evaluated project checkpoint digest before enabling launch", async
   );
   await user.click(screen.getByRole("button", { name: /Use this starting point/i }));
 
-  await waitFor(() => expect(screen.getByRole("button", { name: "Start training" })).toBeEnabled());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Run pipeline check" })).toBeEnabled());
   expect(screen.getByLabelText("Policy receipt")).toHaveTextContent(
     new RegExp(`sha256 ${"d".repeat(64)}`),
   );
@@ -645,7 +668,7 @@ test("blocks launch when the active reward belongs to another reference", async 
 
   expect(await screen.findByText(/Launch is blocked because the active reward and selected motion disagree/i))
     .toHaveTextContent(/g1\/selected-hop/i);
-  const launch = screen.getByRole("button", { name: "Start training" });
+  const launch = screen.getByRole("button", { name: "Inspect candidate" });
   expect(launch).toBeDisabled();
   expect(launch).toHaveAttribute(
     "title",
@@ -653,4 +676,27 @@ test("blocks launch when the active reward belongs to another reference", async 
   );
   expect(screen.queryByText(/replaces it with a flat tracking reward/i))
     .not.toBeInTheDocument();
+});
+
+test("keeps reference inspection blocked when the selected motion query fails", async () => {
+  vi.mocked(getBehaviorDraft).mockResolvedValue({
+    behavior_goal: "Inspect this candidate without starting training.",
+    reference_clip_id: "missing-candidate",
+    reference_robot: "g1",
+  });
+  vi.mocked(getReference).mockRejectedValue(new Error("reference unavailable"));
+  const user = userEvent.setup();
+  renderNewRun();
+
+  await user.click(screen.getByRole("button", { name: "New run" }));
+
+  const launch = await screen.findByRole("button", { name: "Inspect candidate" });
+  await waitFor(() => expect(launch).toHaveAttribute(
+    "title",
+    "The selected motion could not be loaded and its evidence cannot be verified.",
+  ));
+  expect(launch).toBeDisabled();
+  expect(screen.getByText("tracking evidence unavailable")).toBeInTheDocument();
+  expect(screen.getByText(/inspection and training remain blocked/i))
+    .toBeInTheDocument();
 });

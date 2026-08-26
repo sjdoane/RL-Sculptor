@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 import {
   canonicalSelectedIteration,
   PolicyEvidenceReceipt,
+  reportActionsAreCurrent,
 } from "@/components/ReportsTab";
 import type { PolicySummary, StageIteration } from "@/lib/types";
 
@@ -14,6 +15,14 @@ function policy(overrides: Partial<PolicySummary> = {}): PolicySummary {
     checkpoint_bytes: 4096,
     checkpoint_sha256: "a".repeat(64),
     deployable: true,
+    artifact_purpose: "reproducibility",
+    completion_authority: "attested",
+    deployment_status: "qualified",
+    deployment_blockers: [],
+    physical_scene_status: "aligned",
+    lineage_status: "verified",
+    origin_receipt_sha256: "c".repeat(64),
+    reference_clock_sha256: null,
     primary_metric: 100,
     fitness: 0.91,
     reward_version: "v8",
@@ -62,6 +71,7 @@ test("shows the passed physical-channel and resolved-lane receipt", () => {
   expect(receipt).toHaveTextContent("strict_hold_count");
   expect(receipt).toHaveTextContent(/requested 10 → resolved 10/i);
   expect(receipt).toHaveTextContent(/precommitted · percentile 81.3%/i);
+  expect(receipt).toHaveTextContent(/deployment qualification passed/i);
 });
 
 test("fails closed when lane identity fields are absent", () => {
@@ -148,4 +158,20 @@ test("uses only the canonical selection receipt for the project hero", () => {
     [iteration(4, 0.8), iteration(5, 0.99)],
     [{ ...kept, selected: false }, higherFailed],
   )).toBeNull();
+});
+
+test("withholds report actions unless the receipt is current", () => {
+  expect(reportActionsAreCurrent({
+    state: "current",
+    reason: null,
+    claim_status: "descriptive_only",
+    selected_iter_index: null,
+  })).toBe(true);
+  expect(reportActionsAreCurrent({
+    state: "stale",
+    reason: "evidence changed",
+    claim_status: "verified",
+    selected_iter_index: 4,
+  })).toBe(false);
+  expect(reportActionsAreCurrent(undefined)).toBe(false);
 });

@@ -41,7 +41,7 @@ const SCULPT_LOCK_NOTE =
 // browser (localStorage), so it shows once and stays gone.
 const REWARDS_EXPLAINER_KEY = "rs.rewardsExplainer.dismissed";
 
-function RewardsExplainer() {
+export function RewardsExplainer() {
   const [dismissed, setDismissed] = useState(() => {
     try { return localStorage.getItem(REWARDS_EXPLAINER_KEY) === "1"; }
     catch { return false; /* private mode */ }
@@ -56,12 +56,13 @@ function RewardsExplainer() {
     <div className="rs-banner info" style={{ alignItems: "flex-start" }}>
       <Icon name="info" size={17} />
       <span className="rs-grow" style={{ lineHeight: 1.55 }}>
-        <b>How reward evolution works.</b> Each training iteration, the sculptor trains a policy
-        with the current reward, watches the rollout, diagnoses the failure, and writes the next
-        reward version. Versions that improve the tracked metric are kept; regressions are
-        reverted. The list below is that history — every version can be read, diffed against its
-        parent, and traced to the diagnosis that produced it. You can also fork any version by
-        hand, or ask Claude for a rewrite in the prompt box.
+        <b>How reward evolution works.</b> Each iteration can train with the current reward,
+        inspect its rollout, diagnose a failure, and write a candidate reward. The launch plan
+        decides what controls selection: a <b>steered</b> objective may keep or revert candidates,
+        an <b>observe-only</b> objective records evidence without choosing the reward, and an
+        acknowledged <b>blind ablation</b> makes no objective-success claim. The list below is the
+        version history — every version can be read, diffed against its parent, and traced to its
+        diagnosis. You can also fork a version by hand or request a rewrite in the prompt box.
       </span>
       <button
         className="rs-modal-x"

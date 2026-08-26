@@ -438,6 +438,16 @@ const checkpoint = (
   checkpoint_bytes: 4096,
   checkpoint_sha256: "f".repeat(64),
   deployable: false,
+  artifact_purpose: "reproducibility",
+  completion_authority: "attested",
+  deployment_status: overrides.deployable ? "qualified" : "not_certified",
+  deployment_blockers: overrides.deployable
+    ? []
+    : ["deployment authority is incomplete"],
+  physical_scene_status: overrides.deployable ? "aligned" : "unavailable",
+  lineage_status: overrides.deployable ? "verified" : "incomplete",
+  origin_receipt_sha256: overrides.deployable ? "e".repeat(64) : null,
+  reference_clock_sha256: null,
   primary_metric: null,
   fitness: null,
   reward_version: "v1",

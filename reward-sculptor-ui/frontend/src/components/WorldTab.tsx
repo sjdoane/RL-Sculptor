@@ -37,6 +37,13 @@ export function courseBreakdownText(
   return `${total} elements — ${parts.join(" · ")}${suffix}`;
 }
 
+export function worldSelectionLaunchReady(
+  integrityVerified: boolean,
+  robotMatchesProject: boolean | null | undefined,
+): boolean {
+  return integrityVerified && robotMatchesProject !== false;
+}
+
 function eventPhaseCopy(
   phaseId: string,
   program: WorldEventProgram,
@@ -267,6 +274,10 @@ export default function WorldTab({
   const s = selection.data;
   const entries = lineage.data ?? [];
   const robotMismatch = s.shared_summary.robot_matches_project === false;
+  const launchReady = worldSelectionLaunchReady(
+    validation.data?.ok === true,
+    s.shared_summary.robot_matches_project,
+  );
   return (
     <div style={{ display: "grid", gap: 14 }}>
       {robotMismatch && (
@@ -297,7 +308,7 @@ export default function WorldTab({
         <div className="rs-card-head">
           <div className="rs-card-title">
             Authoritative world tuple
-            {validation.data?.ok && (
+            {launchReady && (
               <Badge status="completed" label="Verified for launch" />
             )}
           </div>
@@ -308,7 +319,7 @@ export default function WorldTab({
               {validation.isFetching ? "Verifying…" : "Verify integrity"}
             </Btn>
             <AuthorWorldDialog slug={slug} />
-            {validation.data?.ok && launchAction}
+            {launchReady && launchAction}
           </div>
         </div>
         <div className="rs-card-pad">

@@ -147,6 +147,9 @@ describe("ReferencePickerDialog evidence authority", () => {
     expect(screen.getByText(/passed exact-schedule joint-position and root-height tracking/))
       .toHaveTextContent(/does not certify root-XY tracking, contact safety, collision avoidance, general dynamics feasibility/);
     expect(mocks.getReference).toHaveBeenCalledWith("g1", "four-rail-hop");
+    expect(screen.getByRole("button", {
+      name: "Four-rail traveling hop — g1/four-rail-hop",
+    })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Use motion" })).toBeEnabled();
   });
 

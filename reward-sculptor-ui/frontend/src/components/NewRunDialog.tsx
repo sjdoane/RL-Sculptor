@@ -129,6 +129,21 @@ export function persistClearedReference(
   persist({ reference_clip_id: null, reference_robot: null });
 }
 
+export function startingSkillManifestIssue(
+  selection: StartingPointSelection,
+): string | null {
+  if (selection.kind !== "shared_skill") return null;
+  if (!selection.starting_skill_id || !selection.initialization_mode) {
+    return "Choose an imported skill and an initialization mode."
+  }
+  if (!/^[a-f0-9]{64}$/.test(selection.import_manifest_digest ?? "")) {
+    return "This legacy import has no immutable manifest. Open Starting policy "
+      + "and re-import the original .rskill bundle; re-selecting this record "
+      + "cannot repair it."
+  }
+  return null;
+}
+
 function formatEta(seconds: number): { label: string; finishAt: string } {
   const finish = new Date(Date.now() + seconds * 1000);
   const sameDay = finish.toDateString() === new Date().toDateString();
@@ -617,7 +632,8 @@ export function NewRunDialog({
     && modeReward?.context_current === true;
   const dynamicsAdmission = referenceDetail.data?.dynamics_admission ?? null;
   const exactDynamicsReady = hasExactTierDReceipt(referenceDetail.data);
-  const tierKInspection = dryRun
+  const referenceInspectionRequested = dryRun && referenceClipId != null;
+  const tierKInspection = referenceInspectionRequested
     && referenceDetail.isSuccess
     && !exactDynamicsReady;
   const systemInfo = useSystemInfo();
@@ -1042,7 +1058,7 @@ export function NewRunDialog({
   );
   // A Tier-K reference check returns after immutable contract/reference
   // verification. It never starts sculptor or touches the training runtime.
-  const runtimeReady = tierKInspection || gpuReady;
+  const runtimeReady = referenceInspectionRequested || gpuReady;
   const worldRobotBlocker = worldRobotMismatchBlocker(worldSel.data);
   const worldIntegrityReady = (
     !!worldSel.data && worldValidation.data?.ok === true
@@ -1094,12 +1110,7 @@ export function NewRunDialog({
       && projectReferenceRobot === "unassigned"
       ? "Select a project robot before using an imported starting point."
       : null,
-    startingPoint.kind === "shared_skill"
-      && (!startingPoint.starting_skill_id
-        || !startingPoint.initialization_mode
-        || !/^[a-f0-9]{64}$/.test(startingPoint.import_manifest_digest ?? ""))
-      ? "Re-select the imported skill so its immutable manifest can be pinned."
-      : null,
+    startingSkillManifestIssue(startingPoint),
     startingPoint.kind === "shared_skill"
       && startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed"
       && !startingPoint.acknowledge_legacy_reconstructed_initialization
@@ -1117,11 +1128,11 @@ export function NewRunDialog({
     promotedModeMatches && !promotedModeCurrent
       ? "The promoted phase reward belongs to an older reference or project context. Regenerate and promote it first."
       : null,
-    referenceClipId && !dryRun && referenceDetail.isLoading
+    referenceClipId && referenceDetail.isLoading
       ? "Verifying the motion's Tier-D tracking certificate…"
       : null,
-    referenceClipId && !dryRun && referenceDetail.isError
-      ? "The motion's Tier-D tracking certificate could not be verified."
+    referenceClipId && referenceDetail.isError
+      ? "The selected motion could not be loaded and its evidence cannot be verified."
       : null,
     referenceClipId && !dryRun && !referenceDetail.isLoading
       && !referenceDetail.isError && !exactDynamicsReady
@@ -1144,7 +1155,8 @@ export function NewRunDialog({
       ? startingPoint.warm_start_snapshot
         ? `Unevaluated interrupted save · actor + critic transfer · optimizer/counters reset · SHA ${startingPoint.warm_start_snapshot.checkpoint_sha256.slice(0, 10)}…`
         : "Transfer this project's actor and critic into a fresh training run; optimizer state and counters reset."
-      : `${(startingPoint.initialization_mode ?? "unselected").replaceAll("_", " ")} · ${startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed" ? "legacy-reconstructed contract acknowledged" : "origin-persisted contract"} · manifest-pinned import receipt${startingPoint.import_manifest_digest ? ` · ${startingPoint.import_manifest_digest.slice(0, 10)}…` : ""}`;
+      : startingSkillManifestIssue(startingPoint)
+        ?? `${(startingPoint.initialization_mode ?? "unselected").replaceAll("_", " ")} · ${startingPoint.compatibility_contract_provenance_status === "legacy_reconstructed" ? startingPoint.acknowledge_legacy_reconstructed_initialization ? "legacy-reconstructed contract acknowledged" : "legacy-reconstructed contract awaiting acknowledgement" : "origin-persisted contract"} · manifest-pinned import receipt · ${startingPoint.import_manifest_digest!.slice(0, 10)}…`;
 
   const selectedStartingSkill = startingPoint.kind === "shared_skill"
     ? startingSkills.data?.skills.find(
@@ -1247,9 +1259,11 @@ export function NewRunDialog({
   const objectiveReceiptSection: ExactLaunchReceiptSection = fitnessMetric == null
     ? {
         title: "Objective fitness",
-        summary: allowBlindFitness
-          ? "Blind ablation acknowledged; rewards train, but no independent objective judges progress."
-          : "No objective selected; launch remains blocked.",
+        summary: dryRun
+          ? "Pipeline check is unscored and non-certifying; live training still requires an objective or an acknowledged blind ablation."
+          : allowBlindFitness
+            ? "Blind ablation acknowledged; rewards train, but no independent objective judges progress."
+            : "No objective selected; live training remains blocked.",
         details: ["fitness metric: null", "fitness authority: none"],
       }
     : isLaunchGen
@@ -1343,10 +1357,16 @@ export function NewRunDialog({
                 title={launchBlocker ?? undefined}
               >
                 {validatingLaunch
-                  ? "Verifying environment…"
+                  ? referenceInspectionRequested
+                    ? "Verifying candidate…"
+                    : "Verifying environment…"
                   : launch.isPending
-                    ? tierKInspection ? "Inspecting…" : "Starting…"
-                    : tierKInspection ? "Inspect candidate" : "Start training"}
+                    ? referenceInspectionRequested
+                      ? "Inspecting…"
+                      : dryRun ? "Checking…" : "Starting…"
+                    : referenceInspectionRequested
+                      ? "Inspect candidate"
+                      : dryRun ? "Run pipeline check" : "Start training"}
               </Btn>
             </>
           }
@@ -1414,8 +1434,8 @@ export function NewRunDialog({
             <ReadinessCell
               icon="cpu" label="Training runtime"
               state={runtimeReady ? "ready" : gpuInfo.isLoading ? "checking" : "blocked"}
-              detail={tierKInspection
-                ? "not invoked · Tier-K inspection only"
+              detail={referenceInspectionRequested
+                ? "not invoked · reference inspection is CPU/data-only"
                 : !isMjlab ? "CPU adapter ready" : gpuReady ? `${device} · mjlab + rsl_rl ready` : "CUDA/mjlab preflight failed"}
             />
             <ReadinessCell
@@ -1748,14 +1768,18 @@ export function NewRunDialog({
                       style={{
                         display: "flex", flexWrap: "wrap", alignItems: "center",
                         gap: 6, marginTop: 6, fontSize: 10.5,
-                        color: exactDynamicsReady
-                          ? "var(--st-emerald)"
-                          : "var(--st-amber)",
+                        color: referenceDetail.isError
+                          ? "var(--st-rose)"
+                          : exactDynamicsReady
+                            ? "var(--st-emerald)"
+                            : "var(--st-amber)",
                       }}
                     >
-                      <span className={`rs-badge ${exactDynamicsReady ? "emerald" : "amber"}`}>
+                      <span className={`rs-badge ${referenceDetail.isError ? "rose" : exactDynamicsReady ? "emerald" : "amber"}`}>
                         {referenceDetail.isLoading
                           ? "checking tracking evidence"
+                          : referenceDetail.isError
+                            ? "tracking evidence unavailable"
                           : exactDynamicsReady
                             ? "Tier D tracking verified"
                             : dynamicsAdmission?.admitted
@@ -1763,7 +1787,9 @@ export function NewRunDialog({
                             : `Tier ${dynamicsAdmission?.tier ?? "K"} candidate`}
                       </span>
                       <span>
-                        {exactDynamicsReady
+                        {referenceDetail.isError
+                          ? "The selected motion could not be loaded; inspection and training remain blocked."
+                          : exactDynamicsReady
                           ? `certificate ${dynamicsAdmission?.certificate_digest?.slice(0, 10)}…`
                           : dynamicsAdmission?.admitted
                             ? "Exact artifact/certificate/rollout receipt is incomplete."

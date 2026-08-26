@@ -840,13 +840,22 @@ export async function listPolicyRecoverySnapshots(
   );
 }
 
-/** Download URL for a policy deployment bundle (zip: checkpoint + ONNX/
- *  TorchScript + reward/env-spec/config snapshots + DEPLOY.md). */
+/** Download URL for a deployment-qualified policy archive. The backend
+ * rejects this route unless every deployment authority passed. */
 export function policyExportUrl(
   slug: string, iterIndex: number, runId?: string,
 ): string {
   const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
   return `/api/projects/${slug}/policies/${iterIndex}/export${q}`;
+}
+
+/** Neutral raw reproducibility download. Its manifest always discloses the
+ * qualification status; downloadability itself makes no deployment claim. */
+export function policyReproducibilityUrl(
+  slug: string, iterIndex: number, runId?: string,
+): string {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return `/api/projects/${slug}/policies/${iterIndex}/reproducibility${q}`;
 }
 
 /** List portable starting skills with a compatibility + trust receipt for

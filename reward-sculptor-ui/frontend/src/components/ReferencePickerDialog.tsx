@@ -89,13 +89,19 @@ function PreviewImage({ robot, clipId }: { robot: string; clipId: string }) {
 }
 
 function ResultRow({
-  row, selected, onSelect,
-}: { row: PickerRow; selected: boolean; onSelect: () => void }) {
+  row, robot, selected, onSelect,
+}: {
+  row: PickerRow;
+  robot: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
   return (
     <button
       type="button"
       onClick={onSelect}
       aria-pressed={selected}
+      aria-label={`${row.text} — ${robot}/${row.clip_id}`}
       style={{
         display: "flex", alignItems: "center", gap: 10, width: "100%",
         textAlign: "left", padding: "8px 10px", cursor: "pointer",
@@ -489,6 +495,7 @@ export function ReferencePickerDialog({
             <ResultRow
               key={row.clip_id}
               row={row}
+              robot={robot}
               selected={selectedClipId === row.clip_id}
               onSelect={() => setSelectedClipId(row.clip_id)}
             />

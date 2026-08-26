@@ -689,8 +689,16 @@ export interface PolicySummary {
   /** Exact bytes selected for transfer. Missing or malformed digests fail
    *  closed in the starting-point picker and New Run preflight. */
   checkpoint_sha256: string;
-  /** Server-authoritative completion/export decision. */
+  /** True only when every explicit deployment precondition passed. */
   deployable: boolean;
+  artifact_purpose: "reproducibility";
+  completion_authority: "attested" | "legacy_recovery";
+  deployment_status: "qualified" | "not_certified";
+  deployment_blockers: string[];
+  physical_scene_status: "aligned" | "misaligned" | "not_applicable" | "unavailable";
+  lineage_status: "verified" | "incomplete" | "failed";
+  origin_receipt_sha256: string | null;
+  reference_clock_sha256: string | null;
   primary_metric: number | null;
   fitness: number | null;
   reward_version: string | null;
@@ -703,6 +711,7 @@ export interface PolicySummary {
   route_evidence: PolicyEvidenceValue | null;
   contact_evidence: PolicyEvidenceValue | null;
   hold_evidence: PolicyEvidenceValue | null;
+  same_lane_acceptance?: Record<string, unknown> | null;
   objective_proof_status: "passed" | "failed" | "incomplete";
   objective_proof_blockers: string[];
   /** Worker-authored identity of the rendered evaluation lane. Missing
@@ -1822,10 +1831,23 @@ export interface ReportMissionSource {
   goal: string;
   lifecycle: MissionLifecycleStatus;
   has_report: boolean;
+  report_state: ReportState;
+}
+
+export interface ReportState {
+  state: "missing" | "current" | "stale";
+  reason: string | null;
+  claim_status: "verified" | "descriptive_only" | "unavailable";
+  selected_iter_index: number | null;
+  generated_at?: string | null;
 }
 
 export interface ReportsSources {
-  project_runs: { n_iters: number; has_report: boolean };
+  project_runs: {
+    n_iters: number;
+    has_report: boolean;
+    report_state: ReportState;
+  };
   missions: ReportMissionSource[];
 }
 

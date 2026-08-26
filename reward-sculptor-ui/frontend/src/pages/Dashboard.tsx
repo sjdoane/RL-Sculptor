@@ -5,6 +5,7 @@ import { Badge, Btn, EmptyState, Sparkline } from "@/components/rs/primitives";
 import { useDashboard, useRunningSlugs, useSystemInfo } from "@/hooks/useDashboard";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useProjects } from "@/hooks/useProjects";
+import { projectBadgeStatus } from "@/lib/projectStatus";
 import { formatRelative } from "@/lib/utils";
 import type { JobSummary, ProjectSummary } from "@/lib/types";
 
@@ -55,7 +56,7 @@ function ProjectCard(
         </div>
         {/* §Ship 37: the card used to read "Draft" for the very project
             listed as running in Active jobs directly above it. */}
-        <Badge status={running ? "running" : p.status} />
+        <Badge status={projectBadgeStatus(p.status, running)} />
       </div>
       <div className="rs-pcard-foot">
         <div>
