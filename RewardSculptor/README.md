@@ -4,7 +4,7 @@
 > functions — grounded in a living knowledge graph of research papers.
 > Every edit is cited.
 
-[![tests](https://img.shields.io/badge/tests-63%20passed%2C%201%20skipped-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](pyproject.toml) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](pyproject.toml)
 
 ---
 
@@ -57,14 +57,14 @@ section below for the Brax worked example.
 ## Install
 
 ```bash
-git clone <this-repo>
-cd RewardSculptor
+git clone https://github.com/sjdoane/RL-Sculptor.git
+cd RL-Sculptor/RewardSculptor
 uv sync                            # installs all deps
-cp .env.example .env               # add your ANTHROPIC_API_KEY
+cp .env.example .env               # add ANTHROPIC_API_KEY for live LLM calls
 uv run sculpt --help
 ```
 
-Requires Python ≥ 3.10 and an Anthropic API key.
+Requires Python ≥ 3.10. Live LLM calls require an Anthropic API key.
 
 **GPU requirements (mjlab adapter only).** NVIDIA GPU with CUDA 12.4+
 and ≥ 6 GiB VRAM. Tested daily on RTX 5070 Laptop (8 GiB,
@@ -114,10 +114,9 @@ That's it. The sculptor will:
 8. One-line status on stdout. Repeat until `--iterations` is exhausted or
    the primary metric has not improved for 3 iterations.
 
-Want to see the loop without burning API credits? Add `--dry-run`:
-training is capped at 1000 steps, the diagnose + edit calls return canned
-responses, and the full pipeline completes in under a minute. Perfect for
-plumbing tests.
+Add `--dry-run` to use canned LLM responses and reduce the requested training
+budget. Training and evaluation still run. Use `uv run sculpt --help` to
+inspect the CLI without starting a run.
 
 When a run finishes:
 
@@ -548,7 +547,7 @@ RewardSculptor/
 │       └── reports/...    # populated by `sculpt run`
 ├── docs/
 │   └── adapters.md        # the adapter reference (READ THIS if you're integrating)
-├── tests/                 # 63 tests, 1 skipped (jax-only parity test)
+├── tests/                 # core library tests
 └── scripts/               # verification scripts (phase1_smoke, diagnose_demo, etc.)
 ```
 
@@ -579,7 +578,7 @@ sculpt kg viz --out kg.html                  # interactive graph (see below)
 | `--iterations N`  |   10    | Iterations this invocation runs.                                                          |
 | `--resume`        |  false  | Start after the highest `v<n>.py` in `rewards/`.                                          |
 | `--no-kg`         |  false  | Skip KG queries — diagnoser sees an empty literature context. Ablation mode.              |
-| `--dry-run`       |  false  | Bypass all LLM calls; cap training at 1000 steps. Under a minute end-to-end.              |
+| `--dry-run`       |  false  | Use canned LLM responses and a reduced requested training budget; still train and evaluate. |
 
 ---
 
@@ -630,7 +629,7 @@ papers and techniques that shaped the final reward.
 uv run pytest tests/ -v
 ```
 
-63 tests covering: reward-contract validation, Diagnosis JSON parsing,
+Tests cover reward-contract validation, Diagnosis JSON parsing,
 edit pre-flight + post-flight validation, KG store round-trip, query
 fixtures, adapter-contract compliance for `GymSB3Adapter`, sculpt
 orchestration (scaffold, dry-run, early-stop, resume), and the time-lapse
@@ -655,4 +654,5 @@ Two things the authors are thinking about:
 
 ## License
 
-MIT.
+MIT is declared in [pyproject.toml](pyproject.toml). The full license text is
+not included in this repository snapshot.

@@ -4,10 +4,7 @@
 > grounded in a living knowledge graph of research papers, and gated by an
 > objective metric it has to *earn the right to trust* before it can steer a run.
 
-[![sculptor tests](https://img.shields.io/badge/sculptor-701%20passed%2C%201%20skipped-brightgreen)](RewardSculptor)
-[![backend tests](https://img.shields.io/badge/ui%20backend-345%20passed-brightgreen)](reward-sculptor-ui)
-[![python](https://img.shields.io/badge/python-3.13-blue)](RewardSculptor/pyproject.toml)
-[![license](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
+[![python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](RewardSculptor/pyproject.toml)
 
 ---
 
@@ -112,17 +109,29 @@ The two failure modes the pipeline is built to beat:
 
 ## Quickstart
 
-### Library (CPU, ~1 min dry run)
+### Library
 
 ```bash
 cd RewardSculptor
 uv sync
-cp .env.example .env                       # add ANTHROPIC_API_KEY
+uv run sculpt --help
+```
+
+CLI help lists the available commands without starting training or making LLM
+calls. From the same directory, the optional Hopper demo runs training and
+evaluation:
+
+```bash
 uv run sculpt run \
     --config examples/hopper/config.toml \
     "run forward fast without falling" \
-    --iterations 3 --dry-run               # bypasses LLM calls, caps training
+    --iterations 3 --dry-run
 ```
+
+`--dry-run` uses canned LLM responses and reduces the requested training
+budget. It still uses compute for training and evaluation; completion time
+depends on the trainer configuration and host. Live LLM calls require an
+`ANTHROPIC_API_KEY` in the environment or `.env` file.
 
 ### Control panel (one command)
 
@@ -144,9 +153,9 @@ RL-Sculptor/
 │   ├── sculptor/              #   diagnose · edit · kg · adapters · eval/
 │   ├── examples/hopper/       #   end-to-end CPU demo project
 │   ├── docs/                  #   adapters.md, knowledge_graph.md, remote.md, …
-│   └── tests/                 #   701 passing, 1 skipped (jax parity)
+│   └── tests/                 #   core library tests
 ├── reward-sculptor-ui/        # FastAPI + React/Vite control panel
-│   ├── backend/               #   routes · services · 345 passing tests
+│   ├── backend/               #   routes · services · backend tests
 │   ├── frontend/              #   Vite + React + Tailwind + shadcn/ui
 │   └── run.sh                 #   one-command start
 ├── CONTEXT.md                 # detailed engineering log (per-change changelog)
@@ -157,22 +166,28 @@ RL-Sculptor/
 
 ## Tests
 
-```bash
-# core library — 701 passed, 1 skipped (jax-only parity test)
-cd RewardSculptor && uv run pytest tests/ -q
+Run these commands from the repository root:
 
-# UI backend — 345 passed
-cd reward-sculptor-ui && uv run pytest backend/tests/ -q
+```bash
+# core library
+(cd RewardSculptor && uv run pytest tests/ -q)
+
+# UI backend
+(cd reward-sculptor-ui && uv run pytest backend/tests/ -q)
 
 # frontend typecheck
-cd reward-sculptor-ui/frontend && pnpm typecheck
+(cd reward-sculptor-ui/frontend && pnpm typecheck)
 ```
 
 All Anthropic API calls in the test suites are mocked; GPU tests are skipped on machines
 without CUDA.
 
+These are local verification commands. This snapshot has no hosted test
+workflow; the GitHub Actions dependency-graph job does not run these suites.
+
 ---
 
 ## License
 
-MIT. See each subproject for third-party notices.
+The core package declares MIT in its [package metadata](RewardSculptor/pyproject.toml).
+The full license text is not included in this repository snapshot.
