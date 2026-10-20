@@ -5,12 +5,8 @@ FastAPI backend + React + Vite frontend. Create projects, pick or
 upload a robot, browse the knowledge graph, launch sculpt runs, and
 watch them live — all in one tab.
 
-![Dashboard](docs/screenshots/dashboard.png)
-
-> Screenshots are committed manually by the author — the file above is
-> a zero-byte placeholder on a fresh clone. See
-> [`docs/screenshots/README.md`](docs/screenshots/README.md) for the
-> full list. Replace `dashboard.png` with a real capture when you ship.
+Screenshot capture notes are in
+[`docs/screenshots/README.md`](docs/screenshots/README.md).
 
 ## One-command install
 

@@ -8,6 +8,27 @@ SONIC/OGMP literature. The old numbered task queue below is historical
 context, not an instruction to restart already-completed work. Historical GPU
 heartbeat messages are also not launch authority.
 
+## README accuracy maintenance (2026-10-20)
+
+Root/core READMEs no longer present static test counts as current passing
+status. Test commands remain available; the current hosted dependency-graph
+job does not execute those suites. Historical dated test results below are
+unchanged.
+
+The quickstart begins with CLI help. `sculpt run --dry-run` uses canned LLM
+responses and a reduced requested training budget, while still performing
+training and evaluation. The READMEs and contributor smoke-run instructions
+now say this explicitly and make no fixed completion-time promise.
+
+The existing MIT package-metadata declaration is preserved, with an accurate
+note that this snapshot has no full license text. The UI README links to
+screenshot capture notes instead of embedding its zero-byte placeholder.
+
+Verification covered locked installation resolution, credential-free CLI
+help, changed documentation links and shell syntax. No runtime code,
+dependencies, lockfiles or licensing terms changed; no training, simulator,
+GPU or LLM call was run for this maintenance slice.
+
 Repo root: `/home/samjd/projects`. Two subprojects in one git repo:
 - `RewardSculptor/` — the core Python library + `sculpt` CLI (the train→rollout→diagnose→edit loop, the paper knowledge graph, the objective-metric trust pipeline, adapters for MJLab/MuJoCo + Isaac). Run things with `uv run …` from inside `RewardSculptor/`.
 - `reward-sculptor-ui/` — FastAPI backend + React/Vite frontend that wraps the library (project lifecycle, robot picker, reward editor, KG browser, world builder, live run streaming, reports).

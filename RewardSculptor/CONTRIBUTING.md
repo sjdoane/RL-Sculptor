@@ -48,8 +48,8 @@ easiest ways to contribute, in rough order of impact:
 ## Getting started
 
 ```bash
-git clone <this-repo>
-cd RewardSculptor
+git clone https://github.com/sjdoane/RL-Sculptor.git
+cd RL-Sculptor/RewardSculptor
 uv sync
 cp .env.example .env      # fill in ANTHROPIC_API_KEY
 uv run pytest tests/ -v   # sanity check
@@ -62,7 +62,7 @@ Hot-path development:
 uv run pytest tests/test_adapter_contract.py -v
 uv run pytest tests/test_diagnose.py tests/test_edit.py -v
 
-# Full smoke (under a minute, no API credit spent):
+# Smoke run with canned LLM responses (still trains and evaluates):
 uv run sculpt run \
     --config examples/hopper/config.toml \
     "goal" --iterations 3 --dry-run
@@ -137,8 +137,9 @@ We are actively inviting:
 ### What we'll ask when reviewing your PR
 
 - Does the adapter violate the contract? If yes, we'll reject.
-- Does `--dry-run` work end-to-end in under a minute? If not, we'll
-  reject — that's the smoke test that keeps the project honest.
+- Does `--dry-run` use canned LLM responses and reduce the requested training
+  budget? It still performs training and evaluation; document the adapter's
+  hardware requirements.
 - Does it handle the edge cases documented in `docs/adapters.md`?
   (Vectorized envs, worker remoting, reward module hot-reloads.)
 - Does the contract test pass with no real training? If the test
