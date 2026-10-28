@@ -8,6 +8,15 @@ SONIC/OGMP literature. The old numbered task queue below is historical
 context, not an instruction to restart already-completed work. Historical GPU
 heartbeat messages are also not launch authority.
 
+## Idle UI capture (2026-10-28)
+
+The UI README now shows an actual isolated robot-library session. Its
+bundled robot thumbnails are catalogue illustrations, not training results.
+`reward-sculptor-ui/docs/screenshots/README.md` records the source revision,
+minimal lock-derived inspection environment and clean-state launch commands.
+The full training installation, simulators and providers remain unverified
+by this capture. The old empty PNG placeholders remain unembedded.
+
 ## README accuracy maintenance (2026-10-20)
 
 Root/core READMEs no longer present static test counts as current passing

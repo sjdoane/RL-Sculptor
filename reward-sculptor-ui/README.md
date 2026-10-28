@@ -5,8 +5,11 @@ FastAPI backend + React + Vite frontend. Create projects, pick or
 upload a robot, browse the knowledge graph, launch sculpt runs, and
 watch them live — all in one tab.
 
-Screenshot capture notes are in
-[`docs/screenshots/README.md`](docs/screenshots/README.md).
+![Robot library in a fresh, isolated UI session](docs/screenshots/library-idle.jpg)
+
+Actual localhost capture with no projects, API key, GPU or training stack.
+The cards use bundled catalogue thumbnails; they are not run results.
+See [capture provenance and reproduction](docs/screenshots/README.md).
 
 ## One-command install
 
