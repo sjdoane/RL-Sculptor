@@ -87,9 +87,9 @@ export function LibraryBrowser() {
   }
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "210px 1fr", gap: 18, alignItems: "start" }}>
+    <div className="rs-library-layout">
       {/* Sidebar filters */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "sticky", top: 8 }}>
+      <div className="rs-library-filters">
         <div>
           <div className="rs-caption">Category</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>

@@ -1,6 +1,8 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
+import { Modal } from "@/components/rs/primitives";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useSystemInfo } from "@/hooks/useDashboard";
 import { useTheme } from "@/hooks/useTheme";
@@ -82,6 +84,28 @@ function SystemMini() {
 }
 
 export default function Layout() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 767px)").matches);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const desktopNav = useRef<HTMLElement>(null);
+  const location = useLocation();
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 767px)");
+    const update = () => setNarrow(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [location]);
+  useEffect(() => {
+    if (!narrow && menuOpen) {
+      // Modal has unmounted and restored its opener, which disappears at
+      // this breakpoint. Continue at the visible current desktop link.
+      desktopNav.current?.querySelector<HTMLElement>('[aria-current="page"]')?.focus();
+      setMenuOpen(false);
+    }
+  }, [narrow, menuOpen]);
   // Mounting useTheme here keeps the theme applied app-wide (and tracks
   // system-preference changes) rather than only while Settings is open.
   const { theme, setTheme } = useTheme();
@@ -92,9 +116,8 @@ export default function Layout() {
         : "light"
       : theme;
 
-  return (
-    <div className="rs-app">
-      <nav className="rs-rail" aria-label="Primary">
+  const navigation = (
+      <nav ref={narrow ? undefined : desktopNav} className={narrow ? "rs-compact-nav" : "rs-rail"} aria-label="Primary">
         <div className="rs-rail-mark">
           <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden>
             <rect width="32" height="32" rx="8" fill="var(--ink)" />
@@ -118,6 +141,7 @@ export default function Layout() {
             key={item.to}
             to={item.to}
             end={item.to === "/"}
+            onClick={() => setMenuOpen(false)}
             className={({ isActive }) => "rs-navitem" + (isActive ? " on" : "")}
           >
             <Icon name={item.icon} size={17} />
@@ -139,6 +163,22 @@ export default function Layout() {
           </button>
         </div>
       </nav>
+  );
+
+  return (
+    <div className="rs-app">
+      {narrow ? (
+        <>
+          <header className="rs-compact-head">
+            <span className="rs-rail-word">rl·<b>sculptor</b></span>
+            <button className="rs-btn rs-btn-ghost rs-btn-sm" aria-haspopup="dialog"
+              aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}>
+              <Icon name="menu" size={17} />Menu
+            </button>
+          </header>
+          {menuOpen && <Modal title="Navigation" onClose={() => setMenuOpen(false)}>{navigation}</Modal>}
+        </>
+      ) : navigation}
 
       <main className="rs-main">
         <Outlet />
