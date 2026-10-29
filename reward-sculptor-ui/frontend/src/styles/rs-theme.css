@@ -65,6 +65,18 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-scroll::-webkit-scrollbar-thumb { background: var(--hairline-strong); border-radius: 8px; border: 3px solid var(--canvas); }
 .rs-pad { padding: 28px 32px 60px; max-width: 1320px; }
 .rs-pad-wide { padding: 24px 28px 48px; }
+.rs-compact-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--hairline); flex-shrink: 0; }
+.rs-compact-nav { display: flex; flex-direction: column; gap: 4px; }
+.rs-library-layout { display: grid; grid-template-columns: 210px 1fr; gap: 18px; align-items: start; }
+.rs-library-filters { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 8px; }
+@media (max-width: 767px) {
+  .rs-app { flex-direction: column; }
+  .rs-main { min-height: 0; }
+  .rs-pad { padding: 24px 16px 40px; }
+  .rs-library-layout { grid-template-columns: minmax(0, 1fr); }
+  .rs-library-filters { position: static; }
+}
 
 /* ---------- Left rail ---------- */
 .rs-rail { width: var(--rail-w); flex-shrink: 0; background: var(--canvas); border-right: 1px solid var(--hairline);

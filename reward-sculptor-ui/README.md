@@ -11,6 +11,13 @@ Actual localhost capture with no projects, API key, GPU or training stack.
 The cards use bundled catalogue thumbnails; they are not run results.
 See [capture provenance and reproduction](docs/screenshots/README.md).
 
+Below 768 CSS pixels, Menu opens the existing navigation and system status
+in a keyboard-accessible dialog; the library filters stack above its cards.
+The empty dashboard, library, projects, saved missions and settings were
+inspected at 390–1440 CSS pixels using the isolated UI-only setup. This
+does not verify project detail views, training or provider workflows on
+small screens. See the capture guide for viewport calibration and checks.
+
 ## One-command install
 
 ```bash

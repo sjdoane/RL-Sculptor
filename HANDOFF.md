@@ -8,6 +8,23 @@ SONIC/OGMP literature. The old numbered task queue below is historical
 context, not an instruction to restart already-completed work. Historical GPU
 heartbeat messages are also not launch authority.
 
+## Compact idle UI navigation (2026-10-29)
+
+Below 768 CSS pixels, Layout replaces the fixed rail with a Menu button and
+the existing Modal primitive. Only one navigation/status subtree mounts;
+all five destinations, system status and theme remain available. Opening,
+link/route dismissal, Escape, scrim, focus trapping/restoration and widening
+back to the desktop rail are covered by Layout tests and actual browser
+inspection. Library filters stack at the same breakpoint; desktop sizing
+is preserved. No backend, dependency or training behavior changed.
+
+The original apparent 1124px dashboard overflow was a capture/viewport
+mismatch, not a corrected source defect. Actual narrow clipping was
+reproduced at 390px. Empty real localhost views were checked at 390, 640,
+768, 1124 and 1440 CSS pixels; training, providers and project detail views
+were not exercised. The screenshot guide now distinguishes image pixels
+from measured CSS viewport dimensions. The existing JPEG is unchanged.
+
 ## Idle UI capture (2026-10-28)
 
 The UI README now shows an actual isolated robot-library session. Its

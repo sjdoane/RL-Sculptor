@@ -3,7 +3,8 @@
 `library-idle.jpg` is an unedited browser capture of `/library`, taken on
 2026-10-28 from public source revision
 `52a149a8172e2b84345d1b7f4e8b352fefdc46d6` on macOS, Python 3.12.14,
-Node 24.20.0 and pnpm 9.12.0. The viewport is 1124 × 720.
+Node 24.20.0 and pnpm 9.12.0. The JPEG dimensions are 1124 × 720 pixels;
+image dimensions alone do not establish the browser's CSS viewport size.
 
 This is an idle UI inspection, using a new empty project directory, no API
 key and no installed torch, simulator or embedding model. The library returns
@@ -90,6 +91,17 @@ automatically makes read-only system-availability requests. Do not select a
 robot, create a project or start a job for this capture. Capture the actual
 page without editing its text or injecting API responses. Close the tab and
 press Ctrl+C in both terminals when finished.
+
+For layout QA, explicitly set the browser's CSS viewport and verify
+`window.innerWidth` and `window.innerHeight` before measuring content. Do
+not infer the CSS viewport from screenshot pixel dimensions: a capture can
+be narrower than its page layout. Check both document and inner scroll
+container client/scroll widths, visible controls and keyboard navigation.
+The compact navigation breakpoint is below 768 CSS pixels. Inspect the
+empty dashboard, library, projects, saved missions and settings at 390,
+640, 768, 1124 and 1440 pixels; at narrow widths also test Menu dismissal,
+focus restoration and library filters. These idle checks do not exercise
+project detail views, training or providers.
 
 The capture verified real HTTP 200 responses from `/health`, `/dashboard`,
 `/library/robots`, `/system/gpu`, `/system/info` and the three visible thumbnail
