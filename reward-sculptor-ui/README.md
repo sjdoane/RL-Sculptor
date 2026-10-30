@@ -11,6 +11,13 @@ Actual localhost capture with no projects, API key, GPU or training stack.
 The cards use bundled catalogue thumbnails; they are not run results.
 See [capture provenance and reproduction](docs/screenshots/README.md).
 
+Frontend CI is configured in [frontend.yml](../.github/workflows/frontend.yml)
+for pull requests and main pushes that change the frontend or its workflow.
+It uses Node 22 and the package's pinned pnpm version to install the frozen
+lockfile, run unit tests, typecheck and build on a standard CPU runner.
+Check the corresponding Actions run for its hosted result. This job does
+not exercise the backend, browser layout, simulators, providers or training.
+
 Below 768 CSS pixels, Menu opens the existing navigation and system status
 in a keyboard-accessible dialog; the library filters stack above its cards.
 The empty dashboard, library, projects, saved missions and settings were
