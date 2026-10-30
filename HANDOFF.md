@@ -8,6 +8,15 @@ SONIC/OGMP literature. The old numbered task queue below is historical
 context, not an instruction to restart already-completed work. Historical GPU
 heartbeat messages are also not launch authority.
 
+## Frontend CI configuration (2026-10-30)
+
+`.github/workflows/frontend.yml` adds frontend-only tests, TypeScript checks
+and a production build for frontend/workflow pull-request changes and main
+pushes. It uses Node 22, the package-declared pnpm version and a frozen
+lockfile, with read-only repository permission and no backend or training
+environment. Local command validation is separate from a successful hosted
+Actions run; verify that run's event and revision before reporting CI green.
+
 ## Compact idle UI navigation (2026-10-29)
 
 Below 768 CSS pixels, Layout replaces the fixed rail with a Menu button and
@@ -37,8 +46,8 @@ by this capture. The old empty PNG placeholders remain unembedded.
 ## README accuracy maintenance (2026-10-20)
 
 Root/core READMEs no longer present static test counts as current passing
-status. Test commands remain available; the current hosted dependency-graph
-job does not execute those suites. Historical dated test results below are
+status. Test commands remain available; at that checkpoint the hosted dependency-graph
+job did not execute those suites. Historical dated test results below are
 unchanged.
 
 The quickstart begins with CLI help. `sculpt run --dry-run` uses canned LLM

@@ -1,0 +1,42 @@
+name: Frontend
+
+on:
+  pull_request:
+    paths:
+      - 'reward-sculptor-ui/frontend/**'
+      - '.github/workflows/frontend.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'reward-sculptor-ui/frontend/**'
+      - '.github/workflows/frontend.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Tests, types and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: reward-sculptor-ui/frontend
+    env:
+      CI: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install locked frontend dependencies
+        run: corepack pnpm install --frozen-lockfile
+      - name: Test
+        run: corepack pnpm test
+      - name: Typecheck
+        run: corepack pnpm run typecheck
+      - name: Build
+        run: corepack pnpm run build

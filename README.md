@@ -188,8 +188,12 @@ Run these commands from the repository root:
 All Anthropic API calls in the test suites are mocked; GPU tests are skipped on machines
 without CUDA.
 
-These are local verification commands. This snapshot has no hosted test
-workflow; the GitHub Actions dependency-graph job does not run these suites.
+These remain local verification commands. The [frontend workflow](.github/workflows/frontend.yml)
+is configured to install the frozen frontend lockfile, run its unit tests,
+typecheck and build for frontend/workflow pull-request changes and main pushes.
+Hosted success must be verified from the corresponding Actions run; local
+results alone do not establish it. Core/backend suites remain local, and this
+frontend job does not validate browser layout, providers, simulators or training.
 
 ---
 
